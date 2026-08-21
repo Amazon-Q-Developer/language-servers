@@ -2055,6 +2055,47 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             const objective = JSON.parse(command.input.objective)
             expect(objective.interactive_mode).to.equal('auto')
         })
+
+        it('should include generate_unit_tests:true in objective when opted in', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: true })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(true)
+        })
+
+        it('should include generate_unit_tests:false in objective on explicit decline', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: false })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(false)
+        })
+
+        it('should omit generate_unit_tests from objective when no choice is sent', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1' })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
+
+        it('should omit generate_unit_tests when the value is not a real boolean', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            // A mistyped/non-boolean value must read as "no choice sent", not a decision.
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: 'true' as any })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
     })
 
     describe('createArtifactUploadUrl', () => {

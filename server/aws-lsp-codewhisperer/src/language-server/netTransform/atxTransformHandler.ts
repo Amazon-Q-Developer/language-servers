@@ -472,6 +472,7 @@ export class ATXTransformHandler {
         jobName?: string
         targetFramework?: string
         interactiveMode?: InteractiveMode
+        generateUnitTests?: boolean
     }): Promise<{ jobId: string; status: string } | null> {
         try {
             this.logging.log(`ATX: Starting CreateJob for workspace: ${request.workspaceId}`)
@@ -492,6 +493,13 @@ export class ATXTransformHandler {
             const objective: any = {
                 target_framework: request.targetFramework || 'net10.0',
                 interactive_mode: interactiveModeValue,
+            }
+
+            // The customer's up-front unit-test choice. Only a real boolean counts as a choice:
+            // clients that cannot express one omit the field, and the backend keeps legacy behavior.
+            // Do NOT default this to false here - an explicit false is a decline, not "no choice".
+            if (typeof request.generateUnitTests === 'boolean') {
+                objective.generate_unit_tests = request.generateUnitTests
             }
 
             const orchestratorAgent = getAtxOrchestratorAgent()
@@ -693,6 +701,7 @@ export class ATXTransformHandler {
                 jobName: request.jobName || 'Transform Job',
                 targetFramework: (request.startTransformRequest as any).TargetFramework,
                 interactiveMode: request.interactiveMode,
+                generateUnitTests: (request.startTransformRequest as any).GenerateUnitTests,
             })
 
             if (!createJobResponse?.jobId) {
