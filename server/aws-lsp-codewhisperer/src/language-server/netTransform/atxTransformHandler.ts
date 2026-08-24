@@ -1770,6 +1770,12 @@ export class ATXTransformHandler {
                 result.DiffApplyFailed = true
                 result.DiffApplyFailedStepIds = diffContext.failedStepIds
             }
+            // Surface the backend-resolved interactive mode (from job.objective) on every
+            // response so the IDE can restore it. Single injection point covers all internal
+            // return paths. cachedInteractiveMode is populated in _getTransformInfoInternal.
+            if (result && this.cachedInteractiveMode) {
+                result.InteractiveMode = this.cachedInteractiveMode
+            }
             return result
         } finally {
             this._currentDiffContext = null
