@@ -14,6 +14,7 @@ import {
     MISSING_BEARER_TOKEN_ERROR,
     SAGEMAKER_UNIFIED_STUDIO_SERVICE,
 } from './constants'
+import { AccessDeniedExceptionReason } from '@amzn/codewhisperer-runtime'
 import {
     CodeWhispererStreamingServiceException,
     Origin,
@@ -42,6 +43,52 @@ export function isAwsError(error: unknown): error is Error & { code: string; tim
 
     // AWS SDK v3 errors extend ServiceException
     return error instanceof ServiceException || (error instanceof Error && '$metadata' in error)
+}
+
+/**
+ * Whether `e` (or anything in its cause chain) is Amazon Q Developer refusing this identity because
+ * Builder ID plugin access is blocked.
+ *
+ * RTS gates Q Developer plugin traffic (identified by the shared
+ * `AWS-Language-Servers-AWS-CodeWhisperer` language-server user-agent token) in
+ * `QDevPluginAccessGateHandler`: Builder ID identities created on or after 2026-07-25 are denied with
+ * an `AccessDeniedException` whose reason is `FEATURE_NOT_SUPPORTED`. IdC (Enterprise) identities are
+ * exempt from that gate, so in practice this only fires for Builder ID callers.
+ *
+ * Because the gate runs before the activity, *every* API call from a blocked identity fails this way --
+ * there is no need to probe a specific operation, the first request is enough to detect it.
+ *
+ * The match is deliberately narrow: it requires the reason to be exactly `FEATURE_NOT_SUPPORTED`. The
+ * other modeled reasons -- `UNAUTHORIZED_CUSTOMIZATION_RESOURCE_ACCESS`,
+ * `UNAUTHORIZED_WORKSPACE_CONTEXT_FEATURE_ACCESS` and `TEMPORARILY_SUSPENDED` -- must NOT match. The
+ * last especially: it is transient and recoverable, so treating it as a permanent block would strand a
+ * user whose access is coming back.
+ *
+ * Matching is by exception `name` rather than `instanceof` because the same modeled exception is
+ * generated separately into the runtime and streaming clients, and because callers frequently rethrow
+ * it wrapped. The cause chain is walked for the same reason, with a visited set so a cyclic chain
+ * terminates.
+ *
+ * Note that `FEATURE_NOT_SUPPORTED` is not unique to this gate (other handlers reuse it), so callers
+ * should surface the service's own message rather than substituting their own copy.
+ */
+export function isQDevPluginAccessBlockedError(e: unknown): boolean {
+    const seen = new Set<unknown>()
+    let current: unknown = e
+
+    while (current !== undefined && current !== null && !seen.has(current)) {
+        seen.add(current)
+
+        const name = (current as { name?: unknown }).name
+        const reason = (current as { reason?: unknown }).reason
+        if (name === 'AccessDeniedException' && reason === AccessDeniedExceptionReason.FEATURE_NOT_SUPPORTED) {
+            return true
+        }
+
+        current = (current as { cause?: unknown }).cause
+    }
+
+    return false
 }
 
 export function isAwsThrottlingError(e: unknown): e is ThrottlingException {
