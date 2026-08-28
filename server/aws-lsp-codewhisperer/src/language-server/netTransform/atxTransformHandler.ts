@@ -512,6 +512,7 @@ export class ATXTransformHandler {
         jobName?: string
         targetFramework?: string
         interactiveMode?: InteractiveMode
+        generateUnitTests?: boolean
     }): Promise<{ jobId: string; status: string } | null> {
         try {
             this.logging.log(`ATX: Starting CreateJob for workspace: ${request.workspaceId}`)
@@ -532,6 +533,13 @@ export class ATXTransformHandler {
             const objective: any = {
                 target_framework: request.targetFramework || 'net10.0',
                 interactive_mode: interactiveModeValue,
+            }
+
+            // The customer's up-front unit-test choice. Only a real boolean counts as a choice:
+            // clients that cannot express one omit the field, and the backend keeps legacy behavior.
+            // Do NOT default this to false here - an explicit false is a decline, not "no choice".
+            if (typeof request.generateUnitTests === 'boolean') {
+                objective.generate_unit_tests = request.generateUnitTests
             }
 
             const orchestratorAgent = getAtxOrchestratorAgent()
@@ -1163,6 +1171,7 @@ export class ATXTransformHandler {
                 jobName: request.jobName || 'Transform Job',
                 targetFramework: (request.startTransformRequest as any).TargetFramework,
                 interactiveMode: request.interactiveMode,
+                generateUnitTests: (request.startTransformRequest as any).GenerateUnitTests,
             })
 
             if (!createJobResponse?.jobId) {
@@ -3653,6 +3662,14 @@ export class ATXTransformHandler {
                 const parent = stepMap.get(step.ParentStepId)
                 if (parent) {
                     parent.Children.push(step)
+                    // Substeps of the unit-test-generation step render status-only in the IDE
+                    // (no checkpoint toggle / "View Results" button / checkpoint checkbox); the
+                    // parent keeps its normal affordance. The service does not send a machine
+                    // label, so we key off the parent's name. Only direct children are marked,
+                    // so the parent "Generate Unit Tests" step itself stays interactive.
+                    if (this.isUnitTestGenerationStep(parent.StepName)) {
+                        step.IsStatusOnly = true
+                    }
                 } else {
                     // Orphan step - treat as root level
                     rootChildren.push(step)
@@ -3675,6 +3692,15 @@ export class ATXTransformHandler {
      * Maps an API step response to AtxPlanStep.
      * Converts from FES camelCase to C#-compatible PascalCase.
      */
+    /**
+     * True when a step's name identifies it as the unit-test-generation parent step, whose
+     * direct substeps (plan / generate / merge / coverage) should render status-only in the IDE.
+     * Matches on normalized name because the service sends no machine-readable step label.
+     */
+    private isUnitTestGenerationStep(stepName: string | undefined): boolean {
+        return typeof stepName === 'string' && stepName.trim().toLowerCase() === 'generate unit tests'
+    }
+
     private mapApiStepToNode(apiStep: any): AtxPlanStep & { score?: number } {
         return {
             StepId: apiStep.stepId || '',
@@ -3683,6 +3709,12 @@ export class ATXTransformHandler {
             Description: apiStep.description || '',
             Status: this.mapApiStatus(apiStep.status),
             Children: [],
+            // Defaults false here; the value is assigned structurally during tree assembly
+            // (buildTreeFromFlatList) for substeps of the unit-test-generation step. The service
+            // does not send a machine-readable step label, so parent identity — not a label —
+            // drives this. PascalCase matches the other fields (StepId/HasCheckpoint/...) so it
+            // binds onto the C# AtxPlanStep.IsStatusOnly.
+            IsStatusOnly: false,
             // Keep score for sorting (not sent to C#)
             score: apiStep.score || 0,
         }
