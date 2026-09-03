@@ -4684,7 +4684,12 @@ export class ATXTransformHandler {
             const sentMessageId = sendResult?.message?.messageId
 
             if (!sentMessageId || request.skipPolling) {
-                return { success: true, data: sendResult }
+                // Must match the shape the polling path returns below. The client reads the sent id
+                // from data.sentMessage.messageId and adds it to its seen-set so its own poll does
+                // not re-render the message the user just sent. Returning the raw sendResult nests
+                // that id under `message` instead of `sentMessage`, leaving it unreadable — so every
+                // message sent on this path rendered twice: once locally, once again from the poll.
+                return { success: true, data: { sentMessage: sendResult?.message, response: null } }
             }
 
             // Poll for response until the configured attempt ceiling (default 180 x 5s

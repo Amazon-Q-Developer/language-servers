@@ -127,7 +127,17 @@ describe('ATXTransformHandler - Chat APIs', () => {
                 skipPolling: true,
             })
 
-            expect(result).to.deep.equal({ success: true, data: mockResponse })
+            // skipPolling must return the SAME shape as the polling path, not the raw send result.
+            // The IDE reads data.sentMessage.messageId to seed its seen-set so the 3s chat poll does
+            // not render the server's copy as a second bubble; returning `mockResponse` verbatim
+            // left that unreadable and every beamed message appeared twice.
+            expect(result).to.deep.equal({
+                success: true,
+                data: { sentMessage: mockResponse.message, response: null },
+            })
+            // Assert the consumed path explicitly — deep.equal above would still pass if the field
+            // were renamed on both sides, but the IDE reads exactly this.
+            expect(result.data.sentMessage.messageId).to.equal('msg-123')
             expect(sendStub.calledOnce).to.be.true
         })
 
