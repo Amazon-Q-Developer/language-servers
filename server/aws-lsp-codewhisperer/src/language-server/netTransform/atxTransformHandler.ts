@@ -115,6 +115,10 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// Cap on the parsed-artifact cache. These bounds above limit ONE scan; they cannot
+// limit the number of scans, so repeated discovery sweeps re-downloaded the same
+// artifacts indefinitely. The cache is what bounds the total.
+const BEAM_JSON_ARTIFACT_CACHE_MAX = 500
 
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
@@ -141,6 +145,12 @@ export class ATXTransformHandler {
     // pre-job mode-selection -checkpoint (filter) from the post-build -checkpoint
     // (surface for auto-approve).
     private jobsPastLocalBuild: Set<string> = new Set()
+
+    // Beam: parsed small-JSON artifacts keyed by their IMMUTABLE artifactId (a re-upload
+    // mints a new id, so a cached entry can never be stale). A `null` value is a positive
+    // result meaning "these bytes are definitively not JSON" — the case that dominated the
+    // waste. Transient failures are never cached; see downloadJsonArtifact.
+    private readonly beamJsonArtifactCache = new Map<string, any | null>()
 
     constructor(serviceManager: AtxTokenServiceManager, workspace: Workspace, logging: Logging, runtime: Runtime) {
         this.serviceManager = serviceManager
@@ -928,8 +938,19 @@ export class ATXTransformHandler {
      * failure unzip (AdmZip) and parse the first JSON entry inside.
      */
     private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
+        // Artifacts are immutable — a re-upload mints a new artifactId — so re-fetching
+        // the same id can never yield different bytes. Beam discovery re-scans the same
+        // candidate artifacts on every sweep, so without this the same artifact is
+        // downloaded and re-parsed on every pass (measured: ~2000 download-URL creations
+        // and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
+        // unrelated calls — chat included).
+        if (this.beamJsonArtifactCache.has(artifactId)) {
+            return this.beamJsonArtifactCache.get(artifactId) ?? null
+        }
         try {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
+            // No presigned URL is a transient condition (throttle/authz), so it is NOT
+            // cached — the next sweep must be free to retry.
             if (!dl?.s3PresignedUrl) return null
             const response = await got.get(dl.s3PresignedUrl, {
                 headers: dl.requestHeaders || {},
@@ -940,7 +961,9 @@ export class ATXTransformHandler {
 
             // Direct JSON first (artifact stored raw).
             try {
-                return JSON.parse(buf.toString('utf8'))
+                const parsed = JSON.parse(buf.toString('utf8'))
+                this.cacheJsonArtifact(artifactId, parsed)
+                return parsed
             } catch {
                 // Not raw JSON — likely a ZIP (PK magic). Unzip and parse the first
                 // JSON entry (the beam-map is a single JSON file inside).
@@ -953,18 +976,46 @@ export class ATXTransformHandler {
                             this.logging.log(
                                 `[BEAM-PKG] downloadJsonArtifact: parsed ${artifactId} from zip entry ${entry.entryName}`
                             )
+                            this.cacheJsonArtifact(artifactId, parsed)
                             return parsed
                         } catch {
                             // not this entry — try the next
                         }
                     }
                 }
-                throw new Error('artifact is neither raw JSON nor a zip containing JSON')
+                // Definitively not JSON, and not a zip containing JSON. That is a
+                // PERMANENT property of these bytes, so remember it: this was the bulk
+                // of the waste (1230 repeats in 90s), and it now logs once per artifact
+                // instead of once per sweep.
+                this.logging.log(
+                    `ATX: downloadJsonArtifact: ${artifactId} is neither raw JSON nor a zip containing JSON — caching as not-JSON`
+                )
+                this.cacheJsonArtifact(artifactId, null)
+                return null
             }
         } catch (error) {
+            // TRANSIENT (download/network/throttle/AccessDenied, or a malformed zip that
+            // made AdmZip throw). Deliberately NOT cached — caching one of these would
+            // permanently mark a readable artifact as unreadable.
             this.logging.log(`ATX: downloadJsonArtifact parse/download failed for ${artifactId}: ${String(error)}`)
             return null
         }
+    }
+
+    /**
+     * Record a parsed artifact (or `null` for "definitively not JSON") against its
+     * immutable artifactId. Bounded so a long-lived session cannot grow without limit;
+     * the entries are small parsed objects, and on overflow we simply drop the whole
+     * cache rather than pick a victim — the only cost is re-downloading once.
+     */
+    private cacheJsonArtifact(artifactId: string, value: any | null): void {
+        if (this.beamJsonArtifactCache.size >= BEAM_JSON_ARTIFACT_CACHE_MAX) {
+            this.logging.log(
+                `[BEAM-PKG] downloadJsonArtifact cache reached ${BEAM_JSON_ARTIFACT_CACHE_MAX} entries — clearing`
+            )
+            this.beamJsonArtifactCache.clear()
+        }
+        this.beamJsonArtifactCache.set(artifactId, value)
     }
 
     /**
