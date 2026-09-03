@@ -115,10 +115,17 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
-// Cap on the parsed-artifact cache. These bounds above limit ONE scan; they cannot
+// Cap on the parsed-artifact cache. The two bounds above limit ONE scan; they cannot
 // limit the number of scans, so repeated discovery sweeps re-downloaded the same
 // artifacts indefinitely. The cache is what bounds the total.
-const BEAM_JSON_ARTIFACT_CACHE_MAX = 500
+//
+// 4000 is derived from a measurement, not chosen: a 25-minute session on a 32-job
+// workspace touched 1043 DISTINCT artifacts while issuing ~30000 downloads (~29x
+// redundancy). An earlier value of 500 sat BELOW that working set, so the cache filled,
+// evicted, and refilled continuously — 36 evictions in 25 minutes — and the flood did
+// not move at all. The cap must exceed the working set or the cache is worse than
+// useless: it pays the bookkeeping and delivers no hits.
+const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
@@ -151,6 +158,8 @@ export class ATXTransformHandler {
     // result meaning "these bytes are definitively not JSON" — the case that dominated the
     // waste. Transient failures are never cached; see downloadJsonArtifact.
     private readonly beamJsonArtifactCache = new Map<string, any | null>()
+    // Latch so the cap-reached notice is logged once per process, not once per eviction.
+    private beamJsonArtifactCacheEvicted = false
 
     constructor(serviceManager: AtxTokenServiceManager, workspace: Workspace, logging: Logging, runtime: Runtime) {
         this.serviceManager = serviceManager
@@ -945,7 +954,12 @@ export class ATXTransformHandler {
         // and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
         // unrelated calls — chat included).
         if (this.beamJsonArtifactCache.has(artifactId)) {
-            return this.beamJsonArtifactCache.get(artifactId) ?? null
+            // Re-insert to move this entry to the end: Map iterates in insertion order, so
+            // "oldest key first" is only a true LRU ordering if a hit refreshes position.
+            const cached = this.beamJsonArtifactCache.get(artifactId) ?? null
+            this.beamJsonArtifactCache.delete(artifactId)
+            this.beamJsonArtifactCache.set(artifactId, cached)
+            return cached
         }
         try {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
@@ -1004,16 +1018,31 @@ export class ATXTransformHandler {
 
     /**
      * Record a parsed artifact (or `null` for "definitively not JSON") against its
-     * immutable artifactId. Bounded so a long-lived session cannot grow without limit;
-     * the entries are small parsed objects, and on overflow we simply drop the whole
-     * cache rather than pick a victim — the only cost is re-downloading once.
+     * immutable artifactId, evicting least-recently-used entries at the cap.
+     *
+     * Evicts ONE entry rather than clearing the map. The first version cleared wholesale,
+     * which turns an under-sized cap from a partial loss into a total one: at the cap it
+     * discards every entry including the ones about to be hit, so the hit rate collapses
+     * to zero and the cache does nothing. That is exactly what happened with a cap of 500
+     * against a 1043-artifact working set. Single-victim eviction degrades gradually
+     * instead, so a workspace larger than the cap still gets most of the benefit.
      */
     private cacheJsonArtifact(artifactId: string, value: any | null): void {
-        if (this.beamJsonArtifactCache.size >= BEAM_JSON_ARTIFACT_CACHE_MAX) {
-            this.logging.log(
-                `[BEAM-PKG] downloadJsonArtifact cache reached ${BEAM_JSON_ARTIFACT_CACHE_MAX} entries — clearing`
-            )
-            this.beamJsonArtifactCache.clear()
+        while (this.beamJsonArtifactCache.size >= BEAM_JSON_ARTIFACT_CACHE_MAX) {
+            const oldest = this.beamJsonArtifactCache.keys().next()
+            if (oldest.done) break
+            this.beamJsonArtifactCache.delete(oldest.value)
+            // Logged ONCE, not per eviction — the signal we want is "the working set
+            // exceeded the cap", which is what made the previous under-sized cap
+            // diagnosable. Per-eviction logging would itself become the flood.
+            if (!this.beamJsonArtifactCacheEvicted) {
+                this.beamJsonArtifactCacheEvicted = true
+                this.logging.log(
+                    `[BEAM-PKG] downloadJsonArtifact cache hit its ${BEAM_JSON_ARTIFACT_CACHE_MAX}-entry cap — ` +
+                        `evicting LRU. If this appears, the workspace's artifact working set exceeds the cap ` +
+                        `and the hit rate is degrading; consider raising it.`
+                )
+            }
         }
         this.beamJsonArtifactCache.set(artifactId, value)
     }
