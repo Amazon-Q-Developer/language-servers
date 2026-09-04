@@ -497,6 +497,30 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect((handler as any).jobsPastLocalBuild.has('job-123')).to.be.true
     })
 
+    it('should NOT surface a sibling repo LBV when status is PLANNING and all pending LBVs are out of the loaded scope', async () => {
+        // Beam multi-repo: the IDE loaded one repo (beamScopeStepIds = its subtree). Every pending
+        // HITL is a local-build-verification for a DIFFERENT (sibling) repo's plan step. Surfacing
+        // one would make the IDE build the loaded solution against a sibling's HITL → false-green.
+        // Mirrors the EXECUTING/getHitlAgentArtifact guard: return the plan-only view instead.
+        getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([
+            { tag: 'local-build-verification', taskId: 'task-sib1', stepId: 'sibling-step-1' },
+            { tag: 'local-build-verification', taskId: 'task-sib2', stepId: 'sibling-step-2' },
+        ])
+
+        const result = await handler.getTransformInfo({
+            ...baseRequest,
+            beamScopeStepIds: 'loaded-step-a,loaded-step-b',
+        })
+
+        // Plan-only view: original job status preserved, no HITL surfaced to the IDE.
+        expect(result?.TransformationJob.Status).to.equal('PLANNING')
+        expect(result?.HitlTag).to.be.undefined
+        expect(result?.HitlTaskId).to.be.undefined
+        expect(result?.TransformationPlan).to.deep.equal({ Root: { Children: [] } })
+    })
+
     it('should filter pre-job mode-selection -checkpoint HITL before LBV has run', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -4121,6 +4145,197 @@ describe('ATXTransformHandler - final coverage push', () => {
             const result = await handler.completeArtifactUpload('ws-1', 'job-1', 'art-1')
 
             expect(result).to.be.null
+        })
+    })
+})
+
+describe('ATXTransformHandler - Beam to IDE', () => {
+    let handler: ATXTransformHandler
+    let serviceManager: AtxTokenServiceManager
+    let workspace: Workspace
+    let logging: Logging
+    let runtime: Runtime
+    let sendStub: sinon.SinonStub
+
+    beforeEach(() => {
+        serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        workspace = {} as Workspace
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        runtime = {} as Runtime
+        handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
+        sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
+        sinon.stub(handler as any, 'addAuthToCommand').resolves()
+        sendStub = sinon.stub()
+        ;(handler as any).atxClient = { send: sendStub }
+        // No plan by default → IsLbvOpen defaults true; individual tests can restub.
+        sinon.stub(handler as any, 'getTransformationPlan').resolves(null)
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    // --- getStepId: the centralized field-coalescing helper (contract-tolerant) ---
+    describe('getStepId', () => {
+        it('coalesces stepId / planStepId / parentStepId in priority order', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g({ stepId: 'a', planStepId: 'b', parentStepId: 'c' })).to.equal('a')
+            expect(g({ planStepId: 'b', parentStepId: 'c' })).to.equal('b')
+            expect(g({ parentStepId: 'c' })).to.equal('c')
+        })
+
+        it('returns undefined for null / non-object / no matching field', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g(null)).to.be.undefined
+            expect(g(undefined)).to.be.undefined
+            expect(g('str')).to.be.undefined
+            expect(g({ other: 'x' })).to.be.undefined
+        })
+
+        it('skips an empty-string stepId and falls through to planStepId / parentStepId (|| not ??)', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            // Empty stepId must NOT short-circuit coalescing (the ??→|| hardening) — an empty
+            // string is falsy under ||, so the non-empty planStepId is returned.
+            expect(g({ stepId: '', planStepId: 'step-1' })).to.equal('step-1')
+            // Empty stepId + empty planStepId → fall all the way through to parentStepId.
+            expect(g({ stepId: '', planStepId: '', parentStepId: 'parent-1' })).to.equal('parent-1')
+        })
+    })
+
+    // --- normalizeBeamRepo: tolerant wire-shape mapping ---
+    describe('normalizeBeamRepo', () => {
+        it('maps varied key spellings to the PascalCase IDE shape', () => {
+            const nr = (handler as any).normalizeBeamRepo({
+                repositoryName: 'alice',
+                beamArtifactId: 'art-9',
+                planStepId: 'step-1',
+                tfm: 'net8.0',
+                scenario: 'transformed',
+            })
+            expect(nr.RepositoryName).to.equal('alice')
+            expect(nr.BeamArtifactId).to.equal('art-9')
+            expect(nr.BeamStepId).to.equal('step-1')
+            expect(nr.BeamTargetFramework).to.equal('net8.0')
+            expect(nr.BeamScenario).to.equal('transformed')
+        })
+
+        it('defaults empty fields and scenario=transformed on a bare object', () => {
+            const nr = (handler as any).normalizeBeamRepo({})
+            expect(nr.RepositoryName).to.equal('')
+            expect(nr.BeamScenario).to.equal('transformed')
+        })
+    })
+
+    // --- listBeamedRepos: the core discovery function (empty / beam-map / beam-status / regex) ---
+    describe('listBeamedRepos', () => {
+        const zipArtifacts = (repo: string, hash = 'abc123') => [
+            { artifactId: `zip-${repo}`, fileMetadata: { path: `${repo}_${hash}/${repo}.zip` } },
+        ]
+
+        it('returns [] when the job has no artifacts (never beamed)', async () => {
+            sendStub.resolves({ artifacts: [] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+        })
+
+        it('returns [] when only transformed zips exist but no beam-map / beam-status', async () => {
+            sendStub.resolves({ artifacts: zipArtifacts('alice') })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // A transform-only job must NOT over-list its transformed zips as "beamed".
+            expect(result).to.deep.equal([])
+        })
+
+        it('filters discovery to beam-map membership when a beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice', stepId: 's1', scenario: 'transformed' }] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('rejects malformed beam-map entries (no usable repo name)', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice' }, { junk: true }, null, 'not-an-object'] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // Only the well-formed 'alice' entry survives validation.
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('falls back to beam-status filenames when no beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('strips the -<8hex> suffix on beam-status filenames to resolve the repo', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice-0a1b2c3d.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('does not throw or mismatch when the jobId contains regex metacharacters', async () => {
+            const jobId = 'job.(v1)+[x]'
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: `beam-status-${jobId}-alice.json` } },
+                ],
+            })
+            // Without escaping, `new RegExp` would throw or mismatch on these metachars.
+            const result = await handler.listBeamedRepos('ws-1', jobId)
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('returns [] and logs on send failure (no throw)', async () => {
+            sendStub.rejects(new Error('FES down'))
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+            expect((logging.error as sinon.SinonStub).called).to.be.true
+        })
+    })
+
+    // --- downloadBeamArtifact: destDir path validation (zip-slip defense) ---
+    describe('downloadBeamArtifact', () => {
+        it('rejects a relative destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', 'relative/dir')
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+        })
+
+        it('rejects a destDir containing ".." traversal', async () => {
+            // Absolute but with an un-normalized ".." segment — must be rejected.
+            const bad = `${path.sep}root${path.sep}ws${path.sep}..${path.sep}evil`
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', bad)
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+        })
+
+        it('rejects an empty destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
+            expect(result.Success).to.be.false
         })
     })
 })
