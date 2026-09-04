@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.0.127](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.126...lsp-codewhisperer/v0.0.127) (2026-08-24)
+
+
+### Bug Fixes
+
+* **amazonq:** cover merged env and headers in MCP consent fingerprint ([#2851](https://github.com/Amazon-Q-Developer/language-servers/issues/2851)) ([#2853](https://github.com/Amazon-Q-Developer/language-servers/issues/2853)) ([529aed4](https://github.com/Amazon-Q-Developer/language-servers/commit/529aed43259503cf71b475fb3496de7bfab25f17))
+* beam - flat-named transformed zips + lightweight discovery + IsLbvPending ([#2849](https://github.com/Amazon-Q-Developer/language-servers/issues/2849)) ([863c5bf](https://github.com/Amazon-Q-Developer/language-servers/commit/863c5bf00a6c30ec7658056a155f1ca1005127e6))
+* surface backend interactive mode in getTransformInfo ([836b756](https://github.com/Amazon-Q-Developer/language-servers/commit/836b756ee2d8a553d9b26cf095e12979141e2367))
+
 ## [0.0.126](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.125...lsp-codewhisperer/v0.0.126) (2026-08-20)
 
 
