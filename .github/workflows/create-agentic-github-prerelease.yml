@@ -26,15 +26,23 @@ jobs:
 
             # if user ran this action manually
             - if: github.event_name == 'workflow_dispatch'
+              env:
+                  # Pass untrusted event data through the environment instead of
+                  # interpolating it directly into the script body.
+                  INPUT_TAG_NAME: ${{ github.event.inputs.tag_name }}
               run: |
-                  echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
-                  echo "PRERELEASE_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_ENV
+                  echo "TAG_NAME=$INPUT_TAG_NAME" >> $GITHUB_ENV
+                  echo "PRERELEASE_NAME=$INPUT_TAG_NAME" >> $GITHUB_ENV
 
             # Otherwise a push to a branch triggered this action.
             # Set TAG_NAME and PRERELEASE_NAME based on branch name
             - if: github.event_name != 'workflow_dispatch'
+              env:
+                  # Branch names are attacker-controllable, so read the value from the
+                  # environment instead of interpolating it into the script body.
+                  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
               run: |
-                  BRANCH_NAME="${{ github.event.workflow_run.head_branch }}"
+                  BRANCH_NAME="$HEAD_BRANCH"
                   if [[ "$BRANCH_NAME" == "main" ]]; then
                       echo "TAG_NAME=agentic-alpha" >> $GITHUB_ENV
                       echo "PRERELEASE_NAME=alpha" >> $GITHUB_ENV
@@ -53,6 +61,8 @@ jobs:
 
             # Make a sever version that is "decorated" as prerelease
             - name: Create SERVER_VERSION
+              env:
+                  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
               run: |
                   # example: 1.0.999-pre-main.commitid
                   # SERVER_VERSION - we're making "imitation" manifests that are accessible
@@ -61,7 +71,7 @@ jobs:
                   # in the version.json file.
 
                   AGENTIC_VERSION=$(jq -r '.agenticChat' app/aws-lsp-codewhisperer-runtimes/src/version.json)
-                  COMMIT_SHORT=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-8)
+                  COMMIT_SHORT=$(echo "$HEAD_SHA" | cut -c1-8)
                   echo "SERVER_VERSION=$AGENTIC_VERSION-$PRERELEASE_NAME.$COMMIT_SHORT" >> $GITHUB_ENV
 
             - name: Export outputs

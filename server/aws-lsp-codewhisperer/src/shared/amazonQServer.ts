@@ -116,15 +116,14 @@ export const AmazonQServiceServerFactory =
             amazonQServiceManager.handleOnCredentialsDeleted(type)
         })
 
-        // Add credentials update handler to track when credentials are updated
-        if ('onCredentialsUpdated' in credentialsProvider) {
-            ;(credentialsProvider as any).onCredentialsUpdated((type: CredentialsType) => {
-                log(`Received onCredentialsUpdated notification for type: ${type}`)
-                if ('handleOnCredentialsUpdated' in amazonQServiceManager) {
-                    ;(amazonQServiceManager as any).handleOnCredentialsUpdated(type)
-                }
-            })
-        }
+        // Optional chaining rather than a capability check: the event was added to the runtime after
+        // this server, so a build running on an older runtime simply never receives it. Before that
+        // runtime change this block was an `in` check plus an `any` cast that could never fire, which
+        // is why service construction waited for whichever consumer asked first.
+        credentialsProvider.onCredentialsUpdated?.((type: CredentialsType) => {
+            log(`Received onCredentialsUpdated notification for type: ${type}`)
+            amazonQServiceManager.handleOnCredentialsUpdated(type)
+        })
 
         logging.log('Amazon Q Service server has been initialised')
         return () => {}
