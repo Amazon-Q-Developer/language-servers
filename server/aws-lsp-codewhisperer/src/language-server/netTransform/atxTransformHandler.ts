@@ -77,6 +77,46 @@ interface DiffApplyContext {
 }
 
 /**
+ * Beam to IDE wire/shape types. These pin the shapes flowing through beam discovery so the
+ * compiler catches drift instead of `any` silently accepting anything.
+ * NOTE: the field-name tolerance in normalizeBeamRepo/getStepId is a deliberate bridge to an
+ * as-yet-unversioned web-orchestrator contract (tracked: pin a versioned schema, #57).
+ */
+interface BeamMapRepo {
+    repoName?: string
+    repositoryName?: string
+    repo?: string
+    name?: string
+    artifactId?: string
+    beamArtifactId?: string
+    ArtifactId?: string
+    stepId?: string
+    planStepId?: string
+    parentStepId?: string
+    targetFramework?: string
+    tfm?: string
+    target_framework?: string
+    scenario?: string
+}
+
+/** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
+interface BeamedRepoInfo {
+    RepositoryName: string
+    BeamArtifactId: string
+    BeamStepId: string
+    BeamTargetFramework: string
+    BeamScenario: string
+    IsLbvOpen: boolean
+    // Beamed but LBV HITL not created yet (no beamed node / no LBV child / no plan). IDE shows Load
+    // only when IsLbvOpen && !IsLbvPending, so a repo can't be Loaded before its HITL exists.
+    IsLbvPending: boolean
+}
+
+// Bounds for the beam-map candidate scan (serial download+parse per candidate).
+const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
+const BEAM_MAP_SCAN_BUDGET_MS = 15000
+
+/**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
  */
@@ -530,6 +570,436 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Beam to IDE — read the beam-map artifact from the parent web job and return
+     * the list of beamed repos. The web orchestrator uploads a JSON beam-map
+     * (category HITL_FROM_AGENT) listing repos the user chose to beam. We find it
+     * by listing the parent job's artifacts and picking the beam-map JSON.
+     */
+    async listBeamedRepos(workspaceId: string, parentJobId: string, lightweight = false): Promise<BeamedRepoInfo[]> {
+        try {
+            this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
+            if (!this.atxClient && !(await this.initializeAtxClient())) {
+                throw new Error('ATX client not initialized')
+            }
+
+            // Find the beam-map artifact under the parent job.
+            // NOTE: beam artifacts must be uploaded by the web orchestrator as
+            // CUSTOMER_OUTPUT — the FES client CategoryType enum does not expose
+            // HITL_FROM_AGENT as a listable filter value.
+            const command = new ListArtifactsCommand({
+                workspaceId: workspaceId,
+                jobFilter: {
+                    jobId: parentJobId,
+                    categoryType: 'CUSTOMER_OUTPUT',
+                },
+            })
+            await this.addAuthToCommand(command)
+            const result = (await this.atxClient!.send(command)) as any
+            const artifacts: any[] = result.artifacts || []
+
+            // DIAGNOSTIC: dump exactly what ListArtifacts returned so we can tell
+            // "artifact not in the list" from "filtered out by fileType/.json". Both
+            // otherwise produce the same silent 'no beam-map' verdict.
+            this.logging.log(
+                `[BEAM-PKG] listBeamedRepos: ListArtifacts returned ${artifacts.length} CUSTOMER_OUTPUT artifact(s) for job=${parentJobId}`
+            )
+            for (const a of artifacts) {
+                this.logging.log(
+                    `[BEAM-PKG]   artifact | id=${a.artifactId} fileType=${a.fileType} ` +
+                        `name=${a.name ?? a.fileName ?? ''} path=${a.fileMetadata?.path ?? ''} category=${a.categoryType ?? a.category ?? ''}`
+                )
+            }
+
+            // Enumerate transformed-code ZIP artifacts. Each transformed bundle has a path
+            // like "<repo>_<hash>/<repo>.zip"; the repo name is the path's first segment
+            // (minus the _<hash> suffix) and the artifactId is what the IDE downloads+extracts
+            // to open the solution. NOTE: in a multi-repo job, EVERY repo that transformed on
+            // web has such a zip — so this listing alone is NOT the set of *beamed* repos.
+            const ZIP_RE = /(^|\/)([^/]+?)_[0-9a-f]{6,}\/[^/]+\.zip$/i
+            const transformedZips = artifacts.filter(a => {
+                const p = (a.fileMetadata?.path || '').toLowerCase()
+                return p.endsWith('.zip')
+            })
+
+            // Build repoName -> {artifactId, path} from the transformed zips (deduped).
+            const zipByRepo = new Map<string, { artifactId: string; path: string }>()
+            for (const a of transformedZips) {
+                const path = a.fileMetadata?.path || ''
+                const m = path.match(ZIP_RE)
+                // Repo name from the transformed-source zip, handling both producer shapes: subdir
+                // "<repo>_<hash>/<file>.zip" (ZIP_RE) and flat "<repo>_<hash>[_suffix].zip". Flat must
+                // be handled or a flat-named repo never matches its beam-status entry and drops.
+                const repoName = m
+                    ? m[2]
+                    : (path.split('/').pop() || '')
+                          .replace(/\.zip$/i, '')
+                          .replace(/_(transformed[_-]?source|transformed|migrated|output|source)$/i, '')
+                          .replace(/_[0-9a-f]{6,}$/i, '')
+                if (!repoName || !a.artifactId) continue
+                const key = repoName.toLowerCase()
+                if (!zipByRepo.has(key)) {
+                    zipByRepo.set(key, { artifactId: a.artifactId, path })
+                }
+            }
+
+            // Read the beam-map JSON. It is the AUTHORITATIVE list of which repos the user
+            // EXPLICITLY beamed (its repos[] holds only beamed repos, each with a stepId).
+            // We use it to FILTER the transformed zips down to just the beamed repos — NOT
+            // merely to enrich. Previously discovery returned every transformed zip and used
+            // the beam-map only for enrichment, so in a multi-repo job the IDE showed the
+            // Load button on repos that transformed but were never beamed.
+            // The beam-map artifact often has NO usable name/path/category in the ListArtifacts
+            // response (all empty — observed), so we cannot identify it by label. We instead
+            // scan candidate (non-.zip) artifacts and pick the one whose JSON has a `repos`
+            // array. CRITICAL: each download/parse is wrapped in its OWN try/catch — a single
+            // artifact that throws (or isn't JSON, e.g. an unrelated metadata.json / binary)
+            // must NOT abort the scan, or we miss the real beam-map that comes later in the list
+            // and wrongly fall back to zip-discovery (empty stepId). We scan ALL candidates and
+            // keep the LAST valid repos[] (beam-map is re-written on each beam; latest wins).
+            // Candidate beam-map artifacts = everything EXCEPT the transformed-source
+            // bundles. The beam-map is itself stored as a ZIP by FES (downloadJsonArtifact
+            // unzips + parses it), so we MUST NOT exclude by ".zip" extension — that would
+            // filter out the beam-map itself (the earlier bug: the beam-map 3b1f9c00 has a
+            // .zip path, so a plain !endsWith('.zip') filter skipped it entirely → fell back
+            // to zip-discovery with empty stepId). Instead, exclude only the transformed-
+            // source bundles, whose paths match "<repo>_<hash>/<repo>.zip" (ZIP_RE). Anything
+            // else (including an unnamed/empty-path zip = the beam-map) is a candidate.
+            let beamMapRepos: BeamMapRepo[] | null = null
+            // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
+            // beam-status + one plan fetch. stepId isn't resolved here; the IDE keeps the one from full
+            // discovery / resolves it at Load.
+            const allCandidates = lightweight
+                ? []
+                : artifacts.filter(a => {
+                      const p = (a.fileMetadata?.path || '').toLowerCase()
+                      return !ZIP_RE.test(p) // keep non-transformed-bundle artifacts (incl. the beam-map zip)
+                  })
+            // Bound the scan: each candidate is a serial download+parse, so an artifact-heavy
+            // job (logs, metadata) could otherwise stall the IDE's discovery UI. Cap the number
+            // scanned and enforce an overall deadline; the beam-map is written early and is
+            // small, so a bounded scan reliably finds it.
+            const candidates = allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
+            if (allCandidates.length > candidates.length) {
+                this.logging.log(
+                    `[BEAM-PKG] beam-map scan: capping ${allCandidates.length} candidate(s) to ${candidates.length}`
+                )
+            }
+            const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
+            this.logging.log(
+                `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
+            )
+            for (const a of candidates) {
+                if (!a.artifactId) continue
+                if (Date.now() > scanDeadline) {
+                    this.logging.log(
+                        `[BEAM-PKG] beam-map scan: time budget (${BEAM_MAP_SCAN_BUDGET_MS}ms) exceeded — stopping scan`
+                    )
+                    break
+                }
+                try {
+                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId)
+                    // Validate shape before trusting it: the beam-map is uploaded by the web
+                    // orchestrator, so a malformed, unexpectedly-shaped, or attacker-influenced
+                    // payload must NOT flow into normalizeBeamRepo (which drives which artifacts
+                    // get downloaded and which paths get written). Require repos to be an array
+                    // of objects; keep only entries that yield a non-empty string repo name, and
+                    // reject/skip anything else.
+                    if (map && Array.isArray((map as any).repos)) {
+                        const rawRepos = (map as any).repos as unknown[]
+                        const validRepos = rawRepos.filter(
+                            r => r != null && typeof r === 'object' && !!this.normalizeBeamRepo(r).RepositoryName
+                        )
+                        const rejected = rawRepos.length - validRepos.length
+                        if (rejected > 0) {
+                            this.logging.log(
+                                `[BEAM-PKG] beam-map validation: skipped ${rejected} malformed entr(y/ies) in artifact=${a.artifactId}`
+                            )
+                        }
+                        beamMapRepos = validRepos as BeamMapRepo[]
+                        this.logging.log(
+                            `[BEAM-PKG] beam-map found (${beamMapRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
+                        )
+                        // Do NOT break — keep scanning; a later artifact could be a newer beam-map.
+                        // (Cost is bounded: only empty-path/non-zip artifacts, a handful per job.)
+                    }
+                } catch (e) {
+                    // Non-fatal: this artifact wasn't the beam-map (not JSON, wrong shape, or
+                    // download hiccup). Keep scanning the rest.
+                    this.logging.log(`[BEAM-PKG] beam-map scan: skipped artifact ${a.artifactId}: ${String(e)}`)
+                }
+            }
+
+            const beamed: BeamedRepoInfo[] = []
+
+            // Show-set: fetch the parent job's plan tree ONCE so we can stamp each beamed repo
+            // with whether its Local Build Verification is still open (the IDE shows only repos
+            // still awaiting LBV). Best-effort: if the plan can't be fetched, leave IsLbvOpen
+            // undefined and the IDE defaults it true (never hides a fresh transfer).
+            let planRoot: AtxPlanStep | null = null
+            try {
+                const plan = await this.getTransformationPlan(workspaceId, parentJobId, '', true)
+                planRoot = plan?.Root ?? null
+            } catch (e) {
+                this.logging.log(`[BEAM-PKG] listBeamedRepos: could not fetch plan for LBV-open status: ${String(e)}`)
+            }
+
+            if (beamMapRepos) {
+                // Beam-map present: include ONLY repos listed in it (the beamed ones). Pull the
+                // artifactId from the matching transformed zip; carry stepId/scenario/tfm from
+                // the beam-map entry.
+                for (const r of beamMapRepos) {
+                    const nr = this.normalizeBeamRepo(r)
+                    if (!nr.RepositoryName) continue
+                    const zip = zipByRepo.get(nr.RepositoryName.toLowerCase())
+                    // PREFER the transformed-source zip artifactId (stable + downloadable). The
+                    // beam-map's own BeamArtifactId is NOT reliable: web-orc re-writes the beam-map
+                    // each poll and the id it carries can point at a NON-source artifact with no
+                    // presigned download URL, which made the IDE's BeamArtifactId thrash and Load
+                    // fail with "No presigned URL for beam artifact". The source zip stays constant
+                    // and is always downloadable; fall back to the beam-map id only when there is
+                    // no matching transformed zip.
+                    const artifactId = zip?.artifactId || nr.BeamArtifactId || ''
+                    if (!artifactId) {
+                        this.logging.log(
+                            `[BEAM-PKG] beam-map repo '${nr.RepositoryName}' has no artifact (transformed zip or beam-map) — skipping`
+                        )
+                        continue
+                    }
+                    if (!zip?.artifactId && nr.BeamArtifactId) {
+                        this.logging.log(
+                            `[BEAM-PKG] beam-map repo '${nr.RepositoryName}': no transformed zip matched — falling back to beam-map artifactId ${nr.BeamArtifactId} (may not be downloadable)`
+                        )
+                    }
+                    const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, nr.RepositoryName) : true
+                    const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, nr.RepositoryName) : true
+                    beamed.push({
+                        RepositoryName: nr.RepositoryName,
+                        BeamArtifactId: artifactId,
+                        BeamStepId: nr.BeamStepId || '',
+                        BeamTargetFramework: nr.BeamTargetFramework || '',
+                        BeamScenario: nr.BeamScenario || 'transformed',
+                        IsLbvOpen: lbvOpen,
+                        IsLbvPending: lbvPending,
+                    })
+                    this.logging.log(
+                        `[BEAM-PKG] beamed repo (from beam-map) | repo=${nr.RepositoryName} artifact=${artifactId} stepId=${nr.BeamStepId || '<empty>'} scenario=${nr.BeamScenario || 'transformed'} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                    )
+                }
+            } else {
+                // NO beam-map found. The beam-map artifact is UNRELIABLE — web-orc writes per-repo
+                // beam-STATUS artifacts (beam-status-<jobId>-<repo>.json) reliably but frequently
+                // does NOT write the beam-map. So DERIVE the beamed repos from the beam-status
+                // artifact FILENAMES instead: each names exactly one beamed repo. This is reliable
+                // (status always written), names the exact repos, and correctly yields ZERO for
+                // never-beamed jobs (no beam-status → not beamed) — so it still kills the old
+                // all-transformed-zips over-listing. Only fall back to beam-status when there's no
+                // beam-map (beam-map wins if present). Filename shape:
+                // "beam-status-<jobId>-<repo>.json" OR (for basename-uniqueness)
+                // "beam-status-<jobId>-<repo>-<8hexhash>.json". Capture the whole tail, then resolve
+                // the repo against the CANONICAL zip names (zipByRepo) —
+                // the reliable source — so we're not coupled to the exact label format:
+                //   1) the captured tail matches a zip as-is  -> use it (old no-hash format, or a
+                //      repo whose name legitimately ends in 8 hex),
+                //   2) else strip a trailing "-<8hex>" and match that -> use it (new hashed format).
+                // If neither resolves, fall through (logged below as "no matching transformed zip").
+                const escapedJobId = parentJobId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                const statusRe = new RegExp(`beam-status-${escapedJobId}-(.+)\\.json$`, 'i')
+                const statusRepos = new Set<string>()
+                for (const a of artifacts) {
+                    const p = a.fileMetadata?.path || ''
+                    const m = p.match(statusRe)
+                    if (!m || !m[1]) continue
+                    const tail = m[1]
+                    if (zipByRepo.has(tail.toLowerCase())) {
+                        statusRepos.add(tail)
+                    } else {
+                        const stripped = tail.replace(/-[0-9a-f]{8}$/i, '')
+                        statusRepos.add(zipByRepo.has(stripped.toLowerCase()) ? stripped : tail)
+                    }
+                }
+                if (statusRepos.size > 0) {
+                    for (const repoName of statusRepos) {
+                        const zip = zipByRepo.get(repoName.toLowerCase())
+                        if (!zip?.artifactId) {
+                            this.logging.log(
+                                `[BEAM-PKG] beam-status repo '${repoName}' has no matching transformed zip — skipping`
+                            )
+                            continue
+                        }
+                        const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, repoName) : true
+                        const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, repoName) : true
+                        beamed.push({
+                            RepositoryName: repoName,
+                            BeamArtifactId: zip.artifactId,
+                            BeamStepId: '',
+                            BeamTargetFramework: '',
+                            BeamScenario: 'transformed',
+                            IsLbvOpen: lbvOpen,
+                            IsLbvPending: lbvPending,
+                        })
+                        this.logging.log(
+                            `[BEAM-PKG] beamed repo (from beam-status) | repo=${repoName} artifact=${zip.artifactId} path=${zip.path} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                        )
+                    }
+                    this.logging.log(
+                        `[BEAM-PKG] no beam-map for job=${parentJobId} — derived ${beamed.length} beamed repo(s) from beam-status artifacts`
+                    )
+                } else {
+                    // No beam-map AND no beam-status → this job was genuinely never beamed
+                    // (transform-only). Return zero; do NOT fall back to all transformed zips.
+                    this.logging.log(
+                        `[BEAM-PKG] no beam-map AND no beam-status for job=${parentJobId} — job was not beamed (0 beamed repos; ${zipByRepo.size} transformed zip(s) ignored)`
+                    )
+                }
+            }
+
+            this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
+            return beamed
+        } catch (error) {
+            this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
+            return []
+        }
+    }
+
+    /**
+     * The wire contract with the web orchestrator / FES is not yet pinned to a single
+     * spelling: a plan-step / HITL id arrives as stepId, planStepId, or parentStepId
+     * depending on the source. Centralize the coalescing here so every call site stays
+     * in sync and there's one place to update when the contract is versioned.
+     * TODO: replace with a versioned schema once the web-orc contract is pinned (#57).
+     */
+    private getStepId(obj: any): string | undefined {
+        if (obj == null || typeof obj !== 'object') return undefined
+        // Use || (not ??) so an empty-string id falls through to the next spelling; an empty
+        // stepId must not short-circuit coalescing and then fail every scope match.
+        return obj.stepId || obj.planStepId || obj.parentStepId || undefined
+    }
+
+    /**
+     * Beam-to-IDE scoped LBV selection, shared by getHitlAgentArtifact and the EXECUTING
+     * path so the rule stays in one place. Given the pending HITLs and the loaded repo's
+     * scope step-ids, return the local-build-verification HITL in that repo's subtree, and
+     * whether the scope is active but EVERY pending HITL is a sibling LBV (none in scope) —
+     * in which case the caller returns "none" rather than hand the IDE a sibling's HITL.
+     */
+    private selectScopedLbvHitl(
+        hitls: any[],
+        scopeStepIds: string[]
+    ): { scopedLbv: any | null; allOutOfScopeLbv: boolean } {
+        const lbvHitls = hitls.filter(h => h.tag === 'local-build-verification')
+        if (scopeStepIds.length === 0 || lbvHitls.length === 0) {
+            return { scopedLbv: null, allOutOfScopeLbv: false }
+        }
+        const scopedLbv = lbvHitls.find(h => scopeStepIds.includes(String(this.getStepId(h) ?? ''))) ?? null
+        // Scope active + pending HITLs are ALL LBV but none in scope → all belong to siblings.
+        const allOutOfScopeLbv = !scopedLbv && lbvHitls.length === hitls.length
+        return { scopedLbv, allOutOfScopeLbv }
+    }
+
+    /**
+     * Normalize a beam-map repo item into the PascalCase shape the C# IDE consumes,
+     * tolerant of key-name variants from the web writer (repoName/repo/name,
+     * artifactId/beamArtifactId, stepId/planStepId, targetFramework/tfm).
+     */
+    private normalizeBeamRepo(r: BeamMapRepo | null | undefined): Omit<BeamedRepoInfo, 'IsLbvOpen' | 'IsLbvPending'> {
+        const o: BeamMapRepo = r || {}
+        return {
+            RepositoryName: o.repoName ?? o.repositoryName ?? o.repo ?? o.name ?? '',
+            BeamArtifactId: o.artifactId ?? o.beamArtifactId ?? o.ArtifactId ?? '',
+            BeamStepId: this.getStepId(o) ?? '',
+            BeamTargetFramework: o.targetFramework ?? o.tfm ?? o.target_framework ?? '',
+            BeamScenario: o.scenario ?? 'transformed',
+        }
+    }
+
+    /**
+     * Download a small JSON artifact and parse it. The artifact may be stored as
+     * raw JSON OR zipped (observed: FES stores the beam-map as a ZIP — the bytes
+     * start with the "PK" magic number, so a direct JSON.parse throws
+     * "Unexpected token 'P'"). So: fetch as a buffer, try JSON.parse first, and on
+     * failure unzip (AdmZip) and parse the first JSON entry inside.
+     */
+    private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
+        try {
+            const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
+            if (!dl?.s3PresignedUrl) return null
+            const response = await got.get(dl.s3PresignedUrl, {
+                headers: dl.requestHeaders || {},
+                responseType: 'buffer',
+                timeout: { request: 30000 },
+            })
+            const buf = Buffer.from(response.body)
+
+            // Direct JSON first (artifact stored raw).
+            try {
+                return JSON.parse(buf.toString('utf8'))
+            } catch {
+                // Not raw JSON — likely a ZIP (PK magic). Unzip and parse the first
+                // JSON entry (the beam-map is a single JSON file inside).
+                if (buf.length >= 2 && buf[0] === 0x50 && buf[1] === 0x4b) {
+                    const zip = new AdmZip(buf)
+                    for (const entry of zip.getEntries()) {
+                        if (entry.isDirectory) continue
+                        try {
+                            const parsed = JSON.parse(entry.getData().toString('utf8'))
+                            this.logging.log(
+                                `[BEAM-PKG] downloadJsonArtifact: parsed ${artifactId} from zip entry ${entry.entryName}`
+                            )
+                            return parsed
+                        } catch {
+                            // not this entry — try the next
+                        }
+                    }
+                }
+                throw new Error('artifact is neither raw JSON nor a zip containing JSON')
+            }
+        } catch (error) {
+            this.logging.log(`ATX: downloadJsonArtifact parse/download failed for ${artifactId}: ${String(error)}`)
+            return null
+        }
+    }
+
+    /**
+     * Beam to IDE — download the beam artifact (source + beam-flag + context zip)
+     * from the parent web job and extract it locally so the IDE can open the repo.
+     * Cross-job read works via the workspace-scoped artifact fallback.
+     */
+    async downloadBeamArtifact(
+        workspaceId: string,
+        parentJobId: string,
+        beamArtifactId: string,
+        destDir: string
+    ): Promise<{ Success: boolean; ExtractedPath?: string; Error?: string }> {
+        try {
+            this.logging.log(`[BEAM-PKG] downloadBeamArtifact ${beamArtifactId} -> ${destDir}`)
+            // destDir must be an absolute path (the IDE passes a resolved workspace path).
+            // Reject relative/traversal input so extraction can't be aimed at an unexpected
+            // location; the zip-slip guard in extractAllEntriesTo then confines each entry
+            // within this dir.
+            if (!destDir || !path.isAbsolute(destDir) || destDir.includes('..')) {
+                return { Success: false, Error: 'Invalid destination directory for beam artifact' }
+            }
+            const dl = await this.createArtifactDownloadUrl(workspaceId, parentJobId, beamArtifactId)
+            if (!dl?.s3PresignedUrl) {
+                return { Success: false, Error: 'No presigned URL for beam artifact' }
+            }
+            // downloadAndExtractArchive both downloads AND unzips into destDir.
+            const extractedPath = await Utils.downloadAndExtractArchive(
+                dl.s3PresignedUrl,
+                dl.requestHeaders,
+                destDir,
+                'beam-artifact.zip',
+                this.logging
+            )
+            this.logging.log(`[BEAM-PKG] downloadBeamArtifact extracted -> ${extractedPath}`)
+            return { Success: true, ExtractedPath: extractedPath }
+        } catch (error) {
+            this.logging.error(`[BEAM-PKG] downloadBeamArtifact error: ${String(error)}`)
+            return { Success: false, Error: String(error) }
+        }
+    }
+
+    /**
      * Create artifact upload URL
      */
     async createArtifactUploadUrl(
@@ -798,48 +1268,95 @@ export class ATXTransformHandler {
         }
     }
 
+    // Beam to IDE diagnostics: running count of CreateArtifactDownloadUrl calls this
+    // session, so a call storm (which self-throttles FES and makes a real Load fail with the
+    // misleading "No presigned URL") is VISIBLE in the log. Reset only on process restart.
+    private _createDownloadUrlCallCount = 0
+
     async createArtifactDownloadUrl(
         workspaceId: string,
         jobId: string,
         artifactId: string
     ): Promise<{ s3PresignedUrl: string; requestHeaders?: any } | null> {
-        try {
-            this.logging.log(`ATX: Starting CreateArtifactDownloadUrl for job: ${jobId}`)
+        // Retry on throttling. The get-URL call is throttled by FES under load (a poll storm can
+        // exhaust the quota); a throttled call previously fell straight to null → "No presigned
+        // URL", failing a Load that would have succeeded on retry. Bounded exponential backoff
+        // makes Load resilient to transient throttling without masking a genuine absent-URL (that
+        // still returns null after retries).
+        const maxAttempts = 4
+        let lastErr: any = null
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                this._createDownloadUrlCallCount++
+                this.logging.log(
+                    `ATX: Starting CreateArtifactDownloadUrl for job: ${jobId} (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}, sessionCalls=${this._createDownloadUrlCallCount})`
+                )
 
-            if (!this.atxClient && !(await this.initializeAtxClient())) {
-                throw new Error('ATX client not initialized')
-            }
+                if (!this.atxClient && !(await this.initializeAtxClient())) {
+                    throw new Error('ATX client not initialized')
+                }
 
-            const command = new CreateArtifactDownloadUrlCommand({
-                workspaceId: workspaceId,
-                jobId: jobId,
-                artifactId: artifactId,
-            })
+                const command = new CreateArtifactDownloadUrlCommand({
+                    workspaceId: workspaceId,
+                    jobId: jobId,
+                    artifactId: artifactId,
+                })
 
-            await this.addAuthToCommand(command)
-            const result = (await this.atxClient!.send(command)) as any
-            if (result && result.s3PreSignedUrl) {
-                this.logging.log(`ATX: CreateArtifactDownloadUrl completed successfully`)
+                await this.addAuthToCommand(command)
+                const result = (await this.atxClient!.send(command)) as any
+                if (result && result.s3PreSignedUrl) {
+                    this.logging.log(`ATX: CreateArtifactDownloadUrl completed successfully`)
 
-                const normalizedHeaders: Record<string, string> = {}
-                if (result.requestHeaders) {
-                    for (const [key, value] of Object.entries(result.requestHeaders)) {
-                        normalizedHeaders[key] = Array.isArray(value) ? value[0] : value
+                    const normalizedHeaders: Record<string, string> = {}
+                    if (result.requestHeaders) {
+                        for (const [key, value] of Object.entries(result.requestHeaders)) {
+                            normalizedHeaders[key] = Array.isArray(value) ? value[0] : value
+                        }
                     }
-                }
 
-                return {
-                    s3PresignedUrl: result.s3PreSignedUrl,
-                    requestHeaders: normalizedHeaders,
+                    return {
+                        s3PresignedUrl: result.s3PreSignedUrl,
+                        requestHeaders: normalizedHeaders,
+                    }
+                } else {
+                    // Genuine absent URL (not an error) — retrying won't help; return null now.
+                    this.logging.error(
+                        `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}) — NOT a throttle; not retrying`
+                    )
+                    return null
                 }
-            } else {
-                this.logging.error('ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl')
+            } catch (error) {
+                lastErr = error
+                // Distinguish throttling from other errors so the log tells us WHY a Load failed
+                // (was misattributed to "No presigned URL"). Retry only throttling.
+                const name = (error as any)?.name ?? ''
+                const msg = String(error)
+                const isThrottle =
+                    name === 'ThrottlingException' ||
+                    name === 'TooManyRequestsException' ||
+                    /throttl|too many requests|rate exceeded/i.test(msg)
+                if (isThrottle && attempt < maxAttempts) {
+                    // Exponential base (250, 500, 1000ms) with jitter: under concurrent
+                    // throttling, unjittered lockstep retries amplify the thundering herd that
+                    // caused the throttle. Randomize to spread the retries out.
+                    const base = 250 * Math.pow(2, attempt - 1)
+                    const backoffMs = Math.round(base * (0.5 + Math.random()))
+                    this.logging.log(
+                        `ATX: CreateArtifactDownloadUrl THROTTLED (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`
+                    )
+                    await new Promise(r => setTimeout(r, backoffMs))
+                    continue
+                }
+                this.logging.error(
+                    `ATX: CreateArtifactDownloadUrl error (artifact=${artifactId}, throttle=${isThrottle}, attempt=${attempt}/${maxAttempts}): ${msg}`
+                )
                 return null
             }
-        } catch (error) {
-            this.logging.error(`ATX: CreateArtifactDownloadUrl error: ${String(error)}`)
-            return null
         }
+        this.logging.error(
+            `ATX: CreateArtifactDownloadUrl exhausted ${maxAttempts} attempts (artifact=${artifactId}): ${String(lastErr)}`
+        )
+        return null
     }
 
     async listHitls(workspaceId: string, jobId: string): Promise<any[] | null> {
@@ -1062,13 +1579,15 @@ export class ATXTransformHandler {
     async getHitlAgentArtifact(
         workspaceId: string,
         jobId: string,
-        solutionRootPath: string
+        solutionRootPath: string,
+        beamScopeStepIds?: string
     ): Promise<{
         PlanPath?: string
         ReportPath?: string
         MissingPackageJsonPath?: string
         HitlTag?: string
         TaskId?: string
+        StepId?: string
     } | null> {
         let hitl: any = null
         try {
@@ -1090,10 +1609,53 @@ export class ATXTransformHandler {
                 this.logging.log(`ATX: Found ${hitls.length} hitls (expected 1)`)
             }
 
+            // Beam-to-IDE: when the IDE tells us which repo it loaded (beamScopeStepIds =
+            // that repo's plan-step subtree), prefer the local-build-verification HITL whose stepId
+            // is IN that subtree. On a multi-repo beam job several repos have pending LBV HITLs;
+            // picking the plain first (below) may return a SIBLING's, shadowing the loaded repo's
+            // own HITL so it never builds unless loaded in list order. Tolerate any stepId field
+            // spelling (stepId/planStepId/parentStepId), same as the forwarding path.
+            const scopeStepIds = (beamScopeStepIds || '')
+                .split(',')
+                .map(s => s.trim())
+                .filter(s => s.length > 0)
+            const { scopedLbv, allOutOfScopeLbv } = this.selectScopedLbvHitl(hitls, scopeStepIds)
+            if (scopeStepIds.length > 0) {
+                this.logging.log(
+                    `ATX: getHitlAgentArtifact beam-scoped LBV pick=${scopedLbv ? this.getStepId(scopedLbv) : '<none in scope>'} scope=[${scopeStepIds.join(',')}]`
+                )
+                // Scope is set and the pending HITL(s) are LBV, but NONE is in the loaded repo's
+                // subtree → they all belong to sibling repos. Return null so the IDE isn't handed a
+                // sibling's HITL it would only skip every poll. Non-LBV HITLs (e.g.
+                // missing-packages) still fall through below and are handled normally.
+                if (allOutOfScopeLbv) {
+                    this.logging.log(
+                        'ATX: getHitlAgentArtifact — all pending HITLs are sibling-repo LBV (none in loaded scope); returning none'
+                    )
+                    return null
+                }
+            }
+
+            // When beam scope is active but no in-scope LBV matched, an out-of-scope (sibling) LBV
+            // must NEVER be selectable by the fallback — otherwise a mixed pending set (sibling LBV +
+            // a non-LBV HITL like missing-packages) would let the plain `find(...=== lbv)` below
+            // return the sibling's LBV → the IDE builds its own solution and answers the sibling's
+            // HITL = false green. So drop all LBVs from the fallback pool when scope is set and none
+            // is in scope; only genuinely non-LBV HITLs remain eligible.
+            const fallbackPool =
+                scopeStepIds.length > 0 && !scopedLbv ? hitls.filter(h => h.tag !== 'local-build-verification') : hitls
+
             hitl =
-                hitls.find(h => h.tag === 'local-build-verification') ||
-                hitls.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
-                hitls[0]
+                scopedLbv ||
+                fallbackPool.find(h => h.tag === 'local-build-verification') ||
+                fallbackPool.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
+                fallbackPool[0]
+            if (!hitl) {
+                this.logging.log(
+                    'ATX: getHitlAgentArtifact — beam scope active, only out-of-scope sibling LBV(s) pending; returning none'
+                )
+                return null
+            }
             this.logging.log(
                 `ATX: getHitlAgentArtifact picked hitl tag: ${hitl.tag}, all tags: ${hitls.map(h => h.tag).join(',')}`
             )
@@ -1103,10 +1665,19 @@ export class ATXTransformHandler {
             this.cachedHitl = hitl.taskId
             const hitlTag = hitl.tag || null
 
-            // local-build-verification: IDE handles the build, no artifact download needed
+            // local-build-verification: IDE handles the build, no artifact download needed.
+            // Forward the HITL's plan-step id (the runtime tags it; FES returns it as planStepId)
+            // so a multi-repo beam IDE can tell WHICH repo's LBV this is and skip siblings' HITLs
+            // — without it the IDE answers every repo's HITL against whatever solution is open (a
+            // false-green). Tolerate any field spelling FES/agent use, same as the EXECUTING path.
             if (hitlTag === 'local-build-verification') {
-                this.logging.log('ATX: local-build-verification HITL — returning tag for IDE to handle')
-                return { HitlTag: hitlTag, TaskId: hitl.taskId }
+                const lbvStepId = this.getStepId(hitl)
+                this.logging.log(
+                    `ATX: local-build-verification HITL — returning tag for IDE to handle | stepId=${lbvStepId ?? '<none>'}`
+                )
+                return lbvStepId !== undefined
+                    ? { HitlTag: hitlTag, TaskId: hitl.taskId, StepId: lbvStepId }
+                    : { HitlTag: hitlTag, TaskId: hitl.taskId }
             }
 
             // If no agent artifact, return tag and taskId without downloading
@@ -1199,6 +1770,12 @@ export class ATXTransformHandler {
                 result.DiffApplyFailed = true
                 result.DiffApplyFailedStepIds = diffContext.failedStepIds
             }
+            // Surface the backend-resolved interactive mode (from job.objective) on every
+            // response so the IDE can restore it. Single injection point covers all internal
+            // return paths. cachedInteractiveMode is populated in _getTransformInfoInternal.
+            if (result && this.cachedInteractiveMode) {
+                result.InteractiveMode = this.cachedInteractiveMode
+            }
             return result
         } finally {
             this._currentDiffContext = null
@@ -1258,7 +1835,8 @@ export class ATXTransformHandler {
                 const plan = await this.getTransformationPlan(
                     request.WorkspaceId,
                     request.TransformationJobId,
-                    request.SolutionRootPath
+                    request.SolutionRootPath,
+                    request.IsBeam === true
                 )
 
                 return {
@@ -1300,7 +1878,8 @@ export class ATXTransformHandler {
                 const plan = await this.getTransformationPlan(
                     request.WorkspaceId,
                     request.TransformationJobId,
-                    request.SolutionRootPath
+                    request.SolutionRootPath,
+                    request.IsBeam === true
                 )
 
                 // If GetCheckpoints is requested, populate HasCheckpoint field on steps
@@ -1335,15 +1914,80 @@ export class ATXTransformHandler {
                     : []
 
                 if (blockingHitls.length > 0) {
+                    // Beam-to-IDE: if the IDE sent its loaded-repo scope, prefer the
+                    // local-build-verification HITL in THAT repo's subtree over the first LBV in the
+                    // list (which may be a sibling's on a multi-repo beam job → shadows the loaded
+                    // repo). Same selection rule as getHitlAgentArtifact; applies to the EXECUTING
+                    // path too since a beam job surfaces its LBV HITL here.
+                    const execScopeStepIds = (request.beamScopeStepIds || '')
+                        .split(',')
+                        .map(s => s.trim())
+                        .filter(s => s.length > 0)
+                    const { scopedLbv: scopedExecLbv, allOutOfScopeLbv: execAllOutOfScope } = this.selectScopedLbvHitl(
+                        blockingHitls,
+                        execScopeStepIds
+                    )
+                    if (execScopeStepIds.length > 0) {
+                        this.logging.log(
+                            `ATX: EXECUTING beam-scoped LBV pick=${scopedExecLbv ? this.getStepId(scopedExecLbv) : '<none in scope>'} scope=[${execScopeStepIds.join(',')}]`
+                        )
+                        // Scope set and every blocking HITL is an out-of-scope LBV → they all belong
+                        // to sibling repos. Don't surface a sibling's HITL (the IDE would build the
+                        // loaded solution against it → false-green); report no pending HITL instead.
+                        // Mirrors the guard in getHitlAgentArtifact.
+                        if (execAllOutOfScope) {
+                            this.logging.log(
+                                'ATX: EXECUTING — all pending HITLs are sibling-repo LBV (none in loaded scope); not surfacing'
+                            )
+                            return {
+                                TransformationJob: {
+                                    WorkspaceId: request.WorkspaceId,
+                                    JobId: request.TransformationJobId,
+                                    Status: jobStatus,
+                                } as AtxTransformationJob,
+                                TransformationPlan: plan,
+                            } as AtxGetTransformInfoResponse
+                        }
+                    }
+                    // As in getHitlAgentArtifact: when beam scope is active but no in-scope LBV
+                    // matched, an out-of-scope (sibling) LBV must NEVER be selectable — otherwise a
+                    // mixed pending set (sibling LBV + a non-LBV blocking HITL) lets the plain
+                    // find(...=== lbv) below surface the sibling's LBV → false green. Drop all LBVs
+                    // from the fallback pool in that case; only non-LBV blocking HITLs remain.
+                    const execFallbackPool =
+                        execScopeStepIds.length > 0 && !scopedExecLbv
+                            ? blockingHitls.filter(h => h.tag !== 'local-build-verification')
+                            : blockingHitls
                     const execHitl =
-                        blockingHitls.find(h => h.tag === 'local-build-verification') ||
-                        blockingHitls.find(
+                        scopedExecLbv ||
+                        execFallbackPool.find(h => h.tag === 'local-build-verification') ||
+                        execFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
-                        blockingHitls.find(h => String(h.tag).endsWith('-checkpoint')) ||
-                        blockingHitls[0]
+                        execFallbackPool.find(h => String(h.tag).endsWith('-checkpoint')) ||
+                        execFallbackPool[0]
+                    if (!execHitl) {
+                        this.logging.log(
+                            'ATX: EXECUTING — beam scope active, only out-of-scope sibling LBV(s) pending; not surfacing'
+                        )
+                        return {
+                            TransformationJob: {
+                                WorkspaceId: request.WorkspaceId,
+                                JobId: request.TransformationJobId,
+                                Status: jobStatus,
+                            } as AtxTransformationJob,
+                            TransformationPlan: plan,
+                        } as AtxGetTransformInfoResponse
+                    }
+                    // Multi-repo beam scoping: forward the HITL's own plan stepId so the IDE can
+                    // tell which beamed repo this local-build-verification HITL belongs to. The
+                    // runtime now tags each LBV HITL with its plan-step id and FES returns it on
+                    // the HitlTask; without forwarding it here the IDE sees only the tag+taskId and
+                    // (on a multi-repo job) answers EVERY repo's HITL by building whatever solution
+                    // is open — a false-green. Tolerate any of the field spellings FES/agent use.
+                    const execHitlStepId = this.getStepId(execHitl)
                     this.logging.log(
-                        `ATX: EXECUTING job has pending HITL — tag=${execHitl.tag} taskId=${execHitl.taskId}; surfacing AWAITING_HUMAN_INPUT to IDE`
+                        `ATX: EXECUTING job has pending HITL — tag=${execHitl.tag} taskId=${execHitl.taskId} stepId=${execHitlStepId ?? '<none>'}; surfacing AWAITING_HUMAN_INPUT to IDE`
                     )
                     return {
                         TransformationJob: {
@@ -1353,6 +1997,7 @@ export class ATXTransformHandler {
                         } as AtxTransformationJob,
                         HitlTag: execHitl.tag,
                         HitlTaskId: execHitl.taskId,
+                        StepInformation: execHitlStepId ? { StepId: execHitlStepId } : undefined,
                         TransformationPlan: plan,
                     } as AtxGetTransformInfoResponse
                 }
@@ -1377,19 +2022,53 @@ export class ATXTransformHandler {
                     plan = await this.getTransformationPlan(
                         request.WorkspaceId,
                         request.TransformationJobId,
-                        request.SolutionRootPath
+                        request.SolutionRootPath,
+                        request.IsBeam === true
                     )
                 } catch (e) {
                     // Plan not available yet
                 }
 
-                // Check for pending HITL tasks (e.g. missing packages) - job stays in PLANNING while HITL is pending
+                // Check for pending HITL tasks (e.g. missing packages) - job stays in PLANNING while HITL is pending.
+                // Beam multi-repo: several repos can have a pending LBV HITL at once; prefer the loaded repo's
+                // in-scope one (parity with AWAITING_HUMAN_INPUT). No-op when scope is empty, so non-beam is unchanged.
                 const hitls = await this.listHitls(request.WorkspaceId, request.TransformationJobId)
                 if (hitls && hitls.length > 0) {
+                    const planScopeStepIds = (request.beamScopeStepIds || '')
+                        .split(',')
+                        .map(s => s.trim())
+                        .filter(s => s.length > 0)
+                    const { scopedLbv: scopedPlanLbv, allOutOfScopeLbv: planAllOutOfScopeLbv } =
+                        this.selectScopedLbvHitl(hitls, planScopeStepIds)
+                    // Beam multi-repo parity with EXECUTING / getHitlAgentArtifact: if scope is set and every
+                    // pending HITL is a sibling repo's LBV (none in the loaded repo's subtree), do NOT surface a
+                    // sibling's LBV — return plan-only. Prevents handing the IDE another repo's build HITL.
+                    if (planScopeStepIds.length > 0 && planAllOutOfScopeLbv) {
+                        this.logging.log(
+                            'ATX: PLANNING job — all pending HITLs are sibling-repo LBV (none in loaded scope); not surfacing'
+                        )
+                        return {
+                            TransformationJob: {
+                                WorkspaceId: request.WorkspaceId,
+                                JobId: request.TransformationJobId,
+                                Status: jobStatus,
+                            } as AtxTransformationJob,
+                            TransformationPlan: plan,
+                        } as AtxGetTransformInfoResponse
+                    }
+                    // When scope is set but no in-scope LBV matched, drop out-of-scope LBVs from the fallback
+                    // pool so the plain find() below can't select a sibling's LBV (mixed pending-set case).
+                    const planFallbackPool =
+                        planScopeStepIds.length > 0 && !scopedPlanLbv
+                            ? hitls.filter(h => h.tag !== 'local-build-verification')
+                            : hitls
                     const hitl =
-                        hitls.find(h => h.tag === 'local-build-verification') ||
-                        hitls.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
-                        hitls[0]
+                        scopedPlanLbv ||
+                        planFallbackPool.find(h => h.tag === 'local-build-verification') ||
+                        planFallbackPool.find(
+                            h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
+                        ) ||
+                        planFallbackPool[0]
                     this.logging.log(`ATX: Found HITL task - tag: ${hitl.tag}, hasArtifact: ${!!hitl.agentArtifact}`)
                     // For missing packages HITL, try to download artifact if available
                     if (hitl.tag === 'handle_missing_packages_hitl' || hitl.tag === 'missing-packages') {
@@ -1418,8 +2097,11 @@ export class ATXTransformHandler {
                     }
                     if (hitl.tag === 'local-build-verification') {
                         this.jobsPastLocalBuild.add(request.TransformationJobId)
+                        // Forward the HITL's plan-step id so a multi-repo beam IDE can confirm this LBV
+                        // belongs to the loaded repo (parity with AWAITING_HUMAN_INPUT). Undefined when absent.
+                        const planLbvStepId = this.getStepId(hitl)
                         this.logging.log(
-                            `ATX: ${jobStatus} job has pending LBV HITL — taskId=${hitl.taskId}; surfacing AWAITING_HUMAN_INPUT to IDE`
+                            `ATX: ${jobStatus} job has pending LBV HITL — taskId=${hitl.taskId} stepId=${planLbvStepId ?? '<none>'}; surfacing AWAITING_HUMAN_INPUT to IDE`
                         )
                         return {
                             TransformationJob: {
@@ -1429,6 +2111,7 @@ export class ATXTransformHandler {
                             } as AtxTransformationJob,
                             HitlTag: hitl.tag,
                             HitlTaskId: hitl.taskId,
+                            StepInformation: planLbvStepId ? { StepId: planLbvStepId } : undefined,
                             TransformationPlan: plan,
                         } as AtxGetTransformInfoResponse
                     }
@@ -1496,18 +2179,24 @@ export class ATXTransformHandler {
      * 2. Execution phase: Plan exists, HITL raised for a specific step
      */
     private async handleAwaitingHumanInput(request: AtxGetTransformInfoRequest): Promise<AtxGetTransformInfoResponse> {
-        // Check for local-build-verification HITL first — it can happen with or without a plan
+        // Check for local-build-verification HITL first — it can happen with or without a plan.
+        // Beam-to-IDE: pass the loaded repo's scope so we surface THIS repo's LBV HITL, not
+        // the first in the list (which may be a sibling's on a multi-repo beam job).
         const hitlResponse = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
-            request.SolutionRootPath
+            request.SolutionRootPath,
+            request.beamScopeStepIds
         )
         if (hitlResponse?.HitlTag === 'local-build-verification') {
-            this.logging.log('ATX: local-build-verification HITL — returning directly to IDE')
+            this.logging.log(
+                `ATX: local-build-verification HITL — returning directly to IDE | stepId=${hitlResponse.StepId ?? '<none>'}`
+            )
             const plan = await this.getTransformationPlan(
                 request.WorkspaceId,
                 request.TransformationJobId,
-                request.SolutionRootPath
+                request.SolutionRootPath,
+                request.IsBeam === true
             )
             return {
                 TransformationJob: {
@@ -1518,6 +2207,10 @@ export class ATXTransformHandler {
                 TransformationPlan: plan,
                 HitlTag: 'local-build-verification',
                 HitlTaskId: hitlResponse.TaskId,
+                // Multi-repo beam scoping: forward the LBV HITL's plan-step id so the IDE answers
+                // only the loaded repo's HITL and skips siblings'. Undefined on single-repo/untagged
+                // jobs → IDE falls back to answering it (prior behavior).
+                StepInformation: hitlResponse.StepId ? { StepId: hitlResponse.StepId } : undefined,
             } as AtxGetTransformInfoResponse
         }
 
@@ -1525,7 +2218,8 @@ export class ATXTransformHandler {
         const plan = await this.getTransformationPlan(
             request.WorkspaceId,
             request.TransformationJobId,
-            request.SolutionRootPath
+            request.SolutionRootPath,
+            request.IsBeam === true
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
@@ -1665,6 +2359,104 @@ export class ATXTransformHandler {
         }
 
         return null
+    }
+
+    /**
+     * Beam to IDE: decide whether a beamed repo's Local Build Verification is
+     * still OPEN (i.e. the repo is still waiting for the user to run LBV in the IDE), given the
+     * parent job's plan tree. Used by listBeamedRepos so the IDE shows only repos still awaiting
+     * LBV — a repo whose LBV has completed drops off the "Transferred to IDE" list.
+     *
+     * The web orchestrator names each beamed child node "<repo> (beamed)" under a "(Beamed) Batch"
+     * parent, with a "Local Build Verification" node beneath it. We find the repo's beamed node by
+     * name, then inspect its LBV descendant: OPEN = the LBV node exists and is non-terminal
+     * (PENDING_HUMAN_INPUT / IN_PROGRESS / NOT_STARTED); CLOSED = terminal (SUCCEEDED / COMPLETED /
+     * FAILED / STOPPED). Returns TRUE (open) when we can't resolve it — no plan yet, node not
+     * found, or no LBV child — so a freshly transferred repo is never hidden before its LBV status
+     * is known (the IDE mirrors this default). The caller skips this call entirely when no plan is
+     * available.
+     */
+    private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string): boolean {
+        const repoNode = this.findBeamedRepoNode(planRoot, repoName)
+        if (!repoNode) {
+            // unknown → default open (don't hide a fresh transfer)
+            this.logging.log(
+                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): no beamed repo node found in plan tree`
+            )
+            return true
+        }
+
+        const lbvNode = this.findLbvNode(repoNode)
+        if (!lbvNode) {
+            // no LBV node yet → still pending
+            this.logging.log(
+                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
+            )
+            return true
+        }
+
+        const terminal = this.isTerminalStepStatus(lbvNode.Status)
+        // The decisive trace: repo → its LBV node status → open/closed verdict. On the next run this
+        // is how we PROVE the show-set actually flips: watch a repo go lbvStatus=IN_PROGRESS/
+        // PENDING_HUMAN_INPUT (OPEN) → SUCCEEDED (CLOSED) after Load, and confirm it then drops off.
+        this.logging.log(
+            `[BEAM-LBVOPEN] repo='${repoName}' node='${repoNode.StepName}' lbvNode='${lbvNode.StepName}' ` +
+                `lbvStatus=${lbvNode.Status} terminal=${terminal} → ${terminal ? 'CLOSED (will be hidden)' : 'OPEN (will show)'}`
+        )
+        return !terminal
+    }
+
+    /**
+     * Is this repo's LBV HITL NOT created yet? TRUE when the beamed node isn't in the plan tree, or
+     * has no LBV child. FALSE once an LBV node exists (open or terminal — IsLbvOpen distinguishes
+     * those). Gates the Load button (isLbvOpen && !isLbvPending) so the IDE never Loads before the
+     * HITL exists. Same node resolution as isRepoLbvOpen.
+     */
+    private isRepoLbvHitlPending(planRoot: AtxPlanStep, repoName: string): boolean {
+        const repoNode = this.findBeamedRepoNode(planRoot, repoName)
+        if (!repoNode) return true
+        return !this.findLbvNode(repoNode)
+    }
+
+    /**
+     * Match the beamed repo's plan node. CRITICAL: the plan tree has MULTIPLE nodes named for a
+     * repo — the ORIGINAL TRANSFORM node named plain "<repo>" (top-level, SUCCEEDED, NO LBV child)
+     * AND the BEAM node named "<repo> (beamed)" (under "(Beamed) Batch", carrying the Local Build
+     * Verification child). We MUST prefer the "(beamed)" node — a naive first-match DFS hits the
+     * plain transform node first, finds no LBV child, and wrongly defaults the repo to LBV-open
+     * (making the whole show-set a no-op → every repo shows). So: search for the "(beamed)" node
+     * across the WHOLE tree first; only fall back to a plain "<repo>" match (single-repo/older
+     * jobs that name the beam node just "<repo>") if no "(beamed)" node exists anywhere.
+     */
+    private findBeamedRepoNode(step: AtxPlanStep, repoName: string): AtxPlanStep | null {
+        const beamed = this.findNodeByName(step, `${repoName} (beamed)`.toLowerCase())
+        if (beamed) return beamed
+        return this.findNodeByName(step, repoName.toLowerCase())
+    }
+
+    private findNodeByName(step: AtxPlanStep, lowerName: string): AtxPlanStep | null {
+        if ((step.StepName || '').toLowerCase() === lowerName) return step
+        for (const child of step.Children) {
+            const found = this.findNodeByName(child, lowerName)
+            if (found) return found
+        }
+        return null
+    }
+
+    /** Find the "Local Build Verification" node anywhere under the given node. */
+    private findLbvNode(step: AtxPlanStep): AtxPlanStep | null {
+        if ((step.StepName || '').toLowerCase().includes('local build verification')) return step
+        for (const child of step.Children) {
+            const found = this.findLbvNode(child)
+            if (found) return found
+        }
+        return null
+    }
+
+    /** Terminal step statuses (LBV done, one way or another). */
+    private isTerminalStepStatus(status: string): boolean {
+        const s = String(status || '').toUpperCase()
+        return s === 'SUCCEEDED' || s === 'COMPLETED' || s === 'FAILED' || s === 'STOPPED' || s === 'CANCELLED'
     }
 
     /**
@@ -2486,7 +3278,8 @@ export class ATXTransformHandler {
     async getTransformationPlan(
         workspaceId: string,
         jobId: string,
-        solutionRootPath: string
+        solutionRootPath: string,
+        isBeam: boolean = false
     ): Promise<AtxTransformationPlan> {
         try {
             const plan = await this.fetchPlanTree(workspaceId, jobId)
@@ -2496,7 +3289,23 @@ export class ATXTransformHandler {
                 this.logging.log(`ATX: Could not get worklogs for workspace: ${workspaceId}, job: ${jobId}`)
             })
 
-            // Download completed step artifacts if not already present (all modes)
+            // Download completed step artifacts if not already present.
+            //
+            // Beam-to-IDE (transformed): SKIP this pass. The beamed source is already
+            // the transformed output, so the prior transform job's completed-step
+            // checkpoint diffs are (a) already baked in and (b) not present in the beam
+            // bundle. Attempting to apply them logs "Checkpoint folder not available for
+            // step" and sets DiffApplyFailed on every poll, stalling the LBV loop. New
+            // LBV-round diffs are surfaced via the separate diff-artifact path, which is
+            // not gated here.
+            if (isBeam) {
+                this.logging.log(
+                    `ATX: [BEAM] skipping completed-step artifact apply for beamed job ${jobId} — source is already transformed`
+                )
+                this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
+                return plan
+            }
+
             const anyFailed = await this.downloadCompletedStepArtifacts(workspaceId, jobId, solutionRootPath, plan)
             if (anyFailed && this._currentDiffContext) {
                 this._currentDiffContext.failed = true
@@ -3695,16 +4504,31 @@ export class ATXTransformHandler {
         jobId?: string
         text: string
         skipPolling?: boolean
+        beamStepId?: string
     }): Promise<any> {
         try {
-            this.logging.log(`ATX: Sending chat message for workspace: ${request.workspaceId}`)
+            this.logging.log(
+                `ATX: Sending chat message for workspace: ${request.workspaceId}` +
+                    (request.beamStepId ? ` [BEAM-STEPID] beamStepId=${request.beamStepId}` : '')
+            )
 
             if (!this.atxClient && !(await this.initializeAtxClient())) {
                 throw new Error('ATX FES client not initialized')
             }
 
+            // Beam to IDE (chat routing): the beamed repo's stepId is the routing key the
+            // web orchestrator needs to forward this message to the right repo's sub-agent.
+            // Message-level metadata is stripped by the platform base agent before the
+            // orchestrator sees it (and the SDK ChatJobMetadata type rejects extra fields),
+            // and the LSP can't emit an A2A DataPart — so the only channel that reaches the
+            // orchestrator is the message TEXT. Prepend a machine-parseable token the
+            // orchestrator strips before the LLM sees it (same pattern as the beam marker).
+            // The IDE shows the user's clean text (it renders the message locally before
+            // send), so the token never appears in the user's chat panel.
+            const messageText = request.beamStepId ? `<<beamstep:${request.beamStepId}>> ${request.text}` : request.text
+
             const command = new SendMessageCommand({
-                text: request.text,
+                text: messageText,
                 idempotencyToken: uuidv4(),
                 metadata: {
                     resourcesOnScreen: {
