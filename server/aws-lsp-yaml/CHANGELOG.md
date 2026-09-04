@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.27](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-yaml/v0.1.26...lsp-yaml/v0.1.27) (2026-08-18)
+
+
+### Bug Fixes
+
+* repoint CODEOWNERS and package repository URLs to the new org ([#2838](https://github.com/Amazon-Q-Developer/language-servers/issues/2838)) ([43e44dc](https://github.com/Amazon-Q-Developer/language-servers/commit/43e44dc5af94703f51456cd8a913f0d61af7570e))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @aws/lsp-core bumped from ^0.0.21 to ^0.0.22
+
 ## [0.1.26](https://github.com/aws/language-servers/compare/lsp-yaml/v0.1.25...lsp-yaml/v0.1.26) (2026-02-17)
 
 
