@@ -146,6 +146,10 @@ export interface AtxGetTransformInfoResponse {
     MissingPackageJsonPath?: string | null
     DiffApplyFailed?: boolean
     DiffApplyFailedStepIds?: string[]
+    // Interactive mode as resolved from the backend job objective (interactive_mode).
+    // Surfaced so the IDE can restore the correct mode instead of relying on its local
+    // settings store, which may be missing/stale (e.g. cold restart on another machine).
+    InteractiveMode?: InteractiveMode
 }
 
 /**
