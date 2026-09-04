@@ -497,6 +497,30 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect((handler as any).jobsPastLocalBuild.has('job-123')).to.be.true
     })
 
+    it('should NOT surface a sibling repo LBV when status is PLANNING and all pending LBVs are out of the loaded scope', async () => {
+        // Beam multi-repo: the IDE loaded one repo (beamScopeStepIds = its subtree). Every pending
+        // HITL is a local-build-verification for a DIFFERENT (sibling) repo's plan step. Surfacing
+        // one would make the IDE build the loaded solution against a sibling's HITL → false-green.
+        // Mirrors the EXECUTING/getHitlAgentArtifact guard: return the plan-only view instead.
+        getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([
+            { tag: 'local-build-verification', taskId: 'task-sib1', stepId: 'sibling-step-1' },
+            { tag: 'local-build-verification', taskId: 'task-sib2', stepId: 'sibling-step-2' },
+        ])
+
+        const result = await handler.getTransformInfo({
+            ...baseRequest,
+            beamScopeStepIds: 'loaded-step-a,loaded-step-b',
+        })
+
+        // Plan-only view: original job status preserved, no HITL surfaced to the IDE.
+        expect(result?.TransformationJob.Status).to.equal('PLANNING')
+        expect(result?.HitlTag).to.be.undefined
+        expect(result?.HitlTaskId).to.be.undefined
+        expect(result?.TransformationPlan).to.deep.equal({ Root: { Children: [] } })
+    })
+
     it('should filter pre-job mode-selection -checkpoint HITL before LBV has run', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -4166,6 +4190,15 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(g(undefined)).to.be.undefined
             expect(g('str')).to.be.undefined
             expect(g({ other: 'x' })).to.be.undefined
+        })
+
+        it('skips an empty-string stepId and falls through to planStepId / parentStepId (|| not ??)', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            // Empty stepId must NOT short-circuit coalescing (the ??→|| hardening) — an empty
+            // string is falsy under ||, so the non-empty planStepId is returned.
+            expect(g({ stepId: '', planStepId: 'step-1' })).to.equal('step-1')
+            // Empty stepId + empty planStepId → fall all the way through to parentStepId.
+            expect(g({ stepId: '', planStepId: '', parentStepId: 'parent-1' })).to.equal('parent-1')
         })
     })
 
