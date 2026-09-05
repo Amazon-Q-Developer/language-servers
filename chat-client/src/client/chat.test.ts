@@ -30,7 +30,14 @@ import { MynahUI } from '@aws/mynah-ui'
 import { TabFactory } from './tabs/tabFactory'
 import { ChatClientAdapter } from '../contracts/chatClientAdapter'
 
-describe('Chat', () => {
+describe('Chat', function () {
+    /**
+     * Also jsdom-backed: the slowest cases here reach ~570ms idle and 3.5s under load,
+     * i.e. 70% of the default 5s budget, so they are the next to flake. See the note in
+     * mynahUi.test.ts.
+     */
+    this.timeout(30_000)
+
     const sandbox = sinon.createSandbox()
     const initialTabId = 'tab-1'
     let mynahUi: MynahUI
