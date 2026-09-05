@@ -751,8 +751,64 @@ export class ExecuteBash {
         }
     }
 
+    // cmd.exe internal commands that have no executable on PATH, so 'where' cannot find them.
+    // Kept as a static set because probing 'cmd.exe /c help <cmd>' is locale-dependent: the
+    // "not supported" marker is localized (e.g. German Windows), which made every unknown
+    // command pass validation on non-English systems.
+    private static readonly CMD_BUILTINS = new Set([
+        'assoc',
+        'break',
+        'call',
+        'cd',
+        'chdir',
+        'cls',
+        'color',
+        'copy',
+        'date',
+        'del',
+        'dir',
+        'dpath',
+        'echo',
+        'endlocal',
+        'erase',
+        'exit',
+        'for',
+        'ftype',
+        'goto',
+        'if',
+        'md',
+        'mkdir',
+        'mklink',
+        'move',
+        'path',
+        'pause',
+        'popd',
+        'prompt',
+        'pushd',
+        'rd',
+        'rem',
+        'ren',
+        'rename',
+        'rmdir',
+        'set',
+        'setlocal',
+        'shift',
+        'start',
+        'time',
+        'title',
+        'type',
+        'ver',
+        'verify',
+        'vol',
+    ])
+
     private static async resolveWindowsCommand(logger: Logging, cmd: string): Promise<void> {
-        // 1. Check for external command or alias
+        // 1. Check for built-in command
+        if (ExecuteBash.CMD_BUILTINS.has(cmd.toLowerCase())) {
+            return
+        }
+
+        // 2. Check for external command or alias
         try {
             const whereProc = new processUtils.ChildProcess(logger, 'where', [cmd], {
                 collect: true,
@@ -766,22 +822,6 @@ export class ExecuteBash {
             }
         } catch (err) {
             logger.debug(`'where ${cmd}' failed: ${(err as Error).message}`)
-        }
-
-        // 2. Check for built-in command
-        try {
-            const helpProc = new processUtils.ChildProcess(logger, 'cmd.exe', ['/c', 'help', cmd], {
-                collect: true,
-                waitForStreams: true,
-            })
-            const result = await helpProc.run()
-            const output = result.stdout.trim()
-
-            if (output && !output.includes('This command is not supported by the help utility')) {
-                return
-            }
-        } catch (err) {
-            logger.debug(`'help ${cmd}' failed: ${(err as Error).message}`)
         }
 
         throw new Error(`Command '${cmd}' not found as executable or Windows built-in command`)
