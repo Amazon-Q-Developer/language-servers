@@ -182,6 +182,36 @@ export class ProfileStatusMonitor {
         ProfileStatusMonitor.setMcpState(true)
     }
 
+    static resetMcpManager(): void {
+        try {
+            // note: use dynamic require to satisfy webpack requirements for webworker
+            const McpManager = eval('require')('./mcpManager').McpManager
+            if (McpManager.isInitialized()) {
+                McpManager.instance.setRegistryActive(false)
+                McpManager.instance.resetRegistryService()
+                void McpManager.instance.close(true)
+            }
+        } catch (error) {
+            ProfileStatusMonitor.logging?.error(`Failed to reset MCP manager: ${error}`)
+        }
+    }
+
+    /**
+     * When switching between connections especially builder id
+     * re-discover mcp servers for non-profile connections
+     */
+    static discoverServersWhenNoProfiles(): void {
+        try {
+            // note: use dynamic require to satisfy webpack requirements for webworker
+            const McpManager = eval('require')('./mcpManager').McpManager
+            if (McpManager.isInitialized()) {
+                void McpManager.instance.discoverAllServers()
+            }
+        } catch (error) {
+            ProfileStatusMonitor.logging?.error(`Failed to discover mcp servers when no profiles available: ${error}`)
+        }
+    }
+
     static emitAuthSuccess(): void {
         ProfileStatusMonitor.eventEmitter.emit(AUTH_SUCCESS_EVENT)
     }

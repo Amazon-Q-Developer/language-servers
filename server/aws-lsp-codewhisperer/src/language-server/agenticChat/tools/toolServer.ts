@@ -519,8 +519,8 @@ export const McpToolsServer: Server = ({
             // Wait for profile ARN to be available before checking MCP state
             const checkAndInitialize = async () => {
                 try {
-                    // Check if MCP is enabled via isMcpEnabled check (only call once)
-                    const mcpEnabled = await profileStatusMonitor!.checkInitialState()
+                    // Check if MCP is enabled via get Mcp state
+                    const mcpEnabled = ProfileStatusMonitor.getMcpState()
 
                     if (mcpEnabled) {
                         logging.info('MCP is enabled, discovering servers')

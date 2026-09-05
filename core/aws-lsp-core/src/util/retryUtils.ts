@@ -34,18 +34,18 @@ export interface RetryOptions {
  */
 function defaultIsRetryable(error: any): boolean {
     const errorCode = error.code || error.name
-    const statusCode = error.statusCode
+    const statusCode = error.statusCode || error?.$metadata?.httpStatusCode
 
     // Fast fail on non-retryable client errors (except throttling)
     if (statusCode >= CLIENT_ERROR_MIN && statusCode < CLIENT_ERROR_MAX && errorCode !== THROTTLING_EXCEPTION) {
         return false
     }
 
-    // Retry on throttling, server errors, and specific status codes
+    // Retry on throttling, server errors (5xx), and specific status codes
     return (
         errorCode === THROTTLING_EXCEPTION ||
         errorCode === INTERNAL_SERVER_EXCEPTION ||
-        statusCode === INTERNAL_SERVER_ERROR ||
+        statusCode >= 500 ||
         statusCode === SERVICE_UNAVAILABLE
     )
 }
