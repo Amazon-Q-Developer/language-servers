@@ -527,6 +527,29 @@ describe('TelemetryService', () => {
                 },
             })
         })
+
+        it('should send InteractWithMessage with programming language when provided', () => {
+            const metric = {
+                cwsprChatMessageId: 'message123',
+                cwsprChatInteractionType: ChatInteractionType.InsertAtCursor,
+                cwsprChatAcceptedCharactersLength: 100,
+            }
+            telemetryService.emitChatInteractWithMessage(metric, {
+                conversationId: 'conv123',
+                programmingLanguage: 'typescript',
+            })
+
+            sinon.assert.calledOnce(codeWhisperServiceStub.sendTelemetryEvent)
+            const call = codeWhisperServiceStub.sendTelemetryEvent.getCall(0)
+            const event = call?.args[0]?.telemetryEvent?.chatInteractWithMessageEvent
+
+            // Verify programming language is set correctly
+            if (event) {
+                sinon.assert.match(event.programmingLanguage, {
+                    languageName: 'typescript',
+                })
+            }
+        })
     })
 
     it('should emit CodeCoverageEvent event to STE and to the destination', () => {
