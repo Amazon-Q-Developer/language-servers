@@ -76,6 +76,26 @@ export interface ProcessStats {
     memory: number
     cpu: number
 }
+
+/**
+ * Parses the JSON emitted by the `Get-CimInstance ... | ConvertTo-Json` process-stats query.
+ * Empty output (process already exited) yields zero usage. Exported for testing.
+ */
+export function parseCimProcessStats(output: string): ProcessStats {
+    const trimmed = output.trim()
+    if (!trimmed) {
+        return { cpu: 0, memory: 0 }
+    }
+    const parsed = JSON.parse(trimmed)
+    // ConvertTo-Json emits a bare object for a single match and an array for multiple.
+    const stats = Array.isArray(parsed) ? parsed[0] : parsed
+    const cpu = Number(stats?.PercentProcessorTime)
+    const memory = Number(stats?.WorkingSet)
+    return {
+        cpu: isNaN(cpu) ? 0 : cpu,
+        memory: isNaN(memory) ? 0 : memory,
+    }
+}
 export class ChildProcessTracker {
     static #instance: ChildProcessTracker
     static readonly pollingInterval: number = 10000 // Check usage every 10 seconds
@@ -120,7 +140,7 @@ export class ChildProcessTracker {
             this.logging.warn(`Missing process with id ${pid}`)
             return
         }
-        const stats = this.getUsage(pid)
+        const stats = await this.getUsage(pid)
         if (stats) {
             this.logIfExceeds(pid, stats)
         }
@@ -162,36 +182,32 @@ export class ChildProcessTracker {
         this.#processByPid.clear()
     }
 
-    private getUsage(pid: number): ProcessStats {
+    private async getUsage(pid: number): Promise<ProcessStats> {
         try {
-            return process.platform === 'win32' ? getWindowsUsage() : getUnixUsage()
+            return process.platform === 'win32' ? await getWindowsUsage() : getUnixUsage()
         } catch (e) {
             this.logging.warn(`Failed to get process stats for ${pid}: ${e}`)
             return { cpu: 0, memory: 0 }
         }
 
-        function getWindowsUsage() {
-            const cpuOutput = proc
-                .execFileSync('wmic', [
-                    'path',
-                    'Win32_PerfFormattedData_PerfProc_Process',
-                    'where',
-                    `IDProcess=${pid}`,
-                    'get',
-                    'PercentProcessorTime',
-                ])
-                .toString()
-            const memOutput = proc
-                .execFileSync('wmic', ['process', 'where', `ProcessId=${pid}`, 'get', 'WorkingSetSize'])
-                .toString()
-
-            const cpuPercentage = parseFloat(cpuOutput.split('\n')[1])
-            const memoryBytes = parseInt(memOutput.split('\n')[1]) * 1024
-
-            return {
-                cpu: isNaN(cpuPercentage) ? 0 : cpuPercentage,
-                memory: memoryBytes,
-            }
+        // wmic was removed from current Windows 11 builds; query CIM through PowerShell instead.
+        // A single Win32_PerfFormattedData query provides both cpu percentage and working set,
+        // and ConvertTo-Json keeps the output locale-independent.
+        async function getWindowsUsage(): Promise<ProcessStats> {
+            const output = await new Promise<string>((resolve, reject) => {
+                proc.execFile(
+                    'powershell.exe',
+                    [
+                        '-NoProfile',
+                        '-NonInteractive',
+                        '-Command',
+                        `Get-CimInstance -ClassName Win32_PerfFormattedData_PerfProc_Process -Filter 'IDProcess=${pid}' | Select-Object PercentProcessorTime,WorkingSet | ConvertTo-Json`,
+                    ],
+                    { windowsHide: true },
+                    (error, stdout) => (error ? reject(error) : resolve(stdout))
+                )
+            })
+            return parseCimProcessStats(output)
         }
 
         function getUnixUsage() {
