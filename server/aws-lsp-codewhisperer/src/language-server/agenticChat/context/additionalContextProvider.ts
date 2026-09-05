@@ -715,13 +715,27 @@ export class AdditionalContextProvider {
             .filter(item => item.label === 'image')
             .filter(item => !contextImages.find(ctx => ctx.description === item.description))
 
+        const buildPath = (route: string[] | undefined) => {
+            if (!route?.length) return ''
+            if (route.length === 1) return route[0]
+            if (route.length === 2) return `${route[0]}/${route[1]}`
+            return ''
+        }
+
+        const buildRelativePath = (route: string[] | undefined) => {
+            if (!route?.length) return ''
+            if (route.length === 1) return route[0]
+            if (route.length === 2) return route[1]
+            return ''
+        }
+
         const toEntry = (item: any, pinned: boolean) => ({
             name: item.command?.substring(0, additionalContentNameLimit) ?? '',
             description: item.description ?? '',
             innerContext: '',
             type: 'image',
-            path: item.route?.[0] ?? '',
-            relativePath: item.route?.[0] ?? '',
+            path: buildPath(item.route),
+            relativePath: buildRelativePath(item.route),
             startLine: -1,
             endLine: -1,
             pinned,
@@ -749,7 +763,10 @@ export class AdditionalContextProvider {
         for (const context of mergedContext) {
             if (context.label === 'image' && context.route && context.route.length > 0) {
                 try {
-                    const imagePath = context.route[0]
+                    // Route array handling:
+                    // Selected from file dialog: size 1 = full path ["/User/image.jpg"]
+                    // From workspaceL size 2 = ["/User", "image.jpg"]
+                    const imagePath = context.route.join('/')
                     let format = imagePath.split('.').pop()?.toLowerCase() || ''
                     // Both .jpg and .jpeg files use the exact same JPEG compression algorithm and file structure.
                     if (format === 'jpg') {

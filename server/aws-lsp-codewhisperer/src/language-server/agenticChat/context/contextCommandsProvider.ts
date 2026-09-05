@@ -326,6 +326,12 @@ export class ContextCommandsProvider implements Disposable {
                     label: 'code',
                     icon: 'code-block',
                 })
+            } else if (item.type === 'image') {
+                fileCmds.push({
+                    ...baseItem,
+                    label: 'image',
+                    icon: 'image',
+                })
             }
         }
         const userPromptsItem = await this.getUserPromptsCommand()
