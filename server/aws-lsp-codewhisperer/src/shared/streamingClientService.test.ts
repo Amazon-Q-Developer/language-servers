@@ -232,15 +232,15 @@ describe('StreamingClientServiceToken', () => {
         })
 
         it('aborts in flight generate assistant response requests with explicit abort controller', async () => {
-            const abort = sinon.stub()
-            const signal = sinon.createStubInstance(AbortSignal)
+            const controller1 = new AbortController()
+            const controller2 = new AbortController()
 
-            streamingClientService.generateAssistantResponse(MOCKED_GENERATE_RESPONSE_REQUEST, { abort, signal })
-            streamingClientService.generateAssistantResponse(MOCKED_GENERATE_RESPONSE_REQUEST, { abort, signal })
+            streamingClientService.generateAssistantResponse(MOCKED_GENERATE_RESPONSE_REQUEST, controller1)
+            streamingClientService.generateAssistantResponse(MOCKED_GENERATE_RESPONSE_REQUEST, controller2)
 
             streamingClientService.abortInflightRequests()
 
-            sinon.assert.calledTwice(abort)
+            sinon.assert.calledTwice(abortStub)
             expect(streamingClientService['inflightRequests'].size).to.eq(0)
         })
     })
