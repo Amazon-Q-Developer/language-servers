@@ -36,6 +36,8 @@ import {
     SUFFIX_PERMISSION,
     SUFFIX_UNDOALL,
     SUFFIX_EXPLANATION,
+    shouldRequireAcceptanceForBuiltinTool,
+    shouldRequireAcceptanceForMcpTool,
 } from './constants/toolConstants'
 import { SendMessageCommandInput, ChatCommandInput, ChatCommandOutput } from '../../shared/streamingClientService'
 import {
@@ -2064,9 +2066,16 @@ export class AgenticChatController implements ChatHandlers {
                         const approvedPaths = session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
-                        const { requiresAcceptance, warning, commandCategory } = await tool.requiresAcceptance(
-                            toolUse.input as any,
-                            approvedPaths
+                        const toolValidation = await tool.requiresAcceptance(toolUse.input as any, approvedPaths)
+                        const { warning, commandCategory } = toolValidation
+                        // Plan mode (pairProgrammingMode === false) forces user approval for every
+                        // mutating built-in tool, even for in-workspace or session-approved paths.
+                        // Read-only tools (fsRead, listDirectory, grepSearch, fileSearch) keep their
+                        // normal behavior so chat can still investigate code.
+                        const requiresAcceptance = shouldRequireAcceptanceForBuiltinTool(
+                            toolUse.name,
+                            session.pairProgrammingMode,
+                            toolValidation.requiresAcceptance
                         )
 
                         // Honor built-in permission if available, otherwise use tool's requiresAcceptance
@@ -2161,10 +2170,17 @@ export class AgenticChatController implements ChatHandlers {
                             }
                             if (def) {
                                 const mcpTool = new McpTool(this.#features, def)
-                                const { requiresAcceptance, warning } = await mcpTool.requiresAcceptance(
-                                    serverName,
-                                    toolName
+                                const mcpValidation = await mcpTool.requiresAcceptance(serverName, toolName)
+                                const { warning } = mcpValidation
+                                // Plan mode: every MCP tool requires explicit approval — MCP tools can
+                                // perform arbitrary side effects, and the user toggling agentic mode off
+                                // is an explicit "review everything" intent that overrides per-tool
+                                // alwaysAllow settings until the toggle is turned back on.
+                                const requiresAcceptance = shouldRequireAcceptanceForMcpTool(
+                                    session.pairProgrammingMode,
+                                    mcpValidation.requiresAcceptance
                                 )
+
                                 if (requiresAcceptance) {
                                     const confirmation = this.#processToolConfirmation(
                                         toolUse,
