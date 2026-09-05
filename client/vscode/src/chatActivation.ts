@@ -528,9 +528,24 @@ function registerGenericCommand(commandName: string, genericCommand: string, web
         const selection = getSelectedText()
 
         webview.postMessage({
-            command: 'genericCommand',
-            params: { genericCommand, selection, triggerType },
+            command: 'aws/chat/sendContextCommands',
+            params: {
+                contextCommandGroups: [
+                    {
+                        commands: [
+                            {
+                                command: '@workspace',
+                                description: 'Reference all code in workspace.',
+                            },
+                        ],
+                    },
+                ],
+            },
         })
+        // webview.postMessage({
+        //     command: 'genericCommand',
+        //     params: { genericCommand, selection, triggerType },
+        // })
     })
 }
 
