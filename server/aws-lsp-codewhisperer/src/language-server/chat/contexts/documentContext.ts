@@ -22,7 +22,7 @@ export interface DocumentContextExtractorConfig {
 }
 
 export class DocumentContextExtractor {
-    private static readonly DEFAULT_CHARACTER_LIMIT = 9000
+    private static readonly DEFAULT_CHARACTER_LIMIT = 40000
 
     #characterLimits: number
     #logger?: Features['logging']
