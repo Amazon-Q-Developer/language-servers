@@ -74,7 +74,7 @@ export async function loadMcpServerConfigs(
         try {
             rawText = (await workspace.fs.readFile(fsPath)).toString()
         } catch (e: any) {
-            const errorMsg = `Failed to read MCP config at ${fsPath}: ${e.message}`
+            const errorMsg = `Failed to read MCP config at \`${fsPath}\`: ${e.message}`
             logging.warn(errorMsg)
             configErrors.set(`${fsPath}`, errorMsg)
             continue
@@ -84,14 +84,14 @@ export async function loadMcpServerConfigs(
         try {
             json = JSON.parse(rawText)
         } catch (e: any) {
-            const errorMsg = `Invalid JSON in MCP config at ${fsPath}: ${e.message}`
+            const errorMsg = `Invalid JSON in MCP config at \`${fsPath}\`: ${e.message}`
             logging.warn(errorMsg)
             configErrors.set(`${fsPath}`, errorMsg)
             continue
         }
 
         if (!json.mcpServers || typeof json.mcpServers !== 'object') {
-            const errorMsg = `MCP config at ${fsPath} missing or invalid 'mcpServers' field`
+            const errorMsg = `MCP config at \`${fsPath}\` missing or invalid 'mcpServers' field`
             logging.warn(errorMsg)
             configErrors.set(`${fsPath}`, errorMsg)
             continue

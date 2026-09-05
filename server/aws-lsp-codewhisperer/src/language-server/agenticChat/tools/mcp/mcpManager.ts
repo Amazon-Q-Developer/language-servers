@@ -1653,7 +1653,10 @@ export class McpManager {
                 if (server === 'registry') {
                     return error
                 }
-                return `File: ${server}, Error: ${error}`
+                // Wrap the file path/server name in a code span. This message is rendered
+                // as markdown in the UI, so an unescaped Windows path (e.g. a segment like
+                // "\.aws") would have its backslash stripped and be shown incorrectly.
+                return `File: \`${server}\`, Error: ${error}`
             })
             .join('\n\n')
     }

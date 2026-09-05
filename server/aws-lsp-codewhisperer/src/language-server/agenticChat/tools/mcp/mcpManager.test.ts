@@ -1489,8 +1489,37 @@ describe('McpManager error handling', () => {
         // Test that getConfigLoadErrors returns the expected error messages
         const errors = mgr.getConfigLoadErrors()
         expect(errors).to.not.be.undefined
-        expect(errors).to.include('File: file1.json, Error: File not found error')
-        expect(errors).to.include('File: serverA, Error: Missing command error')
+        expect(errors).to.include('File: `file1.json`, Error: File not found error')
+        expect(errors).to.include('File: `serverA`, Error: Missing command error')
+    })
+
+    it('wraps file paths in code spans so Windows paths render correctly in markdown', async () => {
+        // A Windows path segment like "\.aws" would have its backslash stripped when
+        // rendered as markdown unless the path is wrapped in a code span.
+        const windowsPath = 'C:\\Users\\me\\.aws\\amazonq\\mcp.json'
+        const mockErrors = new Map<string, string>([[windowsPath, 'Invalid JSON error']])
+
+        loadStub = sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map(),
+            serverNameMapping: new Map(),
+            errors: mockErrors,
+            agentConfig: {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            },
+        })
+
+        const mgr = await McpManager.init([], features)
+        await mgr.discoverAllServers()
+
+        const errors = mgr.getConfigLoadErrors()
+        expect(errors).to.include(`File: \`${windowsPath}\`, Error: Invalid JSON error`)
     })
 
     it('returns undefined when no errors exist', async () => {
