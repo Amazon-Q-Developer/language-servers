@@ -58,7 +58,7 @@ export class TestIntentDetector {
     // @VisibleForTesting
     javaTestIntent(content: string): boolean {
         const signaturePattern = new RegExp(
-            '@Test(?:\\s*@\\w+(?:\\(.*?\\))?\\s*)*' +
+            '@Test(?:\\s*@\\w+(?:\\([^)]*\\))?)*' +
                 '(?:\\s*(?:public|protected|private)\\s+)?' +
                 '(?:static\\s+)?' +
                 '\\s*void\\s+\\w+\\s*\\([^)]*\\)' +

@@ -5,6 +5,11 @@ on:
         branches: [main, feature/*, release/agentic/*]
     workflow_dispatch:
 
+# Least-privilege default for GITHUB_TOKEN. This workflow only checks out code,
+# builds bundles, and uploads them as workflow artifacts, so read-only is sufficient.
+permissions:
+    contents: read
+
 jobs:
     build:
         runs-on: ubuntu-latest
