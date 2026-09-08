@@ -38,6 +38,82 @@ describe('ATXTransformHandler - Chat APIs', () => {
         sinon.restore()
     })
 
+    // The beam artifact cache had no tests at all, and the LRU-victim case below is exactly the bug
+    // the cap-correction commit fixed — nothing guarded the regression.
+    describe('downloadJsonArtifact cache', () => {
+        let urlStub: sinon.SinonStub
+
+        beforeEach(() => {
+            urlStub = sinon.stub(handler as any, 'createArtifactDownloadUrl')
+        })
+
+        it('caches a NEGATIVE (not JSON) so the artifact is never re-fetched', async () => {
+            // Negatives were 1230 of the 1980 wasted fetches — the bulk of the win — and "these
+            // bytes are not JSON" is a permanent property, so it must not expire.
+            ;(handler as any).beamJsonArtifactCache.set('a1', {
+                value: null,
+                expiresAt: Number.MAX_SAFE_INTEGER,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a1')
+
+            expect(result).to.equal(null)
+            expect(urlStub.called).to.be.false
+        })
+
+        it('serves a fresh POSITIVE from cache without re-fetching', async () => {
+            ;(handler as any).beamJsonArtifactCache.set('a2', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() + 60_000,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a2')
+
+            expect(result).to.deep.equal({ repos: ['alice'] })
+            expect(urlStub.called).to.be.false
+        })
+
+        it('RE-FETCHES an expired positive — a rewritten beam-map must not be pinned', async () => {
+            // Why positives carry a TTL: web-orc re-writes the beam-map, and if a rewrite reuses the
+            // artifactId a permanent cache would hide every repo beamed after the first one until
+            // the LSP restarted.
+            ;(handler as any).beamJsonArtifactCache.set('a3', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() - 1,
+            })
+            urlStub.resolves(null) // no presigned URL — proves only that the fetch was ATTEMPTED
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a3')
+
+            expect(urlStub.calledOnce).to.be.true
+            expect(result).to.equal(null)
+        })
+
+        it('does NOT cache a missing presigned URL — that is transient', async () => {
+            urlStub.resolves(null)
+
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+
+            expect(urlStub.calledTwice).to.be.true
+            expect((handler as any).beamJsonArtifactCache.has('a4')).to.be.false
+        })
+
+        it('evicts the least-recently-USED entry, not the oldest inserted', async () => {
+            // Guards the cap-correction commit: a hit must refresh recency. Without the
+            // delete+re-insert on read, Map insertion order makes this evict 'first' — the entry
+            // just used — which is how an under-sized cap collapsed the hit rate to zero.
+            const cache = (handler as any).beamJsonArtifactCache
+            cache.set('first', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            cache.set('second', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+
+            // Touch 'first' so it becomes most-recently-used.
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'first')
+
+            expect(Array.from(cache.keys())).to.deep.equal(['second', 'first'])
+        })
+    })
+
     describe('sendMessage', () => {
         it('should send message and return response without polling', async () => {
             const mockResponse = {

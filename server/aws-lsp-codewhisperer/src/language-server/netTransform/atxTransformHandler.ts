@@ -127,6 +127,14 @@ const BEAM_MAP_SCAN_BUDGET_MS = 15000
 // useless: it pays the bookkeeping and delivers no hits.
 const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 
+// How long a PARSED artifact stays cached. Negatives ("not JSON") never expire — that is a property
+// of the bytes — but a positive can be rewritten under the same artifactId (web-orc re-writes the
+// beam-map), so pinning one for the session would hide a repo beamed later. 60s is far longer than
+// the ~13s sweep cadence, so it still collapses the repeated fetches this cache exists to stop,
+// while bounding staleness to one minute. It also bounds RETENTION: parsed values are arbitrary
+// size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
+const BEAM_JSON_POSITIVE_TTL_MS = 60_000
+
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
@@ -153,11 +161,12 @@ export class ATXTransformHandler {
     // (surface for auto-approve).
     private jobsPastLocalBuild: Set<string> = new Set()
 
-    // Beam: parsed small-JSON artifacts keyed by their IMMUTABLE artifactId (a re-upload
-    // mints a new id, so a cached entry can never be stale). A `null` value is a positive
-    // result meaning "these bytes are definitively not JSON" — the case that dominated the
-    // waste. Transient failures are never cached; see downloadJsonArtifact.
-    private readonly beamJsonArtifactCache = new Map<string, any | null>()
+    // Beam: parsed small-JSON artifacts keyed by artifactId. A `null` value is a positive result
+    // meaning "these bytes are definitively not JSON" — the case that dominated the waste, and the
+    // only one cached indefinitely. Parsed values carry an expiry because the same id CAN be
+    // rewritten (see downloadJsonArtifact for why immutability is not assumed). Transient failures
+    // — no presigned URL — are never cached at all.
+    private readonly beamJsonArtifactCache = new Map<string, { value: any | null; expiresAt: number }>()
     // Latch so the cap-reached notice is logged once per process, not once per eviction.
     private beamJsonArtifactCacheEvicted = false
 
@@ -797,7 +806,7 @@ export class ATXTransformHandler {
                             `[BEAM-PKG] beam-map repo '${nr.RepositoryName}': no transformed zip matched — falling back to beam-map artifactId ${nr.BeamArtifactId} (may not be downloadable)`
                         )
                     }
-                    const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, nr.RepositoryName) : true
+                    const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, nr.RepositoryName, parentJobId) : true
                     const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, nr.RepositoryName) : true
                     beamed.push({
                         RepositoryName: nr.RepositoryName,
@@ -809,7 +818,7 @@ export class ATXTransformHandler {
                         IsLbvPending: lbvPending,
                     })
                     this.logging.log(
-                        `[BEAM-PKG] beamed repo (from beam-map) | repo=${nr.RepositoryName} artifact=${artifactId} stepId=${nr.BeamStepId || '<empty>'} scenario=${nr.BeamScenario || 'transformed'} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                        `[BEAM-PKG] beamed repo (from beam-map) | job=${parentJobId} repo=${nr.RepositoryName} artifact=${artifactId} stepId=${nr.BeamStepId || '<empty>'} scenario=${nr.BeamScenario || 'transformed'} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
                     )
                 }
             } else {
@@ -853,7 +862,7 @@ export class ATXTransformHandler {
                             )
                             continue
                         }
-                        const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, repoName) : true
+                        const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, repoName, parentJobId) : true
                         const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, repoName) : true
                         beamed.push({
                             RepositoryName: repoName,
@@ -865,7 +874,7 @@ export class ATXTransformHandler {
                             IsLbvPending: lbvPending,
                         })
                         this.logging.log(
-                            `[BEAM-PKG] beamed repo (from beam-status) | repo=${repoName} artifact=${zip.artifactId} path=${zip.path} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                            `[BEAM-PKG] beamed repo (from beam-status) | job=${parentJobId} repo=${repoName} artifact=${zip.artifactId} path=${zip.path} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
                         )
                     }
                     this.logging.log(
@@ -947,19 +956,34 @@ export class ATXTransformHandler {
      * failure unzip (AdmZip) and parse the first JSON entry inside.
      */
     private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
-        // Artifacts are immutable — a re-upload mints a new artifactId — so re-fetching
-        // the same id can never yield different bytes. Beam discovery re-scans the same
-        // candidate artifacts on every sweep, so without this the same artifact is
-        // downloaded and re-parsed on every pass (measured: ~2000 download-URL creations
-        // and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
+        // Beam discovery re-scans the same candidate artifacts on every sweep, so without a cache
+        // the same artifact is downloaded and re-parsed on every pass (measured: ~2000 download-URL
+        // creations and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
         // unrelated calls — chat included).
-        if (this.beamJsonArtifactCache.has(artifactId)) {
+        //
+        // Deliberately NOT relying on artifacts being immutable. An earlier version did, on the
+        // assumption that a re-upload mints a new artifactId — but this file's own comments record
+        // web-orc RE-WRITING the beam-map (see the beam-map notes above: "re-written on each beam;
+        // latest wins", and the BeamArtifactId "thrash" that forced the beam-status fallback). If a
+        // rewrite reuses the id, a permanent positive cache would pin the FIRST beam-map for the
+        // whole LSP session, so a repo beamed later never appears in the panel until restart, and a
+        // re-beam would leave chat routed at a dead stepId.
+        //
+        // So: NEGATIVES are cached permanently (an artifact that is not JSON does not become JSON,
+        // and negatives were 1230 of the 1980 wasted fetches — the bulk of the win), while POSITIVES
+        // get a short TTL. Positives are a handful per job, so re-fetching one every TTL is cheap,
+        // and it removes the dependency on platform semantics we have not verified.
+        const hit = this.beamJsonArtifactCache.get(artifactId)
+        if (hit && Date.now() < hit.expiresAt) {
             // Re-insert to move this entry to the end: Map iterates in insertion order, so
             // "oldest key first" is only a true LRU ordering if a hit refreshes position.
-            const cached = this.beamJsonArtifactCache.get(artifactId) ?? null
             this.beamJsonArtifactCache.delete(artifactId)
-            this.beamJsonArtifactCache.set(artifactId, cached)
-            return cached
+            this.beamJsonArtifactCache.set(artifactId, hit)
+            return hit.value
+        }
+        if (hit) {
+            // Expired positive — drop it so the fetch below refreshes it.
+            this.beamJsonArtifactCache.delete(artifactId)
         }
         try {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
@@ -1044,7 +1068,10 @@ export class ATXTransformHandler {
                 )
             }
         }
-        this.beamJsonArtifactCache.set(artifactId, value)
+        // value === null means "definitively not JSON" — a permanent property of the bytes, so it
+        // never expires. A parsed positive may be rewritten under the same id, so it does.
+        const expiresAt = value === null ? Number.MAX_SAFE_INTEGER : Date.now() + BEAM_JSON_POSITIVE_TTL_MS
+        this.beamJsonArtifactCache.set(artifactId, { value, expiresAt })
     }
 
     /**
@@ -2465,12 +2492,12 @@ export class ATXTransformHandler {
      * is known (the IDE mirrors this default). The caller skips this call entirely when no plan is
      * available.
      */
-    private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string): boolean {
+    private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string, jobId: string): boolean {
         const repoNode = this.findBeamedRepoNode(planRoot, repoName)
         if (!repoNode) {
             // unknown → default open (don't hide a fresh transfer)
             this.logging.log(
-                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): no beamed repo node found in plan tree`
+                `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' → OPEN (default): no beamed repo node found in plan tree`
             )
             return true
         }
@@ -2479,7 +2506,7 @@ export class ATXTransformHandler {
         if (!lbvNode) {
             // no LBV node yet → still pending
             this.logging.log(
-                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
+                `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
             )
             return true
         }
@@ -2489,7 +2516,7 @@ export class ATXTransformHandler {
         // is how we PROVE the show-set actually flips: watch a repo go lbvStatus=IN_PROGRESS/
         // PENDING_HUMAN_INPUT (OPEN) → SUCCEEDED (CLOSED) after Load, and confirm it then drops off.
         this.logging.log(
-            `[BEAM-LBVOPEN] repo='${repoName}' node='${repoNode.StepName}' lbvNode='${lbvNode.StepName}' ` +
+            `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' node='${repoNode.StepName}' lbvNode='${lbvNode.StepName}' ` +
                 `lbvStatus=${lbvNode.Status} terminal=${terminal} → ${terminal ? 'CLOSED (will be hidden)' : 'OPEN (will show)'}`
         )
         return !terminal
