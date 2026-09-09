@@ -26,6 +26,12 @@ const LIBRARY_DIR = (() => {
     }
     return path.join(__dirname, 'indexing')
 })()
+/*
+ * Using new Function(...) prevents webpack from statically analyzing and attempting
+ * to resolve the dynamic import at build time. This works because the function
+ * is created at runtime, thus webpack cannot parse it.
+ */
+const dynamicVecLibImport = new Function('path', 'return import(path)')
 
 export interface SizeConstraints {
     maxFileSize: number
@@ -117,7 +123,7 @@ export class LocalProjectContextController {
 
             // initialize vecLib and index
             const libraryPath = this.getVectorLibraryPath()
-            const vecLib = vectorLib ?? (await eval(`import("${libraryPath}")`))
+            const vecLib = vectorLib ?? (await dynamicVecLibImport(libraryPath))
             if (vecLib) {
                 try {
                     this._vecLib = await vecLib.start(LIBRARY_DIR, this.clientName)
