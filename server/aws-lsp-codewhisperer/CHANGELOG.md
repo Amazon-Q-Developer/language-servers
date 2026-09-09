@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.128](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.127...lsp-codewhisperer/v0.0.128) (2026-09-09)
+
+
+### Bug Fixes
+
+* AWS Transform unit-test generation choice + status-only UT substeps ([#2857](https://github.com/Amazon-Q-Developer/language-servers/issues/2857)) ([2a478f7](https://github.com/Amazon-Q-Developer/language-servers/commit/2a478f7182a7d91fb5d0b2b559d3b826494fc149))
+
 ## [0.0.127](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.126...lsp-codewhisperer/v0.0.127) (2026-08-24)
 
 
