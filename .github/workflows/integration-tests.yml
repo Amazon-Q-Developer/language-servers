@@ -52,26 +52,37 @@ jobs:
             - name: Configure AWS Credentials
               uses: aws-actions/configure-aws-credentials@v4
               with:
-                  role-to-assume: arn:aws:iam::964765661569:role/GitHubActionsTokenRefresherRole
-                  role-session-name: language-servers-github
+                  # DEXP-owned GitHub-OIDC read role in the gamma-IAD canary account (550160095699):
+                  # least-privilege (GetSecretValue on SSOTokenSecret + kms:Decrypt on its key), no lambda.
+                  role-to-assume: arn:aws:iam::550160095699:role/LanguageServersGitHubActionsReadRole
+                  role-session-name: lsp-integ-ci
                   aws-region: us-east-1
             - name: Build
               run: |
                   npm ci
                   npm run compile
-            - name: Refresh Token
-              run: aws lambda invoke --function-name TokenRefresherLambda --region us-east-1 --payload '{}' response.json
             - name: Get SSO Token
-              uses: aws-actions/aws-secretsmanager-get-secrets@v2
-              with:
-                  secret-ids: |
-                      ,SsoTokenSecret
-                  parse-json-secrets: true
+              # SSOTokenSecret is minted by the canary SSORefreshTokenLambda and self-refreshes
+              # every ~5 min, so no lambda invoke is needed. Public repo: mask the token in logs.
+              run: |
+                  SECRET_JSON="$(aws secretsmanager get-secret-value \
+                    --secret-id SSOTokenSecret \
+                    --region us-east-1 \
+                    --query SecretString --output text)"
+                  TEST_SSO_TOKEN="$(printf '%s' "$SECRET_JSON" | jq -r '.createTokenResponseByUser["canaryGammaIAD"].accessToken')"
+                  if [ -z "$TEST_SSO_TOKEN" ] || [ "$TEST_SSO_TOKEN" = "null" ]; then
+                    echo "::error::Failed to extract accessToken for canaryGammaIAD from SSOTokenSecret"
+                    exit 1
+                  fi
+                  echo "::add-mask::$TEST_SSO_TOKEN"
+                  echo "TEST_SSO_TOKEN=$TEST_SSO_TOKEN" >> "$GITHUB_ENV"
             - name: Run Integration Tests
               run: |
                   npm run test-integ -w integration-tests/q-agentic-chat-server
               env:
-                  TEST_SSO_TOKEN: ${{ env.SSOTOKEN }}
-                  TEST_SSO_START_URL: ${{ secrets.TEST_SSO_START_URL }}
-                  TEST_PROFILE_ARN: ${{ secrets.TEST_PROFILE_ARN }}
+                  TEST_SSO_TOKEN: ${{ env.TEST_SSO_TOKEN }}
+                  TEST_SSO_START_URL: ${{ secrets.INTEG_TEST_SSO_START_URL }}
+                  TEST_PROFILE_ARN: ${{ secrets.INTEG_TEST_PROFILE_ARN }}
                   TEST_RUNTIME_FILE: ${{ github.workspace }}/downloaded-artifacts/aws-lsp-codewhisperer.js
+                  # Tags LSP CI traffic so RTS ServiceMetrics/dashboards can segment or exclude it (BI).
+                  AWS_SDK_UA_APP_ID: lsp-integ-ci

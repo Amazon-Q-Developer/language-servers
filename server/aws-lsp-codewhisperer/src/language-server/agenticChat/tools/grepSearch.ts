@@ -79,6 +79,12 @@ export class GrepSearch {
         await closeWriter(writer)
     }
 
+    // TODO (workspace-boundary hardening): this acceptance check performs a
+    // string-only, non-symlink-aware workspace containment test on the raw
+    // search path. For parity with the file tools, route it through the
+    // symlink-aware requiresPathAcceptance helper (as fsRead/fsWrite/
+    // listDirectory do) before this tool is enabled. Note this tool is not
+    // currently registered as an active tool (see toolServer.ts).
     public async requiresAcceptance(params: GrepSearchParams): Promise<CommandValidation> {
         const path = this.getSearchDirectory(params.path)
         return { requiresAcceptance: !workspaceUtils.isInWorkspace(getWorkspaceFolderPaths(this.workspace), path) }

@@ -5,6 +5,82 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { CommandCategory } from './executeBash'
 
+/**
+ * Resolve a path to its canonical on-disk location in a symlink-aware way,
+ * including when the final path segment is a symlink whose target does not
+ * yet exist (a "dangling" symlink), or when an ancestor directory is a
+ * symlink.
+ *
+ * Unlike fs.realpath, this does not throw for paths that do not exist yet.
+ * It follows a symlink at the leaf (even a dangling one), resolves the
+ * longest existing ancestor through the filesystem, then re-appends any
+ * remaining not-yet-created segments. The returned path therefore reflects
+ * where a subsequent read or write would actually land, so a workspace
+ * boundary check cannot be fooled by an in-workspace link name whose target
+ * points outside the workspace. A `visited` set bounds symlink-cycle
+ * traversal.
+ */
+export async function resolveSymlinkAwarePath(inputPath: string): Promise<string> {
+    let current = path.resolve(inputPath)
+    const visited = new Set<string>()
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        let stats: fs.Stats
+        try {
+            stats = await fs.promises.lstat(current)
+        } catch {
+            // `current` does not exist even as a symlink: resolve its existing
+            // ancestor chain (which may traverse symlinked directories) and
+            // re-append the final, not-yet-created segment.
+            const parent = path.dirname(current)
+            if (parent === current) {
+                return current
+            }
+            const resolvedParent = await resolveSymlinkAwarePath(parent)
+            return path.join(resolvedParent, path.basename(current))
+        }
+
+        if (stats.isSymbolicLink()) {
+            if (visited.has(current)) {
+                // Cyclic symlink: stop resolving and return what we have.
+                return current
+            }
+            visited.add(current)
+            const linkTarget = await fs.promises.readlink(current)
+            current = path.resolve(path.dirname(current), linkTarget)
+            continue
+        }
+
+        // `current` exists and is not a symlink: canonicalize it, which also
+        // resolves any symlinked ancestor directories.
+        try {
+            return await fs.promises.realpath(current)
+        } catch {
+            return current
+        }
+    }
+}
+
+/**
+ * Canonicalize workspace folder paths through the filesystem so boundary
+ * comparisons stay accurate even when a workspace lives under a symlinked
+ * directory (for example, macOS exposes temp directories under /var and /tmp
+ * which are symlinks into /private). Falls back to a lexical resolve for any
+ * folder that cannot be resolved.
+ */
+export async function canonicalizeWorkspaceFolders(workspaceFolderPaths: string[]): Promise<string[]> {
+    return Promise.all(
+        workspaceFolderPaths.map(async folder => {
+            try {
+                return await fs.promises.realpath(folder)
+            } catch {
+                return path.resolve(folder)
+            }
+        })
+    )
+}
+
 interface Output<Kind, Content> {
     kind: Kind
     content: Content
@@ -126,28 +202,15 @@ export async function requiresPathAcceptance(
     approvedPaths?: Map<string, Set<string>>
 ): Promise<CommandValidation> {
     try {
-        // Canonicalize the path through the filesystem so symlinks are resolved
-        // before the workspace-boundary check. path.resolve is string-only and
-        // would treat a symlink as in-workspace based on its name alone, even
-        // when its target lies outside the workspace. For paths that don't
-        // exist yet (e.g., a new file the agent is about to create), fall back
-        // to realpath of the parent directory joined with the basename.
-        let canonicalPath: string
-        try {
-            canonicalPath = await fs.promises.realpath(inputPath)
-        } catch (err: any) {
-            if (err && err.code === 'ENOENT') {
-                const parent = path.dirname(inputPath)
-                try {
-                    const realParent = await fs.promises.realpath(parent)
-                    canonicalPath = path.join(realParent, path.basename(inputPath))
-                } catch {
-                    canonicalPath = path.resolve(inputPath)
-                }
-            } else {
-                canonicalPath = path.resolve(inputPath)
-            }
-        }
+        // Canonicalize the path in a symlink-aware way before the
+        // workspace-boundary check. This resolves symlinks at every segment,
+        // including a symlink at the leaf whose target does not exist yet
+        // (a "dangling" symlink). A string-only resolve, or an fs.realpath
+        // that silently falls back to the literal link name when the target
+        // is missing, would treat such a link as in-workspace based on its
+        // name alone even though a write or read through it would land
+        // outside the workspace.
+        const canonicalPath = await resolveSymlinkAwarePath(inputPath)
 
         // Then check if the path is already approved for this specific tool
         if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
@@ -166,7 +229,10 @@ export async function requiresPathAcceptance(
         // This is the primary security check — files genuinely inside the workspace
         // are trusted regardless of their filename (e.g. "PasswordService.java",
         // "credentials/auth.ts", or paths under a "/dev/" folder).
-        const isInWs = workspaceUtils.isInWorkspace(workspaceFolders, canonicalPath)
+        // Workspace folders are canonicalized too so the comparison holds even
+        // when the workspace itself lives under a symlinked directory.
+        const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(workspaceFolders)
+        const isInWs = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)
         if (isInWs) {
             return { requiresAcceptance: false }
         }

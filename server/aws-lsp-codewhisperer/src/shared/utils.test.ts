@@ -1,3 +1,4 @@
+import { AccessDeniedException, AccessDeniedExceptionReason } from '@amzn/codewhisperer-runtime'
 import {
     ServiceQuotaExceededException,
     ThrottlingException,
@@ -18,6 +19,7 @@ import {
     getUnmodifiedAcceptedTokens,
     isAwsThrottlingError,
     isUsageLimitError,
+    isQDevPluginAccessBlockedError,
     isStringOrNull,
     safeGet,
     getFileExtensionName,
@@ -500,6 +502,85 @@ describe('isAwsThrottlingError', function () {
         ;(errorWithMetadata as any).$metadata = {}
         ;(errorWithMetadata as any).name = 'ThrottlingException'
         assert.strictEqual(isAwsThrottlingError(errorWithMetadata), true)
+    })
+})
+
+describe('isQDevPluginAccessBlockedError', function () {
+    function accessDenied(reason?: string, message = 'denied'): AccessDeniedException {
+        return new AccessDeniedException({
+            message,
+            reason: reason as AccessDeniedExceptionReason,
+            $metadata: {},
+        })
+    }
+
+    it('true for AccessDeniedException with reason FEATURE_NOT_SUPPORTED', function () {
+        // The real service message, from
+        // ExceptionConstants.BUILDER_ID_ACCOUNT_LINK_BLOCKED_EXCEPTION_MESSAGE.
+        const e = accessDenied(
+            'FEATURE_NOT_SUPPORTED',
+            'Please visit https://kiro.dev/ to purchase a Kiro subscription, which can be used with Amazon Q Developer.'
+        )
+        assert.strictEqual(isQDevPluginAccessBlockedError(e), true)
+    })
+
+    it('false for TEMPORARILY_SUSPENDED, which is transient and must keep its retry path', function () {
+        assert.strictEqual(isQDevPluginAccessBlockedError(accessDenied('TEMPORARILY_SUSPENDED')), false)
+    })
+
+    it('false for the other modeled AccessDeniedException reasons', function () {
+        assert.strictEqual(
+            isQDevPluginAccessBlockedError(accessDenied('UNAUTHORIZED_CUSTOMIZATION_RESOURCE_ACCESS')),
+            false
+        )
+        assert.strictEqual(
+            isQDevPluginAccessBlockedError(accessDenied('UNAUTHORIZED_WORKSPACE_CONTEXT_FEATURE_ACCESS')),
+            false
+        )
+    })
+
+    it('false for AccessDeniedException with no reason', function () {
+        // Observed in practice: ListAvailableProfiles rejects every Builder ID caller with
+        // "AWS Builder ID is not supported for this operation" and no reason. That is a request-shape
+        // rejection, not the access block, and must not be treated as one.
+        assert.strictEqual(
+            isQDevPluginAccessBlockedError(
+                accessDenied(undefined, 'AWS Builder ID is not supported for this operation.')
+            ),
+            false
+        )
+    })
+
+    it('false for a different exception type carrying a matching reason', function () {
+        const e = new ServiceException({
+            name: 'ValidationException',
+            message: 'nope',
+            $fault: 'client',
+            $metadata: {},
+        })
+        ;(e as any).reason = 'FEATURE_NOT_SUPPORTED'
+        assert.strictEqual(isQDevPluginAccessBlockedError(e), false)
+    })
+
+    it('unwraps the cause chain', function () {
+        const root = accessDenied('FEATURE_NOT_SUPPORTED')
+        const wrapped = new Error('outer', { cause: new Error('inner', { cause: root }) })
+        assert.strictEqual(isQDevPluginAccessBlockedError(wrapped), true)
+    })
+
+    it('terminates on a cyclic cause chain', function () {
+        const a: any = new Error('a')
+        const b: any = new Error('b')
+        a.cause = b
+        b.cause = a
+        assert.strictEqual(isQDevPluginAccessBlockedError(a), false)
+    })
+
+    it('false for non-error values', function () {
+        assert.strictEqual(isQDevPluginAccessBlockedError(undefined), false)
+        assert.strictEqual(isQDevPluginAccessBlockedError(null), false)
+        assert.strictEqual(isQDevPluginAccessBlockedError('FEATURE_NOT_SUPPORTED'), false)
+        assert.strictEqual(isQDevPluginAccessBlockedError({}), false)
     })
 })
 
