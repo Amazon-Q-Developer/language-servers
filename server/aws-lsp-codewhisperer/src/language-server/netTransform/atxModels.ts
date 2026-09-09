@@ -16,6 +16,7 @@ export interface AtxPlanStep {
     Status: PlanStepStatus
     Children: AtxPlanStep[]
     HasCheckpoint?: boolean
+    IsStatusOnly?: boolean
 }
 
 /**
