@@ -62,6 +62,17 @@ describe('ExecuteBash Tool', () => {
         )
     })
 
+    it('pass validation for a cmd.exe builtin without an executable on PATH', async function () {
+        // Builtins like 'assoc' have no .exe that 'where' can resolve, so they must be
+        // recognized as internal commands. This is only meaningful on Windows.
+        if (process.platform !== 'win32') {
+            this.skip()
+            return
+        }
+        const execBash = new ExecuteBash(features)
+        await execBash.validate({ command: 'assoc' })
+    })
+
     it('validate and invokes the command', async () => {
         const execBash = new ExecuteBash(features)
 
