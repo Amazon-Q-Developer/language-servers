@@ -43,7 +43,7 @@
         "@modelcontextprotocol/sdk": "^1.23.0",
         "@mozilla/readability": "^0.6.0",
         "@smithy/node-http-handler": "^2.5.0",
-        "adm-zip": "^0.5.10",
+        "adm-zip": "^0.6.0",
         "archiver": "^7.0.1",
         "async-mutex": "^0.5.0",
         "axios": "^1.8.4",
