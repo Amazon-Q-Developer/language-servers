@@ -39,6 +39,9 @@ export const IGNORE_PATTERNS = [
     '**/coverage/**',
     // Hidden files
     '**/.*',
+    '!**/.classpath',
+    '!**/.project',
+    '!**/.factorypath',
     // Logs and temporary files
     '**/logs/**',
     '**/tmp/**',
