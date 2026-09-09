@@ -322,6 +322,7 @@ export class TelemetryService {
         options?: {
             conversationId?: string
             acceptedLineCount?: number
+            programmingLanguage?: CodewhispererLanguage
         }
     ) {
         if (options?.conversationId === undefined) {
@@ -353,6 +354,11 @@ export class TelemetryService {
         }
         if (metric.codewhispererCustomizationArn) {
             event.customizationArn = metric.codewhispererCustomizationArn
+        }
+        if (options.programmingLanguage) {
+            event.programmingLanguage = {
+                languageName: getRuntimeLanguage(options.programmingLanguage),
+            }
         }
         return this.invokeSendTelemetryEvent({
             chatInteractWithMessageEvent: event,
