@@ -18,6 +18,7 @@ import {
     FsToolsServer,
     QCodeAnalysisServer,
     McpToolsServer,
+    WebToolsServer,
 } from '@aws/lsp-codewhisperer/out/language-server/agenticChat/tools/toolServer'
 import { RuntimeProps } from '@aws/language-server-runtimes/runtimes/runtime'
 
@@ -39,6 +40,7 @@ const props = {
         QLocalProjectContextServerProxy,
         WorkspaceContextServerTokenProxy,
         McpToolsServer,
+        WebToolsServer,
         // LspToolsServer,
         AmazonQServiceServerIAM,
         AmazonQServiceServerToken,

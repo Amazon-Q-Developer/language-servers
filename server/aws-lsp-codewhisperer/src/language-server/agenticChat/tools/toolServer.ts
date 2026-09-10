@@ -31,6 +31,8 @@ import { ProfileStatusMonitor } from './mcp/profileStatusMonitor'
 import { AmazonQTokenServiceManager } from '../../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 import { SERVICE_MANAGER_TIMEOUT_MS, SERVICE_MANAGER_POLL_INTERVAL_MS } from '../constants/constants'
 import { isUsingIAMAuth } from '../../../shared/utils'
+import { WEB_SEARCH } from '../constants/toolConstants'
+import { WebFetch, WebFetchParams } from './webFetch'
 
 export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     const fsReadTool = new FsRead({ workspace, lsp, logging })
@@ -611,4 +613,92 @@ export const McpToolsServer: Server = ({
         profileStatusMonitor?.stop()
         await McpManager.instance.close()
     }
+}
+
+export const WebToolsServer: Server = ({ logging, agent, lsp, runtime }) => {
+    const webFetchTool = new WebFetch({ logging, lsp, runtime })
+
+    // Add webFetch tool
+    agent.addTool(
+        webFetchTool.getSpec(),
+        async (input: WebFetchParams) => {
+            await webFetchTool.validate(input)
+            return await webFetchTool.invoke(input)
+        },
+        ToolClassification.BuiltIn
+    )
+    const discoverWebSearch = async () => {
+        const serviceManager = AmazonQTokenServiceManager.getInstance()
+        const authState = serviceManager.getState()
+
+        if (authState !== 'INITIALIZED') {
+            logging.info(`WebSearch: Auth not ready (state: ${authState}), scheduling retry`)
+            setTimeout(discoverWebSearch, SERVICE_MANAGER_POLL_INTERVAL_MS)
+            return
+        }
+
+        try {
+            const streamingClient = serviceManager.getStreamingClient()
+
+            const response = await streamingClient.invokeMCP({
+                jsonrpc: '2.0',
+                id: 'webSearch-discovery',
+                method: 'tools/list',
+            })
+
+            if (response.result) {
+                let tools = []
+                if (typeof response.result === 'string') {
+                    try {
+                        const parsed = JSON.parse(response.result)
+                        tools = parsed?.tools || []
+                    } catch (e) {
+                        logging.error(`WebSearch: Failed to parse result as JSON: ${e}`)
+                        return
+                    }
+                } else {
+                    tools = (response.result as any)?.tools || []
+                }
+
+                logging.info(`WebSearch: Discovered ${tools.length} tools`)
+
+                const webSearchTool = tools.find((tool: any) => tool.name === WEB_SEARCH)
+
+                if (webSearchTool) {
+                    logging.info(`WebSearch: Registering tool ${webSearchTool.name}`)
+
+                    agent.addTool(
+                        {
+                            name: webSearchTool.name,
+                            description: webSearchTool.description,
+                            inputSchema: webSearchTool.inputSchema,
+                        },
+                        async (input: any) => {
+                            const toolResponse = await streamingClient.invokeMCP({
+                                jsonrpc: '2.0',
+                                id: `webSearch-${Date.now()}`,
+                                method: 'tools/call',
+                                params: {
+                                    name: webSearchTool.name,
+                                    arguments: input,
+                                },
+                            })
+                            return toolResponse.result
+                        },
+                        ToolClassification.BuiltIn
+                    )
+                } else {
+                    logging.info('WebSearch: Tool not found in available tools')
+                }
+            }
+        } catch (error) {
+            logging.error(`WebSearch: Discovery failed: ${error}`)
+        }
+    }
+
+    lsp.onInitialized(() => {
+        void discoverWebSearch()
+    })
+
+    return () => {}
 }

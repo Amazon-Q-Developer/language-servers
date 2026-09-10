@@ -6,6 +6,8 @@ import {
     SendMessageCommandOutput as SendMessageCommandOutputCodeWhispererStreaming,
     ExportResultArchiveCommandInput as ExportResultArchiveCommandInputCodeWhispererStreaming,
     ExportResultArchiveCommandOutput as ExportResultArchiveCommandOutputCodeWhispererStreaming,
+    InvokeMCPCommandInput as InvokeMCPCommandInputCodeWhispererStreaming,
+    InvokeMCPCommandOutput as InvokeMCPCommandOutputCodeWhispererStreaming,
 } from '@amzn/codewhisperer-streaming'
 import {
     QDeveloperStreaming,
@@ -199,6 +201,30 @@ export class StreamingClientServiceToken extends StreamingClientServiceBase {
         )
         this.inflightRequests.delete(controller)
         return response
+    }
+
+    public async invokeMCP(
+        request: InvokeMCPCommandInputCodeWhispererStreaming,
+        abortController?: AbortController
+    ): Promise<InvokeMCPCommandOutputCodeWhispererStreaming> {
+        const controller: AbortController = abortController ?? new AbortController()
+
+        this.inflightRequests.add(controller)
+
+        try {
+            const response = await this.client.invokeMCP(request, {
+                abortSignal: controller.signal,
+            })
+
+            return response
+        } catch (e) {
+            if (isUsageLimitError(e)) {
+                throw new AmazonQUsageLimitError(e)
+            }
+            throw e
+        } finally {
+            this.inflightRequests.delete(controller)
+        }
     }
 }
 

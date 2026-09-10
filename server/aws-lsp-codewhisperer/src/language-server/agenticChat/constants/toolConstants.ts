@@ -15,6 +15,10 @@ export const LIST_DIRECTORY = 'listDirectory'
 export const GREP_SEARCH = 'grepSearch'
 export const FILE_SEARCH = 'fileSearch'
 
+// Web tools
+export const WEB_SEARCH = 'web_search'
+export const WEB_FETCH = 'webFetch'
+
 // Shell tools
 export const EXECUTE_BASH = 'executeBash'
 
