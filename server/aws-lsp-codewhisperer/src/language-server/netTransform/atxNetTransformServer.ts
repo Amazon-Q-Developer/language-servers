@@ -47,6 +47,9 @@ const AtxGetJobDashboardCommand = 'aws/atxTransform/getJobDashboard'
 const AtxGetJobReportCommand = 'aws/atxTransform/getJobReport'
 const AtxUploadCustomPlanCommand = 'aws/atxTransform/uploadCustomPlan'
 const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
+// Beam to IDE
+const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
+const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
 
 export const AtxNetTransformServerToken =
     (): Server =>
@@ -170,12 +173,13 @@ export const AtxNetTransformServerToken =
                         return await atxTransformHandler.uploadPackages(request)
                     }
                     case AtxSendMessageCommand: {
-                        const { workspaceId, jobId, text, skipPolling } = params as any
+                        const { workspaceId, jobId, text, skipPolling, beamStepId } = params as any
                         return await atxTransformHandler.sendMessage({
                             workspaceId,
                             jobId,
                             text,
                             skipPolling,
+                            beamStepId,
                         })
                     }
                     case AtxListMessagesCommand: {
@@ -269,6 +273,38 @@ export const AtxNetTransformServerToken =
                             request.nextToken
                         )
                     }
+                    // ---- Beam to IDE ----
+                    case AtxListBeamedReposCommand: {
+                        // PascalCase params/return to match the C# ExecuteCommandParams convention.
+                        // Lightweight (optional): the poll-tick refresh sets it to skip the beam-map
+                        // download scan (throttle-safe).
+                        const { WorkspaceId, ParentJobId, Lightweight } = params as any
+                        if (!WorkspaceId || !ParentJobId) {
+                            throw new Error('WorkspaceId and ParentJobId are required for listBeamedRepos')
+                        }
+                        const repos = await atxTransformHandler.listBeamedRepos(
+                            WorkspaceId,
+                            ParentJobId,
+                            Lightweight === true
+                        )
+                        return { Repos: repos }
+                    }
+                    case AtxDownloadBeamArtifactCommand: {
+                        // PascalCase params to match the C# ExecuteCommandParams serialization
+                        // convention used by every other C#-backed ATX command (e.g. downloadArtifact).
+                        const { WorkspaceId, ParentJobId, BeamArtifactId, DestDir } = params as any
+                        if (!WorkspaceId || !ParentJobId || !BeamArtifactId || !DestDir) {
+                            throw new Error(
+                                'WorkspaceId, ParentJobId, BeamArtifactId and DestDir are required for downloadBeamArtifact'
+                            )
+                        }
+                        return await atxTransformHandler.downloadBeamArtifact(
+                            WorkspaceId,
+                            ParentJobId,
+                            BeamArtifactId,
+                            DestDir
+                        )
+                    }
                     default: {
                         throw new Error(`Unknown ATX FES command: ${params.command}`)
                     }
@@ -311,6 +347,8 @@ export const AtxNetTransformServerToken =
                             AtxGetJobReportCommand,
                             AtxUploadCustomPlanCommand,
                             AtxLoadOlderWorklogsCommand,
+                            AtxListBeamedReposCommand,
+                            AtxDownloadBeamArtifactCommand,
                         ],
                     },
                 },
