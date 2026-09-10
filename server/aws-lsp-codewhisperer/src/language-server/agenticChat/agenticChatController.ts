@@ -195,6 +195,7 @@ import {
     AgenticChatError,
     customerFacingErrorCodes,
     getCustomerFacingErrorMessage,
+    isContextWindowOverflow,
     isRequestAbortedError,
     isThrottlingRelated,
     unactionableErrorCodes,
@@ -883,6 +884,10 @@ export class AgenticChatController implements ChatHandlers {
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 
+        // Reset auto-compaction flag at the start of each new user message.
+        // This allows ONE automatic compaction+retry per user turn, preventing infinite loops.
+        session.didAutoCompactOnOverflow = false
+
         // Memory Bank Creation Flow - Delegate to MemoryBankController
         if (this.#memoryBankController.isMemoryBankCreationRequest(params.prompt.prompt)) {
             this.#features.logging.info(`Memory Bank creation request detected for tabId: ${params.tabId}`)
@@ -1155,6 +1160,51 @@ export class AgenticChatController implements ChatHandlers {
                 requestModelId
             )
         } catch (err) {
+            // Auto-compaction on context window overflow: if this is the first overflow
+            // in this user turn, automatically compact the conversation and retry.
+            // The flag prevents infinite loops (set BEFORE compaction so a second overflow falls through).
+            if (isContextWindowOverflow(err) && !session.didAutoCompactOnOverflow) {
+                session.didAutoCompactOnOverflow = true
+                this.#features.logging.info('Context window overflow detected, auto-compacting and retrying...')
+
+                try {
+                    const chatResultStream = this.#getChatResultStream(params.partialResultToken)
+                    const autoCompactMetric = new Metric<CombinedConversationEvent>({
+                        cwsprChatConversationType: 'AgenticChat',
+                    })
+
+                    // Notify user
+                    await chatResultStream.writeResultBlock({
+                        type: 'answer',
+                        body: 'Context limit reached. Compacting conversation and retrying...',
+                        messageId: uuid(),
+                    })
+
+                    // Run compaction using existing method
+                    const compactionRequestInput = this.#getCompactionRequestInput(session)
+                    const promptId = crypto.randomUUID()
+                    session.setCurrentPromptId(promptId)
+
+                    await this.#runCompaction(
+                        compactionRequestInput,
+                        session,
+                        autoCompactMetric,
+                        chatResultStream,
+                        params.tabId,
+                        promptId,
+                        CompactHistoryActionType.Nudge,
+                        session.conversationId,
+                        token
+                    )
+
+                    // Retry the original prompt after compaction
+                    return await this.onChatPrompt(params, token)
+                } catch (compactErr) {
+                    // If auto-compaction itself fails, fall through to normal error handling
+                    this.#features.logging.error(`Auto-compaction failed: ${compactErr}`)
+                }
+            }
+
             // HACK: the chat-client needs to have a partial event with the associated messageId sent before it can accept the final result.
             // Without this, the `working` indicator never goes away.
             // Note: buttons being explicitly empty is required for this hack to work.
@@ -1497,7 +1547,60 @@ export class AgenticChatController implements ChatHandlers {
             this.#debug(
                 `generateAssistantResponse/SendMessage Request: ${JSON.stringify(currentRequestInput, this.#imageReplacer, 2)}`
             )
-            const response = await session.getChatResponse(currentRequestInput)
+            let response
+            try {
+                response = await session.getChatResponse(currentRequestInput)
+            } catch (chatErr) {
+                // Auto-compaction on context window overflow during mid-loop execution.
+                // If this is the first overflow in this user turn, compact and continue the loop.
+                if (isContextWindowOverflow(chatErr) && !session.didAutoCompactOnOverflow) {
+                    session.didAutoCompactOnOverflow = true
+                    this.#features.logging.info(
+                        'Context window overflow in agent loop, auto-compacting and continuing...'
+                    )
+
+                    await chatResultStream.removeResultBlock(loadingMessageId)
+
+                    // Notify user
+                    const resultStreamWriter = chatResultStream.getResultStreamWriter()
+                    await resultStreamWriter.write({
+                        type: 'answer',
+                        body: 'Context limit reached. Compacting conversation and retrying...',
+                        messageId: uuid(),
+                    })
+                    await resultStreamWriter.close()
+
+                    // Run compaction using existing method
+                    const compactionRequestInput = this.#getCompactionRequestInput(session)
+                    const compactPromptId = crypto.randomUUID()
+                    session.setCurrentPromptId(compactPromptId)
+                    const autoCompactMetric = new Metric<CombinedConversationEvent>({
+                        cwsprChatConversationType: 'AgenticChat',
+                    })
+
+                    await this.#runCompaction(
+                        compactionRequestInput,
+                        session,
+                        autoCompactMetric,
+                        chatResultStream,
+                        tabId,
+                        compactPromptId,
+                        CompactHistoryActionType.Nudge,
+                        conversationIdentifier,
+                        token,
+                        documentReference
+                    )
+
+                    // Restore the original promptId so the loop can continue
+                    session.setCurrentPromptId(promptId)
+
+                    // Continue the loop - next iteration will use compacted history
+                    shouldDisplayMessage = false
+                    continue
+                }
+                // Not an overflow or already tried compaction - rethrow
+                throw chatErr
+            }
             if (response.$metadata.requestId) {
                 metric.mergeWith({
                     requestIds: [response.$metadata.requestId],

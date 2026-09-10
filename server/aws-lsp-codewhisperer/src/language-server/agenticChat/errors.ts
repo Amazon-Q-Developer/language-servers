@@ -61,6 +61,27 @@ export function isInputTooLongError(error: unknown): boolean {
     return false
 }
 
+/**
+ * Detects context window overflow errors that can be resolved by compacting conversation history.
+ * Covers various error patterns from different backends and API versions.
+ */
+export function isContextWindowOverflow(error: unknown): boolean {
+    if (isInputTooLongError(error)) {
+        return true
+    }
+
+    const message = (error as Error)?.message?.toLowerCase() ?? ''
+    const name = (error as Error)?.name ?? ''
+    return (
+        name === 'ContextWindowOverflowException' ||
+        message.includes('improperly formed request') ||
+        message.includes('prompt is too long') ||
+        message.includes('context window') ||
+        message.includes('token limit') ||
+        message.includes('maximum context')
+    )
+}
+
 export function isRequestAbortedError(error: unknown): boolean {
     if (error instanceof AgenticChatError && error.code === 'RequestAborted') {
         return true
