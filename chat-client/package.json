@@ -1,6 +1,6 @@
 {
     "name": "@aws/chat-client",
-    "version": "0.1.55",
+    "version": "0.1.56",
     "description": "AWS Chat Client",
     "main": "out/index.js",
     "repository": {
