@@ -18,7 +18,18 @@ import { ChatHistory } from './features/history'
 import { pairProgrammingModeOn, pairProgrammingModeOff } from './texts/pairProgramming'
 import { strictEqual } from 'assert'
 
-describe('MynahUI', () => {
+describe('MynahUI', function () {
+    /**
+     * These tests drive the real MynahUI against jsdom, so creating a tab performs several
+     * hundred milliseconds of synchronous DOM work -- up to ~1.8s for the sendGenericCommand
+     * cases on an idle developer machine. Mocha reports a synchronous test that overruns its
+     * budget as "Timeout of Nms exceeded", so on a loaded CI runner (measured 4.6-7x slower)
+     * the default 5s budget is exceeded and the suite fails on whichever test is unlucky.
+     * One generous budget for the whole suite replaces the per-test 10s/30s patches that
+     * were added for the same reason.
+     */
+    this.timeout(30_000)
+
     let messager: Messager
     let mynahUi: MynahUI
     let inboundChatApi: InboundChatApi
@@ -248,7 +259,6 @@ describe('MynahUI', () => {
 
     describe('sendGenericCommand', () => {
         it('should create a new tab if none exits', function () {
-            this.timeout(10000) // Increase timeout to 10 seconds
             // clear create tab stub since set up process calls it twice
             createTabStub.resetHistory()
             // Stub setTimeout to execute immediately
@@ -275,7 +285,6 @@ describe('MynahUI', () => {
         })
 
         it('should create a new tab if current tab is loading', function () {
-            this.timeout(30000)
             // clear create tab stub since set up process calls it twice
             createTabStub.resetHistory()
             // Stub setTimeout to execute immediately
