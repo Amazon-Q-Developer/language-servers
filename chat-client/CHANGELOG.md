@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.56](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.55...chat-client/v0.1.56) (2026-08-18)
+
+
+### Bug Fixes
+
+* repoint CODEOWNERS and package repository URLs to the new org ([#2838](https://github.com/Amazon-Q-Developer/language-servers/issues/2838)) ([43e44dc](https://github.com/Amazon-Q-Developer/language-servers/commit/43e44dc5af94703f51456cd8a913f0d61af7570e))
+
 ## [0.1.55](https://github.com/aws/language-servers/compare/chat-client/v0.1.54...chat-client/v0.1.55) (2026-06-30)
 
 
