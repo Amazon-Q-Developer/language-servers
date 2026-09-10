@@ -142,6 +142,32 @@ describe('StreamingClientServiceToken', () => {
         expect(streamingClientServiceDefault['shareCodeWhispererContentWithAWS']).to.be.undefined
     })
 
+    describe('access-blocked observer', () => {
+        it('registers exactly one named middleware on the initialize step', () => {
+            // Guards the wiring rather than the callback: the harness stubs
+            // CodeWhispererStreaming.prototype.sendMessage, which bypasses the middleware stack, so a
+            // behavioural test here would pass without the middleware existing at all.
+            //
+            // The name matters. Without it a second registration stacks another observer instead of
+            // replacing the first, which would report the same block twice.
+            const registered = streamingClientService.client.middlewareStack
+                .identify()
+                .filter(entry => entry.includes('detectQDevPluginAccessBlocked'))
+
+            expect(registered).to.have.lengthOf(1)
+            expect(registered[0]).to.contain('initialize')
+        })
+
+        it('exposes a settable observer for the service manager to assign', () => {
+            // Assigned after construction, so the middleware has to read it at call time. If this
+            // became readonly or were dropped, chat-time blocks would go unobserved.
+            const observer = () => {}
+            streamingClientService.onAccessBlocked = observer
+
+            expect(streamingClientService.onAccessBlocked).to.equal(observer)
+        })
+    })
+
     describe('generateAssistantResponse', () => {
         const MOCKED_GENERATE_RESPONSE_REQUEST = {
             conversationState: {

@@ -497,6 +497,30 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect((handler as any).jobsPastLocalBuild.has('job-123')).to.be.true
     })
 
+    it('should NOT surface a sibling repo LBV when status is PLANNING and all pending LBVs are out of the loaded scope', async () => {
+        // Beam multi-repo: the IDE loaded one repo (beamScopeStepIds = its subtree). Every pending
+        // HITL is a local-build-verification for a DIFFERENT (sibling) repo's plan step. Surfacing
+        // one would make the IDE build the loaded solution against a sibling's HITL → false-green.
+        // Mirrors the EXECUTING/getHitlAgentArtifact guard: return the plan-only view instead.
+        getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([
+            { tag: 'local-build-verification', taskId: 'task-sib1', stepId: 'sibling-step-1' },
+            { tag: 'local-build-verification', taskId: 'task-sib2', stepId: 'sibling-step-2' },
+        ])
+
+        const result = await handler.getTransformInfo({
+            ...baseRequest,
+            beamScopeStepIds: 'loaded-step-a,loaded-step-b',
+        })
+
+        // Plan-only view: original job status preserved, no HITL surfaced to the IDE.
+        expect(result?.TransformationJob.Status).to.equal('PLANNING')
+        expect(result?.HitlTag).to.be.undefined
+        expect(result?.HitlTaskId).to.be.undefined
+        expect(result?.TransformationPlan).to.deep.equal({ Root: { Children: [] } })
+    })
+
     it('should filter pre-job mode-selection -checkpoint HITL before LBV has run', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -753,6 +777,58 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(node.ParentStepId).to.be.null
             expect(node.Status).to.equal('NOT_STARTED')
             expect(node.score).to.equal(0)
+        })
+
+        it('mapApiStepToNode defaults IsStatusOnly to false (structural pass assigns it)', () => {
+            // The service sends no machine-readable step label, so the per-node mapper never
+            // sets IsStatusOnly; it is assigned during tree assembly based on parent identity.
+            const node = (handler as any).mapApiStepToNode({
+                stepId: 's1',
+                stepName: 'Merge Tests',
+                status: 'IN_PROGRESS',
+            })
+            expect(node.IsStatusOnly).to.equal(false)
+        })
+    })
+
+    describe('buildTreeFromFlatList - IsStatusOnly (unit-test-generation substeps)', () => {
+        // A realistic flat plan: a "Generate Unit Tests" parent with 4 substeps, plus a
+        // sibling "Transform Projects" parent with its own substep, all under root.
+        const flatPlan = () => [
+            { stepId: 'gut', parentStepId: 'root', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'plan', parentStepId: 'gut', stepName: 'Plan Unit Test Generation', status: 'NOT_STARTED' },
+            { stepId: 'gen', parentStepId: 'gut', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'merge', parentStepId: 'gut', stepName: 'Merge Tests', status: 'NOT_STARTED' },
+            { stepId: 'cov', parentStepId: 'gut', stepName: 'Get Coverage', status: 'NOT_STARTED' },
+            { stepId: 'tp', parentStepId: 'root', stepName: 'Transform Projects', status: 'NOT_STARTED' },
+            { stepId: 'build', parentStepId: 'tp', stepName: 'Solution Build', status: 'NOT_STARTED' },
+        ]
+
+        const findById = (nodes: any[], id: string): any => {
+            for (const n of nodes) {
+                if (n.StepId === id) return n
+                const hit = findById(n.Children || [], id)
+                if (hit) return hit
+            }
+            return null
+        }
+
+        it('marks direct substeps of "Generate Unit Tests" as IsStatusOnly=true', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            for (const id of ['plan', 'gen', 'merge', 'cov']) {
+                expect(findById(roots, id).IsStatusOnly, id).to.equal(true)
+            }
+        })
+
+        it('leaves the parent "Generate Unit Tests" step interactive (IsStatusOnly=false)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'gut').IsStatusOnly).to.equal(false)
+        })
+
+        it('does not mark transformation substeps (different parent)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'tp').IsStatusOnly).to.equal(false)
+            expect(findById(roots, 'build').IsStatusOnly).to.equal(false)
         })
     })
 
@@ -2002,6 +2078,47 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             const command = sendStub.firstCall.args[0]
             const objective = JSON.parse(command.input.objective)
             expect(objective.interactive_mode).to.equal('auto')
+        })
+
+        it('should include generate_unit_tests:true in objective when opted in', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: true })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(true)
+        })
+
+        it('should include generate_unit_tests:false in objective on explicit decline', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: false })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(false)
+        })
+
+        it('should omit generate_unit_tests from objective when no choice is sent', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1' })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
+
+        it('should omit generate_unit_tests when the value is not a real boolean', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            // A mistyped/non-boolean value must read as "no choice sent", not a decision.
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: 'true' as any })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
         })
     })
 
@@ -4166,6 +4283,15 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(g(undefined)).to.be.undefined
             expect(g('str')).to.be.undefined
             expect(g({ other: 'x' })).to.be.undefined
+        })
+
+        it('skips an empty-string stepId and falls through to planStepId / parentStepId (|| not ??)', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            // Empty stepId must NOT short-circuit coalescing (the ??→|| hardening) — an empty
+            // string is falsy under ||, so the non-empty planStepId is returned.
+            expect(g({ stepId: '', planStepId: 'step-1' })).to.equal('step-1')
+            // Empty stepId + empty planStepId → fall all the way through to parentStepId.
+            expect(g({ stepId: '', planStepId: '', parentStepId: 'parent-1' })).to.equal('parent-1')
         })
     })
 
