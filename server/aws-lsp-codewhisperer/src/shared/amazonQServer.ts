@@ -17,9 +17,16 @@ import {
 
 const LOGGING_PREFIX = '[AMAZON Q SERVER]: '
 
+/**
+ * @param serverName Value for the server's `serverInfo.name`. Required, and required to be unique
+ * across every server registered in the same runtime: the runtime rejects `initialize` outright with
+ * `Duplicate servers defined` if two servers report the same name, which takes down the whole language
+ * server rather than the offending one. This factory is instantiated more than once per runtime (IAM
+ * and token), so a shared constant here breaks every bundle that registers both.
+ */
 export const AmazonQServiceServerFactory =
-    (serviceManager: (features: QServiceManagerFeatures) => AmazonQBaseServiceManager): Server =>
-    ({ credentialsProvider, lsp, workspace, logging, runtime, sdkInitializator }) => {
+    (serviceManager: (features: QServiceManagerFeatures) => AmazonQBaseServiceManager, serverName: string): Server =>
+    ({ credentialsProvider, lsp, workspace, logging, runtime, sdkInitializator, notification }) => {
         let amazonQServiceManager: AmazonQBaseServiceManager
 
         const log = (message: string) => {
@@ -39,6 +46,11 @@ export const AmazonQServiceServerFactory =
                 logging,
                 runtime,
                 sdkInitializator,
+                // Required for the service manager to be able to surface anything to the client. It is
+                // optional on QServiceManagerFeatures so that existing constructions (including test
+                // fixtures) keep compiling, which means omitting it here does not fail the build -- it
+                // just silently disables client-facing reporting.
+                notification,
             })
 
             /*
@@ -58,6 +70,14 @@ export const AmazonQServiceServerFactory =
             return {
                 capabilities: {},
                 awsServerCapabilities: {},
+                // Required for anything to reach the client through the notification feature. The
+                // runtime only builds a notification router when a server declares serverInfo, and
+                // showNotification is a silent no-op without one. Not exposed to clients; it is used
+                // internally to route notification followups back to the originating server, so the
+                // name must stay stable.
+                serverInfo: {
+                    name: serverName,
+                },
             }
         })
 
@@ -96,19 +116,31 @@ export const AmazonQServiceServerFactory =
             amazonQServiceManager.handleOnCredentialsDeleted(type)
         })
 
-        // Add credentials update handler to track when credentials are updated
-        if ('onCredentialsUpdated' in credentialsProvider) {
-            ;(credentialsProvider as any).onCredentialsUpdated((type: CredentialsType) => {
-                log(`Received onCredentialsUpdated notification for type: ${type}`)
-                if ('handleOnCredentialsUpdated' in amazonQServiceManager) {
-                    ;(amazonQServiceManager as any).handleOnCredentialsUpdated(type)
-                }
-            })
-        }
+        // Optional chaining rather than a capability check: the event was added to the runtime after
+        // this server, so a build running on an older runtime simply never receives it. Before that
+        // runtime change this block was an `in` check plus an `any` cast that could never fire, which
+        // is why service construction waited for whichever consumer asked first.
+        credentialsProvider.onCredentialsUpdated?.((type: CredentialsType) => {
+            log(`Received onCredentialsUpdated notification for type: ${type}`)
+            amazonQServiceManager.handleOnCredentialsUpdated(type)
+        })
 
         logging.log('Amazon Q Service server has been initialised')
         return () => {}
     }
 
-export const AmazonQServiceServerIAM = AmazonQServiceServerFactory(initBaseIAMServiceManager)
-export const AmazonQServiceServerToken = AmazonQServiceServerFactory(initBaseTokenServiceManager)
+// Must stay distinct from each other, and from every other server registered in the same runtime, or
+// the runtime fails initialize with `Duplicate servers defined`. Must also stay stable over time: they
+// are encoded into the id of every notification the client echoes back, so renaming strands followups
+// for notifications already on screen. Exported so the uniqueness can be asserted in tests.
+export const AMAZON_Q_SERVICE_SERVER_IAM_NAME = 'AWS Language Server for Amazon Q Developer (IAM)'
+export const AMAZON_Q_SERVICE_SERVER_TOKEN_NAME = 'AWS Language Server for Amazon Q Developer (Token)'
+
+export const AmazonQServiceServerIAM = AmazonQServiceServerFactory(
+    initBaseIAMServiceManager,
+    AMAZON_Q_SERVICE_SERVER_IAM_NAME
+)
+export const AmazonQServiceServerToken = AmazonQServiceServerFactory(
+    initBaseTokenServiceManager,
+    AMAZON_Q_SERVICE_SERVER_TOKEN_NAME
+)
