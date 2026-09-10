@@ -698,6 +698,173 @@ describe('Chat', () => {
             assert.match(handleMessageReceiveStub.getCall(0).args[0].data, JSON.stringify(chatEvent.data))
         })
     })
+
+    describe('postMessage origin check regression (P389799154)', () => {
+        // Regression tests for the same-origin guard in handleInboundMessage.
+        // The guard prevents cross-origin XSS via crafted postMessage events.
+
+        const foreignOrigins = [
+            'https://attacker.example.com',
+            'http://evil.localhost',
+            'https://phishing.internal.corp',
+        ]
+
+        // Commands that exercise different switch branches in handleInboundMessage
+        const commandPayloads = [
+            { command: CHAT_REQUEST_METHOD, tabId: 'tab-1', params: { body: 'injected' } },
+            { command: SEND_TO_PROMPT, params: { prompt: 'injected' } },
+            { command: ERROR_MESSAGE, params: { tabId: 'tab-1' } },
+            { command: GENERIC_COMMAND, params: { genericCommand: 'Fix', selection: 'x', triggerType: 'click' } },
+            { command: CHAT_OPTIONS, params: { history: true, export: true } },
+            {
+                command: OPEN_TAB_REQUEST_METHOD,
+                params: { newTabOptions: { data: { messages: [] } } },
+                requestId: 'r1',
+            },
+        ]
+
+        describe('rejects foreign-origin messages across command types', () => {
+            commandPayloads.forEach(payload => {
+                it(`drops ${payload.command} from a foreign origin`, () => {
+                    clientApi.postMessage.resetHistory()
+
+                    const foreignEvent = new window.MessageEvent('message', {
+                        data: payload,
+                        origin: 'https://attacker.example.com',
+                    })
+                    window.dispatchEvent(foreignEvent)
+
+                    // The rejection path emits a telemetry event
+                    // (chatPostMessageRejected) but must NOT process the
+                    // command payload itself.
+                    clientApi.postMessage.getCalls().forEach(call => {
+                        const msg = call.args[0]
+                        // Every call should be the rejection telemetry, not
+                        // the payload's command being dispatched.
+                        sinon.assert.match(msg, {
+                            command: TELEMETRY,
+                            params: sinon.match({ name: 'chatPostMessageRejected' }),
+                        })
+                    })
+                })
+            })
+        })
+
+        describe('rejects messages from various untrusted origins', () => {
+            foreignOrigins.forEach(origin => {
+                it(`rejects origin "${origin}"`, () => {
+                    clientApi.postMessage.resetHistory()
+
+                    const event = new window.MessageEvent('message', {
+                        data: { command: SEND_TO_PROMPT, params: { prompt: 'pwn' } },
+                        origin,
+                    })
+                    window.dispatchEvent(event)
+
+                    // Only rejection telemetry should fire, not the SEND_TO_PROMPT handler
+                    clientApi.postMessage.getCalls().forEach(call => {
+                        const msg = call.args[0]
+                        sinon.assert.match(msg, {
+                            command: TELEMETRY,
+                            params: sinon.match({ name: 'chatPostMessageRejected' }),
+                        })
+                    })
+                })
+            })
+        })
+
+        describe('same-origin messages are processed normally', () => {
+            it('processes SEND_TO_PROMPT from same origin', () => {
+                clientApi.postMessage.resetHistory()
+
+                const event = new window.MessageEvent('message', {
+                    data: { command: SEND_TO_PROMPT, params: { prompt: 'hello' } },
+                    origin: window.location.origin,
+                })
+                window.dispatchEvent(event)
+
+                // SEND_TO_PROMPT triggers a telemetry event — proves the handler ran
+                assert.called(clientApi.postMessage)
+            })
+
+            it('processes CHAT_REQUEST_METHOD from same origin', () => {
+                const endMessageStreamStub = sandbox.stub(mynahUi, 'endMessageStream')
+
+                const event = new window.MessageEvent('message', {
+                    data: { command: CHAT_REQUEST_METHOD, tabId: 'tab-1', params: { body: 'hi' } },
+                    origin: window.location.origin,
+                })
+                window.dispatchEvent(event)
+
+                assert.calledOnce(endMessageStreamStub)
+            })
+
+            it('processes OPEN_TAB_REQUEST_METHOD from same origin', () => {
+                clientApi.postMessage.resetHistory()
+
+                const requestId = 'origin-test-req'
+                const event = new window.MessageEvent('message', {
+                    data: {
+                        command: OPEN_TAB_REQUEST_METHOD,
+                        params: { newTabOptions: { data: { messages: [] } } },
+                        requestId,
+                    },
+                    origin: window.location.origin,
+                })
+                window.dispatchEvent(event)
+
+                assert.calledWithMatch(clientApi.postMessage, {
+                    requestId,
+                    command: OPEN_TAB_REQUEST_METHOD,
+                    params: { success: true },
+                })
+            })
+        })
+
+        describe('rejection is observable without throwing', () => {
+            it('logs console.warn for foreign-origin messages', () => {
+                const warnStub = sandbox.stub(console, 'warn')
+
+                const foreignEvent = new window.MessageEvent('message', {
+                    data: { command: SEND_TO_PROMPT, params: { prompt: 'pwn' } },
+                    origin: 'https://attacker.example.com',
+                })
+                window.dispatchEvent(foreignEvent)
+
+                assert.called(warnStub)
+                assert.calledWithMatch(
+                    warnStub,
+                    'Chat client rejected message from untrusted origin:',
+                    'https://attacker.example.com'
+                )
+            })
+
+            it('does not throw on foreign-origin messages', () => {
+                // Verify the handler gracefully returns without exceptions
+                const foreignEvent = new window.MessageEvent('message', {
+                    data: { command: CHAT_REQUEST_METHOD, tabId: 'tab-1', params: { body: 'x' } },
+                    origin: 'https://attacker.example.com',
+                })
+
+                // dispatchEvent is synchronous — any throw would propagate here
+                window.dispatchEvent(foreignEvent)
+                // If we reach this line, no exception was thrown
+            })
+
+            it('does not log a warning for same-origin messages', () => {
+                const warnStub = sandbox.stub(console, 'warn')
+
+                const event = new window.MessageEvent('message', {
+                    data: { command: SEND_TO_PROMPT, params: { prompt: 'hello' } },
+                    origin: window.location.origin,
+                })
+                window.dispatchEvent(event)
+
+                // The warn should NOT fire for same-origin traffic
+                sinon.assert.neverCalledWithMatch(warnStub, 'Chat client rejected message from untrusted origin:')
+            })
+        })
+    })
 })
 
 /**
