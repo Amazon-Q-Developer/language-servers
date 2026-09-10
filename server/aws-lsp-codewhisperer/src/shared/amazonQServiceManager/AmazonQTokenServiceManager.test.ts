@@ -2,6 +2,7 @@ import * as assert from 'assert'
 import sinon, { StubbedInstance, stubInterface } from 'ts-sinon'
 import { AmazonQTokenServiceManager } from './AmazonQTokenServiceManager'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
+import { CredentialsType } from '@aws/language-server-runtimes/server-interface'
 import { CodeWhispererServiceToken, GenerateSuggestionsRequest } from '../codeWhispererService'
 import {
     AmazonQServiceInitializationError,
@@ -295,6 +296,74 @@ describe('AmazonQTokenServiceManager', () => {
             assert.strictEqual(
                 (await streamingClient.client.config.endpoint()).hostname,
                 'codewhisperer.us-east-1.amazonaws.com'
+            )
+        })
+    })
+
+    describe('Eager initialization on credentials update', () => {
+        const testRegion = 'some-region'
+        const testEndpoint = 'http://some-endpoint-in-some-region'
+
+        beforeEach(() => {
+            // Each test sets up its own manager: the IdC case needs developer profile support enabled,
+            // and the manager is a singleton that refuses a second initialization.
+            AWS_Q_ENDPOINTS.set(testRegion, testEndpoint)
+        })
+
+        it('initializes on bearer credentials without waiting for a consumer', () => {
+            setupServiceManager()
+            setCredentials('builderId')
+            assert.strictEqual(amazonQTokenServiceManager.getState(), 'PENDING_CONNECTION')
+
+            // No getCodewhispererService() call here: the point is that nothing has asked yet.
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
+
+            assert.strictEqual(amazonQTokenServiceManager.getState(), 'INITIALIZED')
+        })
+
+        it('is idempotent, so token refreshes do not rebuild live services', () => {
+            setupServiceManager()
+            setCredentials('builderId')
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
+            const firstService = amazonQTokenServiceManager.getCodewhispererService()
+
+            // Credentials update fires on every token refresh. Rebuilding here would drop in-flight
+            // requests and replace the service the observers are attached to.
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
+
+            assert.strictEqual(amazonQTokenServiceManager.getCodewhispererService(), firstService)
+            assert.strictEqual(amazonQTokenServiceManager.getState(), 'INITIALIZED')
+        })
+
+        it('ignores iam credentials', () => {
+            setupServiceManager()
+            setCredentials('builderId')
+
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('iam' as CredentialsType)
+
+            assert.strictEqual(amazonQTokenServiceManager.getState(), 'PENDING_CONNECTION')
+        })
+
+        it('does not build services for IdC before a profile is chosen', () => {
+            // The whole point of bringing initialization forward is to make a request sooner. For IdC
+            // with developer profiles that would be a request with no profile, so this must stop at
+            // PENDING_Q_PROFILE and create nothing.
+            setupServiceManager(true)
+            setCredentials('identityCenter')
+
+            amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
+
+            assert.strictEqual(amazonQTokenServiceManager.getState(), 'PENDING_Q_PROFILE')
+            assert.throws(() => amazonQTokenServiceManager.getCodewhispererService())
+        })
+
+        it('does not throw when there are no credentials yet', () => {
+            setupServiceManager()
+            // Fires inside the client's credentials request; throwing would make the client believe the
+            // credentials never landed.
+            assert.doesNotThrow(() =>
+                amazonQTokenServiceManager.handleOnCredentialsUpdated('bearer' as CredentialsType)
             )
         })
     })
