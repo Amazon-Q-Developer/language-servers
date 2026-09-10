@@ -20,6 +20,14 @@ export const AUTH_SUCCESS_EVENT = 'authSuccess'
 export class ProfileStatusMonitor {
     private intervalId?: NodeJS.Timeout
     private readonly CHECK_INTERVAL = 24 * 60 * 60 * 1000 // 24 hours
+    /**
+     * Minimum time between auth-triggered profile checks for the same profile.
+     * Auth success events can arrive in rapid succession (token refresh, repeated
+     * configuration updates); without this guard each one issued a GetProfile call.
+     */
+    static readonly AUTH_EVENT_MIN_INTERVAL_MS = 60 * 1000
+    private inFlightCheck?: Promise<boolean | undefined>
+    private lastAuthEventCheck?: { profileArn: string; timestamp: number }
     private codeWhispererClient?: CodeWhispererServiceToken
     private static lastMcpState: boolean = true
     private static readonly MCP_CACHE_DIR = path.join(os.homedir(), '.aws', 'amazonq', 'mcpAdmin')
@@ -40,8 +48,46 @@ export class ProfileStatusMonitor {
 
         // Listen for auth success events
         ProfileStatusMonitor.eventEmitter.on(AUTH_SUCCESS_EVENT, () => {
-            void this.isMcpEnabled()
+            void this.onAuthSuccess()
         })
+    }
+
+    /**
+     * Handles an auth success event. Skips the profile check when the same profile
+     * was already checked within AUTH_EVENT_MIN_INTERVAL_MS, so bursts of auth or
+     * configuration updates do not turn into bursts of GetProfile calls.
+     */
+    private async onAuthSuccess(): Promise<void> {
+        const profileArn = this.tryGetActiveProfileArn()
+        const now = Date.now()
+
+        if (
+            profileArn &&
+            this.lastAuthEventCheck?.profileArn === profileArn &&
+            now - this.lastAuthEventCheck.timestamp < ProfileStatusMonitor.AUTH_EVENT_MIN_INTERVAL_MS
+        ) {
+            this.logging.debug('Skipping MCP configuration check: profile was checked recently')
+            return
+        }
+
+        if (profileArn) {
+            this.lastAuthEventCheck = { profileArn, timestamp: now }
+        }
+
+        try {
+            await this.isMcpEnabled()
+        } catch {
+            // Already logged by isMcpEnabled; nothing else to do for an event-triggered check.
+        }
+    }
+
+    private tryGetActiveProfileArn(): string | undefined {
+        try {
+            return this.getProfileArn(AmazonQTokenServiceManager.getInstance())
+        } catch (error) {
+            this.logging.debug(`Service manager not available for profile check: ${error}`)
+            return undefined
+        }
     }
 
     async checkInitialState(): Promise<boolean> {
@@ -79,7 +125,22 @@ export class ProfileStatusMonitor {
         }
     }
 
-    private async isMcpEnabled(isPeriodicCheck: boolean = false): Promise<boolean | undefined> {
+    /**
+     * Returns the in-flight check if one is running so concurrent callers share a
+     * single GetProfile request instead of each issuing their own.
+     */
+    private isMcpEnabled(isPeriodicCheck: boolean = false): Promise<boolean | undefined> {
+        if (this.inFlightCheck) {
+            return this.inFlightCheck
+        }
+
+        this.inFlightCheck = this.checkMcpEnabled(isPeriodicCheck).finally(() => {
+            this.inFlightCheck = undefined
+        })
+        return this.inFlightCheck
+    }
+
+    private async checkMcpEnabled(isPeriodicCheck: boolean = false): Promise<boolean | undefined> {
         try {
             const serviceManager = AmazonQTokenServiceManager.getInstance()
             const profileArn = this.getProfileArn(serviceManager)
