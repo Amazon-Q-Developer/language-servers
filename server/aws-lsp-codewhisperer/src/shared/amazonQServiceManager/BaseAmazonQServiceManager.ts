@@ -123,6 +123,15 @@ export abstract class BaseAmazonQServiceManager<
     }
 
     abstract handleOnCredentialsDeleted(type: CredentialsType): void
+
+    /**
+     * Called when credentials of the given type have been stored.
+     *
+     * Default is a no-op so a manager only implements it if it has work to bring forward. Overridden
+     * by the token manager to construct services as soon as bearer credentials arrive instead of
+     * waiting for the first consumer.
+     */
+    handleOnCredentialsUpdated(_type: CredentialsType): void {}
     abstract handleOnUpdateConfiguration(params: UpdateConfigurationParams, token: CancellationToken): Promise<void>
 
     public async handleDidChangeConfiguration(): Promise<void> {
