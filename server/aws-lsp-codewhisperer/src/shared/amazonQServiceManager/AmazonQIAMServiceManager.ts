@@ -6,7 +6,11 @@ import {
 } from './BaseAmazonQServiceManager'
 import { getAmazonQRegionAndEndpoint } from './configurationUtils'
 import { StreamingClientServiceIAM } from '../streamingClientService'
-import { AmazonQServiceAlreadyInitializedError, AmazonQServiceInitializationError } from './errors'
+import {
+    AmazonQServiceAlreadyInitializedError,
+    AmazonQServiceInitializationError,
+    AmazonQServicePendingSigninError,
+} from './errors'
 import {
     CancellationToken,
     CredentialsType,
@@ -52,6 +56,13 @@ export class AmazonQIAMServiceManager extends BaseAmazonQServiceManager<
     }
 
     public getCodewhispererService() {
+        // Mirror the token-based manager: do not hand out a service that cannot authenticate.
+        // Without this, the SDK credential callback dereferences `undefined` and every
+        // inline-completion trigger fails with a bare TypeError until credentials arrive.
+        if (!this.hasValidCredentials()) {
+            throw new AmazonQServicePendingSigninError('No IAM credentials available')
+        }
+
         if (!this.cachedCodewhispererService) {
             this.cachedCodewhispererService = new CodeWhispererServiceIAM(
                 this.features.credentialsProvider,
