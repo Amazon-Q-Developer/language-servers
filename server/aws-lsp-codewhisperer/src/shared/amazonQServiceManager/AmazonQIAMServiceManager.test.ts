@@ -2,6 +2,8 @@ import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { deepStrictEqual } from 'assert'
 import sinon from 'ts-sinon'
 import { AmazonQIAMServiceManager } from './AmazonQIAMServiceManager'
+import { AmazonQServicePendingSigninError } from './errors'
+import { CodeWhispererServiceIAM } from '../codeWhispererService'
 import { generateSingletonInitializationTests } from './testUtils'
 import * as utils from '../utils'
 
@@ -22,6 +24,10 @@ describe('AmazonQIAMServiceManager', () => {
                 AmazonQIAMServiceManager.prototype,
                 'updateCachedServiceConfig' as keyof AmazonQIAMServiceManager
             )
+
+            // Default: IAM credentials are present. Individual tests override this to exercise
+            // the missing-credentials path.
+            features.credentialsProvider.hasCredentials.withArgs('iam').returns(true)
 
             AmazonQIAMServiceManager.resetInstance()
             serviceManager = AmazonQIAMServiceManager.initInstance(features)
@@ -63,17 +69,35 @@ describe('AmazonQIAMServiceManager', () => {
                 serviceManager.getCodewhispererService()
                 throw new Error('Expected error was not thrown')
             } catch (error) {
+                deepStrictEqual(error instanceof AmazonQServicePendingSigninError, true)
                 deepStrictEqual((error as Error).message.includes('No IAM credentials available'), true)
             }
         })
 
-        it('should validate credentials before creating service', () => {
-            const hasCredentialsSpy = sinon.spy(features.credentialsProvider, 'hasCredentials')
+        it('should not create or cache a service while IAM credentials are missing', () => {
+            features.credentialsProvider.hasCredentials.withArgs('iam').returns(false)
 
+            try {
+                serviceManager.getCodewhispererService()
+            } catch {
+                // expected
+            }
+
+            sinon.assert.notCalled(updateCachedServiceConfigSpy)
+
+            // Once credentials arrive the service is created normally
+            features.credentialsProvider.hasCredentials.withArgs('iam').returns(true)
+            const service = serviceManager.getCodewhispererService()
+            deepStrictEqual(service instanceof CodeWhispererServiceIAM, true)
+            sinon.assert.calledOnce(updateCachedServiceConfigSpy)
+        })
+
+        it('should validate credentials before creating service', () => {
+            // hasCredentials is already a stub on TestFeatures; assert on it directly
             features.credentialsProvider.hasCredentials.withArgs('iam').returns(true)
             serviceManager.getCodewhispererService()
 
-            sinon.assert.calledWith(hasCredentialsSpy, 'iam')
+            sinon.assert.calledWith(features.credentialsProvider.hasCredentials, 'iam')
         })
 
         it('should return correct credential validation status', () => {
