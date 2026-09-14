@@ -42,7 +42,14 @@ import { Mutex } from 'async-mutex'
 import path = require('path')
 import { URI } from 'vscode-uri'
 import { MessageType } from '@aws/language-server-runtimes/protocol'
-import { hasApproval, recordApproval, removeApproval, fingerprintServerConfig } from './mcpConsentStore'
+import {
+    hasApproval,
+    recordApproval,
+    removeApproval,
+    fingerprintServerConfig,
+    effectiveEnv,
+    effectiveHeaders,
+} from './mcpConsentStore'
 import { sanitizeInput } from '../../../../shared/utils'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import { OAuthClient } from './mcpOauthClient'
@@ -440,6 +447,17 @@ export class McpManager {
             )
             if (!approved) {
                 const cmdLine = [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').slice(0, 200)
+                // Surface the environment variables and headers the server will actually be
+                // launched with. Names only, never values: a config may legitimately hold
+                // tokens, and this string is shown in a dialog and written to logs. Values are
+                // covered by the fingerprint, so any value change re-prompts.
+                const envKeys = Object.keys(effectiveEnv(cfg))
+                const headerNames = Object.keys(effectiveHeaders(cfg))
+                const envLine =
+                    envKeys.length > 0
+                        ? `Environment variables: ${envKeys.join(', ').slice(0, 200)}\n`
+                        : `Environment variables: (none)\n`
+                const headerLine = headerNames.length > 0 ? `Headers: ${headerNames.join(', ').slice(0, 200)}\n` : ''
                 const allowBtn = { title: 'Allow for this server' }
                 const denyBtn = { title: 'Deny' }
                 let choice: { title: string } | null | undefined
@@ -451,8 +469,13 @@ export class McpManager {
                             `A workspace configuration file wants to start an MCP server.\n` +
                             `Server: ${serverName}\n` +
                             `Command: ${cmdLine}\n` +
+                            envLine +
+                            headerLine +
                             `Source: ${configPath}\n\n` +
-                            `Running this server executes the above command on your machine. ` +
+                            `Running this server executes the above command on your machine, ` +
+                            `with the environment variables listed above. ` +
+                            `Review them in the configuration file if you are unsure — variables such as ` +
+                            `NODE_OPTIONS can cause additional code to run. ` +
                             `Only allow if you trust the authors of this workspace.\n\n` +
                             `Your choice will be remembered for this workspace. ` +
                             `If you allow, you won't be asked again unless the server configuration changes.`,

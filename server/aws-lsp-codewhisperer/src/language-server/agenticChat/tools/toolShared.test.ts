@@ -258,13 +258,12 @@ describe('toolShared', () => {
             )
 
             assert.strictEqual(result.requiresAcceptance, false)
-            // requiresPathAcceptance canonicalizes the path with path.resolve() before
-            // passing to isInWorkspace, so verify with the resolved path
-            const expectedPath = path.resolve(filePath)
-            assert.strictEqual(
-                isInWorkspaceStub.calledWith(['/workspace/folder1', '/workspace/folder2'], expectedPath),
-                true
-            )
+            // requiresPathAcceptance canonicalizes the path (symlink-aware) before
+            // passing it to isInWorkspace. The exact canonical form is platform
+            // specific (and is covered by symlinkBoundary.test.ts), so here just
+            // verify isInWorkspace was consulted with an absolute, resolved path.
+            assert.strictEqual(isInWorkspaceStub.called, true)
+            assert.strictEqual(path.isAbsolute(isInWorkspaceStub.firstCall.args[1]), true)
         })
 
         it('should return requiresAcceptance=true if path is not in workspace', async () => {
@@ -284,11 +283,8 @@ describe('toolShared', () => {
             )
 
             assert.strictEqual(result.requiresAcceptance, true)
-            const expectedPath = path.resolve(filePath)
-            assert.strictEqual(
-                isInWorkspaceStub.calledWith(['/workspace/folder1', '/workspace/folder2'], expectedPath),
-                true
-            )
+            assert.strictEqual(isInWorkspaceStub.called, true)
+            assert.strictEqual(path.isAbsolute(isInWorkspaceStub.firstCall.args[1]), true)
         })
 
         it('should return requiresAcceptance=true if an error occurs', async () => {

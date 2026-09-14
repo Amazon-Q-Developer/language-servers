@@ -28,6 +28,12 @@ export class LspApplyWorkspaceEdit {
         this.lsp = features.lsp
     }
 
+    // TODO (workspace-boundary hardening): this tool applies edits without a
+    // workspace-boundary or acceptance check. For parity with the file tools,
+    // add symlink-aware boundary validation and approval gating that mirror the
+    // fs* write tools (resolve each edited URI via requiresPathAcceptance)
+    // before this tool is enabled. Note this tool is not currently registered
+    // in any runtime (LspToolsServer is not enabled).
     public async invoke(params: LspApplyWorkspaceEditParams): Promise<InvokeOutput> {
         try {
             if (!params.edit || !params.edit.changes) {

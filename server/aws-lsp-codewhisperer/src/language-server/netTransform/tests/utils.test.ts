@@ -458,6 +458,26 @@ describe('Utils', () => {
             expect(writeFileStub.calledOnce).to.be.true
         })
 
+        it('should block zip-slip entries that escape the extraction directory', async () => {
+            const mkdirStub = sinon.stub(fs.promises, 'mkdir').resolves()
+            const writeFileStub = sinon.stub(fs.promises, 'writeFile').resolves()
+
+            const entries = [
+                {
+                    entryName: `..${path.sep}..${path.sep}evil.txt`,
+                    isDirectory: false,
+                    getData: () => Buffer.from('malicious'),
+                },
+            ]
+
+            await Utils.extractAllEntriesTo(tempDir, entries as any, mockLogger)
+
+            // The traversal entry must be skipped — nothing written, and it's logged.
+            expect(writeFileStub.called).to.be.false
+            expect(mockLogger.error.calledOnce).to.be.true
+            expect(mockLogger.error.firstCall.args[0]).to.include('escaping extraction directory')
+        })
+
         it('should handle ENOENT error', async () => {
             const entries = [
                 {

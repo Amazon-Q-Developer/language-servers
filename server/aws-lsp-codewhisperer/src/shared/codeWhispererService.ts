@@ -415,6 +415,20 @@ export class CodeWhispererServiceToken extends CodeWhispererServiceBase {
     #abTestingFetchingTimeout: NodeJS.Timeout | undefined
     #features: FeatureEvaluation[] | undefined
 
+    /**
+     * Invoked when any request from this client is rejected because RTS has blocked Q Developer plugin
+     * access for this identity (see {@link isQDevPluginAccessBlockedError}).
+     *
+     * Assigned after construction -- deliberately, so that whoever owns the client lifecycle (and has
+     * access to the client-facing features needed to surface it) can supply the reaction without this
+     * service taking a dependency on it. Follows the same late-binding approach already used for
+     * `shareCodeWhispererContentWithAWS`. When unset, detection is inert.
+     *
+     * The service error itself is always still thrown to the caller; this is purely an observation
+     * hook and must not be used to suppress it.
+     */
+    public onAccessBlocked?: (error: unknown) => void
+
     constructor(
         private credentialsProvider: CredentialsProvider,
         workspace: Workspace,
@@ -446,7 +460,8 @@ export class CodeWhispererServiceToken extends CodeWhispererServiceBase {
             sdkInitializator,
             logging,
             credentialsProvider,
-            () => this.shareCodeWhispererContentWithAWS
+            () => this.shareCodeWhispererContentWithAWS,
+            error => this.onAccessBlocked?.(error)
         )
         this.userContext = userContext
         this.scheduleABTestingFetching()
