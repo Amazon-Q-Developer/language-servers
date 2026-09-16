@@ -9,7 +9,7 @@ import {
 import { disclaimerCard } from '../texts/disclaimer'
 import { ChatMessage } from '@aws/language-server-runtimes-types'
 import { ChatHistory } from '../features/history'
-import { pairProgrammingPromptInput, programmerModeCard } from '../texts/pairProgramming'
+import { pairProgrammingPromptInput } from '../texts/pairProgramming'
 import { modelSelection } from '../texts/modelSelection'
 import { getWelcomeTabHeader } from '../texts/welcome'
 import { chatMessageToChatItem } from '../utils'
@@ -64,17 +64,15 @@ export class TabFactory {
 
     public getChatItems(
         needWelcomeMessages: boolean,
-        pairProgrammingCardActive: boolean,
         deprecationCardActive: boolean,
         chatMessages?: ChatMessage[]
     ): ChatItem[] {
         return [
             ...(this.bannerMessage ? [this.getBannerMessage() as ChatItem] : []),
             ...(needWelcomeMessages
-                ? [
-                      ...(deprecationCardActive ? [deprecationCard] : []),
-                      ...(this.agenticMode && pairProgrammingCardActive ? [programmerModeCard] : []),
-                  ]
+                ? deprecationCardActive
+                    ? [deprecationCard]
+                    : []
                 : chatMessages
                   ? chatMessages.map(msg => chatMessageToChatItem(msg, this.agenticMode))
                   : []),

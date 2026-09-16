@@ -1,7 +1,7 @@
 import { ChatHistory } from '../features/history'
 import { TabFactory } from './tabFactory'
 import * as assert from 'assert'
-import { pairProgrammingPromptInput, programmerModeCard } from '../texts/pairProgramming'
+import { pairProgrammingPromptInput } from '../texts/pairProgramming'
 import { modelSelection } from '../texts/modelSelection'
 import { deprecationCard } from '../texts/deprecation'
 import { ChatMessage } from '@aws/language-server-runtimes-types'
@@ -128,27 +128,27 @@ describe('tabFactory', () => {
         it('shows the deprecation card in a new chat when it is active', () => {
             const tabFactory = new TabFactory({})
 
-            const result = tabFactory.getChatItems(true, false, true)
+            const result = tabFactory.getChatItems(true, true)
 
             assert.deepStrictEqual(result, [deprecationCard])
         })
 
-        it('shows the deprecation card before the agentic feature card', () => {
+        it('replaces the agentic feature card in agentic mode', () => {
             const tabFactory = new TabFactory({})
             tabFactory.enableAgenticMode()
 
-            const result = tabFactory.getChatItems(true, true, true)
+            const result = tabFactory.getChatItems(true, true)
 
-            assert.deepStrictEqual(result, [deprecationCard, programmerModeCard])
+            assert.deepStrictEqual(result, [deprecationCard])
         })
 
         it('hides the deprecation card after it has been acknowledged', () => {
             const tabFactory = new TabFactory({})
             tabFactory.enableAgenticMode()
 
-            const result = tabFactory.getChatItems(true, true, false)
+            const result = tabFactory.getChatItems(true, false)
 
-            assert.deepStrictEqual(result, [programmerModeCard])
+            assert.deepStrictEqual(result, [])
         })
 
         it('does not add welcome cards to restored chats', () => {
@@ -160,15 +160,12 @@ describe('tabFactory', () => {
             ]
             const tabFactory = new TabFactory({})
 
-            const result = tabFactory.getChatItems(false, true, true, messages)
+            const result = tabFactory.getChatItems(false, true, messages)
 
             assert.equal(result.length, 1)
             assert.equal(result[0].body, 'Restored response')
             assert.equal(
-                result.some(
-                    item =>
-                        item.messageId === deprecationCard.messageId || item.messageId === programmerModeCard.messageId
-                ),
+                result.some(item => item.messageId === deprecationCard.messageId),
                 false
             )
         })

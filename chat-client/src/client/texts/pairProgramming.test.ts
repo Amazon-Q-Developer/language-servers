@@ -1,26 +1,8 @@
 import * as assert from 'assert'
 import { ChatItemType } from '@aws/mynah-ui'
-import {
-    programmerModeCard,
-    pairProgrammingPromptInput,
-    pairProgrammingModeOn,
-    pairProgrammingModeOff,
-} from './pairProgramming'
+import { pairProgrammingPromptInput, pairProgrammingModeOn, pairProgrammingModeOff } from './pairProgramming'
 
 describe('pairProgramming', () => {
-    describe('programmerModeCard', () => {
-        it('has correct properties', () => {
-            assert.equal(programmerModeCard.type, ChatItemType.ANSWER)
-            assert.equal(programmerModeCard.title, 'NEW FEATURE')
-            assert.equal(programmerModeCard.messageId, 'programmerModeCardId')
-            assert.equal(programmerModeCard.fullWidth, true)
-            assert.equal(programmerModeCard.canBeDismissed, true)
-            assert.ok(programmerModeCard.body?.includes('Amazon Q can now help'))
-            assert.equal(programmerModeCard.header?.icon, 'code-block')
-            assert.equal(programmerModeCard.header?.iconStatus, 'primary')
-        })
-    })
-
     describe('pairProgrammingPromptInput', () => {
         it('has correct properties', () => {
             assert.equal(pairProgrammingPromptInput.type, 'switch')
