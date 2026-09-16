@@ -129,7 +129,9 @@ const getDefaultTabConfig = (agenticMode?: boolean) => {
 
 type ChatClientConfig = Pick<MynahUIDataModel, 'quickActionCommands'> & {
     disclaimerAcknowledged?: boolean
+    // Retained for compatibility with clients that still send the former feature-card state.
     pairProgrammingAcknowledged?: boolean
+    deprecationNoticeAcknowledged?: boolean
     agenticMode?: boolean
     modelSelectionEnabled?: boolean
     stringOverrides?: Partial<ConfigTexts>
@@ -585,7 +587,7 @@ export const createChat = (
         messager,
         tabFactory,
         config?.disclaimerAcknowledged ?? false,
-        config?.pairProgrammingAcknowledged ?? false,
+        config?.deprecationNoticeAcknowledged ?? false,
         chatClientAdapter,
         featureConfig,
         !!config?.agenticMode,

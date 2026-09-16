@@ -16,6 +16,7 @@ import { ChatClientAdapter } from '../contracts/chatClientAdapter'
 import { ChatMessage, ContextCommand, ListAvailableModelsResult } from '@aws/language-server-runtimes-types'
 import { ChatHistory } from './features/history'
 import { pairProgrammingModeOn, pairProgrammingModeOff } from './texts/pairProgramming'
+import { deprecationCard } from './texts/deprecation'
 import { strictEqual } from 'assert'
 
 describe('MynahUI', () => {
@@ -91,7 +92,7 @@ describe('MynahUI', () => {
         createTabStub.returns({})
         getChatItemsStub = sinon.stub(tabFactory, 'getChatItems')
         getChatItemsStub.returns([])
-        const mynahUiResult = createMynahUi(messager, tabFactory, true, true, undefined, undefined, true)
+        const mynahUiResult = createMynahUi(messager, tabFactory, true, false, undefined, undefined, true)
         mynahUi = mynahUiResult[0]
         inboundChatApi = mynahUiResult[1]
         getSelectedTabIdStub = sinon.stub(mynahUi, 'getSelectedTabId')
@@ -163,7 +164,11 @@ describe('MynahUI', () => {
     })
 
     describe('openTab', () => {
-        it('should create a new tab with welcome messages if tabId not passed and previous messages not passed', () => {
+        it('should show the deprecation card while initializing the first tab', () => {
+            sinon.assert.calledWith(getChatItemsStub, true, true)
+        })
+
+        it('should create a new tab with welcome messages without repeating the deprecation card', () => {
             createTabStub.resetHistory()
             getChatItemsStub.resetHistory()
 
@@ -251,6 +256,7 @@ describe('MynahUI', () => {
             this.timeout(10000) // Increase timeout to 10 seconds
             // clear create tab stub since set up process calls it twice
             createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
             // Stub setTimeout to execute immediately
             const setTimeoutStub = sinon.stub(global, 'setTimeout').callsFake((fn: Function) => {
                 fn()
@@ -265,6 +271,7 @@ describe('MynahUI', () => {
             inboundChatApi.sendGenericCommand({ genericCommand, selection, tabId, triggerType })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, [])
             // updateStore is called four times for a brand new tab:
             //   1. onTabAdd seeds the tab (chatItems + welcome tabHeaderDetails)
             //   2. handleChatPrompt clears the welcome splash before the first prompt
@@ -774,6 +781,25 @@ describe('MynahUI', () => {
             strictEqual(configTexts.stopGenerating, 'Custom stop text')
             strictEqual(configTexts.showMore, 'Custom show more text')
             strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+        })
+    })
+
+    describe('onMessageDismiss', () => {
+        it('acknowledges the deprecation card and removes it from future new chats', () => {
+            const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
+
+            ;(mynahUi as any).props.onMessageDismiss('tab-1', deprecationCard.messageId)
+
+            sinon.assert.calledWithExactly(
+                outboundChatApi.chatPromptOptionAcknowledged as sinon.SinonStub,
+                deprecationCard.messageId
+            )
+            sinon.assert.calledWithExactly(getChatItemsStub, true, false)
+            sinon.assert.calledWithExactly(updateTabDefaultsSpy, {
+                store: {
+                    chatItems: [],
+                },
+            })
         })
     })
 })
