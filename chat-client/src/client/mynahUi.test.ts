@@ -15,7 +15,8 @@ import { ChatItemType, MynahUI, NotificationType } from '@aws/mynah-ui'
 import { ChatClientAdapter } from '../contracts/chatClientAdapter'
 import { ChatMessage, ContextCommand, ListAvailableModelsResult } from '@aws/language-server-runtimes-types'
 import { ChatHistory } from './features/history'
-import { pairProgrammingModeOn, pairProgrammingModeOff } from './texts/pairProgramming'
+import { pairProgrammingModeOn, pairProgrammingModeOff, programmerModeCard } from './texts/pairProgramming'
+import { deprecationCard } from './texts/deprecation'
 import { strictEqual } from 'assert'
 
 describe('MynahUI', () => {
@@ -91,7 +92,7 @@ describe('MynahUI', () => {
         createTabStub.returns({})
         getChatItemsStub = sinon.stub(tabFactory, 'getChatItems')
         getChatItemsStub.returns([])
-        const mynahUiResult = createMynahUi(messager, tabFactory, true, true, undefined, undefined, true)
+        const mynahUiResult = createMynahUi(messager, tabFactory, true, false, false, undefined, undefined, true)
         mynahUi = mynahUiResult[0]
         inboundChatApi = mynahUiResult[1]
         getSelectedTabIdStub = sinon.stub(mynahUi, 'getSelectedTabId')
@@ -170,7 +171,7 @@ describe('MynahUI', () => {
             inboundChatApi.openTab(requestId, {})
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, true, undefined)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -201,7 +202,7 @@ describe('MynahUI', () => {
             })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, false, false, mockMessages)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, false, true, true, mockMessages)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -760,6 +761,7 @@ describe('MynahUI', () => {
                 tabFactory,
                 true,
                 true,
+                true,
                 undefined,
                 undefined,
                 true,
@@ -774,6 +776,42 @@ describe('MynahUI', () => {
             strictEqual(configTexts.stopGenerating, 'Custom stop text')
             strictEqual(configTexts.showMore, 'Custom show more text')
             strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+        })
+    })
+
+    describe('onMessageDismiss', () => {
+        it('acknowledges the deprecation card and removes it from future new chats', () => {
+            const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
+
+            ;(mynahUi as any).props.onMessageDismiss('tab-1', deprecationCard.messageId)
+
+            sinon.assert.calledWithExactly(
+                outboundChatApi.chatPromptOptionAcknowledged as sinon.SinonStub,
+                deprecationCard.messageId
+            )
+            sinon.assert.calledWithExactly(getChatItemsStub, true, true, false)
+            sinon.assert.calledWithExactly(updateTabDefaultsSpy, {
+                store: {
+                    chatItems: [],
+                },
+            })
+        })
+
+        it('acknowledges the agentic feature card without removing the deprecation card from future new chats', () => {
+            const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
+
+            ;(mynahUi as any).props.onMessageDismiss('tab-1', programmerModeCard.messageId)
+
+            sinon.assert.calledWithExactly(
+                outboundChatApi.chatPromptOptionAcknowledged as sinon.SinonStub,
+                programmerModeCard.messageId
+            )
+            sinon.assert.calledWithExactly(getChatItemsStub, true, false, true)
+            sinon.assert.calledWithExactly(updateTabDefaultsSpy, {
+                store: {
+                    chatItems: [],
+                },
+            })
         })
     })
 })
@@ -808,6 +846,7 @@ describe('withAdapter', () => {
         const mynahUiResult = createMynahUi(
             messager as Messager,
             tabFactory,
+            true,
             true,
             true,
             chatClientAdapter,

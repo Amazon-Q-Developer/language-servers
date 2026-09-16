@@ -13,6 +13,7 @@ import { pairProgrammingPromptInput, programmerModeCard } from '../texts/pairPro
 import { modelSelection } from '../texts/modelSelection'
 import { getWelcomeTabHeader } from '../texts/welcome'
 import { chatMessageToChatItem } from '../utils'
+import { deprecationCard } from '../texts/deprecation'
 
 export type DefaultTabData = MynahUIDataModel
 
@@ -64,14 +65,16 @@ export class TabFactory {
     public getChatItems(
         needWelcomeMessages: boolean,
         pairProgrammingCardActive: boolean,
+        deprecationCardActive: boolean,
         chatMessages?: ChatMessage[]
     ): ChatItem[] {
         return [
             ...(this.bannerMessage ? [this.getBannerMessage() as ChatItem] : []),
             ...(needWelcomeMessages
-                ? this.agenticMode && pairProgrammingCardActive
-                    ? [programmerModeCard]
-                    : []
+                ? [
+                      ...(deprecationCardActive ? [deprecationCard] : []),
+                      ...(this.agenticMode && pairProgrammingCardActive ? [programmerModeCard] : []),
+                  ]
                 : chatMessages
                   ? chatMessages.map(msg => chatMessageToChatItem(msg, this.agenticMode))
                   : []),
