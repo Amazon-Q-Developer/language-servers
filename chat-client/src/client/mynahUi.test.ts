@@ -164,14 +164,18 @@ describe('MynahUI', () => {
     })
 
     describe('openTab', () => {
-        it('should create a new tab with welcome messages if tabId not passed and previous messages not passed', () => {
+        it('should show the deprecation card while initializing the first tab', () => {
+            sinon.assert.calledWith(getChatItemsStub, true, true)
+        })
+
+        it('should create a new tab with welcome messages without repeating the deprecation card', () => {
             createTabStub.resetHistory()
             getChatItemsStub.resetHistory()
 
             inboundChatApi.openTab(requestId, {})
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, undefined)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -202,7 +206,7 @@ describe('MynahUI', () => {
             })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, false, true, mockMessages)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, false, false, mockMessages)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -252,6 +256,7 @@ describe('MynahUI', () => {
             this.timeout(10000) // Increase timeout to 10 seconds
             // clear create tab stub since set up process calls it twice
             createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
             // Stub setTimeout to execute immediately
             const setTimeoutStub = sinon.stub(global, 'setTimeout').callsFake((fn: Function) => {
                 fn()
@@ -266,6 +271,7 @@ describe('MynahUI', () => {
             inboundChatApi.sendGenericCommand({ genericCommand, selection, tabId, triggerType })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, [])
             // updateStore is called four times for a brand new tab:
             //   1. onTabAdd seeds the tab (chatItems + welcome tabHeaderDetails)
             //   2. handleChatPrompt clears the welcome splash before the first prompt

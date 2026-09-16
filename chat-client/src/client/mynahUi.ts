@@ -333,8 +333,25 @@ export const createMynahUi = (
 ): [MynahUI, InboundChatApi] => {
     let disclaimerCardActive = !disclaimerAcknowledged
     let deprecationCardActive = !deprecationNoticeAcknowledged
+    let deprecationCardShownInCurrentInstance = false
     let contextCommandGroups: ContextCommandGroups | undefined
     let lastFilterTabId: string | undefined
+
+    const shouldShowDeprecationCard = (tabId: string): boolean => {
+        if (!deprecationCardActive) {
+            return false
+        }
+
+        // Mynah initializes the first tab through both the initial data model and
+        // onTabAdd. Allow both writes for that tab, but suppress the card for every
+        // subsequent tab created in this chat-client instance.
+        if (deprecationCardShownInCurrentInstance && tabId !== tabFactory.initialTabId) {
+            return false
+        }
+
+        deprecationCardShownInCurrentInstance = true
+        return true
+    }
 
     let chatEventHandlers: ChatEventHandler = {
         onCodeInsertToCursorPosition(
@@ -435,7 +452,7 @@ export const createMynahUi = (
             // We check if tabMetadata.openTabKey exists - if it does and is set to true, we skip showing welcome messages
             // since this indicates we're loading a previous chat session rather than starting a new one.
             if (!tabStore?.tabMetadata || !tabStore.tabMetadata.openTabKey) {
-                defaultTabConfig.chatItems = tabFactory.getChatItems(true, deprecationCardActive, [])
+                defaultTabConfig.chatItems = tabFactory.getChatItems(true, shouldShowDeprecationCard(tabId), [])
                 // Roll a fresh "Did you know?" tip for every new tab. The
                 // mynah-ui defaults.store is built once at startup, so without
                 // this override every new tab would inherit the same cached tip.
@@ -824,7 +841,7 @@ export const createMynahUi = (
                 isSelected: true,
                 store: {
                     ...tabFactory.createTab(disclaimerCardActive),
-                    chatItems: tabFactory.getChatItems(true, deprecationCardActive),
+                    chatItems: tabFactory.getChatItems(true, shouldShowDeprecationCard(tabFactory.initialTabId)),
                 },
             },
         },
@@ -1404,8 +1421,13 @@ ${params.message}`,
             const messages = params.newTabOptions?.data?.messages
             const tabId = createTabId(true)
             if (tabId) {
+                const needWelcomeMessages = !messages
                 mynahUi.updateStore(tabId, {
-                    chatItems: tabFactory.getChatItems(messages ? false : true, deprecationCardActive, messages),
+                    chatItems: tabFactory.getChatItems(
+                        needWelcomeMessages,
+                        needWelcomeMessages && shouldShowDeprecationCard(tabId),
+                        messages
+                    ),
                     // onTabAdd suppresses the welcome splash whenever
                     // openTabKey is true (which createTabId(true) sets), so
                     // re-establish it here for the no-messages case so a
