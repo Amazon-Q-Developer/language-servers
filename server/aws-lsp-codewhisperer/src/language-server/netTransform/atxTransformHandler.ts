@@ -115,6 +115,10 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// How long to stop starting optional beam-map scans after FES throttles us. Deliberately longer than
+// the 30s dashboard/info-bar poll interval: a cooldown shorter than the poll would merely delay calls
+// within one sweep instead of dropping whole sweeps, which is the only thing that reduces our rate.
+const BEAM_THROTTLE_COOLDOWN_MS = 90000
 // Cap on the parsed-artifact cache. The two bounds above limit ONE scan; they cannot
 // limit the number of scans, so repeated discovery sweeps re-downloaded the same
 // artifacts indefinitely. The cache is what bounds the total.
@@ -169,6 +173,26 @@ export class ATXTransformHandler {
     private readonly beamJsonArtifactCache = new Map<string, { value: any | null; expiresAt: number }>()
     // Latch so the cap-reached notice is logged once per process, not once per eviction.
     private beamJsonArtifactCacheEvicted = false
+
+    // Process-wide throttle cooldown. The per-call retry in createArtifactDownloadUrl is resilience
+    // for ONE call and does not reduce our rate — under sustained throttling it raises it, because a
+    // rejected call becomes up to four. Nothing currently tells the client to stop STARTING work.
+    // That is the gap behind an alarm that has fired five times in 2026 without resolution: each
+    // round produced a local "make this cheaper" fix while the client kept initiating at the same
+    // rate no matter how hard the service pushed back.
+    //
+    // So: any throttle sets a cooldown, and the optional beam-map scan — the only unbounded-ish
+    // fan-out we own — skips while it is in force. Deliberately longer than the 30s poll interval so
+    // it actually drops sweeps rather than merely delaying calls within one.
+    //
+    // Skipping is SAFE and not a feature regression: the beam-map is optional enrichment. When it is
+    // absent, discovery already derives beamed repos from beam-status artifacts (observed live:
+    // "no beam-map for job=… — derived 1 beamed repo(s) from beam-status artifacts"), and
+    // isRepoLbvOpen defaults to OPEN on a fetch failure so nothing is ever wrongly hidden. A
+    // throttled sweep therefore degrades to the path that already works, and the next uncooled sweep
+    // picks the beam-map up.
+    private beamThrottleCooldownUntilMs = 0
+    private beamThrottleCooldownLogged = false
 
     constructor(serviceManager: AtxTokenServiceManager, workspace: Workspace, logging: Logging, runtime: Runtime) {
         this.serviceManager = serviceManager
@@ -714,7 +738,23 @@ export class ATXTransformHandler {
             // job (logs, metadata) could otherwise stall the IDE's discovery UI. Cap the number
             // scanned and enforce an overall deadline; the beam-map is written early and is
             // small, so a bounded scan reliably finds it.
-            const candidates = allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
+            // Throttle cooldown: skip the optional scan rather than adding to the pressure. The
+            // existing per-call retry only rescues a single call; this is what stops us STARTING more
+            // work while the service is rejecting us.
+            //
+            // Empty the candidate list rather than returning early — an early return would abandon
+            // the whole of listBeamedRepos, including the beam-status discovery below, and the Beamed
+            // tab would go empty for the duration of the cooldown. Emptying skips only the optional
+            // enrichment and lets the path that actually finds beamed repos run untouched.
+            const beamThrottleCoolingDown = this.isBeamThrottleCooldownActive()
+            if (beamThrottleCoolingDown) {
+                this.logging.log(
+                    `[BEAM-PKG] beam-map scan: SKIPPED — throttle cooldown active for another ` +
+                        `${Math.max(0, this.beamThrottleCooldownUntilMs - Date.now())}ms. ` +
+                        `Beam-status discovery continues; the beam-map is optional enrichment.`
+                )
+            }
+            const candidates = beamThrottleCoolingDown ? [] : allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
             if (allCandidates.length > candidates.length) {
                 this.logging.log(
                     `[BEAM-PKG] beam-map scan: capping ${allCandidates.length} candidate(s) to ${candidates.length}`
@@ -955,6 +995,25 @@ export class ATXTransformHandler {
      * "Unexpected token 'P'"). So: fetch as a buffer, try JSON.parse first, and on
      * failure unzip (AdmZip) and parse the first JSON entry inside.
      */
+    /**
+     * Record that FES pushed back. Set on every throttle, retried or not — the signal is "we are
+     * being rejected", which is equally true on the first attempt and the last.
+     */
+    private noteBeamThrottled(): void {
+        this.beamThrottleCooldownUntilMs = Date.now() + BEAM_THROTTLE_COOLDOWN_MS
+        if (!this.beamThrottleCooldownLogged) {
+            this.beamThrottleCooldownLogged = true
+            this.logging.log(
+                `[BEAM-PKG] FES throttled us — pausing the optional beam-map scan for ` +
+                    `${BEAM_THROTTLE_COOLDOWN_MS}ms after each throttle. Logged once per process.`
+            )
+        }
+    }
+
+    private isBeamThrottleCooldownActive(): boolean {
+        return Date.now() < this.beamThrottleCooldownUntilMs
+    }
+
     private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
         // Beam discovery re-scans the same candidate artifacts on every sweep, so without a cache
         // the same artifact is downloaded and re-parsed on every pass (measured: ~2000 download-URL
@@ -1451,6 +1510,11 @@ export class ATXTransformHandler {
                     name === 'ThrottlingException' ||
                     name === 'TooManyRequestsException' ||
                     /throttl|too many requests|rate exceeded/i.test(msg)
+                if (isThrottle) {
+                    // Record it regardless of whether we retry: the signal is "the service is
+                    // pushing back", which is true on the last attempt as much as the first.
+                    this.noteBeamThrottled()
+                }
                 if (isThrottle && attempt < maxAttempts) {
                     // Exponential base (250, 500, 1000ms) with jitter: under concurrent
                     // throttling, unjittered lockstep retries amplify the thundering herd that
@@ -2545,28 +2609,71 @@ export class ATXTransformHandler {
      * jobs that name the beam node just "<repo>") if no "(beamed)" node exists anywhere.
      */
     private findBeamedRepoNode(step: AtxPlanStep, repoName: string): AtxPlanStep | null {
-        const beamed = this.findNodeByName(step, `${repoName} (beamed)`.toLowerCase())
+        const beamed = this.pickLiveNode(this.findAllNodesByName(step, `${repoName} (beamed)`.toLowerCase()))
         if (beamed) return beamed
-        return this.findNodeByName(step, repoName.toLowerCase())
+        return this.pickLiveNode(this.findAllNodesByName(step, repoName.toLowerCase()))
     }
 
-    private findNodeByName(step: AtxPlanStep, lowerName: string): AtxPlanStep | null {
-        if ((step.StepName || '').toLowerCase() === lowerName) return step
-        for (const child of step.Children) {
-            const found = this.findNodeByName(child, lowerName)
-            if (found) return found
+    /**
+     * ALL name matches in DFS order, not just the first. Re-beam makes duplicates real: web-orc
+     * mints a fresh beam-batch parent per batch, so a repo beamed twice has TWO "<repo> (beamed)"
+     * nodes, and runtime RECREATES the LBV child rather than reviving the terminal one (only
+     * non-terminal children are reused). A first-match walk then resolves to the DEAD node, the
+     * repo reports lbvOpen=false, and a successful re-beam never reappears in the Beamed tab.
+     * A matched node's own subtree is not searched, matching the previous first-match semantics.
+     */
+    private findAllNodesByName(step: AtxPlanStep, lowerName: string): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if ((step.StepName || '').toLowerCase() === lowerName) {
+            found.push(step)
+            return found
         }
-        return null
+        for (const child of step.Children) {
+            found.push(...this.findAllNodesByName(child, lowerName))
+        }
+        return found
     }
 
-    /** Find the "Local Build Verification" node anywhere under the given node. */
+    /**
+     * Of several candidate nodes for one repo, pick the LIVE one: the first whose LBV child is
+     * still non-terminal. A candidate with no LBV child yet counts as live — it is pre-terminal,
+     * the same default isRepoLbvOpen applies elsewhere. When every candidate is terminal (all
+     * attempts finished) fall back to the LAST, which is the newest since children are appended.
+     * Non-terminal is the PRIMARY rule precisely so append-order is only ever a tiebreak.
+     */
+    private pickLiveNode(candidates: AtxPlanStep[]): AtxPlanStep | null {
+        if (candidates.length === 0) return null
+        if (candidates.length === 1) return candidates[0]
+        const live = candidates.find(c => {
+            const lbv = this.findLbvNode(c)
+            return lbv ? !this.isTerminalStepStatus(lbv.Status) : true
+        })
+        return live ?? candidates[candidates.length - 1]
+    }
+
+    /**
+     * Find the repo's LIVE "Local Build Verification" node. Prefers a non-terminal node over a
+     * terminal one for the same reason as pickLiveNode: after a re-beam the old STOPPED/FAILED
+     * child and the fresh one sit under the same parent, and a first-match walk picks the dead
+     * one. Falls back to the last (newest) when every attempt is terminal, which is what the
+     * terminal-drop in RebuildBeamedRepos wants to see.
+     */
     private findLbvNode(step: AtxPlanStep): AtxPlanStep | null {
-        if ((step.StepName || '').toLowerCase().includes('local build verification')) return step
-        for (const child of step.Children) {
-            const found = this.findLbvNode(child)
-            if (found) return found
+        const all = this.findAllLbvNodes(step)
+        if (all.length === 0) return null
+        return all.find(n => !this.isTerminalStepStatus(n.Status)) ?? all[all.length - 1]
+    }
+
+    private findAllLbvNodes(step: AtxPlanStep): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if ((step.StepName || '').toLowerCase().includes('local build verification')) {
+            found.push(step)
+            return found
         }
-        return null
+        for (const child of step.Children) {
+            found.push(...this.findAllLbvNodes(child))
+        }
+        return found
     }
 
     /** Terminal step statuses (LBV done, one way or another). */
@@ -4682,6 +4789,16 @@ export class ATXTransformHandler {
             await this.addAuthToCommand(command)
             const sendResult = (await this.atxClient!.send(command)) as any
             const sentMessageId = sendResult?.message?.messageId
+
+            // Join key for correlating a beamed turn across all three packages on one timeline.
+            // The two backends key on different fields — runtime on message_id_sent, web-orc on
+            // msg_len (its send response carries no createdAt) — so emit both names here rather
+            // than forcing either side to translate. beamStep identifies which repo's lane.
+            this.logging.log(
+                `[BEAM-CHAT] sent | message_id_sent=${sentMessageId ?? '<none>'} msg_len=${messageText.length} ` +
+                    `beamStep=${request.beamStepId || '<none>'} job=${request.jobId ?? '<none>'} ` +
+                    `skipPolling=${!!request.skipPolling}`
+            )
 
             if (!sentMessageId || request.skipPolling) {
                 // Must match the shape the polling path returns below. The client reads the sent id
