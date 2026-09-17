@@ -347,6 +347,7 @@ export class OAuthClient {
         rs: URL,
         refresh: string
     ): Promise<Token | undefined> {
+        this.validateTokenEndpoint(meta.token_endpoint)
         const formParams: Record<string, string> = {
             grant_type: 'refresh_token',
             refresh_token: refresh,
@@ -423,6 +424,7 @@ export class OAuthClient {
         if (!code || rxState !== state) throw new Error('Invalid authorization response (state mismatch)')
 
         // Exchange code for token using the auth method from DCR
+        this.validateTokenEndpoint(meta.token_endpoint)
         const tokenParams: Record<string, string> = {
             grant_type: 'authorization_code',
             code,
@@ -537,6 +539,33 @@ export class OAuthClient {
                 params.client_id = reg.client_id
                 break
         }
+    }
+
+    /**
+     * Token exchanges carry refresh tokens, authorization codes, and potentially client credentials.
+     * Require HTTPS for remote endpoints while retaining the OAuth loopback exception for local development.
+     */
+    private static validateTokenEndpoint(endpoint: string): void {
+        let url: URL
+        try {
+            url = new URL(endpoint)
+        } catch {
+            throw new Error('OAuth: token endpoint is not a valid URL')
+        }
+
+        if (url.protocol === 'https:') {
+            return
+        }
+
+        const hostname = url.hostname.toLowerCase()
+        const isLoopbackHttp =
+            url.protocol === 'http:' &&
+            (hostname === 'localhost' || hostname === '[::1]' || hostname.startsWith('127.'))
+        if (isLoopbackHttp) {
+            return
+        }
+
+        throw new Error('OAuth: token endpoint must use HTTPS unless it is a loopback address')
     }
 
     /** Await server.listen() with error rejection for immediate handling. */
