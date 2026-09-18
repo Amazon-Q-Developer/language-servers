@@ -30,11 +30,11 @@ describe('FsRead Tool', () => {
     })
 
     after(async () => {
-        tempFolder.delete()
+        await tempFolder.delete()
     })
 
     afterEach(async () => {
-        tempFolder.clear()
+        await tempFolder.clear()
     })
 
     it('invalidates empty path', async () => {

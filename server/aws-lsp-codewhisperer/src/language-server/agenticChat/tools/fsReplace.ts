@@ -1,7 +1,12 @@
-import { CommandValidation, ExplanatoryParams, InvokeOutput, requiresPathAcceptance } from './toolShared'
+import {
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+} from './toolShared'
 import { EmptyPathError, EmptyDiffsError, FileNotExistsError, TextNotFoundError, MultipleMatchesError } from '../errors'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import * as os from 'os'
 
 interface BaseParams extends ExplanatoryParams {
@@ -37,7 +42,7 @@ export class FsReplace {
         if (!params.diffs || params.diffs.length === 0) {
             throw new EmptyDiffsError()
         }
-        const sanitizedPath = sanitize(params.path)
+        const sanitizedPath = await resolveCanonicalPath(params.path)
         const fileExists = await this.workspace.fs.exists(sanitizedPath)
         if (!fileExists) {
             throw new FileNotExistsError()
@@ -45,7 +50,7 @@ export class FsReplace {
     }
 
     public async invoke(params: FsReplaceParams): Promise<InvokeOutput> {
-        const sanitizedPath = sanitize(params.path)
+        const sanitizedPath = await resolveCanonicalPath(params.path)
 
         await this.handleReplace(params, sanitizedPath)
 

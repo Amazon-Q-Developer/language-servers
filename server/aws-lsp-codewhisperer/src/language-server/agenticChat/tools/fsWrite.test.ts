@@ -108,10 +108,13 @@ describe('FsWrite Tool', function () {
             // Wait a bit for the async void call to complete
             await new Promise(resolve => setTimeout(resolve, 10))
 
-            // Verify updateIndexAndContextCommand was called with correct parameters
+            // Verify updateIndexAndContextCommand was called with correct parameters.
+            // The tool writes to the resolved path, so the indexed path is the
+            // canonical one (on Windows that expands 8.3 short names such as
+            // RUNNER~1 to their long form).
             assert.ok(mockController.updateIndexAndContextCommand.calledOnce)
             const [paths, isAdded] = mockController.updateIndexAndContextCommand.firstCall.args
-            assert.deepStrictEqual(paths, [URI.file(filePath).fsPath])
+            assert.deepStrictEqual(paths, [URI.file(await fs.realpath(filePath)).fsPath])
             assert.strictEqual(isAdded, true)
         })
 

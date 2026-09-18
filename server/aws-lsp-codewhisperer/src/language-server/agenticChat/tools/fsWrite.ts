@@ -1,7 +1,12 @@
-import { CommandValidation, ExplanatoryParams, InvokeOutput, requiresPathAcceptance } from './toolShared'
+import {
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+} from './toolShared'
 import { EmptyPathError, MissingContentError, FileExistsWithSameContentError, EmptyAppendContentError } from '../errors'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
 import { URI } from 'vscode-uri'
 
@@ -41,7 +46,7 @@ export class FsWrite {
         if (!params.path) {
             throw new EmptyPathError()
         }
-        const sanitizedPath = sanitize(params.path)
+        const sanitizedPath = await resolveCanonicalPath(params.path)
         switch (params.command) {
             case 'create': {
                 if (params.fileText === undefined) {
@@ -65,7 +70,7 @@ export class FsWrite {
     }
 
     public async invoke(params: FsWriteParams): Promise<InvokeOutput> {
-        const sanitizedPath = sanitize(params.path)
+        const sanitizedPath = await resolveCanonicalPath(params.path)
         let content = ''
         switch (params.command) {
             case 'create':
