@@ -2552,9 +2552,11 @@ export class ATXTransformHandler {
      * name, then inspect its LBV descendant: OPEN = the LBV node exists and is non-terminal
      * (PENDING_HUMAN_INPUT / IN_PROGRESS / NOT_STARTED); CLOSED = terminal (SUCCEEDED / COMPLETED /
      * FAILED / STOPPED). Returns TRUE (open) when we can't resolve it — no plan yet, node not
-     * found, or no LBV child — so a freshly transferred repo is never hidden before its LBV status
-     * is known (the IDE mirrors this default). The caller skips this call entirely when no plan is
-     * available.
+     * found, or no LBV child on a still-live repo node — so a freshly transferred repo is never
+     * hidden before its LBV status is known (the IDE mirrors this default). The one exception is a
+     * repo node that is itself terminal with no LBV child: that beam ended without ever opening
+     * LBV, so it is CLOSED rather than forever-pending. The caller skips this call entirely when no
+     * plan is available.
      */
     private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string, jobId: string): boolean {
         const repoNode = this.findBeamedRepoNode(planRoot, repoName)
@@ -2568,6 +2570,22 @@ export class ATXTransformHandler {
 
         const lbvNode = this.findLbvNode(repoNode)
         if (!lbvNode) {
+            // No LBV child. Two very different states look identical here: a fresh transfer whose
+            // sub-agent hasn't created the HITL YET, and a beam whose sub-agent never booted and was
+            // reaped by the web orchestrator's spawn-gap recovery (which stops the instance and marks
+            // this repo node terminal). Only the repo node's own status separates them — so read it
+            // before defaulting to open, or a reaped repo sits in the Transferred list forever with a
+            // disabled Load button and no explanation (its re-beam notice goes to the job owner, not
+            // to whoever is waiting in the IDE). Safe on re-beam: the orchestrator re-drives this
+            // node to IN_PROGRESS before reusing it, so a re-beamed repo reads live again.
+            if (this.isTerminalStepStatus(repoNode.Status)) {
+                this.logging.log(
+                    `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' node='${repoNode.StepName}' ` +
+                        `repoStatus=${repoNode.Status} → CLOSED: no Local Build Verification child and the repo node is ` +
+                        `terminal, so the beam ended without ever opening LBV (spawn-gap reap or cancel)`
+                )
+                return false
+            }
             // no LBV node yet → still pending
             this.logging.log(
                 `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
