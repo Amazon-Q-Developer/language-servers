@@ -4518,3 +4518,59 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         })
     })
 })
+
+describe('ATXTransformHandler - isRepoLbvOpen: repo node terminal with no LBV child', () => {
+    // Both directions are asserted deliberately. The gate here reads correctly either way, so a
+    // one-sided test cannot tell a working gate from an unreachable one: removing the branch and
+    // inverting it produce different failures, and only covering both catches both.
+    let handler: ATXTransformHandler
+
+    const planWith = (repoStatus: string, lbvChild?: { StepName: string; Status: string }) => ({
+        StepName: 'root',
+        Status: 'IN_PROGRESS',
+        Children: [
+            {
+                StepName: 'alice (beamed)',
+                Status: repoStatus,
+                Children: lbvChild ? [lbvChild] : [],
+            },
+        ],
+    })
+
+    const isOpen = (plan: any) => (handler as any).isRepoLbvOpen(plan, 'alice', 'job-1') as boolean
+
+    beforeEach(() => {
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            { log: sinon.stub(), error: sinon.stub() } as any,
+            {} as Runtime
+        )
+    })
+
+    afterEach(() => sinon.restore())
+
+    it('CLOSED when the repo node is terminal and has no LBV child — a reaped beam must drop off', () => {
+        // Fails if the branch is removed: without it this returns the default OPEN and the repo
+        // sits in the Transferred list forever with a disabled Load button.
+        expect(isOpen(planWith('STOPPED'))).to.be.false
+    })
+
+    it('CLOSED on a cancelled repo node with no LBV child', () => {
+        expect(isOpen(planWith('CANCELLED'))).to.be.false
+    })
+
+    it('OPEN when the repo node is still live and has no LBV child — a fresh transfer must stay', () => {
+        // Fails if the branch fires on the wrong side: over-gating here hides every repo whose
+        // sub-agent has not yet created its HITL, which is the normal state right after a beam.
+        expect(isOpen(planWith('IN_PROGRESS'))).to.be.true
+    })
+
+    it('still defers to the LBV child when one exists, terminal repo node notwithstanding', () => {
+        // The new branch must not shadow the original signal: with an LBV child present its status
+        // decides, so a repo whose build is still running stays visible even if the parent node has
+        // been marked terminal early.
+        const plan = planWith('SUCCEEDED', { StepName: 'Local Build Verification', Status: 'IN_PROGRESS' })
+        expect(isOpen(plan)).to.be.true
+    })
+})
