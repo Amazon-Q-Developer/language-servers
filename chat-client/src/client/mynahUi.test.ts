@@ -105,11 +105,8 @@ describe('MynahUI', () => {
     })
 
     afterEach(() => {
+        mynahUi.destroy()
         sinon.restore()
-
-        Object.keys(mynahUi.getAllTabs()).forEach(tabId => {
-            mynahUi.removeTab(tabId, (mynahUi as any).lastEventId)
-        })
     })
 
     describe('handleChatPrompt', () => {
@@ -773,14 +770,18 @@ describe('MynahUI', () => {
                 stringOverrides
             )
 
-            // Access the config texts from the instance
-            const configTexts = (customMynahUi as any).props.config.texts
+            try {
+                // Access the config texts from the instance
+                const configTexts = (customMynahUi as any).props.config.texts
 
-            // Verify that string overrides were applied and defaults are preserved
-            strictEqual(configTexts.spinnerText, 'Custom loading message...')
-            strictEqual(configTexts.stopGenerating, 'Custom stop text')
-            strictEqual(configTexts.showMore, 'Custom show more text')
-            strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+                // Verify that string overrides were applied and defaults are preserved
+                strictEqual(configTexts.spinnerText, 'Custom loading message...')
+                strictEqual(configTexts.stopGenerating, 'Custom stop text')
+                strictEqual(configTexts.showMore, 'Custom show more text')
+                strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+            } finally {
+                customMynahUi.destroy()
+            }
         })
     })
 
@@ -841,6 +842,11 @@ describe('withAdapter', () => {
             true
         )
         mynahUi = mynahUiResult[0]
+    })
+
+    afterEach(() => {
+        mynahUi.destroy()
+        sinon.restore()
     })
 
     it('should instantiate and inject mynahUIRef to Adapter', () => {

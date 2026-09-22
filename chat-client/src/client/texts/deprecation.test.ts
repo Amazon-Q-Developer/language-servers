@@ -13,10 +13,10 @@ describe('deprecationCard', () => {
         assert.equal(deprecationCard.canBeDismissed, true)
         assert.equal(deprecationCard.header?.icon, 'warning')
         assert.equal(deprecationCard.header?.iconStatus, 'warning')
-        assert.equal(deprecationCard.header?.body, '### Deprecation notice')
+        assert.equal(deprecationCard.header?.body, '### Amazon Q Developer IDE plugins: end of support')
         assert.equal(
             deprecationCard.body,
-            'On April 30, 2027, AWS will discontinue support for Amazon Q Developer IDE plugins. For capabilities similar to Amazon Q Developer IDE plugins, explore Kiro to access the latest models and features, including agentic coding, chat and MCP support.\n\n[Learn more](https://kiro.dev)'
+            'On April 30, 2027, AWS will discontinue support for Amazon Q Developer IDE plugins. For capabilities similar to Amazon Q Developer IDE plugins, [explore Kiro](https://kiro.dev) to access the latest models and features, including agentic coding, chat and MCP support.\n\n[Learn more](https://aws.amazon.com/blogs/devops/amazon-q-developer-end-of-support-announcement/)'
         )
     })
 })
