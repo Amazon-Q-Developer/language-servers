@@ -389,6 +389,33 @@ describe('Chat', () => {
     })
 
     describe('chatOptions', () => {
+        it('preserves the deprecation notice presentation when chat notifications are added', () => {
+            const chatOptionsRequest = createInboundEvent({
+                command: CHAT_OPTIONS,
+                params: {
+                    chatNotifications: [
+                        {
+                            messageId: 'server-notification',
+                            type: 'answer',
+                            body: 'Server notification',
+                        },
+                    ],
+                },
+            })
+
+            window.dispatchEvent(chatOptionsRequest)
+
+            const chatItems = mynahUi.getTabData(initialTabId).getStore()?.chatItems
+            const notice = chatItems?.find(item => item.messageId === deprecationCard.messageId)
+
+            assert.match(chatItems?.[0].messageId, 'server-notification')
+            assert.match(notice?.title, deprecationCard.title)
+            assert.match(notice?.status, deprecationCard.status)
+            assert.match(notice?.border, deprecationCard.border)
+            assert.match(notice?.fullWidth, deprecationCard.fullWidth)
+            assert.match(notice?.canBeDismissed, deprecationCard.canBeDismissed)
+        })
+
         it('enables history and export features support', () => {
             const chatOptionsRequest = createInboundEvent({
                 command: CHAT_OPTIONS,

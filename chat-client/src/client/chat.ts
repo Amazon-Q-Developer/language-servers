@@ -43,7 +43,6 @@ import {
     CONTEXT_COMMAND_NOTIFICATION_METHOD,
     CONVERSATION_CLICK_REQUEST_METHOD,
     CREATE_PROMPT_NOTIFICATION_METHOD,
-    ChatMessage,
     ChatOptionsUpdateParams,
     ChatParams,
     ChatUpdateParams,
@@ -358,7 +357,7 @@ export const createChat = (
                     // that tab does not have banner message, which arrives in ChatOptions above.
                     const store = mynahUi.getTabData(tabFactory.initialTabId)?.getStore() || {}
                     const chatItems = store.chatItems || []
-                    const updatedInitialItems = tabFactory.getChatItems(false, false, chatItems as ChatMessage[])
+                    const updatedInitialItems = [...tabFactory.getChatItems(false, false), ...chatItems]
 
                     // First clear the tab, so that messages are not appended https://github.com/aws/mynah-ui/blob/38608dff905b3790d85c73e2911ec7071c8a8cdf/docs/USAGE.md#using-updatestore-function
                     mynahUi.updateStore(tabFactory.initialTabId, {
