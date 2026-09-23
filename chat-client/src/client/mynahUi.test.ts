@@ -165,14 +165,14 @@ describe('MynahUI', () => {
             sinon.assert.calledWith(getChatItemsStub, true, true)
         })
 
-        it('should create a new tab with welcome messages without repeating the deprecation card', () => {
+        it('should show the deprecation card in each new tab until it is acknowledged', () => {
             createTabStub.resetHistory()
             getChatItemsStub.resetHistory()
 
             inboundChatApi.openTab(requestId, {})
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, undefined)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -206,6 +206,31 @@ describe('MynahUI', () => {
             sinon.assert.calledOnceWithExactly(getChatItemsStub, false, false, mockMessages)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
+        })
+
+        it('should show the deprecation card in a new tab after a restored chat is opened', () => {
+            const mockMessages: ChatMessage[] = [
+                {
+                    messageId: 'restored-message',
+                    body: 'Restored response',
+                    type: ChatItemType.ANSWER,
+                },
+            ]
+
+            createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
+
+            inboundChatApi.openTab(requestId, {
+                newTabOptions: {
+                    data: {
+                        messages: mockMessages,
+                    },
+                },
+            })
+            inboundChatApi.openTab(requestId, {})
+
+            sinon.assert.calledWithExactly(getChatItemsStub.firstCall, false, false, mockMessages)
+            sinon.assert.calledWithExactly(getChatItemsStub.secondCall, true, true, undefined)
         })
 
         it('should call onOpenTab if a new tab if tabId not passed and tab not created', () => {
@@ -268,7 +293,7 @@ describe('MynahUI', () => {
             inboundChatApi.sendGenericCommand({ genericCommand, selection, tabId, triggerType })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, [])
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, [])
             // updateStore is called four times for a brand new tab:
             //   1. onTabAdd seeds the tab (chatItems + welcome tabHeaderDetails)
             //   2. handleChatPrompt clears the welcome splash before the first prompt
@@ -786,21 +811,54 @@ describe('MynahUI', () => {
     })
 
     describe('onMessageDismiss', () => {
-        it('acknowledges the deprecation card and removes it from future new chats', () => {
+        it('acknowledges the deprecation card and removes it from every open and future new chat', () => {
             const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
-
+            const retainedItem = {
+                messageId: 'retained-message',
+                type: ChatItemType.ANSWER,
+                body: 'Keep me',
+            }
+            getAllTabsStub.returns({
+                'tab-1': {
+                    store: {
+                        chatItems: [deprecationCard, retainedItem],
+                    },
+                },
+                'tab-2': {
+                    store: {
+                        chatItems: [deprecationCard],
+                    },
+                },
+                'tab-3': {
+                    store: {
+                        chatItems: [retainedItem],
+                    },
+                },
+            })
+            updateStoreSpy.resetHistory()
             ;(mynahUi as any).props.onMessageDismiss('tab-1', deprecationCard.messageId)
 
             sinon.assert.calledWithExactly(
                 outboundChatApi.chatPromptOptionAcknowledged as sinon.SinonStub,
                 deprecationCard.messageId
             )
+            sinon.assert.calledWithExactly(updateStoreSpy, 'tab-1', { chatItems: [retainedItem] })
+            sinon.assert.calledWithExactly(updateStoreSpy, 'tab-2', { chatItems: [] })
+            sinon.assert.neverCalledWith(updateStoreSpy, 'tab-3', sinon.match.any)
             sinon.assert.calledWithExactly(getChatItemsStub, true, false)
             sinon.assert.calledWithExactly(updateTabDefaultsSpy, {
                 store: {
                     chatItems: [],
                 },
             })
+
+            createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
+
+            inboundChatApi.openTab(requestId, {})
+
+            sinon.assert.calledOnceWithExactly(createTabStub, false)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
         })
     })
 })

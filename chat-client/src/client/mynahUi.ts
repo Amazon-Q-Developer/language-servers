@@ -333,25 +333,8 @@ export const createMynahUi = (
 ): [MynahUI, InboundChatApi] => {
     let disclaimerCardActive = !disclaimerAcknowledged
     let deprecationCardActive = !deprecationNoticeAcknowledged
-    let deprecationCardShownInCurrentInstance = false
     let contextCommandGroups: ContextCommandGroups | undefined
     let lastFilterTabId: string | undefined
-
-    const shouldShowDeprecationCard = (tabId: string): boolean => {
-        if (!deprecationCardActive) {
-            return false
-        }
-
-        // Mynah initializes the first tab through both the initial data model and
-        // onTabAdd. Allow both writes for that tab, but suppress the card for every
-        // subsequent tab created in this chat-client instance.
-        if (deprecationCardShownInCurrentInstance && tabId !== tabFactory.initialTabId) {
-            return false
-        }
-
-        deprecationCardShownInCurrentInstance = true
-        return true
-    }
 
     let chatEventHandlers: ChatEventHandler = {
         onCodeInsertToCursorPosition(
@@ -452,7 +435,7 @@ export const createMynahUi = (
             // We check if tabMetadata.openTabKey exists - if it does and is set to true, we skip showing welcome messages
             // since this indicates we're loading a previous chat session rather than starting a new one.
             if (!tabStore?.tabMetadata || !tabStore.tabMetadata.openTabKey) {
-                defaultTabConfig.chatItems = tabFactory.getChatItems(true, shouldShowDeprecationCard(tabId), [])
+                defaultTabConfig.chatItems = tabFactory.getChatItems(true, deprecationCardActive, [])
                 // Roll a fresh "Did you know?" tip for every new tab. The
                 // mynah-ui defaults.store is built once at startup, so without
                 // this override every new tab would inherit the same cached tip.
@@ -734,6 +717,16 @@ export const createMynahUi = (
                 deprecationCardActive = false
                 messager.onChatPromptOptionAcknowledged(messageId)
 
+                // Mynah removes the dismissed item from the active tab. Remove
+                // any remaining copies from the other open tabs as well.
+                Object.entries(mynahUi.getAllTabs()).forEach(([storeTabId, tabData]) => {
+                    const chatItems = tabData.store?.chatItems
+                    const updatedChatItems = chatItems?.filter(item => item.messageId !== deprecationCard.messageId)
+                    if (updatedChatItems && updatedChatItems.length !== chatItems?.length) {
+                        mynahUi.updateStore(storeTabId, { chatItems: updatedChatItems })
+                    }
+                })
+
                 // Update the tab defaults to hide the acknowledged card for new tabs.
                 mynahUi.updateTabDefaults({
                     store: {
@@ -841,7 +834,7 @@ export const createMynahUi = (
                 isSelected: true,
                 store: {
                     ...tabFactory.createTab(disclaimerCardActive),
-                    chatItems: tabFactory.getChatItems(true, shouldShowDeprecationCard(tabFactory.initialTabId)),
+                    chatItems: tabFactory.getChatItems(true, deprecationCardActive),
                 },
             },
         },
@@ -1425,7 +1418,7 @@ ${params.message}`,
                 mynahUi.updateStore(tabId, {
                     chatItems: tabFactory.getChatItems(
                         needWelcomeMessages,
-                        needWelcomeMessages && shouldShowDeprecationCard(tabId),
+                        needWelcomeMessages && deprecationCardActive,
                         messages
                     ),
                     // onTabAdd suppresses the welcome splash whenever
