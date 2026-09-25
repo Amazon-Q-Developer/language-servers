@@ -4738,10 +4738,15 @@ export class ATXTransformHandler {
         savePath: string,
         artifactName?: string
     ): Promise<{ Success: boolean; FilePath?: string; Error?: string }> {
+        // Tracked outside the try so a mid-download failure can report how far it got
+        // (distinguishes a stalled connection from a never-started one).
+        let downloadedBytes = 0
         try {
             const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
             if (!downloadInfo) {
-                return { Success: false, Error: 'Failed to get download URL' }
+                const msg = `Failed to get download URL for artifact=${artifactId} (job=${jobId})`
+                this.logging.error(`ATX: downloadArtifactToPath ${msg}`)
+                return { Success: false, Error: msg }
             }
 
             await Utils.directoryExists(savePath)
@@ -4762,7 +4767,6 @@ export class ATXTransformHandler {
                 timeout: { response: 30000, socket: 60000 },
             })
 
-            let downloadedBytes = 0
             downloadStream.on('downloadProgress', ({ transferred }) => {
                 downloadedBytes = transferred
             })
@@ -4772,8 +4776,19 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: downloadArtifactToPath completed artifact=${artifactId}, bytes=${downloadedBytes}`)
             return { Success: true, FilePath: savePath }
         } catch (error) {
-            this.logging.error(`ATX: downloadArtifactToPath failed artifact=${artifactId}: ${String(error)}`)
-            return { Success: false, Error: String(error) }
+            // Log every failure with enough context to diagnose without a repro: the got error
+            // `code` (ETIMEDOUT/ECONNRESET/...), the timeout phase for a TimeoutError, the HTTP
+            // status for an HTTPError, bytes received before the failure, and the full stack.
+            const err = error as any
+            const diagnostics: string[] = []
+            if (err?.code) diagnostics.push(`code=${err.code}`)
+            if (err?.event) diagnostics.push(`timeoutPhase=${err.event}`)
+            if (err?.response?.statusCode) diagnostics.push(`httpStatus=${err.response.statusCode}`)
+            const suffix = diagnostics.length ? ` [${diagnostics.join(', ')}]` : ''
+            this.logging.error(
+                `ATX: downloadArtifactToPath failed artifact=${artifactId} (job=${jobId}) after ${downloadedBytes} bytes: ${String(err?.stack ?? error)}${suffix}`
+            )
+            return { Success: false, Error: `${String(err?.message ?? error)}${suffix}` }
         }
     }
 

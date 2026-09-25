@@ -3222,7 +3222,7 @@ describe('ATXTransformHandler - upload flows, polling, and small wrappers', () =
             const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', 'C:/save')
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.equal('Failed to get download URL')
+            expect(result.Error).to.contain('Failed to get download URL')
         })
 
         it('should stream a large artifact to disk without buffering the whole file', async () => {
