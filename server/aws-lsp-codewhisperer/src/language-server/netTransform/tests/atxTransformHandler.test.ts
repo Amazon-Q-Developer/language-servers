@@ -3,6 +3,8 @@ import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { Readable } from 'stream'
+import got from 'got'
 import { ATXTransformHandler } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -3221,6 +3223,59 @@ describe('ATXTransformHandler - upload flows, polling, and small wrappers', () =
 
             expect(result.Success).to.be.false
             expect(result.Error).to.equal('Failed to get download URL')
+        })
+
+        it('should stream a large artifact to disk without buffering the whole file', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                // Simulate a large payload delivered as a stream (the fix path). The old
+                // implementation buffered this in memory under a 30s whole-request timeout.
+                const payload = Buffer.alloc(5 * 1024 * 1024, 'a')
+                sinon.stub(got, 'stream').returns(Readable.from([payload]) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                const written = fs.readFileSync(path.join(saveDir, 'Transformation_Report.html'))
+                expect(written.length).to.equal(payload.length)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('should return Success=false with the error when the stream fails mid-download', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                const failing = new Readable({
+                    read() {
+                        this.destroy(new Error('socket hang up'))
+                    },
+                })
+                sinon.stub(got, 'stream').returns(failing as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
         })
     })
 
