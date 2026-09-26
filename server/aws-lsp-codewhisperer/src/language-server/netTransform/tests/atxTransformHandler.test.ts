@@ -473,6 +473,59 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTaskId).to.equal('task-lbv')
     })
 
+    it('forwards the missing-packages HITL to the IDE when a plan already exists', async () => {
+        // Regression: handleExecutionPhaseHitl (taken once a plan exists) only handles step-level
+        // HITLs and dropped HitlTag/MissingPackageJsonPath, so the IDE never showed the upload dialog.
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.HitlTaskId).to.equal('task-mp')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('forwards the handle_missing_packages_hitl tag when a plan already exists', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'handle_missing_packages_hitl',
+            TaskId: 'task-mp2',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('handle_missing_packages_hitl')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('still forwards the missing-packages HITL when no plan exists yet', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp3',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
     it('should default to PLANNING-like fallthrough for unknown statuses', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
