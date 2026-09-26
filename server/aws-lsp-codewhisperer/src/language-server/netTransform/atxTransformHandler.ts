@@ -2233,6 +2233,27 @@ export class ATXTransformHandler {
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
 
+        // missing-packages can be raised once a plan already exists (P516058803). Only the planning
+        // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
+        // ({stepId}-review) HITLs and would drop them, so the IDE never shows the package-upload
+        // dialog. Return it directly, mirroring the local-build-verification early-exit above.
+        if (hitlResponse?.HitlTag === 'missing-packages' || hitlResponse?.HitlTag === 'handle_missing_packages_hitl') {
+            this.logging.log(
+                `ATX: missing-packages HITL — returning directly to IDE (hasPlan=${hasPlan}, jsonPath=${hitlResponse.MissingPackageJsonPath ?? '<none>'})`
+            )
+            return {
+                TransformationJob: {
+                    WorkspaceId: request.WorkspaceId,
+                    JobId: request.TransformationJobId,
+                    Status: 'AWAITING_HUMAN_INPUT',
+                } as any,
+                TransformationPlan: plan,
+                HitlTag: hitlResponse.HitlTag,
+                HitlTaskId: hitlResponse.TaskId,
+                MissingPackageJsonPath: hitlResponse.MissingPackageJsonPath,
+            } as AtxGetTransformInfoResponse
+        }
+
         if (hasPlan) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
