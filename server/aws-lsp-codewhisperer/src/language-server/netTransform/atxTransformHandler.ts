@@ -3992,14 +3992,30 @@ export class ATXTransformHandler {
                 let mappedMode = 'auto'
                 if (interactiveMode === 'Interactive') mappedMode = 'interactive'
                 jsonContent.interactive_mode = mappedMode
+                // Keep the cache in step with the mode just asserted. It is what getTransformInfo
+                // reports back to the IDE on every poll, and it is the carry-forward source below,
+                // so leaving it on the job-start value after a switch makes both of those stale.
+                this.cachedInteractiveMode = interactiveMode
                 this.logging.log(`ATX: setCheckpoints interactive_mode=${mappedMode}`)
             } else {
                 // This artifact is full state and the agent reads a missing interactive_mode as
                 // "use the default" (interactive), not "leave it alone". A caller that is only
-                // syncing checkpoints has no mode to assert, so carry forward what the last write
-                // recorded - otherwise a checkpoint sync silently reverts the user's mode a few
-                // seconds after they chose it (V2381727290).
-                const carriedMode = this.readPersistedInteractiveMode(jsonFilePath)
+                // syncing checkpoints has no mode to assert, so carry forward the mode in effect -
+                // otherwise a checkpoint sync silently reverts the user's mode a few seconds after
+                // they chose it (V2381727290).
+                //
+                // Prefer the cache over the file: the cache is seeded from the settings artifact,
+                // which every client writes, whereas the file only records switches made from this
+                // machine - so preferring the file could overwrite a newer mode set from the web UI
+                // with a stale local one.
+                let carriedMode: string | null
+                if (this.cachedInteractiveMode === 'Interactive') {
+                    carriedMode = 'interactive'
+                } else if (this.cachedInteractiveMode === 'Autonomous') {
+                    carriedMode = 'auto'
+                } else {
+                    carriedMode = this.readPersistedInteractiveMode(jsonFilePath)
+                }
                 if (carriedMode) {
                     jsonContent.interactive_mode = carriedMode
                     this.logging.log(`ATX: setCheckpoints carrying forward interactive_mode=${carriedMode}`)

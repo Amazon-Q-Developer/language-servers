@@ -1978,6 +1978,30 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('interactive')
         })
 
+        it('should prefer the mode in effect over a stale local file', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            // A switch made from this machine earlier; the mode has since changed elsewhere.
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'interactive' }))
+            ;(handler as any).cachedInteractiveMode = 'Autonomous'
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        it('should update the cached mode when a switch is asserted', async () => {
+            stubUploadChain()
+            ;(handler as any).cachedInteractiveMode = 'Interactive'
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+
+            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        })
+
         it('should omit interactive_mode when there is nothing to carry forward', async () => {
             stubUploadChain()
 
