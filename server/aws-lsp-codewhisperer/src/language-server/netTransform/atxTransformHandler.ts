@@ -1810,6 +1810,26 @@ export class ATXTransformHandler {
                 } as unknown as AtxGetTransformInfoResponse
             }
 
+            // A mid-job mode change is written to the checkpoint-settings artifact and never back
+            // into the objective, which is the job-creation payload and immutable. Reading the
+            // objective alone therefore restores the mode the job STARTED in and silently discards
+            // any later switch, so reopening the IDE reverted the mode (V2381727290). Prefer the
+            // artifact - it is the store every client writes, so it also reflects a switch made
+            // from the web UI or another IDE - and keep the objective as the fallback for a job
+            // whose mode was never changed and so has no artifact yet.
+            if (this.cachedInteractiveMode === null) {
+                const modeFromSettings = await this.readInteractiveModeFromCheckpointSettings(
+                    request.WorkspaceId,
+                    request.TransformationJobId
+                )
+                if (modeFromSettings) {
+                    this.cachedInteractiveMode = modeFromSettings
+                    this.logging.log(
+                        `ATX: Determined interactive mode from checkpoint-settings artifact: ${modeFromSettings}`
+                    )
+                }
+            }
+
             // If interactive mode is not cached, try to get it from the job objective
             if (this.cachedInteractiveMode === null && job.objective) {
                 try {
@@ -3868,6 +3888,45 @@ export class ATXTransformHandler {
             return { hasMore: false }
         }
         return { hasMore: this._worklogNextTokenByJob.has(jobId) }
+    }
+
+    /**
+     * Reads the effective interactive mode from the checkpoint-settings HITL artifact, which is the
+     * only store a mid-job mode change is written to. Every client that changes the mode uploads
+     * that artifact, so it reflects a switch made from this IDE, another IDE, or the web UI -
+     * unlike objective.interactive_mode, which is fixed when the job is created. Returns null when
+     * no artifact exists yet (the mode was never changed) or it carries no recognisable mode,
+     * leaving the caller to fall back to the objective.
+     */
+    private async readInteractiveModeFromCheckpointSettings(
+        workspaceId: string,
+        jobId: string
+    ): Promise<InteractiveMode | null> {
+        try {
+            const hitlTask = await this.findCheckpointSettingsHitl(workspaceId, jobId)
+            const artifactId = hitlTask?.humanArtifact?.artifactId
+            if (!artifactId) {
+                this.logging.log('ATX: no checkpoint-settings artifact available to read interactive mode from')
+                return null
+            }
+
+            const settings = await this.downloadJsonArtifact(workspaceId, jobId, artifactId)
+            const mode = settings?.interactive_mode
+            if (mode === 'interactive') {
+                return 'Interactive'
+            }
+            if (mode === 'auto') {
+                return 'Autonomous'
+            }
+
+            this.logging.log(
+                `ATX: checkpoint-settings artifact ${artifactId} carries no usable interactive_mode (got ${String(mode)})`
+            )
+            return null
+        } catch (e) {
+            this.logging.log(`ATX: could not read interactive mode from checkpoint-settings: ${String(e)}`)
+            return null
+        }
     }
 
     /**

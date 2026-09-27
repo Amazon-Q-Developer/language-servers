@@ -610,6 +610,80 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
     })
 
+    // The objective is the job-creation payload and never changes, so restoring the mode from it
+    // discards any mid-job switch. The checkpoint-settings artifact is the store every client
+    // writes when the mode changes, so it wins (V2381727290).
+    it('should prefer the checkpoint-settings artifact over the job objective', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+    })
+
+    it('should fall back to the objective when no checkpoint-settings artifact exists', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+    })
+
+    it('should fall back to the objective when the artifact carries no usable mode', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        // A checkpoints-only write from before the carry-forward fix: checkpoints, no mode.
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ 'step-a': true })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+    })
+
+    it('should read the artifact only once, not on every poll', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        const findStub = sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+        await handler.getTransformInfo(baseRequest)
+
+        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(findStub.callCount).to.equal(1)
+    })
+
     it('should return null when getJob throws', async () => {
         getJobStub.rejects(new Error('network'))
 
