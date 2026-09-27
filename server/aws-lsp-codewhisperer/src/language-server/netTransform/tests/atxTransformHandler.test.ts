@@ -1863,6 +1863,83 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('auto')
         })
 
+        // The settings artifact is full state and the agent reads a missing interactive_mode as
+        // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
+        // must not drop a mode the user already chose (V2381727290).
+        const stubUploadChain = () => {
+            sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+            sinon.stub(handler, 'createArtifactUploadUrl').resolves({
+                uploadUrl: 'u',
+                uploadId: 'upload-1',
+                requestHeaders: {},
+            } as any)
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true } as any)
+            sinon.stub(handler, 'updateHitl').resolves({ ok: true })
+        }
+
+        const settingsPathFor = (jobId: string) =>
+            path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'checkpoint-settings.json')
+
+        it('should carry forward a previously written interactive_mode when none is supplied', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true }, 'Autonomous')
+            // A periodic checkpoints-only sync: no mode to assert.
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': false })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written['step-a']).to.equal(false)
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        it('should let an explicit mode override the carried-forward one', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Interactive')
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written.interactive_mode).to.equal('interactive')
+        })
+
+        it('should omit interactive_mode when there is nothing to carry forward', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should ignore an unrecognised persisted interactive_mode rather than echo it', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'bogus' }))
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should not fail the sync when the persisted settings file is corrupt', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, '{ not json')
+
+            const result = await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            expect(result.Success).to.be.true
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written['step-a']).to.equal(true)
+        })
+
         it('should return error when uploadArtifact fails', async () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({

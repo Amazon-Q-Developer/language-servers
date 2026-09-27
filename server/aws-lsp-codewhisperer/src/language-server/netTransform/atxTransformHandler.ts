@@ -3871,6 +3871,26 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Reads interactive_mode back out of the last checkpoint-settings.json we wrote, so a
+     * checkpoints-only sync can preserve it instead of dropping it. Returns null when the file is
+     * absent, unreadable, or holds a value the agent would not recognise - in which case the caller
+     * writes no mode and the agent falls back to its default.
+     */
+    private readPersistedInteractiveMode(jsonFilePath: string): string | null {
+        try {
+            if (!fs.existsSync(jsonFilePath)) {
+                return null
+            }
+            const previous = JSON.parse(fs.readFileSync(jsonFilePath, 'utf8'))
+            const mode = previous?.interactive_mode
+            return mode === 'interactive' || mode === 'auto' ? mode : null
+        } catch (e) {
+            this.logging.log(`ATX: could not read previous checkpoint-settings for interactive_mode: ${String(e)}`)
+            return null
+        }
+    }
+
+    /**
      * Set checkpoints for interactive mode transformation.
      * Lists HITLs with "checkpoint-settings" tag, uploads checkpoints as JSON artifact,
      * and updates the HITL task with the new artifact ID.
@@ -3904,6 +3924,8 @@ export class ATXTransformHandler {
                 fs.mkdirSync(artifactDir, { recursive: true })
             }
 
+            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
+
             // Build JSON content with optional interactiveMode
             const jsonContent: Record<string, any> = { ...checkpoints }
             if (interactiveMode) {
@@ -3912,9 +3934,23 @@ export class ATXTransformHandler {
                 if (interactiveMode === 'Interactive') mappedMode = 'interactive'
                 jsonContent.interactive_mode = mappedMode
                 this.logging.log(`ATX: setCheckpoints interactive_mode=${mappedMode}`)
+            } else {
+                // This artifact is full state and the agent reads a missing interactive_mode as
+                // "use the default" (interactive), not "leave it alone". A caller that is only
+                // syncing checkpoints has no mode to assert, so carry forward what the last write
+                // recorded - otherwise a checkpoint sync silently reverts the user's mode a few
+                // seconds after they chose it (V2381727290).
+                const carriedMode = this.readPersistedInteractiveMode(jsonFilePath)
+                if (carriedMode) {
+                    jsonContent.interactive_mode = carriedMode
+                    this.logging.log(`ATX: setCheckpoints carrying forward interactive_mode=${carriedMode}`)
+                } else {
+                    this.logging.log(
+                        'ATX: setCheckpoints has no interactive_mode to carry forward - agent will apply its default'
+                    )
+                }
             }
 
-            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
             this.logging.log(`ATX: Writing checkpoint-settings.json to ${jsonFilePath}`)
             fs.writeFileSync(jsonFilePath, JSON.stringify(jsonContent, null, 2))
 
