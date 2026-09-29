@@ -1,4 +1,4 @@
-import { expect } from 'chai'
+﻿import { expect } from 'chai'
 import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -7,6 +7,16 @@ import { ATXTransformHandler } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+
+// The interactive-mode cache is keyed by job id, so tests reach it through these rather than a
+// single field. Job scoping is what stops one job's mode being written into another's artifact.
+function cachedMode(handler: any, jobId: string): string | undefined {
+    return handler.interactiveModeByJob.get(jobId)?.mode
+}
+
+function setCachedMode(handler: any, jobId: string, mode: string, source = 'test'): void {
+    handler.interactiveModeByJob.set(jobId, { mode, source })
+}
 
 describe('ATXTransformHandler - Chat APIs', () => {
     let handler: ATXTransformHandler
@@ -594,10 +604,10 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
-    it('should default cachedInteractiveMode to Autonomous when objective is unparseable', async () => {
+    it('should default the cached mode to Autonomous when objective is unparseable', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
             objective: 'not-json',
@@ -607,7 +617,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
     })
 
     // The objective is the job-creation payload and never changes, so restoring the mode from it
@@ -628,7 +638,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
     })
 
     it('should fall back to the objective when no checkpoint-settings artifact exists', async () => {
@@ -642,7 +652,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
     it('should fall back to the objective when the artifact carries no usable mode', async () => {
@@ -661,7 +671,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
     it('should read the artifact only once, not on every poll', async () => {
@@ -680,7 +690,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         await handler.getTransformInfo(baseRequest)
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
         expect(findStub.callCount).to.equal(1)
     })
 
@@ -1985,7 +1995,7 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
             // A switch made from this machine earlier; the mode has since changed elsewhere.
             fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'interactive' }))
-            ;(handler as any).cachedInteractiveMode = 'Autonomous'
+            setCachedMode(handler, 'job-1', 'Autonomous')
 
             await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
 
@@ -1993,13 +2003,36 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('auto')
         })
 
+        // The handler outlives any single job, so an unscoped cache would let one job's mode be
+        // written into another job's settings artifact - which the agent treats as authoritative.
+        it("should not carry one job's mode into another job's artifact", async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-2'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it("should keep each job's asserted mode separate", async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, {}, 'Interactive')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-2')).to.equal('Interactive')
+        })
+
         it('should update the cached mode when a switch is asserted', async () => {
             stubUploadChain()
-            ;(handler as any).cachedInteractiveMode = 'Interactive'
+            setCachedMode(handler, 'job-1', 'Interactive')
 
             await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
         })
 
         it('should omit interactive_mode when there is nothing to carry forward', async () => {
@@ -2536,7 +2569,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+            expect(cachedMode(handler, 'job-1')).to.equal('Interactive')
         })
 
         it('should default cached interactive mode to Autonomous when not specified', async () => {
@@ -2557,7 +2590,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
         })
     })
 })
@@ -4156,12 +4189,12 @@ describe('ATXTransformHandler - final coverage push', () => {
         it('should null-out all cached HITL state', () => {
             ;(handler as any).cachedHitl = 'h'
             ;(handler as any).cachedStepHitl = 's'
-            ;(handler as any).cachedInteractiveMode = 'Interactive'
-            ;(handler as any).clearJobCache()
+            setCachedMode(handler, 'job-1', 'Interactive')
+            ;(handler as any).clearJobCache('job-1')
 
             expect((handler as any).cachedHitl).to.be.null
             expect((handler as any).cachedStepHitl).to.be.null
-            expect((handler as any).cachedInteractiveMode).to.be.null
+            expect(cachedMode(handler, 'job-1')).to.be.undefined
         })
     })
 
