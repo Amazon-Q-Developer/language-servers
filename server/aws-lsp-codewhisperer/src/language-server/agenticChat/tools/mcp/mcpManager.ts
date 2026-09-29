@@ -460,42 +460,60 @@ export class McpManager {
                 const headerLine = headerNames.length > 0 ? `Headers: ${headerNames.join(', ').slice(0, 200)}\n` : ''
                 const allowBtn = { title: 'Allow for this server' }
                 const denyBtn = { title: 'Deny' }
-                let choice: { title: string } | null | undefined
-                try {
-                    choice = await this.features.lsp.window.showMessageRequest({
-                        type: MessageType.Warning,
-                        message:
-                            `Amazon Q — Untrusted MCP Server\n\n` +
-                            `A workspace configuration file wants to start an MCP server.\n` +
-                            `Server: ${serverName}\n` +
-                            `Command: ${cmdLine}\n` +
-                            envLine +
-                            headerLine +
-                            `Source: ${configPath}\n\n` +
-                            `Running this server executes the above command on your machine, ` +
-                            `with the environment variables listed above. ` +
-                            `Review them in the configuration file if you are unsure — variables such as ` +
-                            `NODE_OPTIONS can cause additional code to run. ` +
-                            `Only allow if you trust the authors of this workspace.\n\n` +
-                            `Your choice will be remembered for this workspace. ` +
-                            `If you allow, you won't be asked again unless the server configuration changes.`,
-                        actions: [allowBtn, denyBtn],
-                    })
-                } catch (e: any) {
-                    this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
-                    this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
-                    return
+                const reviewBtn = { title: 'View full configuration' }
+
+                while (true) {
+                    let choice: { title: string } | null | undefined
+                    try {
+                        choice = await this.features.lsp.window.showMessageRequest({
+                            type: MessageType.Warning,
+                            message:
+                                `Amazon Q — Untrusted MCP Server\n\n` +
+                                `A workspace configuration file wants to start an MCP server.\n` +
+                                `Server: ${serverName}\n` +
+                                `Command: ${cmdLine}\n` +
+                                envLine +
+                                headerLine +
+                                `Source: ${configPath}\n\n` +
+                                `Running this server executes the above command on your machine, ` +
+                                `with the environment variables listed above. ` +
+                                `Use View full configuration to inspect the source before allowing. ` +
+                                `Variables such as NODE_OPTIONS can cause additional code to run. ` +
+                                `Only allow if you trust the authors of this workspace.\n\n` +
+                                `Your choice will be remembered for this workspace. ` +
+                                `If you allow, you won't be asked again unless the server configuration changes.`,
+                            actions: [reviewBtn, allowBtn, denyBtn],
+                        })
+                    } catch (e: any) {
+                        this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
+                        this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
+                        return
+                    }
+                    if (choice?.title === reviewBtn.title) {
+                        try {
+                            await this.features.lsp.window.showDocument({
+                                uri: URI.file(configPath).toString(),
+                                takeFocus: true,
+                            })
+                        } catch (e: any) {
+                            this.features.logging.warn(
+                                `MCP: failed to open configuration for '${serverName}': ${e?.message}`
+                            )
+                        }
+                        continue
+                    }
+                    if (choice?.title !== allowBtn.title) {
+                        this.features.logging.info(
+                            `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
+                        )
+                        this.sessionDeniedConsent.add(denyKey)
+                        this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
+                        return
+                    }
+                    await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
+                    this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
+                    break
                 }
-                if (choice?.title !== allowBtn.title) {
-                    this.features.logging.info(
-                        `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
-                    )
-                    this.sessionDeniedConsent.add(denyKey)
-                    this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
-                    return
-                }
-                await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
-                this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
             }
         }
 

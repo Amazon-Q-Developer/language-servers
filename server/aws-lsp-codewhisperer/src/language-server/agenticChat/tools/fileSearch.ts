@@ -1,8 +1,13 @@
 // FileSearch tool based on ListDirectory implementation
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import {
+    CommandValidation,
+    InvokeOutput,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    validatePath,
+} from './toolShared'
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILES } from '../../chat/constants'
 import { CancellationToken } from '@aws/language-server-runtimes/protocol'
 const Fuse = require('fuse.js')
@@ -56,7 +61,7 @@ export class FileSearch {
     }
 
     public async invoke(params: FileSearchParams, token?: CancellationToken): Promise<InvokeOutput> {
-        const path = sanitize(params.path)
+        const path = await resolveCanonicalPath(params.path)
         try {
             // Get all files and directories
             const listing = await workspaceUtils.readDirectoryRecursively(
