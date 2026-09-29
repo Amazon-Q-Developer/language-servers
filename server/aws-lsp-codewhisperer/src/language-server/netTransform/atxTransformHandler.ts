@@ -5,6 +5,8 @@ import got from 'got'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
+import { SignatureV4 } from '@smithy/signature-v4'
+import { Sha256 } from '@aws-crypto/sha256-js'
 import AdmZip = require('adm-zip')
 import { ArtifactManager } from './artifactManager'
 import {
@@ -222,6 +224,20 @@ export class ATXTransformHandler {
             throw new Error('Please select a valid Transform profile to continue')
         }
 
+        const authType = this.serviceManager.getAuthType()
+
+        // IAM path: SigV4-sign the request. Additive branch; the bearer path below is unchanged.
+        if (authType === 'iam') {
+            await this.addSigV4AuthToCommand(command)
+            return
+        }
+
+        // No active auth (IAM credentials present but tenant URL not yet configured, or nothing
+        // signed in): fail before the request reaches the network.
+        if (authType !== 'bearer') {
+            throw new Error('AWS Transform is not signed in - no active authentication')
+        }
+
         const bearerToken = await this.serviceManager.getBearerToken()
         const applicationUrl = await this.getActiveTransformProfileApplicationUrl()
 
@@ -251,6 +267,71 @@ export class ATXTransformHandler {
             {
                 step: 'build',
                 name: 'addAtxAuthMiddleware',
+                priority: 'high',
+            }
+        )
+    }
+
+    /**
+     * SigV4-sign an ATX FES command using the active IAM credentials (service name `transform`).
+     * Region is derived from the tenant URL exactly like the bearer path (getRegionFromProfile), and
+     * the tenant URL is attached as the Origin header, matching the bearer path.
+     */
+    private async addSigV4AuthToCommand(command: any): Promise<void> {
+        const iamCredentials = this.serviceManager.getIamCredentials()
+        const region = (await this.getRegionFromProfile()) || DEFAULT_ATX_FES_REGION
+        const applicationUrl = await this.getActiveTransformProfileApplicationUrl()
+        const cleanOrigin = applicationUrl
+            ? applicationUrl.endsWith('/')
+                ? applicationUrl.slice(0, -1)
+                : applicationUrl
+            : undefined
+
+        const signer = new SignatureV4({
+            service: 'transform',
+            region,
+            credentials: {
+                accessKeyId: iamCredentials.accessKeyId,
+                secretAccessKey: iamCredentials.secretAccessKey,
+                sessionToken: iamCredentials.sessionToken,
+            },
+            sha256: Sha256,
+        })
+
+        this.logging.log(`ATX: Using IAM (SigV4) auth for FES request (service=transform, region=${region})`)
+
+        command.middlewareStack?.add(
+            (next: any) => async (args: any) => {
+                if (!args.request.headers) {
+                    args.request.headers = {}
+                }
+
+                // Set headers case-insensitively (removing any existing case variant) BEFORE signing.
+                // The smithy client already sets a lowercase 'content-type'; a second differently-cased
+                // key would be signed but merged by the HTTP layer on send, invalidating the signature.
+                const setHeader = (name: string, value: string) => {
+                    for (const key of Object.keys(args.request.headers)) {
+                        if (key.toLowerCase() === name.toLowerCase()) {
+                            delete args.request.headers[key]
+                        }
+                    }
+                    args.request.headers[name] = value
+                }
+                setHeader('content-type', 'application/json; charset=UTF-8')
+                setHeader('content-encoding', 'amz-1.0')
+                if (cleanOrigin) {
+                    setHeader('origin', cleanOrigin)
+                }
+
+                // SignatureV4 adds Authorization, X-Amz-Date, and X-Amz-Security-Token (when a session
+                // token is present) over the canonical request.
+                args.request = await signer.sign(args.request)
+                return next(args)
+            },
+            {
+                // finalizeRequest so X-Amz-Target and the serialized body are present at signing time.
+                step: 'finalizeRequest',
+                name: 'addAtxSigV4Middleware',
                 priority: 'high',
             }
         )
@@ -307,8 +388,13 @@ export class ATXTransformHandler {
                 return false
             }
 
-            // Verify authentication details
-            await this.serviceManager.getBearerToken()
+            // Verify authentication details. Bearer validates the token; IAM validates the
+            // credentials in the iam slot. Both paths require the tenant (application) URL.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                this.serviceManager.getIamCredentials()
+            } else {
+                await this.serviceManager.getBearerToken()
+            }
             await this.getActiveTransformProfileApplicationUrl()
 
             return true

@@ -1,5 +1,6 @@
 import {
     CredentialsType,
+    IamCredentials,
     UpdateConfigurationParams,
     CancellationToken,
 } from '@aws/language-server-runtimes/server-interface'
@@ -69,11 +70,24 @@ export class AtxTokenServiceManager {
     ): Promise<void> {
         // Handle aws.transformProfiles, aws.atx, and aws.transform sections
         if (
-            (params.section === 'aws.transformProfiles' ||
-                params.section === 'aws.atx' ||
-                params.section === 'aws.transform') &&
-            params.settings.profileArn !== undefined
+            params.section !== 'aws.transformProfiles' &&
+            params.section !== 'aws.atx' &&
+            params.section !== 'aws.transform'
         ) {
+            return
+        }
+
+        // IAM path: the tenant (application) URL arrives via configuration because there is no
+        // Transform profile to look it up from. Store it directly so it can be used as the FES
+        // Origin/region. Trailing slash stripped to match the profile-derived value.
+        if (params.settings.applicationUrl !== undefined) {
+            const applicationUrl = params.settings.applicationUrl as string
+            this.activeApplicationUrl = applicationUrl ? applicationUrl.replace(/\/$/, '') : null
+            this.log(`ATX: Set application URL from configuration`)
+        }
+
+        // Bearer (IdC) path: profile selection drives the active profile and its application URL.
+        if (params.settings.profileArn !== undefined) {
             const profileArn = params.settings.profileArn as string
 
             await this.ensureProfilesLoaded()
@@ -317,12 +331,49 @@ export class AtxTokenServiceManager {
     }
 
     public hasValidCredentials(): boolean {
-        const runtime = (this.features as any).runtime
-        if (runtime && runtime.getAtxCredentialsProvider) {
-            const atxCredentialsProvider = runtime.getAtxCredentialsProvider()
-            return atxCredentialsProvider?.hasCredentials('bearer') || false
+        // Bearer creds live in the ATX-scoped provider; IAM creds live in the main credentials
+        // provider (populated by aws/credentials/iam/update). The ATX provider throws on any
+        // non-bearer type, so IAM presence must be checked against the main provider only.
+        const atxCredentialsProvider = (this.features as any).runtime?.getAtxCredentialsProvider?.()
+        const hasBearer = atxCredentialsProvider?.hasCredentials('bearer') || false
+        const hasIam = this.features.credentialsProvider?.hasCredentials('iam') || false
+        return hasBearer || hasIam
+    }
+
+    /**
+     * Which authentication mechanism is active for ATX FES calls.
+     * IAM is only reported once both the IAM credentials and the tenant (application) URL are
+     * present, so callers never sign a request before the Origin/region is known. Bearer (IdC)
+     * remains the default whenever an ATX bearer token is present.
+     */
+    public getAuthType(): 'bearer' | 'iam' | null {
+        if (this.features.credentialsProvider?.hasCredentials('iam') && this.activeApplicationUrl) {
+            return 'iam'
         }
-        return false
+        const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
+        if (atxCredentialsProvider?.hasCredentials('bearer')) {
+            return 'bearer'
+        }
+        return null
+    }
+
+    /**
+     * Read the IAM (SigV4) credentials from the main credentials provider's 'iam' slot, decrypted
+     * and stored by the runtime via aws/credentials/iam/update. Includes any expiration the client
+     * supplied as part of the credential payload.
+     */
+    public getIamCredentials(): IamCredentials {
+        const credentials = this.features.credentialsProvider?.getCredentials('iam')
+        if (!credentials || !('accessKeyId' in credentials) || !credentials.accessKeyId) {
+            this.log('ATX: No IAM credentials available in the iam slot')
+            throw new Error('No IAM credentials available for ATX')
+        }
+        // Never log the secret key or session token; the accessKeyId prefix is enough to correlate.
+        this.log(
+            `ATX: Read IAM credentials (accessKeyId=${credentials.accessKeyId.slice(0, 5)}..., ` +
+                `hasSessionToken=${Boolean(credentials.sessionToken)})`
+        )
+        return credentials
     }
 
     public async getBearerToken(): Promise<string> {
