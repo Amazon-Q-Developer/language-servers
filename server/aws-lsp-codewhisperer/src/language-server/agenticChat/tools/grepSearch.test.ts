@@ -1,8 +1,12 @@
 import { strict as assert } from 'assert'
 import * as mockfs from 'mock-fs'
 import * as sinon from 'sinon'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { GrepSearch } from './grepSearch'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
+import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { URI } from 'vscode-uri'
 import { InitializeParams } from '@aws/language-server-runtimes/protocol'
 import * as childProcess from '@aws/lsp-core/out/util/processUtils'
@@ -207,5 +211,82 @@ ${workspaceFolder}/file2.js:5:another match`,
         )
 
         assert.ok(hasExcludePattern, 'Should have exclude pattern for *.js or *.ts')
+    })
+})
+
+// Real-filesystem regression tests for the grepSearch acceptance check now
+// routing through the shared, symlink-aware requiresPathAcceptance helper.
+// Uses temporary directories and symlinks; no payloads are executed.
+describe('GrepSearch requiresAcceptance (symlink-aware workspace boundary)', () => {
+    let root: string
+    let ws: string
+    let outside: string
+
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    const trySymlink = (target: string, linkPath: string): boolean => {
+        try {
+            fs.symlinkSync(target, linkPath)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    const makeGrep = (workspaceDir: string): GrepSearch =>
+        new GrepSearch({
+            logging: noopLogging,
+            workspace: {
+                getAllWorkspaceFolders: () => [{ uri: URI.file(workspaceDir).toString(), name: 'ws' }],
+            },
+            lsp: {},
+        } as any)
+
+    beforeEach(() => {
+        mockfs.restore()
+        const realTmp = fs.realpathSync(os.tmpdir())
+        root = fs.mkdtempSync(path.join(realTmp, 'grep-'))
+        ws = path.join(root, 'workspace')
+        outside = path.join(root, 'outside')
+        fs.mkdirSync(ws)
+        fs.mkdirSync(outside)
+    })
+
+    afterEach(() => {
+        fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    it('does NOT require acceptance for a search path inside the workspace', async () => {
+        const result = await makeGrep(ws).requiresAcceptance({ query: 'x', path: ws })
+        assert.equal(result.requiresAcceptance, false)
+    })
+
+    it('does NOT require acceptance when no path is provided (defaults to workspace)', async () => {
+        const result = await makeGrep(ws).requiresAcceptance({ query: 'x' })
+        assert.equal(result.requiresAcceptance, false)
+    })
+
+    it('requires acceptance for a search path outside the workspace', async () => {
+        const result = await makeGrep(ws).requiresAcceptance({ query: 'x', path: outside })
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a search path that is a symlink escaping the workspace', async function () {
+        const link = path.join(ws, 'link')
+        if (!trySymlink(outside, link)) {
+            return this.skip()
+        }
+        const result = await makeGrep(ws).requiresAcceptance({ query: 'x', path: link })
+        assert.equal(
+            result.requiresAcceptance,
+            true,
+            'symlinked search path escaping workspace must require acceptance'
+        )
     })
 })

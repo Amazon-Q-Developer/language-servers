@@ -1,11 +1,12 @@
 import { strict as assert } from 'assert'
 import * as mockfs from 'mock-fs'
 import * as sinon from 'sinon'
-import { ExecuteBash } from './executeBash'
+import { ExecuteBash, outOfWorkspaceWarningmessage, credentialFileWarningMessage } from './executeBash'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import { URI } from 'vscode-uri'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 
 describe('ExecuteBash Tool', () => {
@@ -157,11 +158,11 @@ describe('ExecuteBash Tool', () => {
         assert.equal(result.commandCategory, 1, 'Should be classified as Mutate')
     })
 
-    it('requires acceptance for path traversal in ls command (bug bounty P347698138)', async () => {
+    it('requires acceptance for repeated path traversal in ls command', async () => {
         const execBash = new ExecuteBash(features)
-        // The exact attack pattern from the bug report: double traversal to confuse validation
+        // Repeated traversal must not bypass workspace validation.
         const result = await execBash.requiresAcceptance({
-            command: 'ls -l .amazonq/../.amazonq/../../../../../../../Users/blackpearl/private',
+            command: 'ls -l .amazonq/../.amazonq/../../../../../../../Users/example/private',
             cwd: workspaceFolder,
         })
 
@@ -627,6 +628,164 @@ describe('ExecuteBash Tool', () => {
             it('should not identify directories', () => {
                 assert.equal((execBash as any).isLikelyBinaryFile('/path/to/directory'), false)
             })
+        })
+    })
+
+    // Real-filesystem regression tests for the bare-relative-path gap and the
+    // symlink-aware boundary checks. These use temporary directories, symlinks,
+    // and inert special-character filenames. No command-injection payload is
+    // ever executed and no real credential file is accessed.
+    describe('requiresAcceptance path-handling hardening (real filesystem)', () => {
+        let root: string
+        let ws: string
+        let outside: string
+
+        const trySymlink = (target: string, linkPath: string): boolean => {
+            try {
+                fs.symlinkSync(target, linkPath)
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        const makeExecBash = (workspaceDir: string): ExecuteBash =>
+            new ExecuteBash({
+                ...features,
+                workspace: {
+                    ...features.workspace,
+                    getAllWorkspaceFolders: () => [{ uri: URI.file(workspaceDir).toString(), name: 'ws' }],
+                },
+            } as any)
+
+        beforeEach(() => {
+            const realTmp = fs.realpathSync(os.tmpdir())
+            root = fs.mkdtempSync(path.join(realTmp, 'eb-'))
+            ws = path.join(root, 'workspace')
+            outside = path.join(root, 'outside')
+            fs.mkdirSync(ws)
+            fs.mkdirSync(outside)
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('requires acceptance for a bare relative arg that is a symlink escaping the workspace', async function () {
+            // notes.txt lives inside the workspace but its target is outside it.
+            const target = path.join(outside, 'escaped.txt')
+            fs.writeFileSync(target, 'data')
+            const link = path.join(ws, 'notes.txt')
+            if (!trySymlink(target, link)) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: ws })
+            assert.equal(
+                result.requiresAcceptance,
+                true,
+                'bare relative symlink escaping workspace must require acceptance'
+            )
+            assert.equal(result.warning, outOfWorkspaceWarningmessage)
+        })
+
+        it('requires acceptance for a "sub/notes.txt" arg that is a symlink escaping the workspace', async function () {
+            const sub = path.join(ws, 'sub')
+            fs.mkdirSync(sub)
+            const target = path.join(outside, 'escaped2.txt')
+            fs.writeFileSync(target, 'data')
+            const link = path.join(sub, 'notes.txt')
+            if (!trySymlink(target, link)) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat sub/notes.txt', cwd: ws })
+            assert.equal(
+                result.requiresAcceptance,
+                true,
+                'sub/notes.txt symlink escaping workspace must require acceptance'
+            )
+            assert.equal(result.warning, outOfWorkspaceWarningmessage)
+        })
+
+        it('requires acceptance for an extensionless symlink escaping the workspace', async function () {
+            const target = path.join(outside, 'data.txt')
+            fs.writeFileSync(target, 'fixture data')
+            if (!trySymlink(target, path.join(ws, 'notes'))) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes', cwd: ws })
+            assert.equal(result.requiresAcceptance, true)
+            assert.equal(result.warning, outOfWorkspaceWarningmessage)
+        })
+
+        it('requires acceptance for a dangling relative symlink escaping the workspace', async function () {
+            if (!trySymlink(path.join(outside, 'missing.txt'), path.join(ws, 'notes'))) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes', cwd: ws })
+            assert.equal(result.requiresAcceptance, true)
+            assert.equal(result.warning, outOfWorkspaceWarningmessage)
+        })
+
+        it('checks the canonical filename for credential-like names', async function () {
+            const target = path.join(ws, 'credentials.txt')
+            fs.writeFileSync(target, 'synthetic fixture only')
+            if (!trySymlink(target, path.join(ws, 'notes.txt'))) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: ws })
+            assert.equal(result.requiresAcceptance, true)
+            assert.equal(result.warning, credentialFileWarningMessage)
+        })
+
+        it('does NOT require acceptance for a genuine bare relative file inside the workspace', async () => {
+            fs.writeFileSync(path.join(ws, 'notes.txt'), 'hello')
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: ws })
+            assert.equal(
+                result.requiresAcceptance,
+                false,
+                'in-workspace bare relative file should not require acceptance'
+            )
+        })
+
+        it('does NOT force an inert special-character in-workspace filename out-of-workspace', async () => {
+            // Inert special-character name; no shell ever parses it here.
+            const weird = 'a b;c.txt'
+            fs.writeFileSync(path.join(ws, weird), 'x')
+            const result = await makeExecBash(ws).requiresAcceptance({ command: `cat '${weird}'`, cwd: ws })
+            assert.equal(
+                result.requiresAcceptance,
+                false,
+                'in-workspace special-char file should not require acceptance'
+            )
+        })
+
+        it('does NOT treat harmless flags/text as out-of-workspace (read-only stays allowed)', async () => {
+            // '-la' is a flag and 'x' is plain text; neither is a path, so a
+            // read-only command in an in-workspace cwd is not flagged.
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'ls -la', cwd: ws })
+            assert.equal(result.requiresAcceptance, false, 'flags/harmless text must not be treated as paths')
+        })
+
+        it('requires acceptance for a symlinked cwd that resolves outside the workspace', async function () {
+            const linkCwd = path.join(ws, 'linkcwd')
+            if (!trySymlink(outside, linkCwd)) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd: linkCwd })
+            assert.equal(result.requiresAcceptance, true, 'symlinked cwd escaping workspace must require acceptance')
+            assert.equal(result.warning, outOfWorkspaceWarningmessage)
+        })
+
+        it('does NOT require acceptance when a symlinked in-workspace file stays inside the workspace', async function () {
+            // A symlink whose target is also inside the workspace must remain allowed.
+            const target = path.join(ws, 'real.txt')
+            fs.writeFileSync(target, 'data')
+            const link = path.join(ws, 'alias.txt')
+            if (!trySymlink(target, link)) {
+                return this.skip()
+            }
+            const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat alias.txt', cwd: ws })
+            assert.equal(result.requiresAcceptance, false, 'in-workspace symlink target should not require acceptance')
         })
     })
 })

@@ -154,29 +154,109 @@ describe('CodeReviewUtils', () => {
     })
 
     describe('executeGitCommand', () => {
-        it('should execute git command and return output on success', async () => {
-            const execStub = sandbox.stub(childProcess, 'exec').callsFake((cmd, callback: any) => {
-                callback(null, 'command output', '')
-                return {} as childProcess.ChildProcess
-            })
+        it('should execute git via execFile (no shell) and return trimmed output on success', async () => {
+            const execFileStub = sandbox
+                .stub(childProcess, 'execFile')
+                .callsFake((file: any, args: any, options: any, callback: any) => {
+                    callback(null, 'command output\n', '')
+                    return {} as childProcess.ChildProcess
+                })
 
-            const result = await CodeReviewUtils.executeGitCommand('git status', 'status', mockLogging)
+            const result = await CodeReviewUtils.executeGitCommand(
+                ['diff', '--', ':(literal)/repo/file.ts'],
+                '/repo',
+                'unstaged',
+                mockLogging
+            )
             expect(result).to.equal('command output')
-            sinon.assert.calledWith(execStub, 'git status', sinon.match.func)
+
+            // The binary is the literal 'git', the argv is passed verbatim, the
+            // working directory is set via cwd, and no shell option is present.
+            const [file, args, options] = execFileStub.firstCall.args as unknown as [string, string[], any]
+            expect(file).to.equal('git')
+            expect(args).to.deep.equal(['diff', '--', ':(literal)/repo/file.ts'])
+            expect(options.cwd).to.equal('/repo')
+            expect(options.shell).to.be.undefined
         })
 
         it('should handle errors and return empty string', async () => {
-            sandbox.stub(childProcess, 'exec').callsFake((cmd, callback: any) => {
+            sandbox.stub(childProcess, 'execFile').callsFake((file: any, args: any, options: any, callback: any) => {
                 callback(new Error('git error'), '', 'error output')
                 return {} as childProcess.ChildProcess
             })
 
-            const result = await CodeReviewUtils.executeGitCommand('git status', 'status', mockLogging)
+            const result = await CodeReviewUtils.executeGitCommand(['diff'], '/repo', 'status', mockLogging)
             expect(result).to.equal('')
             sinon.assert.calledWith(
                 mockLogging.warn,
                 sinon.match(str => str.includes('Git diff failed for status'))
             )
+        })
+    })
+
+    describe('git command construction (path-injection hardening)', () => {
+        let executeGitCommandStub: sinon.SinonStub
+
+        beforeEach(() => {
+            executeGitCommandStub = sandbox.stub(CodeReviewUtils, 'executeGitCommand').resolves('')
+        })
+
+        it('getGitDiff builds argv with a -- separator and a literal pathspec (no shell string)', async () => {
+            await CodeReviewUtils.getGitDiff('/repo/src/app.ts', mockLogging)
+
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'unstaged',
+                mockLogging
+            )
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--staged', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'staged',
+                mockLogging
+            )
+        })
+
+        it('getGitDiffNames builds --name-only argv with a -- separator and a literal pathspec', async () => {
+            await CodeReviewUtils.getGitDiffNames('/repo/src/app.ts', mockLogging)
+
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--name-only', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'unstaged name only',
+                mockLogging
+            )
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--name-only', '--staged', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'staged name only',
+                mockLogging
+            )
+        })
+
+        it('passes shell-metacharacter and glob paths verbatim as a single literal pathspec argument', async () => {
+            // Inert special-character names. A shell command line would split or
+            // expand these; execFile + ':(literal)' + '--' pass them to git as a
+            // single, literal argv element instead.
+            const trickyPath = '/repo/notes; echo hi.txt'
+            await CodeReviewUtils.getGitDiff(trickyPath, mockLogging)
+
+            const firstArgv = executeGitCommandStub.firstCall.args[0] as string[]
+            expect(firstArgv).to.deep.equal(['diff', '--', `:(literal)${trickyPath}`])
+            // The entire path is exactly one argv element (no shell tokenization).
+            expect(firstArgv[firstArgv.length - 1]).to.equal(`:(literal)${trickyPath}`)
+
+            executeGitCommandStub.resetHistory()
+
+            const globPath = '/repo/*.ts'
+            await CodeReviewUtils.getGitDiffNames(globPath, mockLogging)
+            const namesArgv = executeGitCommandStub.firstCall.args[0] as string[]
+            expect(namesArgv).to.deep.equal(['diff', '--name-only', '--', `:(literal)${globPath}`])
         })
     })
 
@@ -727,5 +807,92 @@ describe('CodeReviewUtils', () => {
                 },
             })
         })
+    })
+})
+
+// End-to-end regression tests against a REAL temporary git repository. These
+// prove the fix in practice: an inert special-character filename is matched
+// literally (no shell tokenization) and a glob character in a filename is NOT
+// expanded (literal pathspec). No command-injection payload is executed.
+describe('CodeReviewUtils git diff (real repo, injection-safe)', () => {
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    let repo: string
+    let gitReady = false
+
+    const git = (args: string[], cwd: string) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe' })
+
+    beforeEach(() => {
+        gitReady = false
+        try {
+            childProcess.execFileSync('git', ['--version'], { stdio: 'pipe' })
+        } catch {
+            return
+        }
+        repo = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'cru-git-'))
+        try {
+            git(['init', '-q'], repo)
+            git(['config', 'user.email', 'test@example.com'], repo)
+            git(['config', 'user.name', 'test'], repo)
+            git(['config', 'commit.gpgsign', 'false'], repo)
+            gitReady = true
+        } catch {
+            gitReady = false
+        }
+    })
+
+    afterEach(() => {
+        if (repo) {
+            fs.rmSync(repo, { recursive: true, force: true })
+        }
+    })
+
+    it('returns the changed file for an inert special-character filename without shell interpretation', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        // A shell parsing "git diff ... note;echo.txt" would split on ';' into a
+        // second command; execFile + ':(literal)' + '--' pass it to git literally.
+        const weird = 'note;echo.txt'
+        const filePath = path.join(repo, weird)
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        git(['commit', '-qm', 'init'], repo)
+        fs.appendFileSync(filePath, 'v2\n')
+
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, noopLogging)
+        expect(names.has(weird)).to.equal(true)
+
+        const diff = await CodeReviewUtils.getGitDiff(filePath, noopLogging)
+        expect(diff).to.be.a('string')
+        expect((diff as string).includes(weird)).to.equal(true)
+
+        // A shell split would have tried to run a second command; assert no artifact.
+        expect(fs.existsSync(path.join(repo, 'echo.txt'))).to.equal(false)
+    })
+
+    it('does not expand a glob character in a filename (literal pathspec)', async function () {
+        // Windows does not permit '*' in filenames. Argument construction is tested above on every platform.
+        if (!gitReady || process.platform === 'win32') {
+            return this.skip()
+        }
+        const star = 'star*.txt' // literal file whose NAME contains a glob char
+        const other = 'starXYZ.txt' // would match if '*' were treated as a glob
+        fs.writeFileSync(path.join(repo, star), 'v1\n')
+        fs.writeFileSync(path.join(repo, other), 'v1\n')
+        git(['add', '-A'], repo)
+        git(['commit', '-qm', 'init'], repo)
+        fs.appendFileSync(path.join(repo, star), 'v2\n')
+        fs.appendFileSync(path.join(repo, other), 'v2\n')
+
+        const names = await CodeReviewUtils.getGitDiffNames(path.join(repo, star), noopLogging)
+        expect(names.has(star)).to.equal(true)
+        expect(names.has(other)).to.equal(false)
     })
 })
