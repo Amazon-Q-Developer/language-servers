@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.129](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.128...lsp-codewhisperer/v0.0.129) (2026-09-30)
+
+
+### Bug Fixes
+
+* **amazonq:** forward the missing-packages HITL when a plan already exists ([#2886](https://github.com/Amazon-Q-Developer/language-servers/issues/2886)) ([e201207](https://github.com/Amazon-Q-Developer/language-servers/commit/e20120718966af5e4a37b1360d1a2b10effca0de))
+* **amazonq:** restore a mid-job migration mode from the settings artifact, not the job objective (V2381727290) ([#2887](https://github.com/Amazon-Q-Developer/language-servers/issues/2887)) ([b631e38](https://github.com/Amazon-Q-Developer/language-servers/commit/b631e382f3188a0f0ec426cac9a656fb07211cbb))
+* **amazonq:** stream large ATX artifact downloads to disk ([#2885](https://github.com/Amazon-Q-Developer/language-servers/issues/2885)) ([37d44ca](https://github.com/Amazon-Q-Developer/language-servers/commit/37d44ca3fbc391cf5ebf00aa1cfaa5df7a0e2d80))
+* **netTransform:** Beam to IDE — live beam node, JSON artifact cache, throttle cooldown, reaped-beam drop-off ([#2883](https://github.com/Amazon-Q-Developer/language-servers/issues/2883)) ([95344fd](https://github.com/Amazon-Q-Developer/language-servers/commit/95344fda9686ac6ac0c8360bb4dde04d3bebc822))
+
 ## [0.0.128](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.127...lsp-codewhisperer/v0.0.128) (2026-09-09)
 
 
