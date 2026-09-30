@@ -1,4 +1,4 @@
-import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+﻿import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 import * as fs from 'fs'
 import * as archiver from 'archiver'
 import got from 'got'
@@ -128,12 +128,9 @@ export class ATXTransformHandler {
     private atxClient: ElasticGumbyFrontendClient | null = null
     private cachedHitl: string | null = null
     private cachedStepHitl: string | null = null
-    // Keyed by job id, because the handler outlives any single job. An unscoped cache was merely a
-    // display bug before; now that a checkpoint-only sync carries the cached mode forward into the
-    // settings artifact - which the agent treats as authoritative - a mode belonging to another job
-    // would be written into this one's artifact and change how it runs. `source` exists only so the
-    // carry-forward log can say where the mode came from, which matters when it came from the
-    // job-creation objective rather than from an actual switch.
+    // Keyed by job id: the handler outlives any single job, and the carry-forward below writes the
+    // cached mode into the job's settings artifact, so an unscoped cache could write one job's mode
+    // into another's. `source` is for the carry-forward log only.
     private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
@@ -4017,17 +4014,11 @@ export class ATXTransformHandler {
                 this.setCachedInteractiveMode(jobId, interactiveMode, 'user-switch')
                 this.logging.log(`ATX: setCheckpoints interactive_mode=${mappedMode}`)
             } else {
-                // This artifact is full state and the agent reads a missing interactive_mode as
-                // "use the default" (interactive), not "leave it alone". A caller that is only
-                // syncing checkpoints has no mode to assert, so carry forward the mode in effect -
-                // otherwise a checkpoint sync silently reverts the user's mode a few seconds after
-                // they chose it (V2381727290).
-                //
-                // Prefer this job's cache over the local file: the cache is seeded from the settings
-                // artifact, which every client writes, whereas the file only records switches made
-                // from this machine - so preferring the file could overwrite a newer mode set from
-                // the web UI with a stale local one. The cache is keyed by job, so another job's
-                // mode can never be written into this one's artifact.
+                // This artifact is full state and the agent reads a missing interactive_mode as "use
+                // the default", not "leave it alone", so a checkpoints-only sync has to carry the
+                // current mode forward or it silently reverts the user's choice (V2381727290).
+                // Known limitation: the cache is resolved once per job, so a switch made elsewhere
+                // after that read is overwritten by the next sync.
                 const cachedMode = this.getCachedInteractiveMode(jobId)
                 let carriedMode: string | null
                 let carriedFrom = this.getCachedInteractiveModeSource(jobId)
@@ -4040,9 +4031,6 @@ export class ATXTransformHandler {
                     carriedFrom = 'local-settings-file'
                 }
                 if (carriedMode) {
-                    // Naming the source matters: carrying forward a mode that came from the
-                    // job-creation objective asserts the job's starting mode rather than a real
-                    // choice, which is only correct while no switch has happened.
                     this.logging.log(
                         `ATX: setCheckpoints carrying forward interactive_mode=${carriedMode} (from ${carriedFrom})`
                     )
