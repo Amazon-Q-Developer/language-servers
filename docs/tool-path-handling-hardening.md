@@ -17,7 +17,7 @@ The working-directory check had the same problem.
 
 The path detector also omitted bare relative names such as `notes.txt` and `sub/notes.txt`.
 These arguments skipped the path checks even when they referred to symlinks.
-Credential-name checks examined the link name rather than its target name.
+Credential-name checks examined only the link name and not its target name.
 
 ### grepSearch path approval
 
@@ -44,7 +44,9 @@ Staged and unstaged results still combine as before. Git command failures still 
 
 executeBash resolves argument paths and the working directory through `resolveSymlinkAwarePath`.
 It canonicalizes workspace folders before comparing boundaries.
-It checks canonical paths against prior approvals and the existing credential and executable-file heuristics.
+It checks canonical paths against prior approvals.
+It applies the credential and executable-file heuristics to both the argument name and the canonical target name.
+A link named like a credential or an executable that points to an ordinary file still raises the matching warning.
 
 The additional relative-path detector requires a working directory and excludes flag-like tokens.
 It recognizes an argument when the argument contains a separator, has an extension, or names an existing filesystem entry.
@@ -95,6 +97,7 @@ The fixed check requires approval without executing `ls`.
 
 For the credential-name case, link `workspace/notes.txt` to a synthetic `workspace/credentials.txt` fixture.
 The fixed check requires approval based on the target name.
+A reverse case also applies: a link named `workspace/.env` that points to an ordinary in-workspace file requires approval based on the link name.
 Control tests confirm that ordinary files and links whose targets remain inside the workspace are allowed.
 
 The grepSearch tests check direct outside paths, an outside-target symlink, and allowed workspace paths.

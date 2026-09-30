@@ -1068,6 +1068,80 @@ describe('ExecuteBash requiresAcceptance ReadOnly path handling (expanded, real 
         )
     })
 
+    // The sensitivity heuristic must consider BOTH the lexical argument spelling
+    // and the canonical target. A link named like a credential/binary whose
+    // target is an ordinary file must still warn. Authorization (canonical
+    // isPathApproved) and the workspace boundary stay canonical-only and are
+    // covered by the approval/boundary tests above.
+
+    it('requires acceptance for a ".env" alias whose canonical target is an ordinary file (lexical credential name)', async function () {
+        // .env is a symlink to an ordinary in-workspace file. The canonical
+        // target name is innocuous, so a canonical-only heuristic would miss it;
+        // the lexical spelling ".env" must still raise the credential warning.
+        const target = path.join(ws, 'plain.txt')
+        fs.writeFileSync(target, 'synthetic fixture only')
+        if (!makeLink(target, path.join(ws, '.env'), 'file')) {
+            return this.skip()
+        }
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat .env', cwd: ws })
+        assert.equal(result.requiresAcceptance, true, 'a lexical .env alias must require acceptance')
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('requires acceptance for a "credentials" alias whose canonical target is an ordinary file (lexical credential name)', async function () {
+        const target = path.join(ws, 'plain.txt')
+        fs.writeFileSync(target, 'synthetic fixture only')
+        if (!makeLink(target, path.join(ws, 'credentials'), 'file')) {
+            return this.skip()
+        }
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat credentials', cwd: ws })
+        assert.equal(result.requiresAcceptance, true, 'a lexical credentials alias must require acceptance')
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('requires acceptance for a Windows ".exe" alias whose canonical target is innocuous (lexical binary name)', async function () {
+        // A symlink NAMED tool.exe points to an ordinary .txt file. The binary
+        // heuristic reads IS_WINDOWS_PLATFORM, which is fixed at module load, so
+        // this lexical ".exe" behavior is real only on a genuine Windows host.
+        if (process.platform !== 'win32') {
+            return this.skip()
+        }
+        const target = path.join(ws, 'innocuous.txt')
+        fs.writeFileSync(target, 'synthetic fixture only')
+        if (!makeLink(target, path.join(ws, 'tool.exe'), 'file')) {
+            return this.skip()
+        }
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat tool.exe', cwd: ws })
+        assert.equal(result.requiresAcceptance, true, 'a lexical .exe alias must require acceptance')
+        assert.equal(result.warning, binaryFileWarningMessage)
+    })
+
+    // Performance note (deferred): a proposed optimization would skip
+    // scheme://-looking, nonexistent, or extensionless arguments before the
+    // symlink-aware resolve. This test documents why blindly skipping a
+    // scheme://-looking argument would weaken the boundary check: the shell
+    // treats "x://escaped.txt" as the literal path ws/x:/escaped.txt, and here
+    // "x:" is a symlinked ancestor pointing outside the workspace, so the read
+    // lands outside it. The check must still run for such arguments.
+    it('requires acceptance for a URL-like argument whose symlinked ancestor escapes the workspace (POSIX)', async function () {
+        if (process.platform === 'win32') {
+            // ':' is not a legal filename character on Windows; POSIX-only fixture.
+            return this.skip()
+        }
+        const linkAncestor = path.join(ws, 'x:')
+        if (!makeLink(outside, linkAncestor, 'dir')) {
+            return this.skip()
+        }
+        fs.writeFileSync(path.join(outside, 'escaped.txt'), 'data')
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat x://escaped.txt', cwd: ws })
+        assert.equal(
+            result.requiresAcceptance,
+            true,
+            'a URL-like literal path through a symlinked ancestor must be flagged'
+        )
+        assert.equal(result.warning, outOfWorkspaceWarningmessage)
+    })
+
     it('requires acceptance (fail-closed) when there are no workspace folders and a path is referenced', async () => {
         const noWs = new ExecuteBash({
             ...expFeatures,

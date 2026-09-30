@@ -1142,3 +1142,197 @@ describe('CodeReviewUtils.getFolderPath contract (real path library)', () => {
         expect(CodeReviewUtils.getFolderPath('')).to.equal('')
     })
 })
+
+// ---------------------------------------------------------------------------
+// Real-repository coverage for NATIVE ABSOLUTE pathspecs and for the Git error
+// path. These complement the injection-safe real-repo suite above. A separate,
+// scoped harness is used so a host WITHOUT git self-skips, while any other
+// setup failure surfaces as a real failure instead of a silent skip. Repository
+// identity is supplied per-command via `-c` (no git config is written). Only
+// synthetic files are used; no command is ever executed from a path string and
+// invoke() is never called.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils git diff native absolute pathspec (real repo)', () => {
+    let repo = ''
+    let outside = ''
+    let gitReady = false
+    let warnings: string[] = []
+
+    // Records warn text so a test can assert that an ERROR occurred and key on
+    // the STABLE, non-localized classification our code prepends
+    // ("Git diff failed for <type>:") rather than on localized git stderr text.
+    const recordingLogging = {
+        info: () => {},
+        warn: (m: string) => {
+            warnings.push(m)
+        },
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    const git = (args: string[], cwd: string) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe' })
+
+    // Commit without writing repository or global git config: identity and the
+    // no-gpg-sign setting are passed per-command via `-c`.
+    const commit = (msg: string) =>
+        git(
+            [
+                '-c',
+                'user.email=test@example.com',
+                '-c',
+                'user.name=test',
+                '-c',
+                'commit.gpgsign=false',
+                'commit',
+                '-qm',
+                msg,
+            ],
+            repo
+        )
+
+    beforeEach(function () {
+        warnings = []
+        repo = ''
+        outside = ''
+        gitReady = false
+        // Skip ONLY when git itself is unavailable. Any later setup failure is a
+        // real error and must not be swallowed into a skip.
+        try {
+            childProcess.execFileSync('git', ['--version'], { stdio: 'pipe' })
+        } catch {
+            this.skip()
+            return
+        }
+        const realTmp = fs.realpathSync(os.tmpdir())
+        repo = fs.mkdtempSync(path.join(realTmp, 'cru-abs-'))
+        outside = fs.mkdtempSync(path.join(realTmp, 'cru-out-'))
+        git(['init', '-q'], repo)
+        gitReady = true
+    })
+
+    afterEach(() => {
+        if (repo) {
+            fs.rmSync(repo, { recursive: true, force: true })
+        }
+        if (outside) {
+            fs.rmSync(outside, { recursive: true, force: true })
+        }
+    })
+
+    it('matches an ordinary file by native absolute pathspec (unstaged) via executeGitCommand and the wrappers', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const name = 'ordinary.ts'
+        const filePath = path.join(repo, name)
+        // The wrappers derive the pathspec from this native absolute path; the
+        // separators are not forced to POSIX. Assert win32-absolute only on win.
+        expect(path.isAbsolute(filePath)).to.equal(true)
+        if (process.platform === 'win32') {
+            expect(path.win32.isAbsolute(filePath)).to.equal(true)
+        }
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        commit('init')
+        fs.appendFileSync(filePath, 'v2\n') // working-tree (unstaged) change
+
+        // Low-level: literal absolute pathspec with an explicit cwd = repo.
+        const raw = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', CodeReviewUtils.toLiteralPathspec(filePath)],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(raw).to.be.a('string')
+        expect(raw.length).to.be.greaterThan(0)
+        expect(raw.includes(name)).to.equal(true)
+
+        // High-level wrappers (cwd derived from the artifact path).
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, recordingLogging)
+        expect(names.has(name)).to.equal(true)
+        const diff = await CodeReviewUtils.getGitDiff(filePath, recordingLogging)
+        expect(diff).to.be.a('string')
+        expect((diff as string).includes(name)).to.equal(true)
+    })
+
+    it('matches an ordinary file by native absolute pathspec (staged only)', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const name = 'staged.ts'
+        const filePath = path.join(repo, name)
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        commit('init')
+        fs.appendFileSync(filePath, 'v2\n')
+        git(['add', '-A'], repo) // stage the change
+
+        const lit = CodeReviewUtils.toLiteralPathspec(filePath)
+        // The staged probe sees the change...
+        const staged = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--staged', '--', lit],
+            repo,
+            'staged',
+            recordingLogging
+        )
+        expect(staged.length).to.be.greaterThan(0)
+        expect(staged.includes(name)).to.equal(true)
+        // ...and the working-tree probe is genuinely empty (the change is staged).
+        const unstaged = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', lit],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(unstaged).to.equal('')
+        // No warning was recorded, so the empty unstaged result is a real
+        // no-changes result and not a swallowed git error.
+        expect(warnings.length).to.equal(0)
+
+        // The combined wrapper still returns the staged content, and the names
+        // include the file.
+        const diff = await CodeReviewUtils.getGitDiff(filePath, recordingLogging)
+        expect((diff as string).includes(name)).to.equal(true)
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, recordingLogging)
+        expect(names.has(name)).to.equal(true)
+    })
+
+    it('yields empty output AND a classified warning for an outside-repo pathspec run with cwd = repo', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const outsideFile = path.join(outside, 'outside.ts')
+        fs.writeFileSync(outsideFile, 'v1\n')
+        // git runs INSIDE the repo, but the literal pathspec points OUTSIDE it.
+        const result = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', CodeReviewUtils.toLiteralPathspec(outsideFile)],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(result).to.equal('')
+        // The empty string is an ERROR result, not a no-changes result: the warn
+        // is emitted only on executeGitCommand's error branch. Assert the stable,
+        // non-localized prefix our code prepends (git's stderr text is localized).
+        expect(warnings.some(w => w.startsWith('Git diff failed for unstaged:'))).to.equal(true)
+    })
+
+    it('getGitDiff returns null and getGitDiffNames returns an empty set in a non-repo directory (error, not no-changes)', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        // 'outside' is a real directory that is NOT a git repository, so every
+        // probe git runs there errors out.
+        const file = path.join(outside, 'file.ts')
+        fs.writeFileSync(file, 'v1\n')
+
+        const diff = await CodeReviewUtils.getGitDiff(file, recordingLogging)
+        expect(diff).to.be.null
+        const names = await CodeReviewUtils.getGitDiffNames(file, recordingLogging)
+        expect(names.size).to.equal(0)
+        // A classified warning proves the null / empty result came from a git
+        // error rather than from a tracked file with no changes.
+        expect(warnings.some(w => w.startsWith('Git diff failed for'))).to.equal(true)
+    })
+})

@@ -278,11 +278,20 @@ export class ExecuteBash {
                         continue
                     }
 
-                    // Check if this is a credential file that needs protection
+                    // Check if this is a credential or binary file that needs
+                    // protection. The existence / regular-file guard stays on the
+                    // canonical fullPath (as before), but the sensitivity
+                    // heuristic considers BOTH the lexical spelling (candidate)
+                    // and the canonical target (fullPath). Otherwise a symlink
+                    // named ".env" or "tool.exe" whose target is an ordinary file
+                    // would hide a credential/binary name behind an innocuous
+                    // canonical name. This only widens the warning; approval
+                    // (isPathApproved) and the workspace boundary remain
+                    // canonical-only and are unchanged.
                     try {
                         if (existsSync(fullPath) && statSync(fullPath).isFile()) {
-                            // Check for credential files
-                            if (this.isLikelyCredentialFile(fullPath)) {
+                            // Check for credential files by lexical name OR canonical target.
+                            if (this.isLikelyCredentialFile(candidate) || this.isLikelyCredentialFile(fullPath)) {
                                 this.logging.info(`Detected credential file in command: ${fullPath}`)
                                 return {
                                     requiresAcceptance: true,
@@ -291,8 +300,8 @@ export class ExecuteBash {
                                 }
                             }
 
-                            // Check for binary files
-                            if (this.isLikelyBinaryFile(fullPath)) {
+                            // Check for binary files by lexical name OR canonical target.
+                            if (this.isLikelyBinaryFile(candidate) || this.isLikelyBinaryFile(fullPath)) {
                                 this.logging.info(`Detected binary file in command: ${fullPath}`)
                                 return {
                                     requiresAcceptance: true,
