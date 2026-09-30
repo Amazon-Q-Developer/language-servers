@@ -896,3 +896,249 @@ describe('CodeReviewUtils git diff (real repo, injection-safe)', () => {
         expect(names.has(other)).to.equal(false)
     })
 })
+
+// ---------------------------------------------------------------------------
+// Expanded regression coverage for the git path-injection hardening in
+// getGitDiff / getGitDiffNames. These complement the suites above by
+// exercising the REAL child_process boundary: production must call execFile
+// (no shell) and must never call the shell-using exec. All adversarial path
+// strings below are inert, single argv elements — execFile is stubbed so no
+// process runs, and exec is stubbed AND asserted never-called so nothing can
+// reach a shell even against unfixed code. The real path library is used
+// throughout (path.extname / path.dirname are never stubbed to invented
+// semantics). No reporter payloads, network calls, or internal identifiers
+// are used.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils git argv construction (child_process boundary)', () => {
+    let sandbox: sinon.SinonSandbox
+    let execStub: sinon.SinonStub
+
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    // Every execFile invocation, recorded as {file, args, cwd, shell}. The stub
+    // resolves with empty output so the real executeGitCommand completes without
+    // spawning anything.
+    let calls: Array<{ file: string; args: string[]; cwd: unknown; shell: unknown }>
+
+    beforeEach(() => {
+        sandbox = sinon.createSandbox()
+        calls = []
+        sandbox.stub(childProcess, 'execFile').callsFake((file: any, args: any, options: any, callback: any) => {
+            calls.push({ file, args, cwd: options?.cwd, shell: options?.shell })
+            callback(null, '', '')
+            return {} as childProcess.ChildProcess
+        })
+        // Trap: production must never route git through the shell-using exec.
+        execStub = sandbox.stub(childProcess, 'exec').throws(new Error('Unexpected shell-based Git execution'))
+    })
+
+    afterEach(() => {
+        sandbox.restore()
+    })
+
+    const unstagedOf = () => calls.find(c => !c.args.includes('--staged'))
+    const stagedOf = () => calls.find(c => c.args.includes('--staged'))
+
+    it('getGitDiff runs unstaged and staged diffs via execFile with -- and a literal pathspec', async () => {
+        const artifact = '/repo/src/app.ts'
+        const dir = path.dirname(artifact)
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiff(artifact, noopLogging)
+
+        expect(calls.length).to.equal(2)
+        const unstaged = unstagedOf()
+        const staged = stagedOf()
+        expect(unstaged, 'expected an unstaged diff call').to.not.be.undefined
+        expect(staged, 'expected a staged diff call').to.not.be.undefined
+        expect(unstaged!.args).to.deep.equal(['diff', '--', lit])
+        expect(staged!.args).to.deep.equal(['diff', '--staged', '--', lit])
+        for (const c of calls) {
+            expect(c.file).to.equal('git')
+            expect(c.cwd).to.equal(dir)
+            expect(c.shell).to.be.undefined
+        }
+        sinon.assert.notCalled(execStub)
+    })
+
+    it('getGitDiffNames runs unstaged and staged --name-only diffs via execFile with -- and a literal pathspec', async () => {
+        const artifact = '/repo/src/app.ts'
+        const dir = path.dirname(artifact)
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+        expect(calls.length).to.equal(2)
+        expect(unstagedOf()!.args).to.deep.equal(['diff', '--name-only', '--', lit])
+        expect(stagedOf()!.args).to.deep.equal(['diff', '--name-only', '--staged', '--', lit])
+        for (const c of calls) {
+            expect(c.file).to.equal('git')
+            expect(c.cwd).to.equal(dir)
+            expect(c.shell).to.be.undefined
+        }
+        sinon.assert.notCalled(execStub)
+    })
+
+    // Inert, mocked names covering spaces + metacharacters in BOTH the directory
+    // (cwd) and artifact (pathspec) slots, extension-bearing semicolon and
+    // command-substitution forms, option-like leading dashes, pathspec-magic
+    // leading colon, and glob characters. Each must survive verbatim as a single
+    // literal pathspec argument placed after '--'.
+    const trickyArtifacts: Array<{ label: string; artifact: string }> = [
+        {
+            label: 'spaces and semicolon in directory and artifact slots',
+            artifact: '/a dir; fixture/b sub/app; end.ts',
+        },
+        { label: 'extension before semicolon and comment marker', artifact: '/repo/src/app.ts; fixture #' },
+        { label: 'command-substitution syntax in filename (mocked)', artifact: '/repo/app$(fixture).ts' },
+        { label: 'command-substitution syntax in directory (mocked)', artifact: '/repo/$(fixture)/app.ts' },
+        { label: 'backtick syntax in filename (mocked)', artifact: '/repo/app`fixture`.ts' },
+        { label: 'option-like relative path', artifact: '--output.ts' },
+        { label: 'pathspec-magic relative path', artifact: ':(glob)*.ts' },
+        { label: 'glob star', artifact: '/repo/*.ts' },
+        { label: 'glob bracket class', artifact: '/repo/file[0-9].ts' },
+    ]
+
+    trickyArtifacts.forEach(({ label, artifact }) => {
+        it(`passes ${label} literally in all four Git variants`, async () => {
+            const dir = path.dirname(artifact)
+            const lit = `:(literal)${artifact}`
+
+            await CodeReviewUtils.getGitDiff(artifact, noopLogging)
+            await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+            expect(calls.map(c => c.args)).to.deep.equal([
+                ['diff', '--', lit],
+                ['diff', '--staged', '--', lit],
+                ['diff', '--name-only', '--', lit],
+                ['diff', '--name-only', '--staged', '--', lit],
+            ])
+            for (const call of calls) {
+                expect(call.file).to.equal('git')
+                expect(call.cwd).to.equal(dir)
+                expect(call.shell).to.be.undefined
+            }
+            sinon.assert.notCalled(execStub)
+        })
+    })
+
+    it('getGitDiffNames passes an option-like + glob name verbatim as one literal pathspec after --', async () => {
+        const artifact = '/repo/-rf *.ts'
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+        const unstaged = unstagedOf()!
+        expect(unstaged.args).to.deep.equal(['diff', '--name-only', '--', lit])
+        expect(unstaged.args[unstaged.args.length - 1]).to.equal(lit)
+        sinon.assert.notCalled(execStub)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// Result-combination contract for getGitDiff / getGitDiffNames: how staged and
+// unstaged outputs are merged, de-duplicated, trimmed of empties, and reduced
+// to null / an empty set. Uses the higher-level executeGitCommand stub (same
+// style as the getGitDiff suite above); no process is spawned.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils diff result combination and dedup', () => {
+    let sandbox: sinon.SinonSandbox
+    let execGit: sinon.SinonStub
+
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    beforeEach(() => {
+        sandbox = sinon.createSandbox()
+        sandbox.stub(CodeReviewUtils, 'getFolderPath').returns('/mock/dir')
+        execGit = sandbox.stub(CodeReviewUtils, 'executeGitCommand')
+    })
+
+    afterEach(() => {
+        sandbox.restore()
+    })
+
+    it('getGitDiff returns unstaged-only content when staged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? '' : 'U'))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('U')
+    })
+
+    it('getGitDiff returns staged-only content when unstaged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'S' : ''))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('S')
+    })
+
+    it('getGitDiff joins unstaged and staged with a blank line', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'S' : 'U'))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('U\n\nS')
+    })
+
+    it('getGitDiff returns null when both unstaged and staged are empty', async () => {
+        execGit.resolves('')
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.be.null
+    })
+
+    it('getGitDiffNames de-duplicates names across staged and unstaged', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'b\nc' : 'a\nb'))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names).sort()).to.deep.equal(['a', 'b', 'c'])
+    })
+
+    it('getGitDiffNames returns unstaged-only names when staged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? '' : 'a\nb'))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names).sort()).to.deep.equal(['a', 'b'])
+    })
+
+    it('getGitDiffNames returns staged-only names when unstaged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'c' : ''))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names)).to.deep.equal(['c'])
+    })
+
+    it('getGitDiffNames returns an empty set when both are empty (blank lines filtered)', async () => {
+        execGit.resolves('')
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(names.size).to.equal(0)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// getFolderPath contract pinned against the REAL path library (no stubbing of
+// path.extname / path.dirname). Covers the file-vs-directory decision and the
+// missing/empty inputs. These assert only the existing behavior; they do not
+// add any new policy.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils.getFolderPath contract (real path library)', () => {
+    it('returns the parent directory for a file path with an extension', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src/app.ts')).to.equal(path.dirname('/repo/src/app.ts'))
+    })
+
+    it('returns a directory path (no extension) unchanged', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src')).to.equal('/repo/src')
+    })
+
+    it('strips a single trailing slash from a directory path', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src/')).to.equal('/repo/src')
+    })
+
+    it('treats a dotfile as a directory (path.extname of a dotfile is empty)', () => {
+        expect(path.extname('.env')).to.equal('')
+        expect(CodeReviewUtils.getFolderPath('/repo/.env')).to.equal('/repo/.env')
+    })
+
+    it('returns an empty string for empty input (existing contract; no policy added)', () => {
+        expect(CodeReviewUtils.getFolderPath('')).to.equal('')
+    })
+})
