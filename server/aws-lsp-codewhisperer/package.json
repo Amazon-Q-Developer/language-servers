@@ -34,7 +34,7 @@
         "@amzn/codewhisperer": "file:../../core/codewhisperer/amzn-codewhisperer-1.0.0.tgz",
         "@amzn/codewhisperer-runtime": "file:../../core/codewhisperer-runtime/amzn-codewhisperer-runtime-1.0.0.tgz",
         "@amzn/codewhisperer-streaming": "file:../../core/codewhisperer-streaming/amzn-codewhisperer-streaming-1.0.0.tgz",
-        "@aws-sdk/types": "^3.734.0",
+        "@aws-sdk/types": "^3.974.5",
         "@aws-sdk/util-arn-parser": "^3.723.0",
         "@aws-sdk/util-retry": "^3.374.0",
         "@aws/chat-client-ui-types": "0.1.71",
