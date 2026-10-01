@@ -1,4 +1,4 @@
-import { expect } from 'chai'
+﻿import { expect } from 'chai'
 import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -9,6 +9,16 @@ import { ATXTransformHandler } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+
+// The interactive-mode cache is keyed by job id, so tests reach it through these rather than a
+// single field. Job scoping is what stops one job's mode being written into another's artifact.
+function cachedMode(handler: any, jobId: string): string | undefined {
+    return handler.interactiveModeByJob.get(jobId)?.mode
+}
+
+function setCachedMode(handler: any, jobId: string, mode: string, source = 'test'): void {
+    handler.interactiveModeByJob.set(jobId, { mode, source })
+}
 
 describe('ATXTransformHandler - Chat APIs', () => {
     let handler: ATXTransformHandler
@@ -561,6 +571,59 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTaskId).to.equal('task-lbv')
     })
 
+    it('forwards the missing-packages HITL to the IDE when a plan already exists', async () => {
+        // Regression: handleExecutionPhaseHitl (taken once a plan exists) only handles step-level
+        // HITLs and dropped HitlTag/MissingPackageJsonPath, so the IDE never showed the upload dialog.
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.HitlTaskId).to.equal('task-mp')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('forwards the handle_missing_packages_hitl tag when a plan already exists', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'handle_missing_packages_hitl',
+            TaskId: 'task-mp2',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('handle_missing_packages_hitl')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('still forwards the missing-packages HITL when no plan exists yet', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp3',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
     it('should default to PLANNING-like fallthrough for unknown statuses', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -682,10 +745,10 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
-    it('should default cachedInteractiveMode to Autonomous when objective is unparseable', async () => {
+    it('should default the cached mode to Autonomous when objective is unparseable', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
             objective: 'not-json',
@@ -695,7 +758,81 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    // The objective is the job-creation payload and never changes, so restoring the mode from it
+    // discards any mid-job switch. The checkpoint-settings artifact is the store every client
+    // writes when the mode changes, so it wins (V2381727290).
+    it('should prefer the checkpoint-settings artifact over the job objective', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    it('should fall back to the objective when no checkpoint-settings artifact exists', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should fall back to the objective when the artifact carries no usable mode', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        // A checkpoints-only write from before the carry-forward fix: checkpoints, no mode.
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ 'step-a': true })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should read the artifact only once, not on every poll', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        const findStub = sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+        expect(findStub.callCount).to.equal(1)
     })
 
     it('should return null when getJob throws', async () => {
@@ -1951,6 +2088,130 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('auto')
         })
 
+        // The settings artifact is full state and the agent reads a missing interactive_mode as
+        // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
+        // must not drop a mode the user already chose (V2381727290).
+        const stubUploadChain = () => {
+            sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+            sinon.stub(handler, 'createArtifactUploadUrl').resolves({
+                uploadUrl: 'u',
+                uploadId: 'upload-1',
+                requestHeaders: {},
+            } as any)
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true } as any)
+            sinon.stub(handler, 'updateHitl').resolves({ ok: true })
+        }
+
+        const settingsPathFor = (jobId: string) =>
+            path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'checkpoint-settings.json')
+
+        it('should carry forward a previously written interactive_mode when none is supplied', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true }, 'Autonomous')
+            // A periodic checkpoints-only sync: no mode to assert.
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': false })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written['step-a']).to.equal(false)
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        it('should let an explicit mode override the carried-forward one', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Interactive')
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written.interactive_mode).to.equal('interactive')
+        })
+
+        it('should prefer the mode in effect over a stale local file', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            // A switch made from this machine earlier; the mode has since changed elsewhere.
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'interactive' }))
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        // The handler outlives any single job, so an unscoped cache would let one job's mode be
+        // written into another job's settings artifact - which the agent treats as authoritative.
+        it("should not carry one job's mode into another job's artifact", async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-2'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it("should keep each job's asserted mode separate", async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, {}, 'Interactive')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-2')).to.equal('Interactive')
+        })
+
+        it('should update the cached mode when a switch is asserted', async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Interactive')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it('should omit interactive_mode when there is nothing to carry forward', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should ignore an unrecognised persisted interactive_mode rather than echo it', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'bogus' }))
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should not fail the sync when the persisted settings file is corrupt', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, '{ not json')
+
+            const result = await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            expect(result.Success).to.be.true
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written['step-a']).to.equal(true)
+        })
+
         it('should return error when uploadArtifact fails', async () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({
@@ -2449,7 +2710,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+            expect(cachedMode(handler, 'job-1')).to.equal('Interactive')
         })
 
         it('should default cached interactive mode to Autonomous when not specified', async () => {
@@ -2470,7 +2731,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
         })
     })
 })
@@ -4122,12 +4383,12 @@ describe('ATXTransformHandler - final coverage push', () => {
         it('should null-out all cached HITL state', () => {
             ;(handler as any).cachedHitl = 'h'
             ;(handler as any).cachedStepHitl = 's'
-            ;(handler as any).cachedInteractiveMode = 'Interactive'
-            ;(handler as any).clearJobCache()
+            setCachedMode(handler, 'job-1', 'Interactive')
+            ;(handler as any).clearJobCache('job-1')
 
             expect((handler as any).cachedHitl).to.be.null
             expect((handler as any).cachedStepHitl).to.be.null
-            expect((handler as any).cachedInteractiveMode).to.be.null
+            expect(cachedMode(handler, 'job-1')).to.be.undefined
         })
     })
 

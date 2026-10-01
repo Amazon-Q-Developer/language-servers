@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.57](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.56...chat-client/v0.1.57) (2026-09-30)
+
+
+### Features
+
+* **chat-client:** add IDE deprecation notice ([#2877](https://github.com/Amazon-Q-Developer/language-servers/issues/2877)) ([73dd8c6](https://github.com/Amazon-Q-Developer/language-servers/commit/73dd8c66a3a11a28d8e011ef52bae2fb2d809d5b))
+
 ## [0.1.56](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.55...chat-client/v0.1.56) (2026-08-18)
 
 

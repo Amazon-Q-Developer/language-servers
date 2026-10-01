@@ -1,4 +1,4 @@
-import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+﻿import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 import * as fs from 'fs'
 import * as archiver from 'archiver'
 import got from 'got'
@@ -152,7 +152,10 @@ export class ATXTransformHandler {
     private atxClient: ElasticGumbyFrontendClient | null = null
     private cachedHitl: string | null = null
     private cachedStepHitl: string | null = null
-    private cachedInteractiveMode: InteractiveMode | null = null
+    // Keyed by job id: the handler outlives any single job, and the carry-forward below writes the
+    // cached mode into the job's settings artifact, so an unscoped cache could write one job's mode
+    // into another's. `source` is for the carry-forward log only.
+    private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
@@ -342,8 +345,8 @@ export class ATXTransformHandler {
     private clearJobCache(jobId?: string): void {
         this.cachedHitl = null
         this.cachedStepHitl = null
-        this.cachedInteractiveMode = null
         if (jobId) {
+            this.interactiveModeByJob.delete(jobId)
             this._worklogNextTokenByJob.delete(jobId)
             Utils.clearWorklogCacheForJob(jobId)
         }
@@ -1329,9 +1332,6 @@ export class ATXTransformHandler {
         try {
             this.logging.log(`ATX: Starting transform workflow for workspace: ${request.workspaceId}`)
 
-            // Cache the interactive mode setting
-            this.cachedInteractiveMode = request.interactiveMode || 'Autonomous'
-
             // Step 1: Create transformation job
             const createJobResponse = await this.createJob({
                 workspaceId: request.workspaceId,
@@ -1344,6 +1344,10 @@ export class ATXTransformHandler {
             if (!createJobResponse?.jobId) {
                 throw new Error('Failed to create ATX transformation job')
             }
+
+            // Cache the interactive mode against the new job. Deferred until the job id exists,
+            // since the cache is per job.
+            this.setCachedInteractiveMode(createJobResponse.jobId, request.interactiveMode || 'Autonomous', 'job-start')
 
             // Step 2: Create ZIP file
             const zipFilePath = await this.createZip(request.startTransformRequest)
@@ -1951,11 +1955,12 @@ export class ATXTransformHandler {
                 result.DiffApplyFailed = true
                 result.DiffApplyFailedStepIds = diffContext.failedStepIds
             }
-            // Surface the backend-resolved interactive mode (from job.objective) on every
-            // response so the IDE can restore it. Single injection point covers all internal
-            // return paths. cachedInteractiveMode is populated in _getTransformInfoInternal.
-            if (result && this.cachedInteractiveMode) {
-                result.InteractiveMode = this.cachedInteractiveMode
+            // Surface the resolved interactive mode on every response so the IDE can restore it.
+            // Single injection point covers all internal return paths; the cache is populated in
+            // _getTransformInfoInternal.
+            const resolvedMode = this.getCachedInteractiveMode(request.TransformationJobId)
+            if (result && resolvedMode) {
+                result.InteractiveMode = resolvedMode
             }
             return result
         } finally {
@@ -1971,7 +1976,7 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: Getting transform info for job: ${request.TransformationJobId}`)
 
             // Check if we need to determine interactive mode from the job objective
-            const needObjective = this.cachedInteractiveMode === null
+            const needObjective = this.getCachedInteractiveMode(request.TransformationJobId) === null
             const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective)
 
             if (!job) {
@@ -1982,23 +1987,39 @@ export class ATXTransformHandler {
                 } as unknown as AtxGetTransformInfoResponse
             }
 
+            // A mid-job mode change is written to the checkpoint-settings artifact and never back
+            // into the objective, which is the job-creation payload and immutable. Reading the
+            // objective alone therefore restores the mode the job STARTED in and silently discards
+            // any later switch, so reopening the IDE reverted the mode (V2381727290). Prefer the
+            // artifact - it is the store every client writes, so it also reflects a switch made
+            // from the web UI or another IDE - and keep the objective as the fallback for a job
+            // whose mode was never changed and so has no artifact yet.
+            if (this.getCachedInteractiveMode(request.TransformationJobId) === null) {
+                const modeFromSettings = await this.readInteractiveModeFromCheckpointSettings(
+                    request.WorkspaceId,
+                    request.TransformationJobId
+                )
+                if (modeFromSettings) {
+                    this.setCachedInteractiveMode(request.TransformationJobId, modeFromSettings, 'settings-artifact')
+                    this.logging.log(
+                        `ATX: Determined interactive mode from checkpoint-settings artifact: ${modeFromSettings}`
+                    )
+                }
+            }
+
             // If interactive mode is not cached, try to get it from the job objective
-            if (this.cachedInteractiveMode === null && job.objective) {
+            if (this.getCachedInteractiveMode(request.TransformationJobId) === null && job.objective) {
                 try {
                     const objective = JSON.parse(job.objective)
                     // Map backend string format to InteractiveMode enum
                     // "interactive" -> Interactive, "auto" -> Autonomous
-                    if (objective.interactive_mode === 'interactive') {
-                        this.cachedInteractiveMode = 'Interactive'
-                    } else {
-                        this.cachedInteractiveMode = 'Autonomous'
-                    }
-                    this.logging.log(
-                        `ATX: Determined interactive mode from job objective: ${this.cachedInteractiveMode}`
-                    )
+                    const objectiveMode: InteractiveMode =
+                        objective.interactive_mode === 'interactive' ? 'Interactive' : 'Autonomous'
+                    this.setCachedInteractiveMode(request.TransformationJobId, objectiveMode, 'objective')
+                    this.logging.log(`ATX: Determined interactive mode from job objective: ${objectiveMode}`)
                 } catch (e) {
                     this.logging.log('ATX: Could not parse job objective for interactive mode')
-                    this.cachedInteractiveMode = 'Autonomous'
+                    this.setCachedInteractiveMode(request.TransformationJobId, 'Autonomous', 'objective-unparseable')
                 }
             }
 
@@ -2404,6 +2425,27 @@ export class ATXTransformHandler {
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
+
+        // missing-packages can be raised once a plan already exists (P516058803). Only the planning
+        // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
+        // ({stepId}-review) HITLs and would drop them, so the IDE never shows the package-upload
+        // dialog. Return it directly, mirroring the local-build-verification early-exit above.
+        if (hitlResponse?.HitlTag === 'missing-packages' || hitlResponse?.HitlTag === 'handle_missing_packages_hitl') {
+            this.logging.log(
+                `ATX: missing-packages HITL — returning directly to IDE (hasPlan=${hasPlan}, jsonPath=${hitlResponse.MissingPackageJsonPath ?? '<none>'})`
+            )
+            return {
+                TransformationJob: {
+                    WorkspaceId: request.WorkspaceId,
+                    JobId: request.TransformationJobId,
+                    Status: 'AWAITING_HUMAN_INPUT',
+                } as any,
+                TransformationPlan: plan,
+                HitlTag: hitlResponse.HitlTag,
+                HitlTaskId: hitlResponse.TaskId,
+                MissingPackageJsonPath: hitlResponse.MissingPackageJsonPath,
+            } as AtxGetTransformInfoResponse
+        }
 
         if (hasPlan) {
             // Execution phase: Plan exists, HITL raised during transformation
@@ -4103,6 +4145,79 @@ export class ATXTransformHandler {
         return { hasMore: this._worklogNextTokenByJob.has(jobId) }
     }
 
+    /** Mode cached for this job, or null when none has been resolved yet. */
+    private getCachedInteractiveMode(jobId: string): InteractiveMode | null {
+        return this.interactiveModeByJob.get(jobId)?.mode ?? null
+    }
+
+    /** Where this job's cached mode came from, for diagnostics. Empty when nothing is cached. */
+    private getCachedInteractiveModeSource(jobId: string): string {
+        return this.interactiveModeByJob.get(jobId)?.source ?? ''
+    }
+
+    private setCachedInteractiveMode(jobId: string, mode: InteractiveMode, source: string): void {
+        this.interactiveModeByJob.set(jobId, { mode, source })
+    }
+
+    /**
+     * Reads the effective interactive mode from the checkpoint-settings HITL artifact, which is the
+     * only store a mid-job mode change is written to. Every client that changes the mode uploads
+     * that artifact, so it reflects a switch made from this IDE, another IDE, or the web UI -
+     * unlike objective.interactive_mode, which is fixed when the job is created. Returns null when
+     * no artifact exists yet (the mode was never changed) or it carries no recognisable mode,
+     * leaving the caller to fall back to the objective.
+     */
+    private async readInteractiveModeFromCheckpointSettings(
+        workspaceId: string,
+        jobId: string
+    ): Promise<InteractiveMode | null> {
+        try {
+            const hitlTask = await this.findCheckpointSettingsHitl(workspaceId, jobId)
+            const artifactId = hitlTask?.humanArtifact?.artifactId
+            if (!artifactId) {
+                this.logging.log('ATX: no checkpoint-settings artifact available to read interactive mode from')
+                return null
+            }
+
+            const settings = await this.downloadJsonArtifact(workspaceId, jobId, artifactId)
+            const mode = settings?.interactive_mode
+            if (mode === 'interactive') {
+                return 'Interactive'
+            }
+            if (mode === 'auto') {
+                return 'Autonomous'
+            }
+
+            this.logging.log(
+                `ATX: checkpoint-settings artifact ${artifactId} carries no usable interactive_mode (got ${String(mode)})`
+            )
+            return null
+        } catch (e) {
+            this.logging.log(`ATX: could not read interactive mode from checkpoint-settings: ${String(e)}`)
+            return null
+        }
+    }
+
+    /**
+     * Reads interactive_mode back out of the last checkpoint-settings.json we wrote, so a
+     * checkpoints-only sync can preserve it instead of dropping it. Returns null when the file is
+     * absent, unreadable, or holds a value the agent would not recognise - in which case the caller
+     * writes no mode and the agent falls back to its default.
+     */
+    private readPersistedInteractiveMode(jsonFilePath: string): string | null {
+        try {
+            if (!fs.existsSync(jsonFilePath)) {
+                return null
+            }
+            const previous = JSON.parse(fs.readFileSync(jsonFilePath, 'utf8'))
+            const mode = previous?.interactive_mode
+            return mode === 'interactive' || mode === 'auto' ? mode : null
+        } catch (e) {
+            this.logging.log(`ATX: could not read previous checkpoint-settings for interactive_mode: ${String(e)}`)
+            return null
+        }
+    }
+
     /**
      * Set checkpoints for interactive mode transformation.
      * Lists HITLs with "checkpoint-settings" tag, uploads checkpoints as JSON artifact,
@@ -4137,6 +4252,8 @@ export class ATXTransformHandler {
                 fs.mkdirSync(artifactDir, { recursive: true })
             }
 
+            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
+
             // Build JSON content with optional interactiveMode
             const jsonContent: Record<string, any> = { ...checkpoints }
             if (interactiveMode) {
@@ -4144,10 +4261,41 @@ export class ATXTransformHandler {
                 let mappedMode = 'auto'
                 if (interactiveMode === 'Interactive') mappedMode = 'interactive'
                 jsonContent.interactive_mode = mappedMode
+                // Keep this job's cache in step with the mode just asserted. It is what
+                // getTransformInfo reports back to the IDE on every poll, and it is the
+                // carry-forward source below, so leaving it on the job-start value after a switch
+                // makes both of those stale.
+                this.setCachedInteractiveMode(jobId, interactiveMode, 'user-switch')
                 this.logging.log(`ATX: setCheckpoints interactive_mode=${mappedMode}`)
+            } else {
+                // This artifact is full state and the agent reads a missing interactive_mode as "use
+                // the default", not "leave it alone", so a checkpoints-only sync has to carry the
+                // current mode forward or it silently reverts the user's choice (V2381727290).
+                // Known limitation: the cache is resolved once per job, so a switch made elsewhere
+                // after that read is overwritten by the next sync.
+                const cachedMode = this.getCachedInteractiveMode(jobId)
+                let carriedMode: string | null
+                let carriedFrom = this.getCachedInteractiveModeSource(jobId)
+                if (cachedMode === 'Interactive') {
+                    carriedMode = 'interactive'
+                } else if (cachedMode === 'Autonomous') {
+                    carriedMode = 'auto'
+                } else {
+                    carriedMode = this.readPersistedInteractiveMode(jsonFilePath)
+                    carriedFrom = 'local-settings-file'
+                }
+                if (carriedMode) {
+                    this.logging.log(
+                        `ATX: setCheckpoints carrying forward interactive_mode=${carriedMode} (from ${carriedFrom})`
+                    )
+                    jsonContent.interactive_mode = carriedMode
+                } else {
+                    this.logging.log(
+                        'ATX: setCheckpoints has no interactive_mode to carry forward - agent will apply its default'
+                    )
+                }
             }
 
-            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
             this.logging.log(`ATX: Writing checkpoint-settings.json to ${jsonFilePath}`)
             fs.writeFileSync(jsonFilePath, JSON.stringify(jsonContent, null, 2))
 
