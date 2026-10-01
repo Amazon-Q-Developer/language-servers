@@ -229,4 +229,62 @@ export class AgenticChatEventParser implements ChatResult {
                   data: chatResultWithMetadata,
               }
     }
+
+    /**
+     * Finalizes parsing after the response stream has been fully consumed.
+     *
+     * A tool use only becomes executable once its terminating `stop` event arrives — that
+     * is also the only point at which its streamed input is JSON-parsed. If the stream ends
+     * before that event (for example, the response reaches the output-token limit mid
+     * tool-input), the tool use is left with `stop === false` and no error is recorded, so
+     * `getResult()` reports success. The agentic loop then filters it out (only stopped tool
+     * uses are treated as pending) and completes the turn without ever running the tool — a
+     * silent no-op with no error and no retry.
+     *
+     * To avoid that, a genuinely *truncated tool input* is recorded as an error (reusing the
+     * malformed-JSON prefix so it is handled by the existing recovery branch) and marked
+     * `stop` so it survives the pending-tool-use filter and the model is re-prompted to split
+     * the work into smaller tool uses.
+     *
+     * Two other situations also reach this point and must keep the previous behaviour of being
+     * dropped, otherwise a benign end-of-stream is reported as a failure and re-prompted —
+     * which inflates failure metrics and can re-run the agent loop without making progress:
+     *
+     *  - the request was aborted (response-processing timeout or cancellation): the missing
+     *    `stop` event is expected, and the abort is already surfaced by its own path;
+     *  - no tool input was received at all: the model never committed to a tool call, so
+     *    there is nothing to truncate and nothing to retry.
+     */
+    public finalize(options?: { aborted?: boolean }): Result<ChatResultWithMetadata, string> {
+        for (const toolUseId of Object.keys(this.toolUses)) {
+            const toolUse = this.toolUses[toolUseId]
+            if (toolUse.stop) {
+                continue
+            }
+
+            const partialInput = typeof toolUse.input === 'string' ? toolUse.input : ''
+
+            if (options?.aborted || partialInput.length === 0) {
+                // Leave the tool use unstopped so it is filtered out downstream, as before.
+                this.#logging.debug(
+                    `ToolUse ${toolUseId} (${toolUse.name}) ended without a stop event and is not a truncated input (aborted=${!!options?.aborted}, receivedCharacters=${partialInput.length}); dropping it`
+                )
+                continue
+            }
+
+            this.#logging.error(
+                `ToolUse ${toolUseId} (${toolUse.name}) stream ended before a stop event after ${partialInput.length} characters; input was truncated`
+            )
+            // Reuse the malformed-JSON error prefix so this routes into the same recovery
+            // branch in the agentic loop. Keep the message short so the (potentially very
+            // large) partial input is not echoed back to the model in the tool result.
+            this.error = `ToolUse input is invalid JSON: incomplete tool input, stream ended after ${partialInput.length} characters before completion.`
+            this.toolUses[toolUseId] = {
+                ...toolUse,
+                input: {},
+                stop: true,
+            }
+        }
+        return this.getResult()
+    }
 }
