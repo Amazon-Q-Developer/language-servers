@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.0.129](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.128...lsp-codewhisperer/v0.0.129) (2026-09-30)
+
+
+### Bug Fixes
+
+* **amazonq:** forward the missing-packages HITL when a plan already exists ([#2886](https://github.com/Amazon-Q-Developer/language-servers/issues/2886)) ([e201207](https://github.com/Amazon-Q-Developer/language-servers/commit/e20120718966af5e4a37b1360d1a2b10effca0de))
+* **amazonq:** restore a mid-job migration mode from the settings artifact, not the job objective (V2381727290) ([#2887](https://github.com/Amazon-Q-Developer/language-servers/issues/2887)) ([b631e38](https://github.com/Amazon-Q-Developer/language-servers/commit/b631e382f3188a0f0ec426cac9a656fb07211cbb))
+* **amazonq:** stream large ATX artifact downloads to disk ([#2885](https://github.com/Amazon-Q-Developer/language-servers/issues/2885)) ([37d44ca](https://github.com/Amazon-Q-Developer/language-servers/commit/37d44ca3fbc391cf5ebf00aa1cfaa5df7a0e2d80))
+* **netTransform:** Beam to IDE — live beam node, JSON artifact cache, throttle cooldown, reaped-beam drop-off ([#2883](https://github.com/Amazon-Q-Developer/language-servers/issues/2883)) ([95344fd](https://github.com/Amazon-Q-Developer/language-servers/commit/95344fda9686ac6ac0c8360bb4dde04d3bebc822))
+
+## [0.0.128](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.127...lsp-codewhisperer/v0.0.128) (2026-09-09)
+
+
+### Bug Fixes
+
+* AWS Transform unit-test generation choice + status-only UT substeps ([#2857](https://github.com/Amazon-Q-Developer/language-servers/issues/2857)) ([2a478f7](https://github.com/Amazon-Q-Developer/language-servers/commit/2a478f7182a7d91fb5d0b2b559d3b826494fc149))
+
+## [0.0.127](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.126...lsp-codewhisperer/v0.0.127) (2026-08-24)
+
+
+### Bug Fixes
+
+* **amazonq:** cover merged env and headers in MCP consent fingerprint ([#2851](https://github.com/Amazon-Q-Developer/language-servers/issues/2851)) ([#2853](https://github.com/Amazon-Q-Developer/language-servers/issues/2853)) ([529aed4](https://github.com/Amazon-Q-Developer/language-servers/commit/529aed43259503cf71b475fb3496de7bfab25f17))
+* beam - flat-named transformed zips + lightweight discovery + IsLbvPending ([#2849](https://github.com/Amazon-Q-Developer/language-servers/issues/2849)) ([863c5bf](https://github.com/Amazon-Q-Developer/language-servers/commit/863c5bf00a6c30ec7658056a155f1ca1005127e6))
+* surface backend interactive mode in getTransformInfo ([836b756](https://github.com/Amazon-Q-Developer/language-servers/commit/836b756ee2d8a553d9b26cf095e12979141e2367))
+
+## [0.0.126](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.125...lsp-codewhisperer/v0.0.126) (2026-08-20)
+
+
+### Bug Fixes
+
+* **amazonq:** narrow tool-use   truncation detection and classify retries in telemetry ([#2847](https://github.com/Amazon-Q-Developer/language-servers/issues/2847)) ([1eb2f9f](https://github.com/Amazon-Q-Developer/language-servers/commit/1eb2f9f270c479ca457658e22f2ef0d06f6517ca))
+* scope and forward stepId for the planning-branch LBV HITL ([#2835](https://github.com/Amazon-Q-Developer/language-servers/issues/2835)) ([9f8bb89](https://github.com/Amazon-Q-Developer/language-servers/commit/9f8bb8943c41edc105c460d4b2c60836183cdd2b))
+
+## [0.0.125](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.124...lsp-codewhisperer/v0.0.125) (2026-08-18)
+
+
+### Features
+
+* **amazonq:** initialize Q services when credentials arrive ([#2840](https://github.com/Amazon-Q-Developer/language-servers/issues/2840)) ([4e0d3b0](https://github.com/Amazon-Q-Developer/language-servers/commit/4e0d3b0d69e0aa7a230f64a1b168a09bcfd4b7cd))
+
+
+### Bug Fixes
+
+* **amazonq:** retry truncated tool-use streams instead of dropping them silently ([#2841](https://github.com/Amazon-Q-Developer/language-servers/issues/2841)) ([368a099](https://github.com/Amazon-Q-Developer/language-servers/commit/368a099cc9b5cc3cf7bb1f2298718824a1ab1118))
+* repoint CODEOWNERS and package repository URLs to the new org ([#2838](https://github.com/Amazon-Q-Developer/language-servers/issues/2838)) ([43e44dc](https://github.com/Amazon-Q-Developer/language-servers/commit/43e44dc5af94703f51456cd8a913f0d61af7570e))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @aws/lsp-core bumped from ^0.0.21 to ^0.0.22
+
+## [0.0.124](https://github.com/aws/language-servers/compare/lsp-codewhisperer/v0.0.123...lsp-codewhisperer/v0.0.124) (2026-08-13)
+
+
+### Features
+
+* **amazonq:** surface Q Developer plugin access-blocked rejections to the client ([#2794](https://github.com/aws/language-servers/issues/2794)) ([724f629](https://github.com/aws/language-servers/commit/724f62909ef16e750f52f5ba8b570b42b8bf00c8))
+* scope local build verification to the loaded beamed repo and add beam discovery/download ([#2798](https://github.com/aws/language-servers/issues/2798)) ([49867d7](https://github.com/aws/language-servers/commit/49867d7d2d3c93a5ac9472aaac33b0a26c23cf00))
+
+
+### Bug Fixes
+
+* **amazonq:** deliver Q Developer access-blocked notifications to the client ([#2800](https://github.com/aws/language-servers/issues/2800)) ([5e92430](https://github.com/aws/language-servers/commit/5e924300c371f36df57994b56666e96b5b5b0c1d))
+
 ## [0.0.123](https://github.com/aws/language-servers/compare/lsp-codewhisperer/v0.0.122...lsp-codewhisperer/v0.0.123) (2026-07-23)
 
 

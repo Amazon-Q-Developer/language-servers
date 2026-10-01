@@ -276,11 +276,17 @@ export const AtxNetTransformServerToken =
                     // ---- Beam to IDE ----
                     case AtxListBeamedReposCommand: {
                         // PascalCase params/return to match the C# ExecuteCommandParams convention.
-                        const { WorkspaceId, ParentJobId } = params as any
+                        // Lightweight (optional): the poll-tick refresh sets it to skip the beam-map
+                        // download scan (throttle-safe).
+                        const { WorkspaceId, ParentJobId, Lightweight } = params as any
                         if (!WorkspaceId || !ParentJobId) {
                             throw new Error('WorkspaceId and ParentJobId are required for listBeamedRepos')
                         }
-                        const repos = await atxTransformHandler.listBeamedRepos(WorkspaceId, ParentJobId)
+                        const repos = await atxTransformHandler.listBeamedRepos(
+                            WorkspaceId,
+                            ParentJobId,
+                            Lightweight === true
+                        )
                         return { Repos: repos }
                     }
                     case AtxDownloadBeamArtifactCommand: {
