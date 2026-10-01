@@ -232,9 +232,19 @@ export class Utils {
         zipEntries: AdmZip.IZipEntry[],
         logger: Logging
     ): Promise<void> {
+        // Resolve the extraction root once so every entry can be checked against it.
+        const extractRoot = path.resolve(pathContainingArchive)
         for (const entry of zipEntries) {
             try {
                 const entryPath = path.join(pathContainingArchive, entry.entryName)
+                // Zip-slip guard: reject any entry that resolves outside the extraction
+                // root (../ traversal or absolute paths). Archives can originate from a
+                // remote artifact, so a crafted entry must never write outside destDir.
+                const resolvedEntry = path.resolve(entryPath)
+                if (resolvedEntry !== extractRoot && !resolvedEntry.startsWith(extractRoot + path.sep)) {
+                    logger.error(`Blocked zip entry escaping extraction directory: ${entry.entryName}`)
+                    continue
+                }
                 if (entry.isDirectory) {
                     await fs.promises.mkdir(entryPath, { recursive: true })
                 } else {
