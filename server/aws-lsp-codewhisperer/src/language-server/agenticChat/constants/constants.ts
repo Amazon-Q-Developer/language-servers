@@ -31,8 +31,21 @@ export const SERVICE_MANAGER_TIMEOUT_MS = 10_000 //10 seconds
 export const SERVICE_MANAGER_POLL_INTERVAL_MS = 100
 
 // Compaction
-export const COMPACTION_BODY = (threshold: number) =>
-    `The context window is almost full (${threshold}%) and exceeding it will clear your history. Amazon Q can compact your history instead.`
+/**
+ * Body copy for the compaction nudge.
+ *
+ * `percentUsed` is `currentRequestCount / maxOverallCharacters`, where `currentRequestCount`
+ * is the current turn's input plus the whole serialized history. It is deliberately NOT
+ * capped at 100: a long agentic session (many serialized tool specs plus accumulated
+ * tool_use / tool_result blocks) can legitimately sit well above the budget, and users have
+ * reported values of 200-300%. The real number is kept so it stays diagnosable, but the
+ * wording branches at 100% — otherwise the nudge reads "almost full (300%)", which
+ * contradicts itself and led users to believe the percentage was miscalculated.
+ */
+export const COMPACTION_BODY = (percentUsed: number) =>
+    percentUsed >= 100
+        ? `The context window is full (${percentUsed}% of the limit) and continuing will clear your history. Amazon Q can compact your history instead.`
+        : `The context window is almost full (${percentUsed}%) and exceeding it will clear your history. Amazon Q can compact your history instead.`
 export const COMPACTION_HEADER_BODY = 'Compact chat history?'
 export const COMPACTION_PROMPT = `
 [SYSTEM NOTE: This is an automated summarization request, not from the user]\n\n
