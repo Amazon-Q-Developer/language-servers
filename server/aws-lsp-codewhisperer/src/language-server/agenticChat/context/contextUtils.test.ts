@@ -9,6 +9,7 @@ import {
     mergeRelevantTextDocuments,
     mergeFileLists,
     getCodeSymbolDescription,
+    truncateContextContent,
 } from './contextUtils'
 import * as pathUtils from '@aws/lsp-core/out/util/path'
 import { sanitizeFilename } from '@aws/lsp-core/out/util/text'
@@ -426,6 +427,40 @@ describe('contextUtils', () => {
 
             const result = getCodeSymbolDescription(item, false)
             expect(result).to.equal(`Interface, ${path.join('workspace', 'src', 'models.ts')}`)
+        })
+    })
+
+    describe('truncateContextContent', () => {
+        it('returns content unchanged when it fits within the limit', () => {
+            const content = 'short content'
+            expect(truncateContextContent(content, 100)).to.equal(content)
+        })
+
+        it('returns content unchanged when it is exactly the limit', () => {
+            const content = 'a'.repeat(50)
+            expect(truncateContextContent(content, 50)).to.equal(content)
+        })
+
+        it('appends a truncation marker and never exceeds the limit', () => {
+            const lines = Array.from({ length: 1000 }, (_, i) => `This is line ${i + 1} of a large file.`)
+            const content = lines.join('\n')
+            const maxLength = 4096
+
+            const result = truncateContextContent(content, maxLength)
+
+            expect(result.length).to.equal(maxLength)
+            expect(result.startsWith('This is line 1 of a large file.')).to.equal(true)
+            expect(result).to.include('[Content truncated:')
+            expect(result).to.include(`${content.length} characters`)
+            // The marker must be the tail of the result so the model sees it after the excerpt
+            expect(result.endsWith('Read the file directly to see the rest.]')).to.equal(true)
+        })
+
+        it('falls back to a plain cut when the limit is too small for the marker', () => {
+            const content = 'x'.repeat(500)
+            const result = truncateContextContent(content, 10)
+
+            expect(result).to.equal('x'.repeat(10))
         })
     })
 })

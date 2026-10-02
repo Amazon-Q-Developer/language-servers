@@ -26,6 +26,7 @@ import {
     getInitialContextInfo,
     promptFileExtension,
     getCodeSymbolDescription,
+    truncateContextContent,
 } from './contextUtils'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
 import { Features } from '../../types'
@@ -567,7 +568,7 @@ export class AdditionalContextProvider {
             const entry = {
                 name: prompt.name.substring(0, additionalContentNameLimit),
                 description: '',
-                innerContext: prompt.content.substring(0, workspaceChunkMaxSize),
+                innerContext: truncateContextContent(prompt.content, workspaceChunkMaxSize),
                 type: contextType,
                 path: prompt.filePath,
                 relativePath: relativePath,
