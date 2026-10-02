@@ -139,5 +139,38 @@ describe('AtxTokenServiceManager', () => {
             stubBearer(false)
             assert.strictEqual(manager.getAuthType(), null)
         })
+
+        describe('IAM credentials deleted (aws/credentials/iam/delete)', () => {
+            it('clears the IAM session: no credentials, no tenant URL, no auth type', async () => {
+                stubIam(true)
+                stubBearer(false)
+                await setTenantUrl(tenantUrl)
+                assert.strictEqual(manager.getAuthType(), 'iam')
+                const cacheCallback = sinon.stub()
+                manager.registerCacheCallback(cacheCallback)
+
+                // The runtime clears its IAM slot, then notifies the server.
+                stubIam(false)
+                manager.handleOnCredentialsDeleted('iam' as CredentialsType)
+
+                assert.throws(() => manager.getIamCredentials(), /No IAM credentials/)
+                assert.strictEqual(manager.getActiveApplicationUrl(), null)
+                assert.strictEqual(manager.getAuthType(), null)
+                // The cached FES client is reset.
+                assert(cacheCallback.calledOnce)
+            })
+
+            it('leaves an existing bearer token untouched', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await setTenantUrl(tenantUrl)
+
+                stubIam(false)
+                manager.handleOnCredentialsDeleted('iam' as CredentialsType)
+
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+                assert.strictEqual(await manager.getBearerToken(), 'bearer-token')
+            })
+        })
     })
 })

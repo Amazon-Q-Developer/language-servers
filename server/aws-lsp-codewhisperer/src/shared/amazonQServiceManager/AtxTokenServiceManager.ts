@@ -49,6 +49,15 @@ export class AtxTokenServiceManager {
     }
 
     public handleOnCredentialsDeleted(type: CredentialsType): void {
+        // IAM sign-out (aws/credentials/iam/delete): the runtime has already cleared the IAM credentials slot.
+        // Also drop the tenant URL that came with the IAM session (sign-in repopulates it), and reset the cached
+        // FES client. The bearer token is left untouched.
+        if (type === ('iam' as CredentialsType)) {
+            this.log('ATX: IAM credentials deleted - clearing tenant URL')
+            this.clearAllCaches()
+            return
+        }
+
         if (type === ('bearer' as CredentialsType)) {
             const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
             const hasAtxCredentials = atxCredentialsProvider?.hasCredentials('bearer')
