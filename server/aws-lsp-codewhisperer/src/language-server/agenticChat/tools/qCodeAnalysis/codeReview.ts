@@ -1007,17 +1007,27 @@ export class CodeReview {
                 artifact.path
             )
 
-            // Only a file that passed the filter and was read (readPath set)
-            // feeds Git, and the diff derives from the SAME resolved location
-            // that was read into the zip — never an unread or filtered path.
-            if (readPath !== undefined) {
-                const artifactFileDiffs = await CodeReviewUtils.getGitDiffNames(readPath, this.logging)
-                artifactFileDiffs.forEach(filepath => codeDiffFiles.add(filepath))
-                codeDiff += await CodeReviewUtils.processArtifactWithDiff(
+            // Git runs ONLY for a code-diff scan; a full review performs no Git
+            // at all. This removes the previous name-only call that ran for
+            // every file even in a full review, whose Set result was never
+            // consumed there. For a code-diff scan, the changed-file set and
+            // the diff text both derive from the SAME per-file getGitDiff
+            // result (there is no separate name-only call), and the path is the
+            // SAME resolved, in-workspace, single-linked file that was read into
+            // the zip, so the diff never carries content from an unread,
+            // filtered, or out-of-workspace file. codeDiffFiles is consumed only
+            // for its count, so a file is counted exactly when its own diff is
+            // non-empty.
+            if (isCodeDiffScan && readPath !== undefined) {
+                const fileDiff = await CodeReviewUtils.processArtifactWithDiff(
                     { path: readPath },
                     isCodeDiffScan,
                     this.logging
                 )
+                if (fileDiff.length > 0) {
+                    codeDiffFiles.add(readPath)
+                    codeDiff += fileDiff
+                }
             }
         }
 
@@ -1058,7 +1068,8 @@ export class CodeReview {
                         folderArtifact.canonicalPath,
                         CodeReview.CUSTOMER_CODE_BASE_PATH,
                         canonicalWorkspaceRoots,
-                        includedFiles
+                        includedFiles,
+                        folderArtifact.path
                     )
                     languages.forEach(item => programmingLanguages.add(item))
                 },
@@ -1067,18 +1078,26 @@ export class CodeReview {
                 folderArtifact.path
             )
 
-            // Per-file Git, over the included files only. Each path is the same
-            // resolved, in-workspace, single-linked file that was read into the
-            // zip, so the diff never carries content from a skipped or
-            // out-of-workspace file.
-            for (const includedFile of includedFiles) {
-                const artifactFileDiffs = await CodeReviewUtils.getGitDiffNames(includedFile, this.logging)
-                artifactFileDiffs.forEach(filepath => codeDiffFiles.add(filepath))
-                codeDiff += await CodeReviewUtils.processArtifactWithDiff(
-                    { path: includedFile },
-                    isCodeDiffScan,
-                    this.logging
-                )
+            // Per-file Git, over the included files only, and ONLY for a
+            // code-diff scan (a full review performs no Git). Each path is the
+            // same resolved, in-workspace, single-linked file that was read into
+            // the zip, so the diff never carries content from a skipped or
+            // out-of-workspace file, and there is no whole-folder Git request.
+            // The changed-file set and the diff text both derive from the SAME
+            // per-file getGitDiff result (no separate name-only call);
+            // codeDiffFiles is consumed only for its count.
+            if (isCodeDiffScan) {
+                for (const includedFile of includedFiles) {
+                    const fileDiff = await CodeReviewUtils.processArtifactWithDiff(
+                        { path: includedFile },
+                        isCodeDiffScan,
+                        this.logging
+                    )
+                    if (fileDiff.length > 0) {
+                        codeDiffFiles.add(includedFile)
+                        codeDiff += fileDiff
+                    }
+                }
             }
         }
 
@@ -1133,19 +1152,22 @@ export class CodeReview {
     /**
      * Recursively add a folder and its contents to a zip archive
      * @param zip JSZip instance to add files to
-     * @param folderPath Canonical path to the folder to add
+     * @param folderPath Canonical path to the folder currently being scanned
      * @param zipPath Relative path within the zip archive
      * @param canonicalWorkspaceRoots Canonical workspace roots used for the per-entry re-checks
      * @param includedFiles Accumulator of the canonical file paths actually read
      *   into the zip; the caller derives the folder's Git diff only from these,
      *   so a skipped or out-of-workspace file never contributes diff text.
+     * @param archiveFolderPath Submitted-layout path for this directory. Used
+     *   only for ZIP entry names and finding paths, never for filesystem reads.
      */
     private async addFolderToZip(
         zip: JSZip,
         folderPath: string,
         zipPath: string,
         canonicalWorkspaceRoots: string[],
-        includedFiles: Set<string>
+        includedFiles: Set<string>,
+        archiveFolderPath: string
     ): Promise<Set<string>> {
         try {
             let programmingLanguages = new Set<string>()
@@ -1184,7 +1206,11 @@ export class CodeReview {
 
                     const fileLanguage = CodeReviewUtils.getFileLanguage(name)
                     const content = await this.workspace.fs.readFile(readPath)
-                    let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(readPath)
+                    // Preserve the submitted directory layout for archive names
+                    // without using it for reads. The content and Git path remain
+                    // the checked canonical location.
+                    const displayPath = path.join(archiveFolderPath, name)
+                    let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(displayPath)
                     zip.file(`${zipPath}${normalizedArtifactPath}`, content)
                     programmingLanguages.add(fileLanguage)
                     // Record the exact location read into the zip so the folder's
@@ -1219,7 +1245,8 @@ export class CodeReview {
                         canonicalDir,
                         zipPath,
                         canonicalWorkspaceRoots,
-                        includedFiles
+                        includedFiles,
+                        path.join(archiveFolderPath, name)
                     )
                     languages.forEach(item => programmingLanguages.add(item))
                 }

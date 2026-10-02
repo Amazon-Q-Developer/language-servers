@@ -442,18 +442,24 @@ describe('CodeReview', () => {
             expect(result.zipBuffer).to.be.instanceOf(Buffer)
             expect(result.md5Hash).to.be.a('string')
             expect(result.isCodeDiffPresent).to.be.a('boolean')
-            expect(getGitDiffNamesStub.called).to.be.true
+            // A code-diff scan (isFullReviewRequest=false) derives the diff from
+            // the per-file getGitDiff (processArtifactWithDiff); the separate
+            // name-only call is no longer used.
+            expect(getGitDiffNamesStub.called, 'name-only git must not be called').to.be.false
+            expect(processArtifactWithDiffStub.called, 'per-file diff must run for a code-diff scan').to.be.true
         })
 
         it('should handle code diff generation', async () => {
             processArtifactWithDiffStub.resolves('diff content\n')
 
+            // isFullReviewRequest=false -> code-diff scan, so the gated per-file
+            // diff path runs and a non-empty diff marks the artifact present.
             const result = await (codeReview as any).prepareFilesAndFoldersForUpload(
                 'Test requirement',
                 [{ path: realFile }],
                 [],
                 [],
-                true
+                false
             )
 
             expect(result.isCodeDiffPresent).to.be.true
