@@ -605,26 +605,40 @@ describe('CodeReview artifact workspace boundary (real filesystem)', () => {
         // validation pass, then make only the pre-read re-check fail, so the
         // defensive realpath-catch and not-a-regular-file branches run with no
         // dependency on OS permissions. Nothing is ever read in either case.
-        it('rejects a file that becomes unresolvable between validation and the pre-read re-check', async () => {
-            const file = mk(ws, 'app.js', 'console.log(1)\n')
-            const canonFile = await fs.promises.realpath(file)
-            const realRealpath = fs.promises.realpath.bind(fs.promises)
-            let seen = 0
-            const rp = sandbox.stub(fs.promises, 'realpath')
-            rp.callsFake(((p: any, ...rest: any[]) => {
-                if (p === canonFile) {
-                    seen++
-                    // 1st call = up-front validation (passes); 2nd = pre-read re-check (fails closed).
-                    if (seen >= 2) {
-                        return Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
-                    }
+        for (const nonCanonicalInput of [false, true]) {
+            it(`rejects a file that becomes unresolvable between validation and the pre-read re-check${nonCanonicalInput ? ' (non-canonical input)' : ''}`, async () => {
+                const file = mk(ws, 'app.js', 'console.log(1)\n')
+                // Do not use path.join here: it would remove the explicit dot segment.
+                const submittedFile = nonCanonicalInput
+                    ? `${path.dirname(file)}${path.sep}.${path.sep}${path.basename(file)}`
+                    : file
+                const canonFile = await fs.promises.realpath(file)
+                if (nonCanonicalInput) {
+                    expect(submittedFile).to.not.equal(canonFile)
                 }
-                return realRealpath(p, ...rest)
-            }) as any)
-            const cr = makeCodeReview([ws])
-            await expectRejects(prepare(cr, [{ path: file }], [], []), /does not exist or cannot be resolved/)
-            assertNoReadOrGit()
-        })
+                const realRealpath = fs.promises.realpath.bind(fs.promises)
+                const observedPaths: string[] = []
+                const rp = sandbox.stub(fs.promises, 'realpath')
+                rp.callsFake(((p: any, ...rest: any[]) => {
+                    // Validation receives the submitted spelling; re-check receives
+                    // its canonical spelling (which may differ on Windows).
+                    if (p === submittedFile || p === canonFile) {
+                        observedPaths.push(p)
+                        if (observedPaths.length === 2) {
+                            return Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
+                        }
+                    }
+                    return realRealpath(p, ...rest)
+                }) as any)
+                const cr = makeCodeReview([ws])
+                await expectRejects(
+                    prepare(cr, [{ path: submittedFile }], [], []),
+                    /does not exist or cannot be resolved/
+                )
+                expect(observedPaths).to.deep.equal([submittedFile, canonFile])
+                assertNoReadOrGit()
+            })
+        }
 
         it('rejects a file that turns into a directory between validation and the pre-read re-check', async () => {
             const file = mk(ws, 'app.js', 'console.log(1)\n')
@@ -644,6 +658,7 @@ describe('CodeReview artifact workspace boundary (real filesystem)', () => {
             }) as any)
             const cr = makeCodeReview([ws])
             await expectRejects(prepare(cr, [{ path: file }], [], []), /not a regular file/)
+            expect(seen).to.equal(2)
             assertNoReadOrGit()
         })
     })
@@ -655,33 +670,48 @@ describe('CodeReview artifact workspace boundary (real filesystem)', () => {
         it('aborts the walk when a discovered file becomes unresolvable before its realpath', async () => {
             const dir = path.join(ws, 'walk')
             fs.mkdirSync(dir)
-            const vanish = path.join(dir, 'vanish.js')
+            // Force distinct submitted/canonical spellings on every platform.
+            const vanish = `${dir}${path.sep}.${path.sep}vanish.js`
             fs.writeFileSync(vanish, 'x')
+            const canonicalVanish = await fs.promises.realpath(vanish)
             const realRealpath = fs.promises.realpath.bind(fs.promises)
+            let injected = false
             const rp = sandbox.stub(fs.promises, 'realpath')
-            rp.callsFake(((p: any, ...rest: any[]) =>
-                p === vanish
-                    ? Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
-                    : realRealpath(p, ...rest)) as any)
+            rp.callsFake(((p: any, ...rest: any[]) => {
+                if (p === vanish || p === canonicalVanish) {
+                    injected = true
+                    return Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
+                }
+                return realRealpath(p, ...rest)
+            }) as any)
             const cr = makeCodeReview([ws])
             await expectRejects(prepare(cr, [], [{ path: dir }], []), /does not exist or cannot be resolved/)
-            expect(readFileArgs()).to.not.include(vanish)
+            expect(injected, 'walk realpath failure must be injected').to.equal(true)
+            assertNoReadOrGit()
         })
 
         it('aborts the walk when a discovered subdirectory becomes unresolvable before its realpath', async () => {
             const dir = path.join(ws, 'walk')
             fs.mkdirSync(dir)
-            const subdir = path.join(dir, 'sub')
+            // Force distinct submitted/canonical spellings on every platform.
+            const subdir = `${dir}${path.sep}.${path.sep}sub`
             fs.mkdirSync(subdir)
             fs.writeFileSync(path.join(subdir, 'deep.js'), 'x')
+            const canonicalSubdir = await fs.promises.realpath(subdir)
             const realRealpath = fs.promises.realpath.bind(fs.promises)
+            let injected = false
             const rp = sandbox.stub(fs.promises, 'realpath')
-            rp.callsFake(((p: any, ...rest: any[]) =>
-                p === subdir
-                    ? Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
-                    : realRealpath(p, ...rest)) as any)
+            rp.callsFake(((p: any, ...rest: any[]) => {
+                if (p === subdir || p === canonicalSubdir) {
+                    injected = true
+                    return Promise.reject(Object.assign(new Error('vanished'), { code: 'ENOENT' }))
+                }
+                return realRealpath(p, ...rest)
+            }) as any)
             const cr = makeCodeReview([ws])
             await expectRejects(prepare(cr, [], [{ path: dir }], []), /does not exist or cannot be resolved/)
+            expect(injected, 'subdirectory realpath failure must be injected').to.equal(true)
+            assertNoReadOrGit()
         })
 
         it('aborts the walk when a discovered subdirectory resolves outside the workspace', async () => {
@@ -689,14 +719,25 @@ describe('CodeReview artifact workspace boundary (real filesystem)', () => {
             // containment re-check rejects before any descent into it.
             const dir = path.join(ws, 'walk')
             fs.mkdirSync(dir)
-            const subdir = path.join(dir, 'sub')
+            // Force distinct submitted/canonical spellings on every platform.
+            const subdir = `${dir}${path.sep}.${path.sep}sub`
             fs.mkdirSync(subdir)
+            const canonicalSubdir = await fs.promises.realpath(subdir)
+            const canonicalOutside = await fs.promises.realpath(outside)
             const realRealpath = fs.promises.realpath.bind(fs.promises)
+            let injected = false
             const rp = sandbox.stub(fs.promises, 'realpath')
-            rp.callsFake(((p: any, ...rest: any[]) =>
-                p === subdir ? Promise.resolve(outside) : realRealpath(p, ...rest)) as any)
+            rp.callsFake(((p: any, ...rest: any[]) => {
+                if (p === subdir || p === canonicalSubdir) {
+                    injected = true
+                    return Promise.resolve(canonicalOutside)
+                }
+                return realRealpath(p, ...rest)
+            }) as any)
             const cr = makeCodeReview([ws])
             await expectRejects(prepare(cr, [], [{ path: dir }], []), /inside an open workspace/)
+            expect(injected, 'outside subdirectory target must be injected').to.equal(true)
+            assertNoReadOrGit()
         })
     })
 
