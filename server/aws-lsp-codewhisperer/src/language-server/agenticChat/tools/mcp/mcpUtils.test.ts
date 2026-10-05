@@ -28,6 +28,15 @@ import {
     convertPersonaToAgent,
     migrateToAgentConfig,
 } from './mcpUtils'
+import {
+    EXECUTE_BASH,
+    FILE_SEARCH,
+    FS_READ,
+    FS_REPLACE,
+    FS_WRITE,
+    GREP_SEARCH,
+    LIST_DIRECTORY,
+} from '../../constants/toolConstants'
 import type { MCPServerConfig } from './mcpTypes'
 import { McpPermissionType } from './mcpTypes'
 import { pathToFileURL } from 'url'
@@ -579,6 +588,58 @@ describe('createNamespacedToolName', () => {
         const reserved = new Set(['fsRead'])
         const result = createNamespacedToolName('github', 'create_issue', tools, toolNameMapping, reserved)
         expect(result).to.equal('create_issue')
+    })
+
+    it('refuses every built-in tool name', () => {
+        const builtIns = [FS_READ, FS_WRITE, FS_REPLACE, LIST_DIRECTORY, GREP_SEARCH, FILE_SEARCH, EXECUTE_BASH]
+        const reserved = new Set(builtIns)
+
+        for (const builtIn of builtIns) {
+            const result = createNamespacedToolName('evil', builtIn, tools, toolNameMapping, reserved)
+            expect(result, `${builtIn} must not be claimed`).to.equal(`evil___${builtIn}`)
+            expect(tools.has(builtIn), `${builtIn} must stay unclaimed`).to.be.false
+        }
+    })
+
+    it('gives two servers advertising the same built-in name distinct namespaced names', () => {
+        const reserved = new Set(['fsRead'])
+        const first = createNamespacedToolName('alpha', 'fsRead', tools, toolNameMapping, reserved)
+        const second = createNamespacedToolName('beta', 'fsRead', tools, toolNameMapping, reserved)
+        expect(first).to.equal('alpha___fsRead')
+        expect(second).to.equal('beta___fsRead')
+        expect(tools.has('fsRead')).to.be.false
+    })
+
+    it('reuses the namespaced name when the same server tool is seen again', () => {
+        const reserved = new Set(['fsRead'])
+        const first = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        const second = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(second).to.equal(first)
+        expect(toolNameMapping.size).to.equal(1)
+    })
+
+    it('keeps a truncated namespaced name out of the reserved set', () => {
+        const longServer = 'very_long_server_name_that_definitely_exceeds_the_maximum_allowed_length'
+        const reserved = new Set(['fsRead'])
+        const result = createNamespacedToolName(longServer, 'fsRead', tools, toolNameMapping, reserved)
+        expect(result.length).to.be.lessThanOrEqual(MAX_TOOL_NAME_LENGTH)
+        expect(result.endsWith('___fsRead')).to.be.true
+        expect(reserved.has(result)).to.be.false
+    })
+
+    it('does not fall back onto a reserved name via the numeric suffix path', () => {
+        // Force the namespaced form to be unavailable so the suffix path runs.
+        tools.add('evil___fsRead')
+        const reserved = new Set(['fsRead', 'fsRead1'])
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(reserved.has(result)).to.be.false
+        expect(result).to.not.equal('fsRead')
+        expect(result).to.not.equal('fsRead1')
+    })
+
+    it('leaves behavior unchanged when no reserved names are supplied', () => {
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping)
+        expect(result).to.equal('fsRead')
     })
 })
 
