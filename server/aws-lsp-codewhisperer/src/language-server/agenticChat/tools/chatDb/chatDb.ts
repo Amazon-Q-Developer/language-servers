@@ -69,6 +69,21 @@ export class ChatDatabase {
     #loadTimeMs?: number
     #dbFileSize?: number
     #historyMaintainer: ChatHistoryMaintainer
+    /**
+     * Minimal, mode-specific pending state for pair programming mode selections
+     * made before the LokiJS database finishes loading (while isInitialized() is
+     * false). This is intentionally NOT a general settings queue: it captures only
+     * pair programming mode so an explicit user choice — especially turning the
+     * mode OFF — survives initialization and is visible on reads, without masking
+     * unrelated settings loaded from disk.
+     *
+     * The global entry uses an optional wrapper so "set to undefined" is
+     * distinguishable from "never set". The most recent write wins, which keeps
+     * the last global selection authoritative across interleaved global/per-tab
+     * setters.
+     */
+    #pendingGlobalPairProgrammingMode?: { value: boolean | undefined }
+    #pendingTabPairProgrammingMode: Map<string, boolean | undefined> = new Map()
 
     constructor(features: Features) {
         this.#features = features
@@ -230,6 +245,42 @@ export class ChatDatabase {
         this.#db.addCollection(SettingsCollection)
         this.#initialized = true
         this.#loadTimeMs = Date.now() - startTime
+        // The database is now ready; apply any pair programming mode selections
+        // that were made while it was still loading.
+        this.flushPendingPairProgrammingMode()
+    }
+
+    /**
+     * Applies pair programming mode selections captured before the database
+     * finished loading. Per-tab selections are written first; the global
+     * selection is applied LAST so the last in-session global selection wins,
+     * even though setTabPairProgrammingMode also updates the global default as a
+     * side effect (interleaved setters). Unrelated settings already loaded from
+     * disk are preserved because the underlying writes merge rather than replace.
+     */
+    private flushPendingPairProgrammingMode(): void {
+        if (!this.#initialized) {
+            return
+        }
+
+        // Snapshot and clear the pending buffers first. The setters below run in
+        // the initialized path and must not read or write the pending state.
+        const pendingTabModes = this.#pendingTabPairProgrammingMode
+        this.#pendingTabPairProgrammingMode = new Map()
+        const pendingGlobal = this.#pendingGlobalPairProgrammingMode
+        this.#pendingGlobalPairProgrammingMode = undefined
+
+        // Apply per-tab selections first. setTabPairProgrammingMode also mirrors
+        // the value into global settings, so applying the global selection AFTER
+        // this loop keeps the last in-session global selection authoritative.
+        for (const [tabId, mode] of pendingTabModes) {
+            this.setTabPairProgrammingMode(tabId, mode)
+        }
+
+        // Apply the final global selection last (last write wins).
+        if (pendingGlobal) {
+            this.setPairProgrammingMode(pendingGlobal.value)
+        }
     }
 
     getOpenTabs() {
@@ -1020,11 +1071,23 @@ export class ChatDatabase {
     }
 
     getPairProgrammingMode(): boolean | undefined {
+        if (!this.#initialized) {
+            // Before the database is ready, surface the pending global selection
+            // (including an explicit OFF) rather than nothing.
+            return this.#pendingGlobalPairProgrammingMode?.value
+        }
         const settings = this.getSettings()
         return settings?.pairProgrammingMode
     }
 
     setPairProgrammingMode(pairProgrammingMode: boolean | undefined): void {
+        if (!this.#initialized) {
+            // Preserve the global selection until the database is ready. The most
+            // recent write wins, keeping last-global-selection semantics across
+            // interleaved global and per-tab setters.
+            this.#pendingGlobalPairProgrammingMode = { value: pairProgrammingMode }
+            return
+        }
         // Get existing settings to preserve other fields like modelId
         const settings = this.getSettings() || { modelId: undefined }
         this.updateSettings({ ...settings, pairProgrammingMode })
@@ -1085,13 +1148,15 @@ export class ChatDatabase {
      * @returns The tab's pair programming mode, or undefined if not set
      */
     getTabPairProgrammingMode(tabId: string): boolean | undefined {
-        if (this.#initialized) {
-            const collection = this.#db.getCollection<Tab>(TabCollection)
-            const historyId = this.#historyIdMapping.get(tabId)
-            if (historyId) {
-                const tab = collection.findOne({ historyId })
-                return tab?.pairProgrammingMode
-            }
+        if (!this.#initialized) {
+            // Surface a pending per-tab selection made before the database is ready.
+            return this.#pendingTabPairProgrammingMode.get(tabId)
+        }
+        const collection = this.#db.getCollection<Tab>(TabCollection)
+        const historyId = this.#historyIdMapping.get(tabId)
+        if (historyId) {
+            const tab = collection.findOne({ historyId })
+            return tab?.pairProgrammingMode
         }
         return undefined
     }
@@ -1102,28 +1167,34 @@ export class ChatDatabase {
      * @param pairProgrammingMode The pair programming mode to set
      */
     setTabPairProgrammingMode(tabId: string, pairProgrammingMode: boolean | undefined): void {
-        if (this.#initialized) {
-            const collection = this.#db.getCollection<Tab>(TabCollection)
-            const historyId = this.getOrCreateHistoryId(tabId)
-            const tab = collection.findOne({ historyId })
-
-            this.#features.logging.log(`Setting tab pair programming mode: tabId=${tabId}, mode=${pairProgrammingMode}`)
-
-            if (!tab) {
-                this.addTabWithContext(collection, historyId, {})
-                const newTab = collection.findOne({ historyId })
-                if (newTab) {
-                    newTab.pairProgrammingMode = pairProgrammingMode
-                    collection.update(newTab)
-                }
-            } else {
-                tab.pairProgrammingMode = pairProgrammingMode
-                collection.update(tab)
-            }
-
-            // Also update global settings with the latest selection for new tab defaults
-            this.setPairProgrammingMode(pairProgrammingMode)
+        if (!this.#initialized) {
+            // Preserve the per-tab selection and mirror it into the pending global
+            // selection, matching the initialized behavior where setting a tab's
+            // mode also updates the global default for new tabs.
+            this.#pendingTabPairProgrammingMode.set(tabId, pairProgrammingMode)
+            this.#pendingGlobalPairProgrammingMode = { value: pairProgrammingMode }
+            return
         }
+        const collection = this.#db.getCollection<Tab>(TabCollection)
+        const historyId = this.getOrCreateHistoryId(tabId)
+        const tab = collection.findOne({ historyId })
+
+        this.#features.logging.log(`Setting tab pair programming mode: tabId=${tabId}, mode=${pairProgrammingMode}`)
+
+        if (!tab) {
+            this.addTabWithContext(collection, historyId, {})
+            const newTab = collection.findOne({ historyId })
+            if (newTab) {
+                newTab.pairProgrammingMode = pairProgrammingMode
+                collection.update(newTab)
+            }
+        } else {
+            tab.pairProgrammingMode = pairProgrammingMode
+            collection.update(tab)
+        }
+
+        // Also update global settings with the latest selection for new tab defaults
+        this.setPairProgrammingMode(pairProgrammingMode)
     }
 
     /**
@@ -1154,7 +1225,13 @@ export class ChatDatabase {
         if (globalMode !== undefined) {
             return globalMode
         }
-        // Default to true for first-time users
+        // Before initialization, with no explicit in-session choice, we cannot
+        // know the persisted preference yet. Default to false (mode OFF) so we
+        // never force agentic mode ON over a possibly-persisted OFF preference.
+        if (!this.#initialized) {
+            return false
+        }
+        // Initialized with genuinely no stored preference → first-time user default.
         return true
     }
 

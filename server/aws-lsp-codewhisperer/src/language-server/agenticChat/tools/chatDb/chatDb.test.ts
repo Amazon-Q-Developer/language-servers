@@ -708,6 +708,172 @@ describe('ChatDatabase', () => {
             }, 'Should not throw when no instance exists')
         })
     })
+
+    describe('Pair Programming Mode Initialization', () => {
+        // These tests exercise the window before the LokiJS database finishes
+        // loading (isInitialized() === false). To make that window deterministic,
+        // we build a dedicated instance whose filesystem `mkdir` never resolves,
+        // so LokiJS autoload never completes and the instance stays uninitialized
+        // until we explicitly call databaseInitialize().
+        let modeDb: ChatDatabase
+
+        beforeEach(() => {
+            const neverResolvingMkdir = sinon.stub().returns(new Promise<void>(() => {}))
+            const modeFeatures = {
+                ...(mockFeatures as any),
+                workspace: {
+                    ...(mockFeatures.workspace as any),
+                    fs: {
+                        ...(mockFeatures.workspace as any).fs,
+                        mkdir: neverResolvingMkdir,
+                    },
+                },
+            } as unknown as Features
+            // Use `new` (not getInstance) so this controlled instance is independent
+            // of the singleton created by the outer beforeEach.
+            modeDb = new ChatDatabase(modeFeatures)
+        })
+
+        afterEach(() => {
+            modeDb.close()
+        })
+
+        it('pre-init reads: effective mode is false and settings are undefined with no pending choice', () => {
+            assert.strictEqual(modeDb.isInitialized(), false, 'Database should be uninitialized')
+            assert.strictEqual(modeDb.getPairProgrammingMode(), undefined, 'Global mode should be undefined')
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-1'), undefined, 'Tab mode should be undefined')
+            // Key regression: before init with no explicit choice, do NOT default to
+            // true (agentic ON). Default to false so a possibly-persisted OFF is not
+            // overridden before the database is ready.
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-1'),
+                false,
+                'Effective mode should be false when uninitialized with no pending choice'
+            )
+        })
+
+        it('early OFF: an explicit global OFF before init is surfaced on reads and survives the flush', async () => {
+            modeDb.setPairProgrammingMode(false)
+
+            assert.strictEqual(modeDb.isInitialized(), false, 'Database should still be uninitialized')
+            assert.strictEqual(modeDb.getPairProgrammingMode(), false, 'Pending OFF should be surfaced before init')
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-1'),
+                false,
+                'Effective mode should honor the pending OFF before init'
+            )
+
+            await modeDb.databaseInitialize(0)
+
+            assert.strictEqual(modeDb.getPairProgrammingMode(), false, 'OFF should be flushed to global settings')
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-1'),
+                false,
+                'Effective mode should remain false after init'
+            )
+        })
+
+        it('early OFF (per-tab): an explicit tab OFF before init is surfaced on reads', () => {
+            modeDb.setTabPairProgrammingMode('tab-1', false)
+
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-1'), false, 'Pending tab OFF should be surfaced')
+            // Per-tab setters also mirror into the pending global default.
+            assert.strictEqual(modeDb.getPairProgrammingMode(), false, 'Tab OFF should mirror into pending global')
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-1'),
+                false,
+                'Effective mode should honor the pending tab OFF before init'
+            )
+        })
+
+        it('mixed tab choices: distinct per-tab selections before init are preserved through the flush', async () => {
+            modeDb.setTabPairProgrammingMode('tab-a', true)
+            modeDb.setTabPairProgrammingMode('tab-b', false)
+
+            // Pre-init reads reflect each tab's own pending selection.
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-a'), true, 'tab-a pending should be true')
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-b'), false, 'tab-b pending should be false')
+            assert.strictEqual(modeDb.getEffectiveTabPairProgrammingMode('tab-a'), true, 'tab-a effective pre-init')
+            assert.strictEqual(modeDb.getEffectiveTabPairProgrammingMode('tab-b'), false, 'tab-b effective pre-init')
+
+            await modeDb.databaseInitialize(0)
+
+            // After flush, per-tab selections are persisted independently.
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-a'), true, 'tab-a should persist true')
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-b'), false, 'tab-b should persist false')
+            assert.strictEqual(modeDb.getEffectiveTabPairProgrammingMode('tab-a'), true, 'tab-a effective post-init')
+            assert.strictEqual(modeDb.getEffectiveTabPairProgrammingMode('tab-b'), false, 'tab-b effective post-init')
+        })
+
+        it('final global ordering: the last global selection wins across interleaved setters after flush', async () => {
+            // Interleave per-tab setters (which mirror into global) with direct
+            // global setters. The last global write (false) must be authoritative.
+            modeDb.setTabPairProgrammingMode('tab-a', true) // global -> true
+            modeDb.setPairProgrammingMode(false) // global -> false
+            modeDb.setTabPairProgrammingMode('tab-b', true) // global -> true
+            modeDb.setPairProgrammingMode(false) // global -> false (last)
+
+            await modeDb.databaseInitialize(0)
+
+            assert.strictEqual(
+                modeDb.getPairProgrammingMode(),
+                false,
+                'Global mode should equal the last global selection, not the last tab mirror'
+            )
+            // Per-tab selections are still preserved independently of the global value.
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-a'), true, 'tab-a should persist true')
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-b'), true, 'tab-b should persist true')
+            // A brand-new tab with no selection falls back to the final global value.
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-c'),
+                false,
+                'New tab should inherit the final global selection'
+            )
+        })
+
+        it('loaded settings preserved: flushing pending mode merges into (does not clobber) existing settings', async () => {
+            modeDb.setPairProgrammingMode(false) // pending global OFF
+
+            // Simulate settings that were loaded from disk before the flush runs.
+            // getSettings is what the flush reads before writing the merged record.
+            const loadedSettings = {
+                modelId: 'model-X',
+                pairProgrammingMode: undefined,
+                cachedModels: [{ id: 'm1', name: 'M1' }],
+                cachedDefaultModelId: 'm1',
+                modelCacheTimestamp: 123456,
+            }
+            const getSettingsStub = sinon.stub(modeDb, 'getSettings').returns(loadedSettings as any)
+
+            await modeDb.databaseInitialize(0)
+
+            getSettingsStub.restore()
+
+            // The pending mode is applied...
+            assert.strictEqual(modeDb.getPairProgrammingMode(), false, 'Pending OFF should be flushed')
+            // ...without dropping unrelated loaded settings.
+            assert.strictEqual(modeDb.getModelId(), 'model-X', 'modelId should be preserved')
+            const cached = modeDb.getCachedModels()
+            assert.ok(cached, 'Cached models should be preserved')
+            assert.deepStrictEqual(cached.models, loadedSettings.cachedModels, 'Cached models should be intact')
+            assert.strictEqual(cached.defaultModelId, 'm1', 'Cached default model should be intact')
+            assert.strictEqual(cached.timestamp, 123456, 'Cache timestamp should be intact')
+        })
+
+        it('initialized defaults: effective mode is true when initialized with no explicit choice', async () => {
+            await modeDb.databaseInitialize(0)
+
+            assert.strictEqual(modeDb.getPairProgrammingMode(), undefined, 'No global setting should exist')
+            assert.strictEqual(modeDb.getTabPairProgrammingMode('tab-1'), undefined, 'No tab setting should exist')
+            // Once initialized with genuinely no stored preference, keep the
+            // first-time-user default of true.
+            assert.strictEqual(
+                modeDb.getEffectiveTabPairProgrammingMode('tab-1'),
+                true,
+                'Effective mode should default to true when initialized with no choice'
+            )
+        })
+    })
 })
 function uuid(): `${string}-${string}-${string}-${string}-${string}` {
     throw new Error('Function not implemented.')

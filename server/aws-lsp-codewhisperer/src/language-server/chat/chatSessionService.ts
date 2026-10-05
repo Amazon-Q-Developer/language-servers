@@ -28,7 +28,8 @@ type DeferredHandler = {
     reject: (err: Error) => void
 }
 export class ChatSessionService {
-    public pairProgrammingMode: boolean = true
+    // Session creation alone must not grant write access before mode initialization.
+    public pairProgrammingMode: boolean = false
     public contextListSent: boolean = false
     public isMemoryBankGeneration: boolean = false
     #modelId: string | undefined

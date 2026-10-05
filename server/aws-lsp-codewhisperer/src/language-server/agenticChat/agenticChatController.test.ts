@@ -12,6 +12,7 @@ import {
     ContentType,
     GenerateAssistantResponseCommandInput,
     SendMessageCommandInput,
+    ToolResultStatus,
 } from '@amzn/codewhisperer-streaming'
 import {
     QDeveloperStreaming,
@@ -58,6 +59,9 @@ import { ChatDatabase } from './tools/chatDb/chatDb'
 import { LocalProjectContextController } from '../../shared/localProjectContextController'
 import { CancellationError } from '@aws/lsp-core'
 import { ToolApprovalException } from './tools/toolShared'
+import { FsWrite } from './tools/fsWrite'
+import { FsRead } from './tools/fsRead'
+import { AgenticChatTriggerContext } from './context/agenticChatTriggerContext'
 import * as constants from './constants/constants'
 import { GENERIC_ERROR_MS } from './constants/constants'
 import { TokenLimitsCalculator } from './utils/tokenLimitsCalculator'
@@ -3634,6 +3638,438 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+    })
+
+    describe('agentic coding (pair programming) mode regression', () => {
+        const PP_KEY = 'pair-programmer-mode'
+        let getEffectiveModeStub: sinon.SinonStub
+
+        const getSession = (tabId: string) => chatSessionManagementService.getSession(tabId).data!
+
+        // Make the write tool observable in the session's tool set so that OFF-mode
+        // exclusion (and ON-mode availability) is testable through the real #getTools.
+        const withFsWriteInToolset = () => {
+            testFeatures.agent.getTools = sinon.stub().returns(
+                ['mock-tool-name', 'codeReview', 'fsRead', 'fsWrite'].map(name => ({
+                    toolSpecification: { name, description: 'Mock tool for testing' },
+                }))
+            )
+        }
+
+        const makeResultStream = () =>
+            ({
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            }) as any
+
+        beforeEach(() => {
+            // Normal initialized default: the effective mode is ON unless a test overrides it.
+            getEffectiveModeStub = sinon
+                .stub(ChatDatabase.prototype, 'getEffectiveTabPairProgrammingMode')
+                .returns(true)
+        })
+
+        describe('onChatPrompt mode option', () => {
+            it('explicit pair-programmer-mode=false corrects an ON session and excludes fsWrite', async () => {
+                withFsWriteInToolset()
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                assert.strictEqual(session.pairProgrammingMode, true)
+
+                const prepareRequestSpy = sinon.spy(AgenticChatTriggerContext.prototype, 'getChatParamsFromTrigger')
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Hello', options: { [PP_KEY]: 'false' } } },
+                    mockCancellationToken
+                )
+
+                assert.strictEqual(session.pairProgrammingMode, false)
+                sinon.assert.calledOnce(prepareRequestSpy)
+                assert.ok(!prepareRequestSpy.firstCall.args[6]?.some(tool => tool.toolSpecification.name === 'fsWrite'))
+
+                // The write tool is now excluded from the session's tool set: dispatch is blocked.
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resetHistory()
+                await chatController.processToolUses(
+                    [{ toolUseId: 'tu-w', name: 'fsWrite', input: { path: '/tmp/a.ts' }, stop: true } as any],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+                sinon.assert.notCalled(runToolStub)
+            })
+
+            it('explicit pair-programmer-mode=true turns an OFF session back ON', async () => {
+                getEffectiveModeStub.returns(false)
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                assert.strictEqual(session.pairProgrammingMode, false)
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Hello', options: { [PP_KEY]: 'true' } } } as any,
+                    mockCancellationToken
+                )
+
+                assert.strictEqual(session.pairProgrammingMode, true)
+            })
+
+            it('omitted prompt options preserve the current mode', async () => {
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                assert.strictEqual(session.pairProgrammingMode, true)
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Hello' } },
+                    mockCancellationToken
+                )
+
+                assert.strictEqual(session.pairProgrammingMode, true)
+            })
+
+            it('any explicit non-"true" option value disables the mode', async () => {
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                assert.strictEqual(session.pairProgrammingMode, true)
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Hello', options: { [PP_KEY]: 'maybe' } } } as any,
+                    mockCancellationToken
+                )
+
+                assert.strictEqual(session.pairProgrammingMode, false)
+            })
+
+            it('lazily creates the session honoring an effective OFF mode when no tab-add occurred', async () => {
+                getEffectiveModeStub.returns(false)
+                assert.ok(!chatSessionManagementService.hasSession(mockTabId))
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Hello' } },
+                    mockCancellationToken
+                )
+
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+            })
+        })
+
+        describe('onTabAdd lazy creation and preservation', () => {
+            it('initializes a new session from the effective OFF mode and notifies the UI', () => {
+                getEffectiveModeStub.returns(false)
+
+                chatController.onTabAdd({ tabId: mockTabId })
+
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+                sinon.assert.calledWithMatch(testFeatures.chat.chatOptionsUpdate as sinon.SinonStub, {
+                    tabId: mockTabId,
+                    pairProgrammingMode: false,
+                })
+            })
+
+            it('does not overwrite an OFF session on a late or repeated tab add', () => {
+                getEffectiveModeStub.returns(false)
+                chatController.onTabAdd({ tabId: mockTabId })
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+
+                // The effective mode later reports ON, but the existing session must be preserved.
+                getEffectiveModeStub.returns(true)
+                chatController.onTabAdd({ tabId: mockTabId })
+
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+            })
+        })
+
+        describe('restored per-tab OFF with global ON synchronizes the session', () => {
+            const historyId = 'history-restore'
+
+            // Drive the real controller restore callback through TabBarController.loadChats.
+            const primeRestore = () => {
+                // New sessions initially inherit global ON. The restored tab's
+                // OFF preference becomes available only after its history mapping.
+                let mapped = false
+                getEffectiveModeStub.callsFake(() => !mapped)
+                sinon
+                    .stub(ChatDatabase.prototype, 'getOpenTabs')
+                    .returns([{ historyId, conversations: [{ messages: [] }] }] as any)
+                sinon.stub(ChatDatabase.prototype, 'setHistoryIdMapping').callsFake(() => {
+                    mapped = true
+                })
+                sinon.stub(ChatDatabase.prototype, 'updateTabOpenState')
+                sinon.stub(ChatDatabase.prototype, 'getTabPreferences').returns({ pairProgrammingMode: false })
+                sinon.stub(ChatDatabase.prototype, 'getLoadTime').returns(undefined)
+                sinon.stub(ChatDatabase.prototype, 'getDatabaseFileSize').returns(undefined)
+                testFeatures.chat.openTab = sinon.stub().resolves({ tabId: mockTabId }) as any
+            }
+
+            it('restore before tab-add leaves the session OFF', async () => {
+                primeRestore()
+
+                await chatController.restorePreviousChats()
+
+                // The restore callback created and synchronized the session OFF.
+                assert.ok(chatSessionManagementService.hasSession(mockTabId))
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+
+                chatController.onTabAdd({ tabId: mockTabId })
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+            })
+
+            it('tab-add before restore leaves the session OFF', async () => {
+                primeRestore()
+
+                chatController.onTabAdd({ tabId: mockTabId })
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, true)
+
+                await chatController.restorePreviousChats()
+                assert.strictEqual(getSession(mockTabId).pairProgrammingMode, false)
+                sinon.assert.calledWithMatch(testFeatures.chat.chatOptionsUpdate as sinon.SinonStub, {
+                    tabId: mockTabId,
+                    pairProgrammingMode: false,
+                })
+            })
+        })
+
+        describe('onPromptInputOptionChange', () => {
+            it('preserves the mode for a model-only option event', () => {
+                const cachedModels = [
+                    { id: 'model-x', name: 'X', description: 'test', tokenLimits: { maxInputTokens: 200000 } },
+                ]
+                sinon.stub(ChatDatabase.prototype, 'getCachedModels').returns({
+                    models: cachedModels as any,
+                    defaultModelId: 'model-x',
+                    timestamp: Date.now(),
+                })
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                assert.strictEqual(session.pairProgrammingMode, true)
+
+                chatController.onPromptInputOptionChange({
+                    tabId: mockTabId,
+                    optionsValues: { 'model-selection': 'model-x' },
+                })
+
+                assert.strictEqual(session.modelId, 'model-x')
+                assert.strictEqual(session.pairProgrammingMode, true)
+            })
+
+            it('rejects queued restricted-tool approvals when turned OFF and never runs the tool', () => {
+                withFsWriteInToolset()
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+
+                // A restricted (write) tool and a read tool each have a pending approval.
+                const writeReject = sinon.spy()
+                const readReject = sinon.spy()
+                session.toolUseLookup.set('tu-w', { name: 'fsWrite', toolUseId: 'tu-w' } as any)
+                session.toolUseLookup.set('tu-r', { name: 'fsRead', toolUseId: 'tu-r' } as any)
+                session.setDeferredToolExecution('tu-w', sinon.spy(), writeReject)
+                session.setDeferredToolExecution('tu-r', sinon.spy(), readReject)
+
+                chatController.onPromptInputOptionChange({
+                    tabId: mockTabId,
+                    optionsValues: { [PP_KEY]: 'false' },
+                })
+
+                assert.strictEqual(session.pairProgrammingMode, false)
+                // The write-tool approval is rejected and cleared; the read-tool one survives.
+                sinon.assert.calledOnce(writeReject)
+                assert.ok(writeReject.firstCall.args[0] instanceof ToolApprovalException)
+                assert.strictEqual(session.getDeferredToolExecution('tu-w'), undefined)
+                sinon.assert.notCalled(readReject)
+                assert.ok(session.getDeferredToolExecution('tu-r') !== undefined)
+                sinon.assert.notCalled(testFeatures.agent.runTool as sinon.SinonStub)
+            })
+        })
+
+        describe('processToolUses mode enforcement', () => {
+            const writeToolUse = { toolUseId: 'tu-w', name: 'fsWrite', input: { path: '/tmp/a.ts' }, stop: true }
+            const readToolUse = { toolUseId: 'tu-r', name: 'fsRead', input: { paths: ['/tmp/a.ts'] }, stop: true }
+
+            const freshSession = (mode: boolean) => {
+                chatController.onTabAdd({ tabId: mockTabId })
+                const session = getSession(mockTabId)
+                session.pairProgrammingMode = mode
+                return session
+            }
+
+            it('blocks a returned write tool when the session mode is OFF', async () => {
+                withFsWriteInToolset()
+                const session = freshSession(false)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resetHistory()
+
+                const results = await chatController.processToolUses(
+                    [writeToolUse as any],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                sinon.assert.notCalled(runToolStub)
+                assert.strictEqual(results[0]?.status, ToolResultStatus.ERROR)
+            })
+
+            it('dispatches a write tool when the session mode is ON', async () => {
+                withFsWriteInToolset()
+                sinon.stub(FsWrite.prototype, 'requiresAcceptance').resolves({ requiresAcceptance: false } as any)
+                sinon.stub(AgenticChatTriggerContext.prototype, 'getTextDocumentFromPath').resolves(undefined)
+                const session = freshSession(true)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resetHistory()
+                runToolStub.resolves({})
+
+                await chatController.processToolUses(
+                    [writeToolUse as any],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                sinon.assert.called(runToolStub)
+                assert.strictEqual(runToolStub.firstCall.args[0], 'fsWrite')
+            })
+
+            it('blocks dispatch when the mode flips OFF while an async permission check is pending', async () => {
+                withFsWriteInToolset()
+                const session = freshSession(true)
+                // Simulate a concurrent mode change during the async requiresAcceptance call.
+                const requiresAcceptanceStub = sinon
+                    .stub(FsWrite.prototype, 'requiresAcceptance')
+                    .callsFake(async () => {
+                        session.pairProgrammingMode = false
+                        return { requiresAcceptance: false } as any
+                    })
+                sinon.stub(AgenticChatTriggerContext.prototype, 'getTextDocumentFromPath').resolves(undefined)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resetHistory()
+
+                await chatController.processToolUses(
+                    [writeToolUse as any],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                // Passed the entry guard (mode ON) but blocked by the re-check after the await.
+                sinon.assert.called(requiresAcceptanceStub)
+                sinon.assert.notCalled(runToolStub)
+            })
+
+            it('does not wait for approval if OFF arrives while the approval card is rendered', async () => {
+                withFsWriteInToolset()
+                sinon.stub(FsWrite.prototype, 'requiresAcceptance').resolves({ requiresAcceptance: true })
+                const session = freshSession(true)
+                const resultStream = makeResultStream()
+                resultStream.writeResultBlock.onFirstCall().callsFake(async () => {
+                    chatController.onPromptInputOptionChange({
+                        tabId: mockTabId,
+                        optionsValues: { [PP_KEY]: 'false' },
+                    })
+                    return 1
+                })
+
+                const results = await chatController.processToolUses(
+                    [writeToolUse],
+                    resultStream,
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                sinon.assert.notCalled(testFeatures.agent.runTool as sinon.SinonStub)
+                assert.strictEqual(session.getDeferredToolExecution('tu-w'), undefined)
+                assert.strictEqual(results[0]?.status, ToolResultStatus.ERROR)
+            })
+
+            it('rejects a real pending write approval when the mode is turned OFF', async () => {
+                withFsWriteInToolset()
+                sinon.stub(FsWrite.prototype, 'requiresAcceptance').resolves({ requiresAcceptance: true })
+                const session = freshSession(true)
+                let approvalReady!: () => void
+                const ready = new Promise<void>(resolve => {
+                    approvalReady = resolve
+                })
+                const setDeferred = session.setDeferredToolExecution.bind(session)
+                sinon.stub(session, 'setDeferredToolExecution').callsFake((id, resolve, reject) => {
+                    setDeferred(id, resolve, reject)
+                    approvalReady()
+                })
+                const pending = chatController.processToolUses(
+                    [writeToolUse],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+                const rejected = assert.rejects(pending, ToolApprovalException)
+                await ready
+
+                chatController.onPromptInputOptionChange({
+                    tabId: mockTabId,
+                    optionsValues: { [PP_KEY]: 'false' },
+                })
+
+                await rejected
+                sinon.assert.notCalled(testFeatures.agent.runTool as sinon.SinonStub)
+                assert.strictEqual(session.getDeferredToolExecution('tu-w'), undefined)
+            })
+
+            it('blocks dispatch when OFF arrives during the last document read before a write', async () => {
+                withFsWriteInToolset()
+                sinon.stub(FsWrite.prototype, 'requiresAcceptance').resolves({ requiresAcceptance: false })
+                const session = freshSession(true)
+                sinon.stub(AgenticChatTriggerContext.prototype, 'getTextDocumentFromPath').callsFake(async () => {
+                    chatController.onPromptInputOptionChange({
+                        tabId: mockTabId,
+                        optionsValues: { [PP_KEY]: 'false' },
+                    })
+                    return undefined
+                })
+
+                const results = await chatController.processToolUses(
+                    [writeToolUse],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                sinon.assert.notCalled(testFeatures.agent.runTool as sinon.SinonStub)
+                assert.strictEqual(results[0]?.status, ToolResultStatus.ERROR)
+            })
+
+            it('keeps read tools usable when the session mode is OFF', async () => {
+                withFsWriteInToolset()
+                sinon.stub(FsRead.prototype, 'requiresAcceptance').resolves({ requiresAcceptance: false } as any)
+                const session = freshSession(false)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resetHistory()
+                runToolStub.resolves({})
+
+                await chatController.processToolUses(
+                    [readToolUse as any],
+                    makeResultStream(),
+                    session,
+                    mockTabId,
+                    mockCancellationToken
+                )
+
+                sinon.assert.called(runToolStub)
+                assert.strictEqual(runToolStub.firstCall.args[0], 'fsRead')
+            })
         })
     })
 })
