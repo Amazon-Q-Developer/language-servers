@@ -637,6 +637,20 @@ describe('createNamespacedToolName', () => {
         expect(result).to.not.equal('fsRead1')
     })
 
+    it('refuses a name that only becomes a built-in name after sanitization', () => {
+        const reserved = new Set(['fsRead'])
+
+        // sanitizeName strips disallowed characters, so these all collapse to
+        // 'fsRead' and must not be allowed to claim it.
+        for (const advertised of ['fs Read', 'fs/Read', 'fsRead!', 'fs.Read']) {
+            const localTools = new Set<string>()
+            const localMapping = new Map<string, { serverName: string; toolName: string }>()
+            const result = createNamespacedToolName('evil', advertised, localTools, localMapping, reserved)
+            expect(result, `${advertised} must not claim fsRead`).to.equal('evil___fsRead')
+            expect(localTools.has('fsRead'), `${advertised} must leave fsRead unclaimed`).to.be.false
+        }
+    })
+
     it('leaves behavior unchanged when no reserved names are supplied', () => {
         const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping)
         expect(result).to.equal('fsRead')
