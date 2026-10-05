@@ -1269,17 +1269,28 @@ export function findServerInRegistry(registry: McpRegistryData, serverName: stri
  * Create a namespaced tool name from server and tool names.
  * Handles truncation and conflicts according to specific rules.
  * Also stores the mapping from namespaced name back to original names.
+ *
+ * `reservedNames` holds names an MCP tool must never occupy (the built-in tool
+ * names). Without it an MCP server could advertise e.g. `fsRead` and win the
+ * bare name, so the request would be routed through the built-in permission
+ * branch instead of the MCP one.
  */
 export function createNamespacedToolName(
     serverName: string,
     toolName: string,
     allNamespacedTools: Set<string>,
-    toolNameMapping: Map<string, { serverName: string; toolName: string }>
+    toolNameMapping: Map<string, { serverName: string; toolName: string }>,
+    reservedNames: Set<string> = new Set()
 ): string {
     // First, check if this server/tool combination already has a mapping
     // If it does, reuse that name to maintain consistency across reinitializations
     for (const [existingName, mapping] of toolNameMapping.entries()) {
         if (mapping.serverName === serverName && mapping.toolName === toolName) {
+            // Never reuse a stale mapping that points at a reserved built-in name.
+            if (reservedNames.has(existingName)) {
+                toolNameMapping.delete(existingName)
+                break
+            }
             // If the name is already in the set, it's already registered
             // If not, add it to the set
             if (!allNamespacedTools.has(existingName)) {
@@ -1292,8 +1303,13 @@ export function createNamespacedToolName(
     // Sanitize the tool name
     const sanitizedToolName = sanitizeName(toolName)
 
-    // First try to use just the tool name if it's not already in use and fits within length limit
-    if (sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(sanitizedToolName)) {
+    // First try to use just the tool name if it's not already in use, is not a
+    // reserved built-in name, and fits within length limit
+    if (
+        sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH &&
+        !allNamespacedTools.has(sanitizedToolName) &&
+        !reservedNames.has(sanitizedToolName)
+    ) {
         allNamespacedTools.add(sanitizedToolName)
         toolNameMapping.set(sanitizedToolName, { serverName, toolName })
         return sanitizedToolName
@@ -1304,7 +1320,7 @@ export function createNamespacedToolName(
     const fullName = `${serverName}${sep}${sanitizedToolName}`
 
     // If the full name fits and is unique, use it
-    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName)) {
+    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName) && !reservedNames.has(fullName)) {
         allNamespacedTools.add(fullName)
         toolNameMapping.set(fullName, { serverName, toolName })
         return fullName
@@ -1317,7 +1333,7 @@ export function createNamespacedToolName(
             const truncatedServer = serverName.substring(0, maxServerLength)
             const namespacedName = `${truncatedServer}${sep}${sanitizedToolName}`
 
-            if (!allNamespacedTools.has(namespacedName)) {
+            if (!allNamespacedTools.has(namespacedName) && !reservedNames.has(namespacedName)) {
                 allNamespacedTools.add(namespacedName)
                 toolNameMapping.set(namespacedName, { serverName, toolName })
                 return namespacedName
@@ -1345,7 +1361,7 @@ export function createNamespacedToolName(
             candidateName = `${truncatedTool}${suffix}`
         }
 
-        if (!allNamespacedTools.has(candidateName)) {
+        if (!allNamespacedTools.has(candidateName) && !reservedNames.has(candidateName)) {
             allNamespacedTools.add(candidateName)
             toolNameMapping.set(candidateName, { serverName, toolName })
             return candidateName

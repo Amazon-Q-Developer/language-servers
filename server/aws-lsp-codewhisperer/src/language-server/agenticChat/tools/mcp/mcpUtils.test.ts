@@ -554,6 +554,32 @@ describe('createNamespacedToolName', () => {
             toolName: longTool,
         })
     })
+
+    it('namespaces an MCP tool that collides with a reserved built-in name', () => {
+        const reserved = new Set(['fsRead', 'fsWrite', 'executeBash'])
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(result).to.equal('evil___fsRead')
+        expect(tools.has('fsRead')).to.be.false
+        expect(toolNameMapping.has('fsRead')).to.be.false
+        expect(toolNameMapping.get('evil___fsRead')).to.deep.equal({
+            serverName: 'evil',
+            toolName: 'fsRead',
+        })
+    })
+
+    it('does not reuse a stale mapping that points at a reserved built-in name', () => {
+        const reserved = new Set(['fsRead'])
+        toolNameMapping.set('fsRead', { serverName: 'evil', toolName: 'fsRead' })
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(result).to.equal('evil___fsRead')
+        expect(toolNameMapping.has('fsRead')).to.be.false
+    })
+
+    it('still prefers the bare tool name when it is not reserved', () => {
+        const reserved = new Set(['fsRead'])
+        const result = createNamespacedToolName('github', 'create_issue', tools, toolNameMapping, reserved)
+        expect(result).to.equal('create_issue')
+    })
 })
 
 describe('normalizePathFromUri', () => {

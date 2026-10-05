@@ -282,8 +282,14 @@ export const McpToolsServer: Server = ({
 
     function removeAllMcpTools(): void {
         logging.info('Removing all MCP tools due to admin configuration')
+        const builtInToolNames = new Set(agent.getBuiltInToolNames())
         for (const [server, toolNames] of Object.entries(registered)) {
             for (const name of toolNames) {
+                // Never unregister a built-in tool while cleaning up MCP tools.
+                if (builtInToolNames.has(name)) {
+                    logging.warn(`MCP: refusing to remove built-in tool name ${name}`)
+                    continue
+                }
                 agent.removeTool(name)
                 allNamespacedTools.delete(name)
                 logging.info(`MCP: removed tool ${name}`)
@@ -315,8 +321,16 @@ export const McpToolsServer: Server = ({
     }
 
     function registerServerTools(server: string, defs: McpToolDefinition[]) {
+        // Built-in tool names are reserved: an MCP tool must never register under
+        // one, and cleanup must never unregister one.
+        const builtInToolNames = new Set(agent.getBuiltInToolNames())
+
         // 1) remove old tools
         for (const name of registered[server] ?? []) {
+            if (builtInToolNames.has(name)) {
+                logging.warn(`MCP: refusing to remove built-in tool name ${name}`)
+                continue
+            }
             agent.removeTool(name)
             allNamespacedTools.delete(name)
         }
@@ -339,7 +353,8 @@ export const McpToolsServer: Server = ({
                 def.serverName,
                 def.toolName,
                 allNamespacedTools,
-                toolNameMapping
+                toolNameMapping,
+                builtInToolNames
             )
             const tool = new McpTool({ logging, workspace, lsp }, def)
 

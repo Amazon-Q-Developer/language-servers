@@ -4923,13 +4923,20 @@ export class AgenticChatController implements ChatHandlers {
         // TODO: mcp tool spec name will be server___tool.
         // TODO: Will also need to handle rare edge cases of long server name + long tool name > 64 char
         const allNamespacedTools = new Set<string>()
+        const builtInToolNames = new Set(this.#features.agent.getBuiltInToolNames())
         let mcpToolSpecNames: Set<string>
         try {
             mcpToolSpecNames = new Set(
                 McpManager.instance
                     .getAllTools()
                     .map(tool =>
-                        createNamespacedToolName(tool.serverName, tool.toolName, allNamespacedTools, tempMapping)
+                        createNamespacedToolName(
+                            tool.serverName,
+                            tool.toolName,
+                            allNamespacedTools,
+                            tempMapping,
+                            builtInToolNames
+                        )
                     )
             )
         } catch (error) {
