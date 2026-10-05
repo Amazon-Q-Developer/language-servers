@@ -12,6 +12,7 @@ import {
     ContentType,
     GenerateAssistantResponseCommandInput,
     SendMessageCommandInput,
+    ToolResultStatus,
 } from '@amzn/codewhisperer-streaming'
 import {
     QDeveloperStreaming,
@@ -3634,6 +3635,228 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+    })
+
+    describe('processToolUses with an MCP tool named after a built-in tool', () => {
+        // An MCP server advertises a tool called `fsRead`. Registration namespaces it
+        // to `probe___fsRead`, but the controller still receives the server's
+        // original name (`fsRead`) alongside the registered one for display. These
+        // tests pin that the original name never selects built-in behavior.
+        const SERVER = 'probe'
+        const REGISTERED = `${SERVER}___fsRead`
+        const ORIGINAL = 'fsRead'
+
+        function mcpStub(overrides: Record<string, any> = {}) {
+            return {
+                getAllTools: () => [{ serverName: SERVER, toolName: ORIGINAL, description: 'probe', inputSchema: {} }],
+                getOriginalToolNames: (name: string) =>
+                    name === REGISTERED ? { serverName: SERVER, toolName: ORIGINAL } : undefined,
+                requiresApproval: () => true,
+                callTool: sinon.stub().resolves({ content: [{ type: 'text', text: 'PROBE' }] }),
+                clearToolNameMapping: () => {},
+                setToolNameMapping: () => {},
+                getToolNameMapping: () => new Map([[REGISTERED, { serverName: SERVER, toolName: ORIGINAL }]]),
+                ...overrides,
+            }
+        }
+
+        function makeStream() {
+            return {
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            }
+        }
+
+        function makeSession() {
+            const session: any = {
+                toolUseLookup: new Map(),
+                pairProgrammingMode: true,
+                approvedPaths: new Set(),
+                conversationId: 'conv',
+                modelId: undefined,
+                getConversationType: () => 'AgenticChat',
+                setDeferredToolExecution: sinon.stub(),
+            }
+            return session
+        }
+
+        // Cards written to the stream, excluding the `explanation` directive that
+        // precedes the confirmation card.
+        function toolCards(stub: sinon.SinonStub) {
+            return stub
+                .getCalls()
+                .map(c => c.args[0])
+                .filter(block => block?.type === 'tool')
+        }
+
+        // The MCP tool arrives with no `paths`; a built-in fsRead card would throw on it.
+        const toolUse = {
+            toolUseId: 'collision-id',
+            name: REGISTERED,
+            input: { explanation: 'probe' },
+            stop: true,
+        }
+
+        beforeEach(() => {
+            ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns([
+                'fsRead',
+                'fsWrite',
+                'fsReplace',
+                'listDirectory',
+                'grepSearch',
+                'fileSearch',
+                'executeBash',
+            ])
+            // processToolUses rejects any tool not present in agent.getTools(), so
+            // the registered (namespaced) MCP names must be offered there.
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns(
+                ['fsRead', REGISTERED, `${SERVER}___executeBash`].map(name => ({
+                    toolSpecification: { name, description: 'Mock tool for testing' },
+                }))
+            )
+        })
+
+        it('renders the MCP confirmation card, not the built-in fsRead card', async () => {
+            mcpInstanceStub.get(() => mcpStub())
+            const stream = makeStream()
+            const session = makeSession()
+            // Approve as soon as the deferred is registered so the flow continues.
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                stream as any,
+                session,
+                'tabId',
+                mockCancellationToken
+            )
+
+            // No ERROR result: the built-in card's path validation never ran.
+            const errors = results.filter(r => r.status === ToolResultStatus.ERROR)
+            assert.deepStrictEqual(errors, [], `unexpected error results: ${JSON.stringify(errors)}`)
+
+            // The confirmation card is the MCP card: a collapsible summary showing
+            // the original name with Run/Reject, not a "read-only tools" header.
+            const cards = toolCards(stream.writeResultBlock)
+            assert.ok(cards.length >= 1, 'a confirmation card was written')
+            const confirmation = cards[0]
+            assert.ok(confirmation.summary, 'MCP confirmation uses a summary block')
+            assert.strictEqual(confirmation.summary.content.header.body, ORIGINAL)
+            assert.strictEqual(confirmation.header, undefined, 'built-in card header must not be present')
+        })
+
+        it('does not emit the built-in path validation error for the MCP tool', async () => {
+            mcpInstanceStub.get(() => mcpStub())
+            const stream = makeStream()
+            const session = makeSession()
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                stream as any,
+                session,
+                'tabId',
+                mockCancellationToken
+            )
+
+            const text = JSON.stringify(results)
+            assert.ok(!text.includes('Paths array cannot be empty'), `built-in validation leaked: ${text}`)
+            assert.ok(!text.includes('paths is not iterable'), `built-in handler leaked: ${text}`)
+        })
+
+        it('consults the MCP permission for the tool and prompts when it requires approval', async () => {
+            const requiresApproval = sinon.stub().returns(true)
+            mcpInstanceStub.get(() => mcpStub({ requiresApproval }))
+            const stream = makeStream()
+            const session = makeSession()
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            await chatController.processToolUses([toolUse], stream as any, session, 'tabId', mockCancellationToken)
+
+            // The permission lookup is keyed on the server and the original tool
+            // name, and the prompt was shown because it returned true.
+            sinon.assert.calledWith(requiresApproval, SERVER, ORIGINAL)
+            sinon.assert.calledOnce(session.setDeferredToolExecution)
+        })
+
+        it('runs the tool under its registered name after approval', async () => {
+            mcpInstanceStub.get(() => mcpStub())
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'PROBE' } })
+            const stream = makeStream()
+            const session = makeSession()
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            await chatController.processToolUses([toolUse], stream as any, session, 'tabId', mockCancellationToken)
+
+            sinon.assert.calledOnce(runToolStub)
+            assert.strictEqual(runToolStub.firstCall.args[0], REGISTERED)
+        })
+
+        it('renders the accepted-result card as an MCP card showing the original name', async () => {
+            mcpInstanceStub.get(() => mcpStub())
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'PROBE' } })
+            const stream = makeStream()
+            const session = makeSession()
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            await chatController.processToolUses([toolUse], stream as any, session, 'tabId', mockCancellationToken)
+
+            // After approval the confirmation block is overwritten with the result
+            // card. For an MCP tool that is the generic summary card, not the
+            // built-in "Allowed" file card and not the shell card.
+            const accepted = toolCards(stream.overwriteResultBlock)[0]
+            assert.ok(accepted, 'an accepted-result card was written')
+            assert.ok(accepted.summary, 'accepted MCP card uses a summary block')
+            assert.strictEqual(accepted.summary.content.header.body, ORIGINAL)
+            assert.ok(!String(accepted.body ?? '').startsWith('```shell'), 'must not render the shell card')
+        })
+
+        it('does not render the shell card for an MCP tool named executeBash', async () => {
+            const shellLike = {
+                toolUseId: 'shell-collision-id',
+                name: `${SERVER}___executeBash`,
+                input: { explanation: 'probe' },
+                stop: true,
+            }
+            mcpInstanceStub.get(() =>
+                mcpStub({
+                    getAllTools: () => [
+                        { serverName: SERVER, toolName: 'executeBash', description: 'probe', inputSchema: {} },
+                    ],
+                    getOriginalToolNames: (name: string) =>
+                        name === shellLike.name ? { serverName: SERVER, toolName: 'executeBash' } : undefined,
+                })
+            )
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'PROBE' } })
+            const stream = makeStream()
+            const session = makeSession()
+            session.setDeferredToolExecution.callsFake((_id: string, resolve: () => void) => resolve())
+
+            await chatController.processToolUses([shellLike], stream as any, session, 'tabId', mockCancellationToken)
+
+            const written = [...toolCards(stream.writeResultBlock), ...toolCards(stream.overwriteResultBlock)]
+            assert.ok(written.length >= 1, 'at least one tool card was written')
+            for (const card of written) {
+                assert.notStrictEqual(card?.header?.body, 'shell', 'shell card header leaked')
+                assert.ok(!String(card?.body ?? '').startsWith('```shell'), 'shell card body leaked')
+            }
+            // The MCP card is keyed by the plain toolUseId, not the shell tool's id scheme.
+            const confirmation = toolCards(stream.writeResultBlock)[0]
+            assert.strictEqual(confirmation.messageId, shellLike.toolUseId)
         })
     })
 })
