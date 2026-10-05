@@ -3269,7 +3269,8 @@ export class AgenticChatController implements ChatHandlers {
         }
 
         // Determine if this is a built-in tool or MCP tool
-        const isStandardTool = this.#features.agent.getBuiltInToolNames().includes(dispatchName)
+        const isStandardTool =
+            dispatchName !== undefined && this.#features.agent.getBuiltInToolNames().includes(dispatchName)
 
         if (isStandardTool) {
             return {
