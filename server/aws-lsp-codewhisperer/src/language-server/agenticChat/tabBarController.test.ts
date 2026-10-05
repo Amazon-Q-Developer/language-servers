@@ -23,6 +23,9 @@ describe('TabBarController', () => {
     let tabBarController: TabBarController
     let clock: sinon.SinonFakeTimers
     let telemetryService: TelemetryService
+    // Fifth TabBarController arg: the controller-provided callback that restores
+    // the per-tab agentic coding (pair programming) mode onto the live session.
+    let restorePairProgrammingModeStub: sinon.SinonStub
 
     beforeEach(() => {
         testFeatures = new TestFeatures()
@@ -38,6 +41,8 @@ describe('TabBarController', () => {
             getDatabaseFileSize: sinon.stub(),
             getLoadTime: sinon.stub(),
             getTabPreferences: sinon.stub().returns({}),
+            // Default effective mode ON; restore tests override per tab as needed.
+            getEffectiveTabPairProgrammingMode: sinon.stub().returns(true),
         } as unknown as ChatDatabase
 
         telemetryService = {
@@ -46,7 +51,14 @@ describe('TabBarController', () => {
             emitLoadHistory: sinon.stub(),
         } as any
 
-        tabBarController = new TabBarController(testFeatures, chatHistoryDb, telemetryService, sinon.stub())
+        restorePairProgrammingModeStub = sinon.stub()
+        tabBarController = new TabBarController(
+            testFeatures,
+            chatHistoryDb,
+            telemetryService,
+            sinon.stub(),
+            restorePairProgrammingModeStub
+        )
         clock = sinon.useFakeTimers()
     })
 
@@ -516,6 +528,49 @@ describe('TabBarController', () => {
 
             // Verify only the last 250 messages were passed
             assert.strictEqual(passedMessages.length, 250)
+        })
+
+        it('restores per-tab mode via the callback using the new tabId, after mapping and before the UI update', async () => {
+            const historyId = 'history-ppm'
+            const mockTab = { historyId, conversations: [{ messages: [] }] } as unknown as Tab
+
+            // Restored tab had agentic coding turned OFF.
+            ;(chatHistoryDb.getEffectiveTabPairProgrammingMode as sinon.SinonStub).returns(false)
+            // Preferences carry the mode so the UI chatOptionsUpdate is emitted.
+            ;(chatHistoryDb.getTabPreferences as sinon.SinonStub).returns({ pairProgrammingMode: false })
+
+            const openTabStub = sinon.stub<[OpenTabParams], Promise<OpenTabResult>>().resolves({ tabId: 'newTabId' })
+            testFeatures.chat.openTab = openTabStub
+
+            await tabBarController.restoreTab(mockTab)
+
+            // Execution state is restored onto the new tabId (not the historyId).
+            sinon.assert.calledOnceWithExactly(restorePairProgrammingModeStub, 'newTabId', false)
+            sinon.assert.calledWith(chatHistoryDb.getEffectiveTabPairProgrammingMode as sinon.SinonStub, 'newTabId')
+
+            // Mapping is established first; the session is updated before the UI is told.
+            sinon.assert.callOrder(
+                chatHistoryDb.setHistoryIdMapping as sinon.SinonStub,
+                chatHistoryDb.getEffectiveTabPairProgrammingMode as sinon.SinonStub,
+                restorePairProgrammingModeStub,
+                testFeatures.chat.chatOptionsUpdate as sinon.SinonStub
+            )
+            sinon.assert.calledWithMatch(testFeatures.chat.chatOptionsUpdate as sinon.SinonStub, {
+                tabId: 'newTabId',
+                pairProgrammingMode: false,
+            })
+        })
+
+        it('restores an ON per-tab mode through the callback', async () => {
+            const mockTab = { historyId: 'history-on', conversations: [{ messages: [] }] } as unknown as Tab
+            ;(chatHistoryDb.getEffectiveTabPairProgrammingMode as sinon.SinonStub).returns(true)
+
+            const openTabStub = sinon.stub<[OpenTabParams], Promise<OpenTabResult>>().resolves({ tabId: 'tabOn' })
+            testFeatures.chat.openTab = openTabStub
+
+            await tabBarController.restoreTab(mockTab)
+
+            sinon.assert.calledOnceWithExactly(restorePairProgrammingModeStub, 'tabOn', true)
         })
     })
 

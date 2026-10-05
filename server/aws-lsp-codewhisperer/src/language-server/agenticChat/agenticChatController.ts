@@ -368,7 +368,13 @@ export class AgenticChatController implements ChatHandlers {
             features,
             this.#chatHistoryDb,
             telemetryService,
-            (tabId: string) => this.sendPinnedContext(tabId)
+            (tabId: string) => this.sendPinnedContext(tabId),
+            (tabId, enabled) => {
+                const { data: session, success } = this.#getOrCreateSession(tabId)
+                if (success) {
+                    this.#setPairProgrammingMode(session, enabled)
+                }
+            }
         )
 
         // Inject McpManager.getResources as a callback to avoid importing McpManager directly
@@ -868,7 +874,10 @@ export class AgenticChatController implements ChatHandlers {
         })
     }
 
-    async onChatPrompt(params: ChatParams, token: CancellationToken): Promise<ChatResult | ResponseError<ChatResult>> {
+    async onChatPrompt(
+        params: ChatParams & { prompt: { options?: Record<string, unknown> } },
+        token: CancellationToken
+    ): Promise<ChatResult | ResponseError<ChatResult>> {
         const clientRegion = this.#features.lsp.getClientInitializeParams()?.initializationOptions?.aws?.region
         const maybeGovResponse = getGovCloudUnsupportedResponse(clientRegion)
         if (maybeGovResponse) {
@@ -880,11 +889,18 @@ export class AgenticChatController implements ChatHandlers {
 
         IdleWorkspaceManager.recordActivityTimestamp()
 
-        const sessionResult = this.#chatSessionManagementService.getSession(params.tabId)
+        const sessionResult = this.#getOrCreateSession(params.tabId)
         const { data: session, success } = sessionResult
 
         if (!success) {
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
+        }
+
+        // Mynah sends the displayed mode with each prompt, including restored tabs
+        // that did not emit an option-change event. Older clients may omit it.
+        const requestedMode = params.prompt.options?.['pair-programmer-mode']
+        if (requestedMode !== undefined) {
+            this.#setPairProgrammingMode(session, requestedMode === 'true')
         }
 
         // Memory Bank Creation Flow - Delegate to MemoryBankController
@@ -1965,6 +1981,9 @@ export class AgenticChatController implements ChatHandlers {
         session: ChatSessionService,
         toolName: string
     ) {
+        // The mode can change while the approval card is being rendered. Avoid
+        // registering an approval that the OFF event already tried to cancel.
+        this.#assertToolAvailable(session, toolUse.name)
         const deferred = this.#createDeferred()
         session.setDeferredToolExecution(toolUse.toolUseId!, deferred.resolve, deferred.reject)
         this.#log(`Prompting for tool approval for tool: ${toolName ?? toolUse.name}`)
@@ -2002,10 +2021,7 @@ export class AgenticChatController implements ChatHandlers {
 
             try {
                 // TODO: Can we move this check in the event parser before the stream completes?
-                const availableToolNames = this.#getTools(session).map(tool => tool.toolSpecification.name)
-                if (!availableToolNames.includes(toolUse.name)) {
-                    throw new Error(`Tool ${toolUse.name} is not available in the current mode`)
-                }
+                this.#assertToolAvailable(session, toolUse.name)
 
                 this.recordChunk(`tool_execution_start - ${toolUse.name}`)
                 this.#toolStartTime = Date.now()
@@ -2224,6 +2240,10 @@ export class AgenticChatController implements ChatHandlers {
                         this.#features.logging.warn(`could not parse CodeReview tool input: ${e}`)
                     }
                 }
+
+                // Mode may change while permission checks, approvals, or document
+                // reads are pending. Do not dispatch a tool using the earlier decision.
+                this.#assertToolAvailable(session, toolUse.name)
 
                 // After approval, add the path to the approved paths in the session
                 const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
@@ -4050,19 +4070,13 @@ export class AgenticChatController implements ChatHandlers {
             this.sendPinnedContext(params.tabId)
         }
 
-        const sessionResult = this.#chatSessionManagementService.createSession(params.tabId)
+        const sessionResult = this.#getOrCreateSession(params.tabId)
         const { data: session, success } = sessionResult
         if (!success) {
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 
-        // Get the saved pair programming mode from the database or default to true if not found
-        const savedPairProgrammingMode = this.#chatHistoryDb.getPairProgrammingMode()
-        session.pairProgrammingMode = savedPairProgrammingMode !== undefined ? savedPairProgrammingMode : true
-        if (session) {
-            // Set the logging object on the session
-            session.setLogging(this.#features.logging)
-        }
+        session.setLogging(this.#features.logging)
 
         // Update the client with the initial pair programming mode
         this.#features.chat.chatOptionsUpdate({
@@ -4808,8 +4822,32 @@ export class AgenticChatController implements ChatHandlers {
         }
     }
 
+    #getOrCreateSession(tabId: string) {
+        const existed = this.#chatSessionManagementService.hasSession(tabId)
+        const result = this.#chatSessionManagementService.getSession(tabId)
+        if (result.success && !existed) {
+            result.data.pairProgrammingMode = this.#chatHistoryDb.getEffectiveTabPairProgrammingMode(tabId)
+        }
+        return result
+    }
+
+    #setPairProgrammingMode(session: ChatSessionService, enabled: boolean) {
+        session.pairProgrammingMode = enabled
+        if (!enabled) {
+            const allowedTools = new Set(this.#getTools(session).map(tool => tool.toolSpecification.name))
+            for (const [toolUseId, toolUse] of session.toolUseLookup) {
+                if (toolUse.name && !allowedTools.has(toolUse.name)) {
+                    session
+                        .getDeferredToolExecution(toolUseId)
+                        ?.reject(new ToolApprovalException('Tool canceled: agentic coding is off', true))
+                    session.removeDeferredToolExecution(toolUseId)
+                }
+            }
+        }
+    }
+
     onPromptInputOptionChange(params: PromptInputOptionChangeParams) {
-        const sessionResult = this.#chatSessionManagementService.getSession(params.tabId)
+        const sessionResult = this.#getOrCreateSession(params.tabId)
         const { data: session, success } = sessionResult
 
         if (!success) {
@@ -4817,7 +4855,11 @@ export class AgenticChatController implements ChatHandlers {
             return
         }
 
-        session.pairProgrammingMode = params.optionsValues['pair-programmer-mode'] === 'true'
+        const requestedMode = params.optionsValues['pair-programmer-mode']
+        if (requestedMode !== undefined) {
+            this.#setPairProgrammingMode(session, requestedMode === 'true')
+            this.#chatHistoryDb.setTabPairProgrammingMode(params.tabId, session.pairProgrammingMode)
+        }
         const newModelId = params.optionsValues['model-selection']
 
         // Set model (automatically recalculates token limits)
@@ -4828,7 +4870,6 @@ export class AgenticChatController implements ChatHandlers {
         }
 
         this.#chatHistoryDb.setTabModelId(params.tabId, session.modelId)
-        this.#chatHistoryDb.setTabPairProgrammingMode(params.tabId, session.pairProgrammingMode)
     }
 
     updateConfiguration = (newConfig: AmazonQWorkspaceConfig) => {
@@ -4850,6 +4891,12 @@ export class AgenticChatController implements ChatHandlers {
         // Force a service request to get current Q user subscription status.
         this.#paidTierMode = undefined
         this.#subscriptionStatusPromise = undefined
+    }
+
+    #assertToolAvailable(session: ChatSessionService, toolName: string | undefined) {
+        if (!this.#getTools(session).some(tool => tool.toolSpecification.name === toolName)) {
+            throw new Error(`Tool ${toolName} is not available in the current mode`)
+        }
     }
 
     #getTools(session: ChatSessionService) {

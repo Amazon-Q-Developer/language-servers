@@ -43,17 +43,20 @@ export class TabBarController {
     #chatHistoryDb: ChatDatabase
     #telemetryService: TelemetryService
     #sendPinnedContext: (tabId: string) => void
+    #restorePairProgrammingMode: (tabId: string, enabled: boolean) => void
 
     constructor(
         features: Features,
         chatHistoryDb: ChatDatabase,
         telemetryService: TelemetryService,
-        sendPinnedContext: (tabId: string) => void
+        sendPinnedContext: (tabId: string) => void,
+        restorePairProgrammingMode: (tabId: string, enabled: boolean) => void
     ) {
         this.#features = features
         this.#chatHistoryDb = chatHistoryDb
         this.#telemetryService = telemetryService
         this.#sendPinnedContext = sendPinnedContext
+        this.#restorePairProgrammingMode = restorePairProgrammingMode
     }
 
     /**
@@ -311,6 +314,10 @@ export class TabBarController {
 
             // Restore per-tab preferences (model selection and agentic coding mode)
             const preferences = this.#chatHistoryDb.getTabPreferences(selectedTab.historyId)
+            // Update the execution state before displaying the restored mode. The
+            // history mapping is not available when the client first adds this tab.
+            const pairProgrammingMode = this.#chatHistoryDb.getEffectiveTabPairProgrammingMode(tabId)
+            this.#restorePairProgrammingMode(tabId, pairProgrammingMode)
             if (preferences.modelId !== undefined || preferences.pairProgrammingMode !== undefined) {
                 // Validate modelId against current available models
                 let validModelId = preferences.modelId
