@@ -988,14 +988,13 @@ export class McpEventHandler {
         if (serverName === 'Built-in') {
             // Handle Built-in server specially
             const allTools = this.#features.agent.getTools({ format: 'bedrock' })
-            let mcpToolNames = new Set<string>()
-            try {
-                mcpToolNames = new Set(McpManager.instance.getAllTools().map(tool => tool.toolName))
-            } catch (error) {
-                this.#features.logging.debug(`McpManager not initialized for getAllTools: ${error}`)
-            }
+            // Select built-in tools by their registered classification rather than
+            // by excluding MCP tool names. An MCP server's original tool name can
+            // match a built-in name, which would otherwise hide the built-in entry
+            // from this list.
+            const builtInToolNames = new Set(this.#features.agent.getBuiltInToolNames())
             const builtInTools = allTools
-                .filter(tool => !mcpToolNames.has(tool.toolSpecification.name))
+                .filter(tool => builtInToolNames.has(tool.toolSpecification.name))
                 .map(tool => {
                     // Set default permission based on tool name
                     const permission = 'alwaysAllow'

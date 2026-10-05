@@ -316,12 +316,13 @@ export class AgenticChatController implements ChatHandlers {
      * @param toolUse The tool use object
      * @returns The message ID to use
      */
-    #getMessageIdForToolUse(toolType: string | undefined, toolUse: ToolUse): string {
+    #getMessageIdForToolUse(toolUse: ToolUse): string {
         const toolUseId = toolUse.toolUseId!
+        // Keyed on the registered tool name only. The server-supplied name for
+        // an MCP tool must not steer a card to the built-in executeBash
+        // message id.
         // Return plain toolUseId for executeBash, add "_permission" suffix for all other tools
-        return toolUse.name === EXECUTE_BASH || toolType === EXECUTE_BASH
-            ? toolUseId
-            : `${toolUseId}${SUFFIX_PERMISSION}`
+        return toolUse.name === EXECUTE_BASH ? toolUseId : `${toolUseId}${SUFFIX_PERMISSION}`
     }
 
     /**
@@ -2832,10 +2833,15 @@ export class AgenticChatController implements ChatHandlers {
         originalToolName: string,
         toolType?: string
     ): ChatResult {
+        // Dispatch on the registered tool name. `originalToolName` and `toolType`
+        // carry the server-supplied name for MCP tools and are display-only, so
+        // they must not be able to select built-in rendering. The built-in path
+        // passes toolUse.name here, so built-in behavior is unchanged.
+        const dispatchName = toolUse.name
         const toolName = originalToolName ?? (toolType || toolUse.name)
 
         // Handle bash commands with special formatting
-        if (toolName === EXECUTE_BASH) {
+        if (dispatchName === EXECUTE_BASH) {
             return {
                 messageId: toolUse.toolUseId,
                 type: 'tool',
@@ -2863,7 +2869,7 @@ export class AgenticChatController implements ChatHandlers {
         }
         let body: string | undefined
 
-        switch (toolName) {
+        switch (dispatchName) {
             case FS_REPLACE:
             case FS_WRITE:
             case FS_READ:
@@ -2900,7 +2906,7 @@ export class AgenticChatController implements ChatHandlers {
                         content: {
                             header: {
                                 icon: 'tools',
-                                body: `${originalToolName ?? (toolType || toolUse.name)}`,
+                                body: `${toolName}`,
                                 status: {
                                     status: isAccept ? 'success' : 'error',
                                     icon: isAccept ? 'ok' : 'cancel',
@@ -2923,7 +2929,7 @@ export class AgenticChatController implements ChatHandlers {
         }
 
         return {
-            messageId: this.#getMessageIdForToolUse(toolType, toolUse),
+            messageId: this.#getMessageIdForToolUse(toolUse),
             type: 'tool',
             body,
             header,
@@ -3275,7 +3281,7 @@ export class AgenticChatController implements ChatHandlers {
         if (isStandardTool) {
             return {
                 type: 'tool',
-                messageId: this.#getMessageIdForToolUse(toolType, toolUse),
+                messageId: this.#getMessageIdForToolUse(toolUse),
                 header,
                 // The warning explains why acceptance is needed, so show it above
                 // the body rather than using it only as a spacing flag.
