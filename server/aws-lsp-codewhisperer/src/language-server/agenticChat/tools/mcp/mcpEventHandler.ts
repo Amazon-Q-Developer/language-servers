@@ -988,13 +988,30 @@ export class McpEventHandler {
         if (serverName === 'Built-in') {
             // Handle Built-in server specially
             const allTools = this.#features.agent.getTools({ format: 'bedrock' })
-            // Select built-in tools by their registered classification rather than
-            // by excluding MCP tool names. An MCP server's original tool name can
-            // match a built-in name, which would otherwise hide the built-in entry
-            // from this list.
+            // MCP tools are registered under their namespaced name, so collect
+            // both that and the server's original tool name.
+            const mcpToolNames = new Set<string>()
+            try {
+                for (const tool of McpManager.instance.getAllTools()) {
+                    mcpToolNames.add(tool.toolName)
+                }
+                for (const namespaced of McpManager.instance.getToolNameMapping().keys()) {
+                    mcpToolNames.add(namespaced)
+                }
+            } catch (error) {
+                this.#features.logging.debug(`McpManager not initialized for getAllTools: ${error}`)
+            }
+            // A built-in is always listed, even when an MCP server advertises a
+            // tool of the same name. Tools registered without a classification
+            // keep the previous behavior of being listed unless they match an
+            // MCP tool name.
             const builtInToolNames = new Set(this.#features.agent.getBuiltInToolNames())
             const builtInTools = allTools
-                .filter(tool => builtInToolNames.has(tool.toolSpecification.name))
+                .filter(
+                    tool =>
+                        builtInToolNames.has(tool.toolSpecification.name) ||
+                        !mcpToolNames.has(tool.toolSpecification.name)
+                )
                 .map(tool => {
                     // Set default permission based on tool name
                     const permission = 'alwaysAllow'
