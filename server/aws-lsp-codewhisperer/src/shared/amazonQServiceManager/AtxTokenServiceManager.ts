@@ -22,6 +22,9 @@ export class AtxTokenServiceManager {
     private activeProfileArn: string | null = null
     private cachedTransformProfiles: any[] = []
     private activeApplicationUrl: string | null = null
+    // Auth mode declared by the client (aws.atx authType). Null when the client does not declare one
+    // (older clients), in which case the auth type is derived from the credentials present.
+    private activeAuthMode: 'iam' | 'bearer' | null = null
 
     // ATX service instances
     private cachedAtxCodewhispererService?: CodeWhispererServiceToken
@@ -54,6 +57,9 @@ export class AtxTokenServiceManager {
         // FES client. The bearer token is left untouched.
         if (type === ('iam' as CredentialsType)) {
             this.log('ATX: IAM credentials deleted - clearing tenant URL')
+            if (this.activeAuthMode === 'iam') {
+                this.activeAuthMode = null
+            }
             this.clearAllCaches()
             return
         }
@@ -86,6 +92,12 @@ export class AtxTokenServiceManager {
             return
         }
 
+        // Auth mode declared by the client with each sign-in. Applied before the other keys so an IAM tenant URL
+        // sent in the same update is kept.
+        if (params.settings.authType !== undefined) {
+            this.setAuthMode(params.settings.authType)
+        }
+
         // IAM path: the tenant (application) URL arrives via configuration because there is no
         // Transform profile to look it up from. Store it directly so it can be used as the FES
         // Origin/region. Trailing slash stripped to match the profile-derived value.
@@ -109,6 +121,24 @@ export class AtxTokenServiceManager {
 
             // Clears Transform Handler gumby client since profile changed
             this.cacheCallbacks.forEach(callback => callback())
+        }
+    }
+
+    private setAuthMode(authType: unknown): void {
+        const mode = authType === 'iam' || authType === 'bearer' ? authType : null
+        if (mode === this.activeAuthMode) {
+            return
+        }
+
+        const previousMode = this.activeAuthMode
+        this.activeAuthMode = mode
+        this.log(`ATX: Auth mode changed from ${previousMode ?? 'none'} to ${mode ?? 'none'}`)
+
+        // Switching to bearer: drop the tenant URL left by an IAM session (the IdC profile repopulates it) and reset
+        // the cached FES client, as the IAM credentials delete does. IAM credentials still held by the runtime are
+        // ignored while in bearer mode.
+        if (mode === 'bearer') {
+            this.clearAllCaches()
         }
     }
 
@@ -354,13 +384,25 @@ export class AtxTokenServiceManager {
      * IAM is only reported once both the IAM credentials and the tenant (application) URL are
      * present, so callers never sign a request before the Origin/region is known. Bearer (IdC)
      * remains the default whenever an ATX bearer token is present.
+     * When the client has declared an auth mode (aws.atx authType), only that mode is reported, so
+     * stale credentials of the other type are never used.
      */
     public getAuthType(): 'bearer' | 'iam' | null {
-        if (this.features.credentialsProvider?.hasCredentials('iam') && this.activeApplicationUrl) {
+        const iamReady = Boolean(this.features.credentialsProvider?.hasCredentials('iam') && this.activeApplicationUrl)
+        const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
+        const bearerReady = Boolean(atxCredentialsProvider?.hasCredentials('bearer'))
+
+        if (this.activeAuthMode === 'iam') {
+            return iamReady ? 'iam' : null
+        }
+        if (this.activeAuthMode === 'bearer') {
+            return bearerReady ? 'bearer' : null
+        }
+
+        if (iamReady) {
             return 'iam'
         }
-        const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
-        if (atxCredentialsProvider?.hasCredentials('bearer')) {
+        if (bearerReady) {
             return 'bearer'
         }
         return null
