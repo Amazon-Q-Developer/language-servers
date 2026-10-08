@@ -207,7 +207,7 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
     }
 
     // Normalize path separators for consistent comparison
-    const normalizedFilePath = filePath.replace(/\\\\/g, '/')
+    const normalizedFilePath = filePath.replace(/\\/g, '/')
 
     // Check if the exact path is approved for this tool
     if (toolPaths.has(filePath) || toolPaths.has(normalizedFilePath)) {
@@ -219,7 +219,7 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
 
     // Check if any approved path is a parent of the file path using isParentFolder
     for (const approvedPath of toolPaths) {
-        const normalizedApprovedPath = approvedPath.replace(/\\\\/g, '/')
+        const normalizedApprovedPath = approvedPath.replace(/\\/g, '/')
 
         // Check using the isParentFolder utility
         if (workspaceUtils.isParentFolder(normalizedApprovedPath, normalizedFilePath)) {
@@ -350,5 +350,6 @@ function isSensitivePath(filePath: string): boolean {
         /\/dev\//,
     ]
 
-    return sensitivePatterns.some(pattern => pattern.test(filePath))
+    const normalizedPath = process.platform === 'win32' ? filePath.replace(/\\/g, '/') : filePath
+    return sensitivePatterns.some(pattern => pattern.test(normalizedPath))
 }

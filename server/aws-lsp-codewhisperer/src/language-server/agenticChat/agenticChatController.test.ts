@@ -4,8 +4,11 @@
  */
 
 import * as crypto from 'crypto'
+import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import * as chokidar from 'chokidar'
+import { URI } from 'vscode-uri'
 import {
     ChatResponseStream,
     CodeWhispererStreaming,
@@ -35,7 +38,7 @@ import {
     ChatUpdateParams,
     ConnectionMetadata,
 } from '@aws/language-server-runtimes/server-interface'
-import { Model } from '@aws/language-server-runtimes/protocol'
+import { MessageType, Model } from '@aws/language-server-runtimes/protocol'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import * as assert from 'assert'
 import { createIterableResponse, setCredentialsForAmazonQTokenServiceManagerFactory } from '../../shared/testUtils'
@@ -3634,6 +3637,182 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+    })
+
+    describe('onFileClicked workspace containment', () => {
+        // Chat file-list cards carry paths that originate in model tool results,
+        // so a click must not open arbitrary files. A real temp directory stands
+        // in for the workspace because the containment check canonicalizes
+        // folders through the filesystem.
+        let workspaceDir: string
+        let outsideDir: string
+        let insideFile: string
+        let outsideFile: string
+        let showDocumentStub: sinon.SinonStub
+        let showMessageRequestStub: sinon.SinonStub
+
+        const OPEN = { title: 'Open' }
+        const CANCEL = { title: 'Cancel' }
+
+        beforeEach(async () => {
+            workspaceDir = await fs.promises.realpath(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ws-')))
+            outsideDir = await fs.promises.realpath(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'outside-')))
+            insideFile = path.join(workspaceDir, 'inside.txt')
+            outsideFile = path.join(outsideDir, 'secret.txt')
+            await fs.promises.writeFile(insideFile, 'inside')
+            await fs.promises.writeFile(outsideFile, 'outside')
+            ;(testFeatures.workspace.getAllWorkspaceFolders as sinon.SinonStub).returns([
+                { uri: URI.file(workspaceDir).toString(), name: 'ws' },
+            ])
+            showDocumentStub = testFeatures.lsp.window.showDocument as sinon.SinonStub
+            showDocumentStub.resetHistory()
+            // An out-of-workspace path prompts the user. Default to declining so
+            // each "refuses" case below means "refused when the user declines".
+            showMessageRequestStub = sinon.stub().resolves(CANCEL)
+            testFeatures.lsp.window.showMessageRequest = showMessageRequestStub
+            chatController.onTabAdd({ tabId: mockTabId })
+        })
+
+        afterEach(async () => {
+            await fs.promises.rm(workspaceDir, { recursive: true, force: true })
+            await fs.promises.rm(outsideDir, { recursive: true, force: true })
+        })
+
+        function openedUris(): string[] {
+            return showDocumentStub.getCalls().map(c => c.args[0].uri)
+        }
+
+        it('opens a file inside the workspace from a fullPath card', async () => {
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'inside.txt', fullPath: insideFile })
+            assert.deepStrictEqual(openedUris(), [URI.file(insideFile).toString()])
+        })
+
+        it('refuses a fullPath outside the workspace', async () => {
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+            sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('refuses a relative filePath that escapes the workspace', async () => {
+            const escaping = path.relative(workspaceDir, outsideFile)
+            assert.ok(escaping.startsWith('..'), 'test precondition: path must traverse upward')
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: escaping })
+            sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('refuses an fsRead card path outside the workspace when it was never approved', async () => {
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-1', {
+                toolUseId: 'read-1',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-1', filePath: outsideFile })
+            sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('opens an fsRead card path outside the workspace when the user approved it in this session', async () => {
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-2', {
+                toolUseId: 'read-2',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+            session.addApprovedPath(outsideFile, 'fsRead')
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-2', filePath: outsideFile })
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
+            // Already approved for this tool, so no dialog is shown.
+            sinon.assert.notCalled(showMessageRequestStub)
+        })
+
+        it('does not treat an fsWrite approval as permission to open via an fsRead card', async () => {
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-3', {
+                toolUseId: 'read-3',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+            session.addApprovedPath(outsideFile, 'fsWrite')
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-3', filePath: outsideFile })
+            sinon.assert.notCalled(showDocumentStub)
+            // Not approved for fsRead, so the user is asked rather than silently opened.
+            sinon.assert.calledOnce(showMessageRequestStub)
+        })
+
+        it('prompts with a warning for an out-of-workspace path and opens when the user chooses Open', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            const request = showMessageRequestStub.firstCall.args[0]
+            assert.strictEqual(request.type, MessageType.Warning)
+            assert.ok(request.message.includes(outsideFile), 'dialog names the exact path being opened')
+            assert.deepStrictEqual(
+                request.actions.map((a: { title: string }) => a.title),
+                ['Open', 'Cancel']
+            )
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
+        })
+
+        it('does not open when the user dismisses the dialog without choosing', async () => {
+            showMessageRequestStub.resolves(null)
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+            sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('remembers an Open choice so the same path does not prompt again', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            assert.strictEqual(openedUris().length, 2)
+        })
+
+        it('surfaces the sensitive-path reason in the dialog for a sensitive out-of-workspace file', async () => {
+            const sensitiveDir = path.join(outsideDir, '.ssh')
+            await fs.promises.mkdir(sensitiveDir, { recursive: true })
+            const sensitiveFile = path.join(sensitiveDir, 'authorized_keys')
+            await fs.promises.writeFile(sensitiveFile, 'k')
+
+            await chatController.onFileClicked({
+                tabId: mockTabId,
+                filePath: 'authorized_keys',
+                fullPath: sensitiveFile,
+            })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            const request = showMessageRequestStub.firstCall.args[0]
+            assert.ok(/sensitive/i.test(request.message), `dialog explains why: ${request.message}`)
+            sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('opens a prompt file from the user prompts directory outside the workspace', async () => {
+            const promptsDir = path.join(outsideDir, '.aws', 'amazonq', 'prompts')
+            await fs.promises.mkdir(promptsDir, { recursive: true })
+            const promptFile = path.join(promptsDir, 'my.prompt.md')
+            await fs.promises.writeFile(promptFile, '# prompt')
+            const homeStub = sinon.stub(os, 'homedir').returns(outsideDir)
+            try {
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: 'my.prompt.md', fullPath: promptFile })
+                assert.deepStrictEqual(openedUris(), [URI.file(promptFile).toString()])
+            } finally {
+                homeStub.restore()
+            }
+        })
+
+        it('refuses a non-prompt file placed in the prompts directory', async () => {
+            const promptsDir = path.join(outsideDir, '.aws', 'amazonq', 'prompts')
+            await fs.promises.mkdir(promptsDir, { recursive: true })
+            const stray = path.join(promptsDir, 'credentials')
+            await fs.promises.writeFile(stray, 'x')
+            const homeStub = sinon.stub(os, 'homedir').returns(outsideDir)
+            try {
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: 'credentials', fullPath: stray })
+                sinon.assert.notCalled(showDocumentStub)
+            } finally {
+                homeStub.restore()
+            }
         })
     })
 })

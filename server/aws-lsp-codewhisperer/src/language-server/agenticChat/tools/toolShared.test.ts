@@ -6,6 +6,7 @@ import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
+import { ChatSessionService } from '../../chat/chatSessionService'
 import { Context } from 'mocha'
 
 // Re-export isSensitivePath for testing via the module's internal function
@@ -26,6 +27,24 @@ describe('toolShared', () => {
             const filePath = '/test/path'
 
             assert.strictEqual(isPathApproved(filePath, 'testTool', approvedPaths), true)
+        })
+
+        it('matches an exact Windows file approval stored by the session', () => {
+            const session = new ChatSessionService()
+            const filePath = 'C:\\workspace\\notes.txt'
+            session.addApprovedPath(filePath, 'fsRead')
+            assert.ok(session.approvedPaths.get('fsRead')?.has('C:/workspace/notes.txt'))
+            assert.strictEqual(isPathApproved(filePath, 'fsRead', session.approvedPaths), true)
+            assert.strictEqual(isPathApproved(filePath, 'fsWrite', session.approvedPaths), false)
+            assert.strictEqual(isPathApproved('C:\\workspace\\other.txt', 'fsRead', session.approvedPaths), false)
+        })
+
+        it('matches an exact UNC file approval stored by the session', () => {
+            const session = new ChatSessionService()
+            const filePath = '\\\\server\\share\\notes.txt'
+            session.addApprovedPath(filePath, 'fsRead')
+            assert.ok(session.approvedPaths.get('fsRead')?.has('//server/share/notes.txt'))
+            assert.strictEqual(isPathApproved(filePath, 'fsRead', session.approvedPaths), true)
         })
 
         it('should return true if a path is a parent folder', () => {
@@ -341,7 +360,7 @@ describe('toolShared', () => {
         })
 
         it('should require acceptance for sensitive paths', async () => {
-            const filePath = '/home/user/.ssh/id_rsa'
+            const filePath = path.join(path.parse(process.cwd()).root, 'fixture-home', '.ssh', 'id_rsa')
 
             const result = await requiresPathAcceptance(
                 filePath,
