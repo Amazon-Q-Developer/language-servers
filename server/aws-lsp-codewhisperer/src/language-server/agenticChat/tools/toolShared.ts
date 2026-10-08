@@ -160,7 +160,11 @@ export async function validatePath(path: string, exists: (p: string) => Promise<
     if (!path || path.trim().length === 0) {
         throw new Error('Path cannot be empty.')
     }
-    const pathExists = await exists(path)
+    // Check the location the tool will actually operate on. Checking the raw
+    // input instead would resolve `~` relative to the process working
+    // directory, while the approval check and the operation expand it to the
+    // home directory, so validation could pass or fail on a different file.
+    const pathExists = await exists(await resolveCanonicalPath(path))
     if (!pathExists) {
         throw new Error(`Path "${path}" does not exist or cannot be accessed.`)
     }
