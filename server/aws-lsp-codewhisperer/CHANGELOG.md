@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.0.130](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.129...lsp-codewhisperer/v0.0.130) (2026-10-08)
+
+
+### Features
+
+* add MCP configuration review action ([ba53363](https://github.com/Amazon-Q-Developer/language-servers/commit/ba533638ff88afa5222021535261a7fd0181b6e0))
+
+
+### Bug Fixes
+
+* **amazonq:** align tilde path validation and add regression tests ([5d2080a](https://github.com/Amazon-Q-Developer/language-servers/commit/5d2080a8c037ad677fe940c9bc87c7cca8452854))
+* **amazonq:** distinguish consent-denied MCP servers ([d51b874](https://github.com/Amazon-Q-Developer/language-servers/commit/d51b87433c4452240fe92647cd996cd4e3da4dfe))
+* **amazonq:** mark truncated MCP consent previews ([6bf4bcd](https://github.com/Amazon-Q-Developer/language-servers/commit/6bf4bcd60af2a023b35dd7a9f11514339be8632d))
+* **amazonq:** preserve existing MCP consent prompt behavior ([effa710](https://github.com/Amazon-Q-Developer/language-servers/commit/effa7109c1cac5859dcfe6fffa255943b0197075))
+* **amazonq:** serialize MCP server consent prompts ([bb2e883](https://github.com/Amazon-Q-Developer/language-servers/commit/bb2e883fc32aeeb44151b0fceef6e17bb038f81e))
+* confirm reads and writes of files that carry more than one name ([5626b4a](https://github.com/Amazon-Q-Developer/language-servers/commit/5626b4aa43b515b39db41ede4215077d520e77c1))
+* enforce CodeReview artifact workspace boundaries ([#2898](https://github.com/Amazon-Q-Developer/language-servers/issues/2898)) ([0007ee9](https://github.com/Amazon-Q-Developer/language-servers/commit/0007ee91a6defc224e0dd38123fbdd70bca26389))
+* harden tool path handling ([63da91a](https://github.com/Amazon-Q-Developer/language-servers/commit/63da91a3418a03850d94fcc539c2a36e623068a6))
+* harden tool path handling ([63da91a](https://github.com/Amazon-Q-Developer/language-servers/commit/63da91a3418a03850d94fcc539c2a36e623068a6))
+* require approval for in-place writes to multiply linked files ([41a1fd1](https://github.com/Amazon-Q-Developer/language-servers/commit/41a1fd182dfc73588e7e0ed29fd9c443512092dc))
+* resolve filesystem tool paths symlink-aware before read/write/list ([ab7627c](https://github.com/Amazon-Q-Developer/language-servers/commit/ab7627c75cfd4af353b4c23a3e38c2b86273cb05))
+* validate MCP OAuth token endpoints ([57827d9](https://github.com/Amazon-Q-Developer/language-servers/commit/57827d915b929425961e8645b8fb913dace9c212))
+
 ## [0.0.129](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.128...lsp-codewhisperer/v0.0.129) (2026-09-30)
 
 
