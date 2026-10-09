@@ -310,14 +310,22 @@ export class CodeWhispererServiceIAM extends CodeWhispererServiceBase {
                 logging.info('CodeWhispererService IAM: Attempting to get credentials')
 
                 try {
-                    const creds = credentialsProvider.getCredentials('iam') as AwsCredentialIdentity
+                    const creds = credentialsProvider.getCredentials('iam') as AwsCredentialIdentity | undefined
+                    if (!creds?.accessKeyId || !creds.secretAccessKey) {
+                        // Same contract as the bearer-token provider: fail with a clear auth error
+                        // instead of a TypeError from dereferencing missing credentials.
+                        throw new Error('Authorization failed, IAM credentials are not set')
+                    }
                     logging.info('CodeWhispererService IAM: Successfully got credentials')
 
                     return {
                         accessKeyId: creds.accessKeyId,
                         secretAccessKey: creds.secretAccessKey,
                         sessionToken: creds.sessionToken,
-                        expiration: creds.expiration,
+                        // Credentials are pushed to the server over JSON, so `expiration` arrives as an
+                        // ISO string. The SDK calls `expiration.getTime()` when deciding whether to
+                        // refresh, so it must be a real Date (see StreamingClientServiceIAM for the same).
+                        expiration: creds.expiration ? new Date(creds.expiration) : undefined,
                     }
                 } catch (err) {
                     if (err instanceof Error) {

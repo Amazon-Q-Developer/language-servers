@@ -14,6 +14,7 @@ import {
     CancellationToken,
     InlineCompletionWithReferencesParams,
 } from '@aws/language-server-runtimes/server-interface'
+import { AwsCredentialIdentity } from '@aws-sdk/types'
 import * as sinon from 'sinon'
 import * as assert from 'assert'
 import {
@@ -211,6 +212,96 @@ describe('CodeWhispererService', function () {
         describe('getCredentialsType', function () {
             it('should return iam credentials type', function () {
                 assert.strictEqual(service.getCredentialsType(), 'iam')
+            })
+        })
+
+        describe('credentials provider callback', function () {
+            // Re-create the service with a stub that captures the SDK client options so the
+            // `credentials` function handed to the SigV4 client can be exercised directly.
+            let capturedCredentialsFn: () => Promise<AwsCredentialIdentity>
+
+            beforeEach(function () {
+                const createClientStub = require('../client/sigv4/codewhisperer')
+                    .createCodeWhispererSigv4Client as sinon.SinonStub
+                createClientStub.callsFake((options: any) => {
+                    capturedCredentialsFn = options.credentials
+                    return { send: sandbox.stub(), middlewareStack: { add: sandbox.stub() } }
+                })
+                service = new CodeWhispererServiceIAM(
+                    mockCredentialsProvider as any,
+                    {} as any,
+                    mockLogging as any,
+                    'us-east-1',
+                    'https://codewhisperer.us-east-1.amazonaws.com',
+                    mockSDKInitializator as any
+                )
+            })
+
+            it('should throw a clear authorization error when IAM credentials are not set', async function () {
+                mockCredentialsProvider.getCredentials.withArgs('iam').returns(undefined)
+
+                await assert.rejects(
+                    () => capturedCredentialsFn(),
+                    (err: unknown) =>
+                        err instanceof Error &&
+                        !(err instanceof TypeError) &&
+                        err.message === 'Authorization failed, IAM credentials are not set'
+                )
+            })
+
+            it('should throw a clear authorization error when IAM credentials are incomplete', async function () {
+                // deliberately incomplete credentials object
+                mockCredentialsProvider.getCredentials.withArgs('iam').returns({ accessKeyId: 'AKIA' } as any)
+
+                await assert.rejects(
+                    () => capturedCredentialsFn(),
+                    (err: unknown) => err instanceof Error && !(err instanceof TypeError)
+                )
+            })
+
+            it('should convert a string expiration into a Date so the SDK can call getTime()', async function () {
+                // Credentials reach the server over JSON, so Date fields arrive as ISO strings.
+                const iso = new Date(Date.now() + 3600 * 1000).toISOString()
+                mockCredentialsProvider.getCredentials.withArgs('iam').returns({
+                    accessKeyId: 'AKIA',
+                    secretAccessKey: 'secret',
+                    sessionToken: 'token',
+                    expiration: iso,
+                } as any)
+
+                const identity = await capturedCredentialsFn()
+                assert.ok(identity.expiration instanceof Date, 'expiration must be a Date instance')
+                assert.strictEqual(identity.expiration!.toISOString(), iso)
+                // This is exactly what @smithy/core does when deciding whether to refresh.
+                assert.doesNotThrow(() => identity.expiration!.getTime())
+            })
+
+            it('should leave expiration undefined when the credentials have none', async function () {
+                mockCredentialsProvider.getCredentials.withArgs('iam').returns({
+                    accessKeyId: 'AKIA',
+                    secretAccessKey: 'secret',
+                    sessionToken: 'token',
+                } as any)
+
+                const identity = await capturedCredentialsFn()
+                assert.strictEqual(identity.expiration, undefined)
+            })
+
+            it('should return the IAM credentials when they are set', async function () {
+                const expiration = new Date()
+                mockCredentialsProvider.getCredentials.withArgs('iam').returns({
+                    accessKeyId: 'AKIA',
+                    secretAccessKey: 'secret',
+                    sessionToken: 'token',
+                    expiration,
+                })
+
+                assert.deepStrictEqual(await capturedCredentialsFn(), {
+                    accessKeyId: 'AKIA',
+                    secretAccessKey: 'secret',
+                    sessionToken: 'token',
+                    expiration,
+                })
             })
         })
 
