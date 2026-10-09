@@ -68,7 +68,7 @@ describe('ATX .NET LSP transform output and progress', function (this: Mocha.Sui
     let workspaceId: string
     const tempDirs: string[] = []
 
-    const jobName = (id: string) => `${JOB_NAME_PREFIX}${id}-${Date.now()}`
+    const jobName = (id: string) => session.jobName(id)
 
     before(async function (this: Mocha.Context) {
         if (!runtimeFile || !token || !startUrl) {
@@ -85,11 +85,7 @@ describe('ATX .NET LSP transform output and progress', function (this: Mocha.Sui
         this.timeout(15 * 60000)
         if (session && workspaceId) {
             await session.checkAndCleanup(workspaceId, new Set())
-            try {
-                await session.fesDeleteWorkspace(workspaceId)
-            } catch (e) {
-                console.error(`[teardown] could not delete workspace ${workspaceId}: ${e}`)
-            }
+            await session.deleteWorkspaceIfEmpty(workspaceId)
         }
         session?.close()
         for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true })
@@ -467,15 +463,17 @@ describe('ATX .NET LSP transform output and progress', function (this: Mocha.Sui
                 )
             }
 
-            // The transformed solution is the zip among the job's outputs: it extracts and targets net8.0.
-            const sourceZip = listed.Artifacts.find((a: any) => path.basename(a.Name) === 'TransformedSource.zip')
-            expect(sourceZip, 'TransformedSource.zip in listArtifacts').to.exist
-            const extracted = path.join(saveDir, 'TransformedSource')
-            new AdmZip(path.join(saveDir, 'TransformedSource.zip')).extractAllTo(extracted, true)
+            // The transformed solution is the one zip among the job's outputs. The agent names it (seen:
+            // TransformedSource.zip, BobsBookstoreClassic_Migrated.zip), so match on the extension.
+            const zips = listed.Artifacts.filter((a: any) => path.extname(a.Name).toLowerCase() === '.zip')
+            expect(zips, 'exactly one .zip in listArtifacts').to.have.length(1)
+            const zipFile = path.join(saveDir, path.basename(zips[0].Name))
+            const extracted = path.join(saveDir, 'transformed')
+            new AdmZip(zipFile).extractAllTo(extracted, true)
             const projects = findFiles(extracted, '.csproj')
-            console.log(`TransformedSource.zip has ${projects.length} .csproj file(s):`)
+            console.log(`${zips[0].Name} has ${projects.length} .csproj file(s):`)
             for (const p of projects) console.log(`  ${path.relative(extracted, p)}: ${targetFrameworks(p)}`)
-            expect(projects, '.csproj files in TransformedSource.zip').to.not.be.empty
+            expect(projects, `.csproj files in ${zips[0].Name}`).to.not.be.empty
             for (const p of projects) {
                 expect(fs.readFileSync(p, 'utf8'), path.relative(extracted, p)).to.match(/net8\.0/)
             }
