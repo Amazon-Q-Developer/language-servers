@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.58](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.57...chat-client/v0.1.58) (2026-10-08)
+
+
+### Bug Fixes
+
+* **amazonq:** distinguish consent-denied MCP servers ([d51b874](https://github.com/Amazon-Q-Developer/language-servers/commit/d51b87433c4452240fe92647cd996cd4e3da4dfe))
+
 ## [0.1.57](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.56...chat-client/v0.1.57) (2026-09-30)
 
 
