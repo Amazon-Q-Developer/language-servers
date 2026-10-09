@@ -50,9 +50,15 @@ export class LspClient {
             })
 
             this.server.listen(this.port, '127.0.0.1', () => {
+                const lspLogFile = process.env.LSP_LOG_FILE
                 this.process = spawn('node', [this.runtimeFile, `--socket=${this.port}`], {
-                    stdio: 'ignore',
+                    stdio: lspLogFile ? ['ignore', 'pipe', 'pipe'] : 'ignore',
                 })
+                if (lspLogFile) {
+                    const out = require('fs').createWriteStream(lspLogFile, { flags: 'a' })
+                    this.process.stdout?.pipe(out)
+                    this.process.stderr?.pipe(out)
+                }
                 this.process.on('error', err => {
                     reject(new Error(`Failed to spawn LSP: ${err.message}`))
                 })
@@ -102,6 +108,12 @@ export class LspClient {
                 }
 
                 if (message.method === 'window/logMessage') {
+                    if (process.env.LSP_LOG_FILE) {
+                        require('fs').appendFileSync(
+                            process.env.LSP_LOG_FILE,
+                            `[${new Date().toISOString()}] [logMessage t=${message.params?.type}] ${message.params?.message}\n`
+                        )
+                    }
                     continue
                 }
 

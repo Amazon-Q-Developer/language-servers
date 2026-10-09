@@ -7,8 +7,10 @@
         "test-integ": "npm run compile && mocha --timeout 7200000 \"./out/**/*.test.js\""
     },
     "devDependencies": {
+        "@amazon/elastic-gumby-frontend-client": "file:../../core/atx-fes-client/amazon-elastic-gumby-frontend-client-1.1.0.tgz",
         "@types/chai": "^4.3.5",
         "@types/mocha": "^10.0.9",
+        "adm-zip": "^0.5.10",
         "chai": "^4.3.7",
         "mocha": "^11.0.1",
         "typescript": "^5.0.0"
