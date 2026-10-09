@@ -7,6 +7,8 @@ import { expect } from 'chai'
 import * as sinon from 'sinon'
 import { McpEventHandler } from './mcpEventHandler'
 import { McpManager } from './mcpManager'
+import { MCPServerConfig, McpServerStatus } from './mcpTypes'
+import { ProfileStatusMonitor } from './profileStatusMonitor'
 import * as mcpUtils from './mcpUtils'
 import { getGlobalAgentConfigPath } from './mcpUtils'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
@@ -209,6 +211,132 @@ describe('McpEventHandler error handling', () => {
         const statusItem = serverItem?.children?.[0].children?.find(item => item.title === 'status')
         expect(statusItem).to.not.be.undefined
         expect(statusItem?.description).to.equal('FAILED')
+    })
+
+    describe('MCP server list regressions', () => {
+        async function setupServers(
+            configs: Map<string, MCPServerConfig>,
+            statuses: Record<string, McpServerStatus>,
+            reasons: Record<string, string> = {}
+        ) {
+            sinon.stub(ProfileStatusMonitor, 'getMcpState').returns(true)
+            const mgr = await McpManager.init([], features)
+            sinon.stub(mgr, 'getAllServerConfigs').returns(configs)
+            sinon.stub(mgr, 'getAllToolsWithPermissions').returns([])
+            sinon.stub(mgr, 'isServerDisabled').callsFake(name => configs.get(name)?.disabled ?? false)
+            const states = new Map(
+                Object.entries(statuses).map(([name, status]) => [
+                    name,
+                    { status, toolsCount: 0, lastError: reasons[name] },
+                ])
+            )
+            sinon.stub(mgr, 'getServerState').callsFake(name => states.get(name))
+            sinon.stub(mgr, 'getAllServerStates').returns(states)
+        }
+
+        for (const [name, status, disabled, command, expectedGroup] of [
+            ['allowed', McpServerStatus.ENABLED, false, 'node', 'Active'],
+            ['initializing', McpServerStatus.INITIALIZING, false, 'node', 'Active'],
+            ['untrusted', McpServerStatus.UNINITIALIZED, false, 'node', 'Active'],
+            ['invalid', McpServerStatus.FAILED, false, '', 'Active'],
+            ['denied', McpServerStatus.DISABLED, false, 'node', 'Denied'],
+            ['disabled', McpServerStatus.DISABLED, true, 'node', 'Disabled'],
+        ] as const) {
+            it(`includes a single ${name} server in ${expectedGroup}`, async () => {
+                const configs = new Map([[name, { command, disabled }]])
+                await setupServers(
+                    configs,
+                    { [name]: status },
+                    name === 'denied' ? { [name]: 'consent not granted' } : {}
+                )
+
+                const result = await eventHandler.onListMcpServers({})
+
+                expect(result.list).to.have.lengthOf(1)
+                expect(result.list[0].groupName).to.equal(expectedGroup)
+                expect(result.list[0].children?.map(item => item.title)).to.deep.equal([name])
+                expect(result.list[0].children?.[0].children?.[0].children?.[0].description).to.equal(status)
+                expect(configs.get(name)?.disabled).to.equal(disabled)
+            })
+        }
+
+        it('keeps the remaining server after deleting from two down to one', async () => {
+            const configs = new Map([
+                ['first', { command: 'node' }],
+                ['second', { command: 'node' }],
+            ])
+            await setupServers(configs, { first: McpServerStatus.ENABLED, second: McpServerStatus.ENABLED })
+            const before = await eventHandler.onListMcpServers({})
+            expect(before.list[0].children).to.have.lengthOf(2)
+
+            configs.delete('first')
+            const after = await eventHandler.onListMcpServers({})
+            expect(after.list).to.have.lengthOf(1)
+            expect(after.list[0].children?.map(item => item.title)).to.deep.equal(['second'])
+        })
+
+        it('separates consent denial from both active and explicitly disabled servers', async () => {
+            const configs = new Map([
+                ['allowed', { command: 'node', disabled: false }],
+                ['denied', { command: 'node', disabled: false }],
+                ['disabled', { command: 'node', disabled: true }],
+            ])
+            await setupServers(
+                configs,
+                {
+                    allowed: McpServerStatus.ENABLED,
+                    denied: McpServerStatus.DISABLED,
+                    disabled: McpServerStatus.DISABLED,
+                },
+                { denied: 'consent not granted' }
+            )
+
+            const result = await eventHandler.onListMcpServers({})
+
+            expect(result.list.map(group => [group.groupName, group.children?.map(item => item.title)])).to.deep.equal([
+                ['Active', ['allowed']],
+                ['Denied', ['denied']],
+                ['Disabled', ['disabled']],
+            ])
+            expect(result.list[1].children?.[0].description).to.equal('consent not granted')
+            expect(configs.get('denied')?.disabled).to.be.false
+        })
+
+        it('preserves the consent explanation when opening a denied server', async () => {
+            await setupServers(
+                new Map([['denied', { command: 'node', disabled: false }]]),
+                { denied: McpServerStatus.DISABLED },
+                { denied: 'consent not granted' }
+            )
+            const permissionUpdate = sinon.spy(McpManager.instance, 'updateServerPermission')
+
+            const result = await eventHandler.onMcpServerClick({ id: 'open-mcp-server', title: 'denied' })
+
+            expect(result.header.status.title).to.equal('consent not granted')
+            sinon.assert.notCalled(permissionUpdate)
+        })
+
+        it('keeps an explicit disable in Disabled even if a prior denial reason remains', async () => {
+            await setupServers(
+                new Map([['disabled', { command: 'node', disabled: true }]]),
+                { disabled: McpServerStatus.DISABLED },
+                { disabled: 'consent not granted' }
+            )
+
+            const result = await eventHandler.onListMcpServers({})
+
+            expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
+        })
+
+        it('does not label other runtime-disabled states as consent denial', async () => {
+            await setupServers(new Map([['disabled', { command: 'node', disabled: false }]]), {
+                disabled: McpServerStatus.DISABLED,
+            })
+
+            const result = await eventHandler.onListMcpServers({})
+
+            expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
+        })
     })
 
     it('handles server click events for fixing failed servers', async () => {
