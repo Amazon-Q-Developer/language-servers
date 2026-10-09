@@ -1280,7 +1280,7 @@ export function createNamespacedToolName(
     toolName: string,
     allNamespacedTools: Set<string>,
     toolNameMapping: Map<string, { serverName: string; toolName: string }>,
-    reservedNames: Set<string> = new Set()
+    reservedNames: Set<string>
 ): string {
     // First, check if this server/tool combination already has a mapping
     // If it does, reuse that name to maintain consistency across reinitializations

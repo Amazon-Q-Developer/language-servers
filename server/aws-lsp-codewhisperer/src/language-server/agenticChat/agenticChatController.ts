@@ -24,6 +24,9 @@ import {
     GREP_SEARCH,
     FILE_SEARCH,
     EXECUTE_BASH,
+    CODE_REVIEW,
+    DISPLAY_FINDINGS,
+    SEMANTIC_SEARCH,
     BUTTON_RUN_SHELL_COMMAND,
     BUTTON_REJECT_SHELL_COMMAND,
     BUTTON_REJECT_MCP_TOOL,
@@ -36,6 +39,7 @@ import {
     SUFFIX_PERMISSION,
     SUFFIX_UNDOALL,
     SUFFIX_EXPLANATION,
+    getReservedBuiltInToolNames,
 } from './constants/toolConstants'
 import { SendMessageCommandInput, ChatCommandInput, ChatCommandOutput } from '../../shared/streamingClientService'
 import {
@@ -2126,10 +2130,10 @@ export class AgenticChatController implements ChatHandlers {
                         }
                         break
                     }
-                    case CodeReview.toolName:
-                    case DisplayFindings.toolName:
+                    case CODE_REVIEW:
+                    case DISPLAY_FINDINGS:
                     // no need to write tool message for CodeReview or DisplayFindings
-                    case SemanticSearch.toolName:
+                    case SEMANTIC_SEARCH:
                         // For internal A/B we don't need tool message
                         break
                     // — DEFAULT ⇒ Only MCP tools, but can also handle generic tool execution messages
@@ -4935,7 +4939,7 @@ export class AgenticChatController implements ChatHandlers {
         // TODO: mcp tool spec name will be server___tool.
         // TODO: Will also need to handle rare edge cases of long server name + long tool name > 64 char
         const allNamespacedTools = new Set<string>()
-        const builtInToolNames = new Set(this.#features.agent.getBuiltInToolNames())
+        const builtInToolNames = getReservedBuiltInToolNames(this.#features.agent.getBuiltInToolNames())
         let mcpToolSpecNames: Set<string>
         try {
             mcpToolSpecNames = new Set(

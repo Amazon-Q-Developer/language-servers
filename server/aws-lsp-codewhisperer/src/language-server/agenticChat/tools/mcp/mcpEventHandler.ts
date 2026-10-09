@@ -31,6 +31,7 @@ import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import { McpRegistryService } from './mcpRegistryService'
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
+import { getReservedBuiltInToolNames } from '../../constants/toolConstants'
 
 interface PermissionOption {
     label: string
@@ -1005,7 +1006,7 @@ export class McpEventHandler {
             // tool of the same name. Tools registered without a classification
             // keep the previous behavior of being listed unless they match an
             // MCP tool name.
-            const builtInToolNames = new Set(this.#features.agent.getBuiltInToolNames())
+            const builtInToolNames = getReservedBuiltInToolNames(this.#features.agent.getBuiltInToolNames())
             const builtInTools = allTools
                 .filter(
                     tool =>
