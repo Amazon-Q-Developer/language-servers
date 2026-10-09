@@ -30,7 +30,7 @@ describe('ATX .NET LSP job lifecycle', function (this: Mocha.Suite) {
     let before_: Set<string>
     const orphansFound: string[] = []
 
-    const jobName = (id: string) => `${JOB_NAME_PREFIX}${id}-${Date.now()}`
+    const jobName = (id: string) => session.jobName(id)
     const start = (id: string, overrides: Partial<{ workspaceId: string; root: string; files: string[] }> = {}) =>
         session.startTransform({
             workspaceId: overrides.workspaceId ?? workspaceId,
@@ -56,11 +56,7 @@ describe('ATX .NET LSP job lifecycle', function (this: Mocha.Suite) {
         this.timeout(15 * 60000)
         if (session && workspaceId) {
             await session.checkAndCleanup(workspaceId, new Set())
-            try {
-                await session.fesDeleteWorkspace(workspaceId)
-            } catch (e) {
-                console.error(`[teardown] could not delete workspace ${workspaceId}: ${e}`)
-            }
+            await session.deleteWorkspaceIfEmpty(workspaceId)
         }
         session?.close()
     })

@@ -1,3 +1,4 @@
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { LspClient } from './lspClient'
@@ -92,6 +93,11 @@ export class AtxTestSession {
     applicationUrl = ''
     private fesClient: any
     private readonly createdJobs = new Map<string, string>() // jobId -> workspaceId
+    /**
+     * Goes into every job name this session creates. Other runs (a scheduled suite, a teammate's local
+     * run) can create jobs in the same workspace; the tag is how cleanup tells those apart from ours.
+     */
+    readonly runTag = crypto.randomBytes(3).toString('hex')
 
     constructor(
         private readonly runtimeFile: string,
@@ -164,14 +170,23 @@ export class AtxTestSession {
         return result
     }
 
+    /** A job name unique to this run: IntegTest-<id>-<runTag>-<timestamp>. */
+    jobName(id: string): string {
+        return `${JOB_NAME_PREFIX}${id}-${this.runTag}-${Date.now()}`
+    }
+
     trackJob(jobId: string, workspaceId: string): void {
         this.createdJobs.set(jobId, workspaceId)
     }
 
-    async listJobIds(workspaceId: string): Promise<Map<string, string>> {
+    async listJobs(workspaceId: string): Promise<any[]> {
         const result = await this.command({ command: 'aws/atxTransform/listJobs', WorkspaceId: workspaceId })
         if (!result?.Jobs) throw new Error(`listJobs failed: ${JSON.stringify(result)}`)
-        return new Map(result.Jobs.map((j: any) => [j.JobId, j.Status]))
+        return result.Jobs
+    }
+
+    async listJobIds(workspaceId: string): Promise<Map<string, string>> {
+        return new Map((await this.listJobs(workspaceId)).map((j: any) => [j.JobId, j.Status]))
     }
 
     async getStatus(workspaceId: string, jobId: string): Promise<any> {
@@ -252,19 +267,27 @@ export class AtxTestSession {
     }
 
     /**
-     * Orphan check. Call `snapshot` before a test and `checkAndCleanup` after it: any job that
-     * appeared in the workspace but was never returned to the test is an orphan. Everything the
-     * test created (and every orphan) is stopped and deleted. Returns the orphan IDs.
+     * Orphan check. Call `snapshot` before a test and `checkAndCleanup` after it: any job with this
+     * run's tag that appeared in the workspace but was never returned to the test is an orphan.
+     * Everything the test created (and every orphan) is stopped and deleted; jobs without the tag
+     * belong to other clients and are left alone. Returns the orphan IDs.
      */
     async snapshot(workspaceId: string): Promise<Set<string>> {
         return new Set((await this.listJobIds(workspaceId)).keys())
     }
 
     async checkAndCleanup(workspaceId: string, before: Set<string>): Promise<string[]> {
-        const after = await this.listJobIds(workspaceId)
-        const orphans = [...after.keys()].filter(id => !before.has(id) && !this.createdJobs.has(id))
+        const appeared = (await this.listJobs(workspaceId)).filter(
+            (j: any) => !before.has(j.JobId) && !this.createdJobs.has(j.JobId)
+        )
+        // Only a job carrying this run's tag can be an orphan of ours. Anything else came from another
+        // client; log it and leave it alone, so cleanup never stops someone else's job.
+        const ours = (j: any) => String(j.JobName ?? '').includes(`-${this.runTag}-`)
+        for (const j of appeared.filter(j => !ours(j))) console.log(`[foreign job, left alone] ${JSON.stringify(j)}`)
+        const orphans = appeared.filter(ours)
+        for (const j of orphans) console.error(`[orphan] ${JSON.stringify(j)}`)
         const toClean = [...this.createdJobs.entries()]
-        for (const id of orphans) toClean.push([id, workspaceId])
+        for (const j of orphans) toClean.push([j.JobId, workspaceId])
         for (const [jobId, wsId] of toClean) {
             try {
                 await this.stopAndDelete(wsId, jobId)
@@ -273,6 +296,22 @@ export class AtxTestSession {
             }
         }
         this.createdJobs.clear()
-        return orphans
+        return orphans.map((j: any) => j.JobId)
+    }
+
+    /** Delete a test workspace, unless another client still has jobs in it. */
+    async deleteWorkspaceIfEmpty(workspaceId: string): Promise<void> {
+        try {
+            const remaining = await this.listJobs(workspaceId)
+            if (remaining.length) {
+                console.log(
+                    `[teardown] keeping workspace ${workspaceId}: ${remaining.length} job(s) from other clients`
+                )
+                return
+            }
+            await this.fesDeleteWorkspace(workspaceId)
+        } catch (e) {
+            console.error(`[teardown] could not delete workspace ${workspaceId}: ${e}`)
+        }
     }
 }
