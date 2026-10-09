@@ -1,8 +1,13 @@
 // Port from VSC: https://github.com/aws/aws-toolkit-vscode/blob/0eea1d8ca6e25243609a07dc2a2c31886b224baa/packages/core/src/codewhispererChat/tools/listDirectory.ts#L19
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import {
+    CommandValidation,
+    InvokeOutput,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    validatePath,
+} from './toolShared'
 import { CancellationError, workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILES } from '../../chat/constants'
 import { CancellationToken } from '@aws/language-server-runtimes/protocol'
 
@@ -59,7 +64,7 @@ export class ListDirectory {
     }
 
     public async invoke(params: ListDirectoryParams, token?: CancellationToken): Promise<InvokeOutput> {
-        const path = sanitize(params.path)
+        const path = await resolveCanonicalPath(params.path)
         try {
             const result = await workspaceUtils.readDirectoryWithTreeOutput(
                 { workspace: this.workspace, logging: this.logging },

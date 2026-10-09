@@ -304,4 +304,94 @@ describe('AgenticChatEventParser', () => {
 
         assert.deepStrictEqual(chatEventParser.getResult(), { success: true, data: expectedData })
     })
+
+    it('finalize flags an unterminated tool use (no stop event) as incomplete and marks it stopped', () => {
+        const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+        // A tool use whose input streams in fragments but never receives a `stop` event
+        // (e.g. the response hit the output-token limit mid tool-input).
+        chatEventParser.processPartialEvent({
+            toolUseEvent: {
+                toolUseId: 'tool-1',
+                name: 'fsWrite',
+                input: '{"path":"out.py","fileText":"import os',
+                stop: false,
+            },
+        })
+        const midStream = chatEventParser.processPartialEvent({
+            toolUseEvent: {
+                toolUseId: 'tool-1',
+                name: 'fsWrite',
+                input: '\\nprint(1)',
+                stop: false,
+            },
+        })
+
+        // Mid-stream this looks like a clean success and would be filtered out (dropped) by the loop.
+        assert.strictEqual(midStream.success, true)
+        assert.strictEqual(midStream.data?.toolUses['tool-1'].stop, false)
+
+        // After the stream ends, finalize() surfaces it as an error and marks it stopped so it
+        // survives the pending-tool-use filter and is routed into the existing retry path.
+        const result = chatEventParser.finalize()
+        assert.strictEqual(result.success, false)
+        assert.ok(result.error?.startsWith('ToolUse input is invalid JSON:'))
+        assert.strictEqual(result.data?.toolUses['tool-1'].stop, true)
+    })
+
+    it('finalize leaves a properly stopped tool use untouched', () => {
+        const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+        chatEventParser.processPartialEvent({
+            toolUseEvent: {
+                toolUseId: 'tool-1',
+                name: 'fsWrite',
+                input: '{"path":"out.py","fileText":"print(1)"}',
+                stop: true,
+            },
+        })
+
+        const result = chatEventParser.finalize()
+        assert.strictEqual(result.success, true)
+        assert.strictEqual(result.data?.toolUses['tool-1'].stop, true)
+        assert.deepStrictEqual(result.data?.toolUses['tool-1'].input, { path: 'out.py', fileText: 'print(1)' })
+    })
+
+    it('finalize does not flag an unterminated tool use when no input was received', () => {
+        const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+        // The model announced a tool use but never streamed any input before the stream ended.
+        // There is nothing to truncate, so this must be dropped rather than retried.
+        chatEventParser.processPartialEvent({
+            toolUseEvent: {
+                toolUseId: 'tool-1',
+                name: 'fsWrite',
+                input: '',
+                stop: false,
+            },
+        })
+
+        const result = chatEventParser.finalize()
+        assert.strictEqual(result.success, true)
+        assert.strictEqual(result.data?.toolUses['tool-1'].stop, false)
+    })
+
+    it('finalize does not flag an unterminated tool use when the request was aborted', () => {
+        const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+        chatEventParser.processPartialEvent({
+            toolUseEvent: {
+                toolUseId: 'tool-1',
+                name: 'fsWrite',
+                input: '{"path":"out.py","fileText":"import os',
+                stop: false,
+            },
+        })
+
+        // An aborted request (response-processing timeout or cancellation) is expected to end
+        // without a stop event, so it must not be reported as a truncated tool input.
+        const result = chatEventParser.finalize({ aborted: true })
+        assert.strictEqual(result.success, true)
+        assert.strictEqual(result.data?.toolUses['tool-1'].stop, false)
+    })
 })
