@@ -177,6 +177,9 @@ export const qLanguageIdByDocumentLanguageId: { [key: string]: CodewhispererLang
     vue: 'vue',
     yaml: 'yaml',
     yml: 'yaml',
+    // Some IDEs (e.g. VS Code) report docker-compose files with the 'dockercompose'
+    // language id rather than 'yaml'; treat it as YAML so completions are provided.
+    dockercompose: 'yaml',
 }
 
 export const getSupportedLanguageId = (
