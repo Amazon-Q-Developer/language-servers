@@ -5,7 +5,7 @@ import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance } from '
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
-import { TestFeatures } from '@aws/language-server-runtimes/testing'
+import { TestFeatures, createCheckedFileOperations } from '@aws/language-server-runtimes/testing'
 import { Context } from 'mocha'
 
 // Re-export isSensitivePath for testing via the module's internal function
@@ -903,6 +903,7 @@ describe('toolShared', () => {
                     this.skip()
                     return
                 }
+                mockWorkspace.fs.checkedFiles = createCheckedFileOperations()
                 tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hardlink-'))
                 workspaceDir = path.join(tmpRoot, 'workspace')
                 fs.mkdirSync(workspaceDir)

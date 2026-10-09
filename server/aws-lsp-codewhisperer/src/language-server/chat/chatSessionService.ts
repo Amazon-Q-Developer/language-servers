@@ -20,8 +20,10 @@ import { MAX_REQUEST_ATTEMPTS } from '../agenticChat/constants/constants'
 import { TokenLimits, TokenLimitsCalculator } from '../agenticChat/utils/tokenLimitsCalculator'
 import { Model } from '@aws/language-server-runtimes/protocol'
 
+import { CheckedTarget } from '../agenticChat/tools/checkedFileIo'
+
 export type ChatSessionServiceConfig = CodeWhispererStreamingClientConfig
-type FileChange = { before?: string; after?: string }
+type FileChange = { before?: string; after?: string; targetPath?: string; target?: CheckedTarget }
 
 type DeferredHandler = {
     resolve: () => void

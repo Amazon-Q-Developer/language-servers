@@ -6,6 +6,7 @@ import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { TextDocument, Workspace } from '@aws/language-server-runtimes/server-interface'
 import { testFolder } from '@aws/lsp-core'
 import { StubbedInstance } from 'ts-sinon'
+import { withCheckedFileOperations, checkedTarget } from './checkedFileFixtures.test'
 
 describe('FsRead Tool', () => {
     let features: TestFeatures
@@ -26,6 +27,7 @@ describe('FsRead Tool', () => {
                         .catch(() => false),
             } as Workspace['fs'],
         } as StubbedInstance<Workspace>
+        features.workspace.fs = withCheckedFileOperations(features.workspace.fs) as typeof features.workspace.fs
         tempFolder = await testFolder.TestFolder.create()
     })
 
@@ -40,7 +42,7 @@ describe('FsRead Tool', () => {
     it('invalidates empty path', async () => {
         const fsRead = new FsRead(features)
         await assert.rejects(
-            fsRead.validate({ paths: [''] }),
+            fsRead.validate({ paths: [''] }, [{ path: '', state: 'unverified' }]),
             /Path cannot be empty/i,
             'Expected an error about empty path'
         )
@@ -51,8 +53,8 @@ describe('FsRead Tool', () => {
         const fsRead = new FsRead(features)
 
         await assert.rejects(
-            fsRead.validate({ paths: [filePath] }),
-            /does not exist or cannot be accessed/i,
+            fsRead.validate({ paths: [filePath] }, [await checkedTarget(filePath)]),
+            /does not exist/i,
             'Expected an error indicating the path does not exist'
         )
     })
@@ -61,8 +63,8 @@ describe('FsRead Tool', () => {
         const fileContent = 'A'.repeat(FsRead.maxResponseSize + 10)
         const filePath = await tempFolder.write('largeFile.txt', fileContent)
         const fsRead = new FsRead(features)
-        await fsRead.validate({ paths: [filePath] })
-        const result = await fsRead.invoke({ paths: [filePath] })
+        await fsRead.validate({ paths: [filePath] }, [await checkedTarget(filePath)])
+        const result = await fsRead.invoke({ paths: [filePath] }, [await checkedTarget(filePath)])
 
         verifyResult(result, [
             { path: filePath, content: 'A'.repeat(FsRead.maxResponseSize - 3) + '...', truncated: true },
@@ -74,7 +76,7 @@ describe('FsRead Tool', () => {
         const filePath = await tempFolder.write('fullFile.txt', fileContent)
 
         const fsRead = new FsRead(features)
-        const result = await fsRead.invoke({ paths: [filePath] })
+        const result = await fsRead.invoke({ paths: [filePath] }, [await checkedTarget(filePath)])
         verifyResult(result, [{ path: filePath, content: fileContent, truncated: false }])
     })
 
@@ -85,7 +87,10 @@ describe('FsRead Tool', () => {
         const filePath1 = await tempFolder.write('fullFile1.txt', fileContent1)
 
         const fsRead = new FsRead(features)
-        const result = await fsRead.invoke({ paths: [filePath, filePath1] })
+        const result = await fsRead.invoke({ paths: [filePath, filePath1] }, [
+            await checkedTarget(filePath),
+            await checkedTarget(filePath1),
+        ])
         verifyResult(result, [
             { path: filePath, content: fileContent, truncated: false },
             { path: filePath1, content: fileContent1, truncated: false },

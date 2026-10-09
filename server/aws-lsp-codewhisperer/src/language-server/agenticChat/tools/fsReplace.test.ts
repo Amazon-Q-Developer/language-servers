@@ -8,6 +8,7 @@ import { Workspace } from '@aws/language-server-runtimes/server-interface'
 import { StubbedInstance } from 'ts-sinon'
 import { FsReplace, ReplaceParams } from './fsReplace'
 import * as os from 'os'
+import { withCheckedFileOperations, checkedTarget } from './checkedFileFixtures.test'
 
 describe('FsReplace Tool', function () {
     let tempFolder: testFolder.TestFolder
@@ -34,6 +35,7 @@ describe('FsReplace Tool', function () {
                         .catch(() => false),
             } as Workspace['fs'],
         } as StubbedInstance<Workspace>
+        features.workspace.fs = withCheckedFileOperations(features.workspace.fs) as typeof features.workspace.fs
         tempFolder = await testFolder.TestFolder.create()
     })
 
@@ -64,12 +66,12 @@ describe('FsReplace Tool', function () {
                 ],
             }
             const fsReplace = new FsReplace(features)
-            const output = await fsReplace.invoke(params)
+            const output = await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const content = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(content, 'Goodbye World')
 
-            assert.deepStrictEqual(output, expectedOutput)
+            assert.deepStrictEqual(output.output, expectedOutput.output)
         })
 
         it('throws error when no matches are found', async function () {
@@ -86,7 +88,10 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await assert.rejects(() => fsReplace.invoke(params), /No occurrences of "Invalid" were found/)
+            await assert.rejects(
+                async () => fsReplace.invoke(params, await checkedTarget(params.path)),
+                /No occurrences of "Invalid" were found/
+            )
         })
 
         it('throws error when multiple matches are found', async function () {
@@ -105,7 +110,7 @@ describe('FsReplace Tool', function () {
 
             const fsReplace = new FsReplace(features)
             await assert.rejects(
-                () => fsReplace.invoke(params),
+                async () => fsReplace.invoke(params, await checkedTarget(params.path)),
                 /Multiple occurrences of "Hello" were found when only 1 is expected/
             )
         })
@@ -124,12 +129,12 @@ describe('FsReplace Tool', function () {
                 ],
             }
             const fsReplace = new FsReplace(features)
-            const output = await fsReplace.invoke(params)
+            const output = await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const content = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(content, 'Text with special chars: REPLACED')
 
-            assert.deepStrictEqual(output, expectedOutput)
+            assert.deepStrictEqual(output.output, expectedOutput.output)
         })
 
         it('preserves whitespace and newlines during replacement', async function () {
@@ -146,12 +151,12 @@ describe('FsReplace Tool', function () {
                 ],
             }
             const fsReplace = new FsReplace(features)
-            const output = await fsReplace.invoke(params)
+            const output = await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const content = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(content, 'Line 1\n    Double indented\nLine 3')
 
-            assert.deepStrictEqual(output, expectedOutput)
+            assert.deepStrictEqual(output.output, expectedOutput.output)
         })
     })
 
@@ -170,7 +175,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'before\r\nnew line 1\r\nnew line 2\r\nnew line 3\r\nafter')
@@ -190,7 +195,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'before\nnew line 1\nnew line 2\nnew line 3\nafter')
@@ -210,7 +215,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'before\rnew line 1\rnew line 2\rnew line 3\rafter')
@@ -230,7 +235,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'before\r\nnew line 1\r\nnew line 2\r\nnew line 3\r\nend\r\nafter')
@@ -250,7 +255,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'before replacement after')
@@ -270,7 +275,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, `before line 1${os.EOL}line 2 after`)
@@ -290,7 +295,7 @@ describe('FsReplace Tool', function () {
             }
 
             const fsReplace = new FsReplace(features)
-            await fsReplace.invoke(params)
+            await fsReplace.invoke(params, await checkedTarget(params.path))
 
             const result = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(result, 'start\r\nprefix center suffix\r\nend')

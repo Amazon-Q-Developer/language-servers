@@ -1,10 +1,5 @@
-import {
-    CommandValidation,
-    ExplanatoryParams,
-    InvokeOutput,
-    requiresPathAcceptance,
-    resolveCanonicalPath,
-} from './toolShared'
+import { CheckedTarget, readCheckedFile, updateCheckedFile } from './checkedFileIo'
+import { CommandValidation, ExplanatoryParams, InvokeOutput, requiresPathAcceptance } from './toolShared'
 import { EmptyPathError, MissingContentError, FileExistsWithSameContentError, EmptyAppendContentError } from '../errors'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
@@ -42,19 +37,26 @@ export class FsWrite {
         this.lsp = features.lsp
     }
 
-    public async validate(params: FsWriteParams): Promise<void> {
+    /**
+     * `targetPath` is the canonical path the approval check evaluated for
+     * `params.path`. It is required so validation looks at the same file the
+     * write will touch; `params.path` is never resolved here.
+     */
+    public async validate(params: FsWriteParams, targetPath: CheckedTarget): Promise<void> {
         if (!params.path) {
             throw new EmptyPathError()
         }
-        const sanitizedPath = await resolveCanonicalPath(params.path)
         switch (params.command) {
             case 'create': {
                 if (params.fileText === undefined) {
                     throw new MissingContentError()
                 }
-                const fileExists = await this.workspace.fs.exists(sanitizedPath)
+                const fileExists =
+                    targetPath.state === 'unverified'
+                        ? await this.workspace.fs.exists(targetPath.path)
+                        : targetPath.state === 'existing'
                 if (fileExists) {
-                    const oldContent = await this.workspace.fs.readFile(sanitizedPath)
+                    const oldContent = await readCheckedFile(this.workspace, targetPath, this.logging)
                     if (oldContent === params.fileText) {
                         throw new FileExistsWithSameContentError()
                     }
@@ -69,21 +71,23 @@ export class FsWrite {
         }
     }
 
-    public async invoke(params: FsWriteParams): Promise<InvokeOutput> {
-        const sanitizedPath = await resolveCanonicalPath(params.path)
+    /** Uses the checked target without resolving the original alias again. */
+    public async invoke(params: FsWriteParams, targetPath: CheckedTarget): Promise<InvokeOutput> {
         let content = ''
+        let fileUpdate: InvokeOutput['fileUpdate']
         switch (params.command) {
             case 'create':
-                await this.handleCreate(params, sanitizedPath)
+                fileUpdate = await this.handleCreate(params, targetPath)
                 content = 'File created successfully'
                 break
             case 'append':
-                await this.handleAppend(params, sanitizedPath)
+                fileUpdate = await this.handleAppend(params, targetPath)
                 content = 'File appended successfully'
                 break
         }
 
         return {
+            fileUpdate,
             output: {
                 kind: 'text',
                 content,
@@ -108,21 +112,32 @@ export class FsWrite {
         })
     }
 
-    private async handleCreate(params: CreateParams, sanitizedPath: string): Promise<void> {
+    private async handleCreate(params: CreateParams, targetPath: CheckedTarget) {
         const content = params.fileText
-        await this.workspace.fs.writeFile(sanitizedPath, content)
+        const outcome = await updateCheckedFile(
+            this.workspace,
+            targetPath,
+            () => content,
+            { create: true, readExisting: false },
+            this.logging
+        )
 
         // Add created file to @Files list
         void LocalProjectContextController.getInstance().then(controller => {
-            const filePath = URI.file(sanitizedPath).fsPath
+            const filePath = URI.file(targetPath.path).fsPath
             return controller.updateIndexAndContextCommand([filePath], true)
         })
+        return outcome
     }
 
-    private async handleAppend(params: AppendParams, sanitizedPath: string): Promise<void> {
-        const fileContent = await this.workspace.fs.readFile(sanitizedPath)
-        const newContent = getAppendContent(params, fileContent)
-        await this.workspace.fs.writeFile(sanitizedPath, newContent)
+    private async handleAppend(params: AppendParams, targetPath: CheckedTarget) {
+        return updateCheckedFile(
+            this.workspace,
+            targetPath,
+            fileContent => getAppendContent(params, fileContent),
+            {},
+            this.logging
+        )
     }
 
     public getSpec() {

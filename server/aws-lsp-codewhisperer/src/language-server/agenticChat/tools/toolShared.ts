@@ -5,6 +5,60 @@ import { sanitize } from '@aws/lsp-core/out/util/path'
 import * as fs from 'fs'
 import * as path from 'path'
 import { CommandCategory } from './executeBash'
+import { EmptyPathError } from '../errors'
+import { captureCheckedTarget, CheckedTarget } from './checkedFileIo'
+import { FileUpdateOutcome } from '@aws/language-server-runtimes/server-interface'
+
+const resolvedTargets = new WeakMap<object, { toolName: string; targets: readonly CheckedTarget[] }>()
+const fileUpdates = new WeakMap<object, FileUpdateOutcome>()
+
+/** Bind immutable checked targets to the exact object passed through the in-process runtime. */
+export function withResolvedTargets<T extends object>(
+    input: T,
+    toolName: string,
+    targets: readonly CheckedTarget[]
+): T {
+    const executionInput = { ...input }
+    resolvedTargets.set(executionInput, {
+        toolName,
+        targets: Object.freeze(targets.map(target => Object.freeze({ ...target }))),
+    })
+    return executionInput
+}
+
+export function recordFileUpdate(input: object, outcome: FileUpdateOutcome | undefined): void {
+    if (outcome) fileUpdates.set(input, outcome)
+}
+
+export function getFileUpdate(input: object): FileUpdateOutcome | undefined {
+    return fileUpdates.get(input)
+}
+
+export function discardResolvedTargets(input: object): void {
+    resolvedTargets.delete(input)
+    fileUpdates.delete(input)
+}
+
+/** Consume the checked targets once; model fields and copied inputs cannot grant approval. */
+export function requireResolvedTargets(
+    input: object,
+    toolName: string,
+    expectedCount: number
+): readonly CheckedTarget[] {
+    const entry = resolvedTargets.get(input)
+    if (!entry || entry.toolName !== toolName) {
+        throw new Error('No checked targets for this operation.')
+    }
+    resolvedTargets.delete(input)
+    if (expectedCount < 1 || entry.targets.length !== expectedCount) {
+        throw new Error('Checked targets do not match this operation.')
+    }
+    return entry.targets
+}
+
+export function requireResolvedTarget(input: object, toolName: string): CheckedTarget {
+    return requireResolvedTargets(input, toolName, 1)[0]
+}
 
 /**
  * Resolve a path to its canonical on-disk location in a symlink-aware way,
@@ -141,6 +195,8 @@ interface Output<Kind, Content> {
 
 export interface InvokeOutput {
     output: Output<'text', string> | Output<'json', object>
+    /** Internal bookkeeping removed by the tool server before returning model output. */
+    fileUpdate?: FileUpdateOutcome
 }
 
 export interface CommandValidation {
@@ -154,6 +210,15 @@ export interface CommandValidation {
      * the usual "outside of your workspace" wording would be wrong.
      */
     acceptanceReason?: 'multiplyLinkedFile'
+    /**
+     * The canonical on-disk paths the check evaluated, in input order. Callers
+     * that go on to act on these paths must use exactly these values rather
+     * than resolving the input again, so the operation lands where the check
+     * looked.
+     */
+    canonicalPaths?: string[]
+    checkedTargets?: readonly CheckedTarget[]
+    validationError?: Error
 }
 
 export async function validatePath(path: string, exists: (p: string) => Promise<boolean>) {
@@ -267,70 +332,64 @@ export async function requiresPathAcceptance(
     options?: PathAcceptanceOptions
 ): Promise<CommandValidation> {
     try {
+        if (typeof inputPath !== 'string' || !inputPath.trim()) {
+            throw new EmptyPathError()
+        }
         // Canonicalize in a symlink-aware way before the workspace-boundary
         // check: a link whose name sits inside the workspace can point outside
         // it, including when the target does not exist yet (a dangling link).
-        // The I/O tools resolve through the same helper, so the boundary check
-        // and the operation derive the path the same way.
+        // The resolved path is returned in `canonicalPaths` so the caller acts
+        // on the exact value the check evaluated instead of resolving again.
         const canonicalPath = await resolveCanonicalPath(inputPath)
+        const target: CheckedTarget = options?.flagMultiplyLinkedFiles
+            ? await captureCheckedTarget(workspace, canonicalPath)
+            : Object.freeze({ path: canonicalPath, state: 'unverified' })
+        const checked = { canonicalPaths: [canonicalPath], checkedTargets: Object.freeze([target]) }
 
-        // Then check if the path is already approved for this specific tool
         if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
-            return { requiresAcceptance: false }
+            return { requiresAcceptance: false, ...checked }
         }
 
         const workspaceFolders = getWorkspaceFolderPaths(workspace)
         if (!workspaceFolders || workspaceFolders.length === 0) {
-            if (logging) {
-                logging.debug('No workspace folders found when checking file acceptance')
-            }
-            return { requiresAcceptance: true }
+            logging?.debug('No workspace folders found when checking file acceptance')
+            return { requiresAcceptance: true, ...checked }
         }
 
-        // Check if the canonicalized path is inside the workspace.
-        // This is the primary security check — files genuinely inside the workspace
-        // are trusted regardless of their filename (e.g. "PasswordService.java",
-        // "credentials/auth.ts", or paths under a "/dev/" folder).
-        // Workspace folders are canonicalized too so the comparison holds even
-        // when the workspace itself lives under a symlinked directory.
         const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(workspaceFolders)
-        const isInWs = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)
-        if (isInWs) {
-            // Being inside the workspace by path is not sufficient for a file
-            // that has more than one name. `lstat` reports a hard link as an
-            // ordinary file, so the resolver above cannot follow it and the
-            // canonical path is the in-workspace name; the file's other names
-            // stay invisible to this check and may be outside the workspace.
-            // Reading it returns data that lives under those names too, and
-            // modifying it in place changes the contents under all of them.
-            if (options?.flagMultiplyLinkedFiles && (await hasAdditionalHardLinks(canonicalPath))) {
+        if (workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)) {
+            const multiplyLinked =
+                target.state === 'existing'
+                    ? BigInt(target.linkCount) > 1n
+                    : target.state === 'unverified' && options?.flagMultiplyLinkedFiles
+                      ? await hasAdditionalHardLinks(canonicalPath)
+                      : false
+            if (options?.flagMultiplyLinkedFiles && multiplyLinked) {
                 return {
                     requiresAcceptance: true,
                     warning: multiplyLinkedFileWarning(options.flagMultiplyLinkedFiles),
                     acceptanceReason: 'multiplyLinkedFile',
+                    ...checked,
                 }
             }
-            return { requiresAcceptance: false }
+            return { requiresAcceptance: false, ...checked }
         }
 
-        // For paths OUTSIDE the workspace, check if they target sensitive system
-        // locations. We check both the raw input and the resolved path to catch
-        // traversal attempts like "/workspace/../../etc/passwd".
         if (isSensitivePath(inputPath) || isSensitivePath(canonicalPath)) {
             return {
                 requiresAcceptance: true,
                 warning: 'Access to sensitive system files requires explicit approval',
+                ...checked,
             }
         }
-
-        // Path is outside workspace but not a known sensitive location
-        return { requiresAcceptance: true }
+        return { requiresAcceptance: true, ...checked }
     } catch (error) {
         if (logging) {
             logging.error(`Error checking file acceptance: ${error}`)
         }
-        // In case of error, safer to require acceptance
-        return { requiresAcceptance: true }
+        // In case of error, safer to require acceptance. No canonical path is
+        // returned, so a caller that needs one to proceed will refuse.
+        return { requiresAcceptance: true, validationError: error instanceof Error ? error : new Error(String(error)) }
     }
 }
 

@@ -4,12 +4,14 @@ import * as path from 'path'
 import * as assert from 'assert'
 import * as fs from 'fs/promises'
 import { InvokeOutput } from './toolShared'
+import { checkedTarget as resolveCanonicalPath } from './checkedFileFixtures.test'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { Workspace } from '@aws/language-server-runtimes/server-interface'
 import { StubbedInstance } from 'ts-sinon'
 import * as sinon from 'sinon'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
 import { URI } from 'vscode-uri'
+import { withCheckedFileOperations } from './checkedFileFixtures.test'
 
 describe('FsWrite Tool', function () {
     let tempFolder: testFolder.TestFolder
@@ -46,6 +48,7 @@ describe('FsWrite Tool', function () {
                         .catch(() => false),
             } as Workspace['fs'],
         } as StubbedInstance<Workspace>
+        features.workspace.fs = withCheckedFileOperations(features.workspace.fs) as typeof features.workspace.fs
         tempFolder = await testFolder.TestFolder.create()
 
         // Set up LocalProjectContextController mock
@@ -95,12 +98,12 @@ describe('FsWrite Tool', function () {
                 path: filePath,
             }
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const content = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(content, 'Hello World')
 
-            assert.deepStrictEqual(output, expectedOutput)
+            assert.deepStrictEqual({ output: output.output }, expectedOutput)
 
             // Verify LocalProjectContextController was called
             assert.ok(localProjectContextControllerStub.calledOnce)
@@ -129,12 +132,12 @@ describe('FsWrite Tool', function () {
                 path: filePath,
             }
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const content = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(content, 'Goodbye')
 
-            assert.deepStrictEqual(output, expectedOutput)
+            assert.deepStrictEqual({ output: output.output }, expectedOutput)
         })
     })
 
@@ -150,12 +153,12 @@ describe('FsWrite Tool', function () {
             }
 
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const newContent = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(newContent, 'Line 1\nLine 2\nLine 3\nLine 4')
 
-            assert.deepStrictEqual(output, expectedOutputAppend)
+            assert.deepStrictEqual({ output: output.output }, expectedOutputAppend)
         })
 
         it('adds a newline before appending if file does not end with one', async function () {
@@ -169,12 +172,12 @@ describe('FsWrite Tool', function () {
             }
 
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const newContent = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(newContent, 'Line 1\nLine 2\nLine 3\nLine 4')
 
-            assert.deepStrictEqual(output, expectedOutputAppend)
+            assert.deepStrictEqual({ output: output.output }, expectedOutputAppend)
         })
 
         it('appends to an empty file', async function () {
@@ -187,12 +190,12 @@ describe('FsWrite Tool', function () {
                 fileText: 'Line 1',
             }
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const newContent = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(newContent, 'Line 1')
 
-            assert.deepStrictEqual(output, expectedOutputAppend)
+            assert.deepStrictEqual({ output: output.output }, expectedOutputAppend)
         })
 
         it('appends multiple lines correctly', async function () {
@@ -204,12 +207,12 @@ describe('FsWrite Tool', function () {
                 fileText: 'Line 2\nLine 3',
             }
             const fsWrite = new FsWrite(features)
-            const output = await fsWrite.invoke(params)
+            const output = await fsWrite.invoke(params, await resolveCanonicalPath(params.path))
 
             const newContent = await features.workspace.fs.readFile(filePath)
             assert.strictEqual(newContent, 'Line 1\nLine 2\nLine 3')
 
-            assert.deepStrictEqual(output, expectedOutputAppend)
+            assert.deepStrictEqual({ output: output.output }, expectedOutputAppend)
         })
 
         it('throws error when file does not exist', async function () {
@@ -222,7 +225,10 @@ describe('FsWrite Tool', function () {
             }
 
             const fsWrite = new FsWrite(features)
-            await assert.rejects(() => fsWrite.invoke(params), /no such file or directory/)
+            await assert.rejects(
+                async () => fsWrite.invoke(params, await resolveCanonicalPath(params.path)),
+                /no such file or directory/i
+            )
         })
     })
 })
