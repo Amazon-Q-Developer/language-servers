@@ -1,5 +1,7 @@
+import { execSync } from 'child_process'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import { LspClient } from './lspClient'
 
@@ -38,6 +40,28 @@ export function getSourceFiles(
     return files
 }
 
+/**
+ * Copy a solution to a fresh temp folder. Use it for tests that poll with SolutionRootPath: the LSP
+ * then applies step diffs and writes worklogs and artifacts under that root, which would otherwise
+ * change the shared fixture for every suite that runs after.
+ */
+export function copyFixture(src: string, label: string): string {
+    const dest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), `atx-${label}-`)), path.basename(src))
+    const excluded = ['.git', 'artifactWorkspace']
+    fs.cpSync(src, dest, { recursive: true, filter: s => !excluded.includes(path.basename(s)) })
+    return dest
+}
+
+/** Read the current bearer token from the secret the token refresher keeps up to date. */
+export function readTokenFromSecretsManager(): string {
+    const secretId = process.env.TEST_SSO_TOKEN_SECRET_ID || 'AtxSsoTokenSecret'
+    const result = execSync(
+        `aws secretsmanager get-secret-value --secret-id ${secretId} --query SecretString --output text`,
+        { encoding: 'utf-8' }
+    )
+    return JSON.parse(result).bearerToken.replace('Bearer ', '')
+}
+
 export interface StartTransformInputs {
     workspaceId: string
     jobName: string
@@ -45,8 +69,11 @@ export interface StartTransformInputs {
     sourceFiles: string[]
 }
 
-/** The StartTransform payload VS sends for Bobs Bookstore (same shape as the existing E2E test). */
-export function buildStartTransformRequest(inputs: StartTransformInputs) {
+/**
+ * The StartTransform payload VS sends for Bobs Bookstore (same shape as the existing E2E test).
+ * `overrides` replaces fields of the inner StartTransformRequest, e.g. the transform flags.
+ */
+export function buildStartTransformRequest(inputs: StartTransformInputs, overrides: Record<string, any> = {}) {
     const root = inputs.solutionRootPath
     const project = (name: string, type: string) => ({
         Name: name,
@@ -78,6 +105,7 @@ export function buildStartTransformRequest(inputs: StartTransformInputs) {
             TransformNetStandardProjects: false,
             EnableRazorViewTransform: true,
             EnableWebFormsTransform: false,
+            ...overrides,
         },
     }
 }
@@ -98,10 +126,11 @@ export class AtxTestSession {
      * run) can create jobs in the same workspace; the tag is how cleanup tells those apart from ours.
      */
     readonly runTag = crypto.randomBytes(3).toString('hex')
+    private refreshTimer: NodeJS.Timeout | undefined
 
     constructor(
         private readonly runtimeFile: string,
-        private readonly token: string,
+        private token: string,
         private readonly startUrl: string
     ) {
         this.client = new LspClient(runtimeFile)
@@ -132,7 +161,26 @@ export class AtxTestSession {
     }
 
     close(): void {
+        if (this.refreshTimer) clearInterval(this.refreshTimer)
         this.client.close()
+    }
+
+    /**
+     * For suites that outlive the token (~1h): re-read it from Secrets Manager on an interval and
+     * push it to the LSP, the same way the IDE pushes a refreshed SSO token. A failed refresh is
+     * logged and the old token kept, so the next request shows the real error.
+     */
+    startTokenRefresh(intervalMs = 25 * 60000): void {
+        this.refreshTimer = setInterval(async () => {
+            try {
+                const token = readTokenFromSecretsManager()
+                await this.updateToken(token)
+                this.token = token
+                console.log('[token] refreshed')
+            } catch (e) {
+                console.error(`[token] refresh failed: ${e}`)
+            }
+        }, intervalMs)
     }
 
     async updateToken(token: string): Promise<void> {
@@ -164,8 +212,8 @@ export class AtxTestSession {
      * Every startTransform goes through here. A job ID is recorded for cleanup; an error
      * response is returned as-is so the caller decides, but never leads to polling.
      */
-    async startTransform(inputs: StartTransformInputs): Promise<any> {
-        const result = await this.command(buildStartTransformRequest(inputs), 300000)
+    async startTransform(inputs: StartTransformInputs, overrides: Record<string, any> = {}): Promise<any> {
+        const result = await this.command(buildStartTransformRequest(inputs, overrides), 300000)
         if (result?.TransformationJobId) this.createdJobs.set(result.TransformationJobId, inputs.workspaceId)
         return result
     }
@@ -189,13 +237,18 @@ export class AtxTestSession {
         return new Map((await this.listJobs(workspaceId)).map((j: any) => [j.JobId, j.Status]))
     }
 
-    async getStatus(workspaceId: string, jobId: string): Promise<any> {
-        return this.command({
-            command: 'aws/atxTransform/getTransformInfo',
-            TransformationJobId: jobId,
-            WorkspaceId: workspaceId,
-            useOrchestratorAgent: true,
-        })
+    /** `extra` adds optional getTransformInfo inputs, e.g. SolutionRootPath or GetCheckpoints. */
+    async getStatus(workspaceId: string, jobId: string, extra: Record<string, any> = {}): Promise<any> {
+        return this.command(
+            {
+                command: 'aws/atxTransform/getTransformInfo',
+                TransformationJobId: jobId,
+                WorkspaceId: workspaceId,
+                useOrchestratorAgent: true,
+                ...extra,
+            },
+            300000
+        )
     }
 
     /** Poll getTransformInfo until the status is in `want` or the deadline passes. */
