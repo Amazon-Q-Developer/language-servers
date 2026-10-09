@@ -1943,6 +1943,7 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
     const workspaceMcp = '/tmp/ws-a/.amazonq/mcp.json'
 
     let showMessageStub: sinon.SinonStub
+    let showDocumentStub: sinon.SinonStub
     let hasApprovalStub: sinon.SinonStub
     let recordApprovalStub: sinon.SinonStub
     let setStateSpy: sinon.SinonSpy
@@ -1953,13 +1954,14 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         recordApprovalStub = sinon.stub(consentStore, 'recordApproval').resolves()
 
         showMessageStub = sinon.stub()
+        showDocumentStub = sinon.stub().resolves({ success: true })
         const featuresWithPrompt = {
             ...features,
             workspace: {
                 ...fakeWorkspace,
                 fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome },
             },
-            lsp: { window: { showMessageRequest: showMessageStub } },
+            lsp: { window: { showMessageRequest: showMessageStub, showDocument: showDocumentStub } },
         }
         sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
             servers: new Map(),
@@ -2028,6 +2030,66 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         expect(showMessageStub.calledOnce).to.be.true
     })
 
+    it('marks truncated consent previews and visually separates their source', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const longCommand = 'c'.repeat(201)
+        const longEnvName = 'E'.repeat(201)
+        const longHeaderName = 'H'.repeat(201)
+        const cfg: MCPServerConfig = {
+            command: longCommand,
+            args: [],
+            env: { [longEnvName]: 'hidden-env-value' },
+            headers: { [longHeaderName]: 'hidden-header-value' },
+            __configPath__: workspaceMcp,
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include(`Command: ${longCommand.slice(0, 200)} { ... }\n`)
+        expect(message).to.include(`Environment variables: ${longEnvName.slice(0, 200)} { ... }\n`)
+        expect(message).to.include(`Headers: ${longHeaderName.slice(0, 200)} { ... }\n• Source: ${workspaceMcp}`)
+        expect(message).to.not.include('hidden-env-value')
+        expect(message).to.not.include('hidden-header-value')
+    })
+
+    it('does not mark complete consent previews as truncated', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            command: 'sh',
+            args: ['-c', 'x'],
+            env: { DEMO_ENV: 'hidden-env-value' },
+            headers: { 'X-Demo': 'hidden-header-value' },
+            __configPath__: workspaceMcp,
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Command: sh -c x\n')
+        expect(message).to.include('Environment variables: DEMO_ENV\n')
+        expect(message).to.include(`Headers: X-Demo\n• Source: ${workspaceMcp}`)
+        expect(message).to.not.include('{ ... }')
+    })
+
+    it('opens the workspace configuration and re-prompts before allowing', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.onFirstCall().resolves({ title: 'View full configuration' })
+        showMessageStub.onSecondCall().resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = { command: 'sh', args: ['-c', 'x'], __configPath__: workspaceMcp }
+
+        try {
+            await (mgr as any).initOneServerInternal('svc', cfg)
+        } catch {}
+
+        expect(showMessageStub.calledTwice).to.be.true
+        expect(showDocumentStub.calledOnce).to.be.true
+        expect(showDocumentStub.firstCall.args[0].uri).to.equal('file:///tmp/ws-a/.amazonq/mcp.json')
+        expect(showDocumentStub.firstCall.args[0].takeFocus).to.be.true
+        expect(recordApprovalStub.called).to.be.false
+    })
     it('denial sets DISABLED state and caches the decision', async () => {
         const mgr = await buildMgr()
         showMessageStub.resolves({ title: 'Deny' })
