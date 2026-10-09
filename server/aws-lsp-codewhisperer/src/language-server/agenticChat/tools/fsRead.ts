@@ -1,5 +1,10 @@
-import { sanitize } from '@aws/lsp-core/out/util/path'
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import {
+    CommandValidation,
+    InvokeOutput,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    validatePath,
+} from './toolShared'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { FSREAD_MAX_PER_FILE, FSREAD_MAX_TOTAL } from '../constants/constants'
 
@@ -46,7 +51,14 @@ export class FsRead {
     ): Promise<CommandValidation> {
         // Check acceptance for all paths in the array
         for (const path of params.paths) {
-            const validation = await requiresPathAcceptance(path, 'fsRead', this.workspace, this.logging, approvedPaths)
+            const validation = await requiresPathAcceptance(
+                path,
+                'fsRead',
+                this.workspace,
+                this.logging,
+                approvedPaths,
+                { flagMultiplyLinkedFiles: 'read' }
+            )
             if (validation.requiresAcceptance) {
                 return validation
             }
@@ -57,7 +69,7 @@ export class FsRead {
     public async invoke(params: FsReadParams): Promise<InvokeOutput> {
         const fileResult: FileReadResult[] = []
         for (const path of params.paths) {
-            const sanitizedPath = sanitize(path)
+            const sanitizedPath = await resolveCanonicalPath(path)
             const content = await this.readFile(sanitizedPath)
             this.logging.info(`Read file: ${sanitizedPath}, size: ${content.length}`)
             fileResult.push({ path, content, truncated: false })
