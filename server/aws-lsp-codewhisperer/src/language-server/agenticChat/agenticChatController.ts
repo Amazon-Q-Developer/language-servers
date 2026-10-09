@@ -165,7 +165,13 @@ import { FsRead, FsReadParams } from './tools/fsRead'
 import { ListDirectory, ListDirectoryParams } from './tools/listDirectory'
 import { FsWrite, FsWriteParams } from './tools/fsWrite'
 import { ExecuteBash, ExecuteBashParams } from './tools/executeBash'
-import { ExplanatoryParams, InvokeOutput, ToolApprovalException } from './tools/toolShared'
+import {
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    resolveSymlinkAwarePath,
+    ToolApprovalException,
+} from './tools/toolShared'
 import { validatePathBasic, validatePathExists, validatePaths as validatePathsSync } from './utils/pathValidation'
 import { calculateModifiedLines } from './utils/fileModificationMetrics'
 import { TokenLimitsCalculator } from './utils/tokenLimitsCalculator'
@@ -180,6 +186,10 @@ import {
     OUTPUT_LIMIT_EXCEEDS_PARTIAL_MSG,
     RESPONSE_TIMEOUT_MS,
     RESPONSE_TIMEOUT_PARTIAL_MSG,
+    INCOMPLETE_TOOL_USE_RETRY_LIMIT_MSG,
+    MAX_INCOMPLETE_TOOL_USE_RETRIES,
+    INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING,
+    INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED,
     COMPACTION_BODY,
     COMPACTION_HEADER_BODY,
     DEFAULT_MACOS_RUN_SHORTCUT,
@@ -1426,6 +1436,9 @@ export class AgenticChatController implements ChatHandlers {
         let iterationCount = 0
         let shouldDisplayMessage = true
         let currentRequestCount = 0
+        // Number of consecutive responses that produced an incomplete tool-use input. Bounded
+        // so a model that keeps truncating cannot keep the agent loop running indefinitely.
+        let consecutiveIncompleteToolUses = 0
         const pinnedContext = additionalContext?.filter(item => item.pinned)
 
         metric.recordStart()
@@ -1644,6 +1657,8 @@ export class AgenticChatController implements ChatHandlers {
             let toolResults: ToolResult[]
             session.setConversationType('AgenticChatWithToolUse')
             if (result.success) {
+                // A complete tool use was received, so the incomplete-input streak is over.
+                consecutiveIncompleteToolUses = 0
                 // Process tool uses and update the request input for the next iteration
                 toolResults = await this.processToolUses(
                     pendingToolUses,
@@ -1688,6 +1703,21 @@ export class AgenticChatController implements ChatHandlers {
                     status: ToolResultStatus.ERROR,
                     content: [{ text: result.error }],
                 }))
+                // Classify the failure *before* emitting telemetry. An incomplete tool-use input is
+                // retried inside this loop and usually recovers within the same user turn, so it is
+                // not a user-visible failure and should not depress a per-call success rate. Because
+                // the retry budget is bounded we already know here whether this iteration will be
+                // retried, which lets us distinguish the transient case from the terminal give-up.
+                const isIncompleteToolUse = result.error.startsWith('ToolUse input is invalid JSON:')
+                let willRetryIncompleteToolUse = false
+                let invokeLlmReason: string | undefined
+                if (isIncompleteToolUse) {
+                    consecutiveIncompleteToolUses++
+                    willRetryIncompleteToolUse = consecutiveIncompleteToolUses <= MAX_INCOMPLETE_TOOL_USE_RETRIES
+                    invokeLlmReason = willRetryIncompleteToolUse
+                        ? INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING
+                        : INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED
+                }
                 this.#telemetryController.emitAgencticLoop_InvokeLLM(
                     response.$metadata.requestId!,
                     conversationId,
@@ -1703,9 +1733,25 @@ export class AgenticChatController implements ChatHandlers {
                     this.#timeBetweenChunks,
                     session.pairProgrammingMode,
                     this.#abTestingAllocation?.experimentName,
-                    this.#abTestingAllocation?.userVariation
+                    this.#abTestingAllocation?.userVariation,
+                    invokeLlmReason
                 )
-                if (result.error.startsWith('ToolUse input is invalid JSON:')) {
+                if (isIncompleteToolUse) {
+                    if (!willRetryIncompleteToolUse) {
+                        // The model has failed to produce a complete tool request several times
+                        // in a row. Retrying again is unlikely to help and would keep the agent
+                        // loop running, so stop and surface a real error to the user instead.
+                        this.#features.logging.error(
+                            `Giving up after ${consecutiveIncompleteToolUses} consecutive incomplete tool uses: ${result.error}`
+                        )
+                        await chatResultStream.updateOngoingProgressResult('Error')
+                        finalResult = {
+                            success: false,
+                            error: INCOMPLETE_TOOL_USE_RETRY_LIMIT_MSG,
+                            data: result.data,
+                        }
+                        break
+                    }
                     content =
                         'Your toolUse input is incomplete, try again. If the error happens consistently, break this task down into multiple tool uses with smaller input. Do not apologize.'
                     shouldDisplayMessage = false
@@ -1951,6 +1997,8 @@ export class AgenticChatController implements ChatHandlers {
         for (const toolUse of toolUses) {
             // Store buttonBlockId to use it in `catch` block if needed
             let cachedButtonBlockId
+            // Set once the user has been asked about this tool use and allowed it.
+            let toolApprovalGranted = false
             if (!toolUse.name || !toolUse.toolUseId) continue
             session.toolUseLookup.set(toolUse.toolUseId, toolUse)
 
@@ -2023,10 +2071,8 @@ export class AgenticChatController implements ChatHandlers {
                         const approvedPaths = session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
-                        const { requiresAcceptance, warning, commandCategory } = await tool.requiresAcceptance(
-                            toolUse.input as any,
-                            approvedPaths
-                        )
+                        const { requiresAcceptance, warning, commandCategory, acceptanceReason } =
+                            await tool.requiresAcceptance(toolUse.input as any, approvedPaths)
 
                         // Honor built-in permission if available, otherwise use tool's requiresAcceptance
                         // const requiresAcceptance = builtInPermission || toolRequiresAcceptance
@@ -2037,7 +2083,10 @@ export class AgenticChatController implements ChatHandlers {
                                 toolUse,
                                 requiresAcceptance,
                                 warning,
-                                commandCategory
+                                commandCategory,
+                                undefined,
+                                undefined,
+                                acceptanceReason
                             )
                             cachedButtonBlockId = await chatResultStream.writeResultBlock(confirmationResult)
                             const isExecuteBash = toolUse.name === EXECUTE_BASH
@@ -2059,6 +2108,8 @@ export class AgenticChatController implements ChatHandlers {
                                     session,
                                     toolUse.name
                                 )
+                                // waitForToolApproval throws when the user rejects.
+                                toolApprovalGranted = true
                             }
                             if (isExecuteBash) {
                                 this.#telemetryController.emitInteractWithAgenticChat(
@@ -2140,6 +2191,7 @@ export class AgenticChatController implements ChatHandlers {
                                         session,
                                         toolName
                                     )
+                                    toolApprovalGranted = true
                                 }
 
                                 // Store the blockId in the session for later use
@@ -2184,10 +2236,27 @@ export class AgenticChatController implements ChatHandlers {
                     }
                 }
 
-                // After approval, add the path to the approved paths in the session
+                // Record the path only when the user was actually asked and
+                // allowed it. Recording every path a tool touches turns this map
+                // into "paths the tool has seen", which then short-circuits the
+                // acceptance check on later calls — so a path that was harmless
+                // on first use (an ordinary file inside the workspace) would
+                // skip the check after it becomes something the user should be
+                // asked about, such as a name that a hard link now shares with a
+                // file outside the workspace.
                 const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
-                if (inputPath) {
+                if (inputPath && toolApprovalGranted) {
                     session.addApprovedPath(inputPath, toolUse.name)
+                    // The acceptance check compares the canonical path, so also
+                    // record that form; otherwise an approval never matches when
+                    // the input reaches the file through a symlinked ancestor
+                    // (a symlinked home directory, or macOS /tmp) and the user is
+                    // asked again on every call. Resolved the same way as
+                    // requiresPathAcceptance.
+                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
+                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
+                        session.addApprovedPath(canonicalInputPath, toolUse.name)
+                    }
                 }
 
                 const ws = this.#getWritableStream(chatResultStream, toolUse)
@@ -3006,9 +3075,14 @@ export class AgenticChatController implements ChatHandlers {
         warning?: string,
         commandCategory?: CommandCategory,
         toolType?: string,
-        builtInPermission?: boolean
+        builtInPermission?: boolean,
+        acceptanceReason?: CommandValidation['acceptanceReason']
     ): ChatResult {
         const toolName = toolType || toolUse.name
+        // A multiply linked path is inside the workspace, so the filesystem
+        // prompts below describe the shared file rather than a location outside
+        // the workspace.
+        const isMultiplyLinkedFile = acceptanceReason === 'multiplyLinkedFile'
         let buttons: Button[] = []
         let header: {
             body: string
@@ -3097,14 +3171,16 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
-                    body: builtInPermission
-                        ? '#### Allow file modification'
-                        : '#### Allow file modification outside of your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow file modification'
+                            : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
-                body = builtInPermission
-                    ? `I need permission to modify files.\n\`${writeFilePath}\``
-                    : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                body =
+                    builtInPermission || isMultiplyLinkedFile
+                        ? `I need permission to modify files.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
             }
 
@@ -3119,14 +3195,16 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
-                    body: builtInPermission
-                        ? '#### Allow file modification'
-                        : '#### Allow file modification outside of your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow file modification'
+                            : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
-                body = builtInPermission
-                    ? `I need permission to modify files.\n\`${writeFilePath}\``
-                    : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                body =
+                    builtInPermission || isMultiplyLinkedFile
+                        ? `I need permission to modify files.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
             }
 
@@ -3136,9 +3214,10 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'tools',
                     iconForegroundStatus: 'tools',
-                    body: builtInPermission
-                        ? '#### Allow read-only tools'
-                        : '#### Allow read-only tools outside your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow read-only tools'
+                            : '#### Allow read-only tools outside your workspace',
                     buttons,
                 }
 
@@ -3151,9 +3230,10 @@ export class AgenticChatController implements ChatHandlers {
                     this.#debug(`Processing ${toolUse.name} for paths: ${JSON.stringify(paths)}`)
                     const formattedPaths: string[] = []
                     paths.forEach(element => formattedPaths.push(`\`${element}\``))
-                    body = builtInPermission
-                        ? `I need permission to read files.\n${formattedPaths.join('\n')}`
-                        : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
+                    body =
+                        builtInPermission || isMultiplyLinkedFile
+                            ? `I need permission to read files.\n${formattedPaths.join('\n')}`
+                            : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
                 } else {
                     const readFilePath = (toolUse.input as unknown as ListDirectoryParams).path
 
@@ -3190,7 +3270,9 @@ export class AgenticChatController implements ChatHandlers {
                 type: 'tool',
                 messageId: this.#getMessageIdForToolUse(toolType, toolUse),
                 header,
-                body: warning ? (toolName === EXECUTE_BASH ? '' : '\n\n') + body : body,
+                // The warning explains why acceptance is needed, so show it above
+                // the body rather than using it only as a spacing flag.
+                body: warning ? (toolName === EXECUTE_BASH ? '' : warning + '\n\n') + body : body,
             }
         } else {
             return {
@@ -4667,7 +4749,12 @@ export class AgenticChatController implements ChatHandlers {
             cwsprChatResponseLength: chatEventParser.body?.length ?? 0,
         })
 
-        return chatEventParser.getResult()
+        // Use finalize() (not getResult()) so a tool use whose stream ended before its
+        // terminating `stop` event is surfaced as an incomplete-input error and retried,
+        // rather than being silently dropped and reported as a successful turn. The abort
+        // state is passed in so a timed-out/cancelled request is not misreported as a
+        // truncated tool input.
+        return chatEventParser.finalize({ aborted: abortSignal?.aborted === true })
     }
 
     /**
