@@ -1,6 +1,7 @@
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { workspaceUtils } from '@aws/lsp-core'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
+import { sanitize } from '@aws/lsp-core/out/util/path'
 import * as fs from 'fs'
 import * as path from 'path'
 import { CommandCategory } from './executeBash'
@@ -63,6 +64,17 @@ export async function resolveSymlinkAwarePath(inputPath: string): Promise<string
 }
 
 /**
+ * Resolve an input path to the canonical on-disk location a read, write, or
+ * list should act on: `sanitize()` (expand `~`, make absolute) followed by
+ * `resolveSymlinkAwarePath()` (follow symlinks at every segment). Tools resolve
+ * through this helper so the workspace-boundary check and the operation itself
+ * derive the path the same way.
+ */
+export async function resolveCanonicalPath(inputPath: string): Promise<string> {
+    return resolveSymlinkAwarePath(sanitize(inputPath))
+}
+
+/**
  * Canonicalize workspace folder paths through the filesystem so boundary
  * comparisons stay accurate even when a workspace lives under a symlinked
  * directory (for example, macOS exposes temp directories under /var and /tmp
@@ -81,6 +93,46 @@ export async function canonicalizeWorkspaceFolders(workspaceFolderPaths: string[
     )
 }
 
+/**
+ * True when `canonicalPath` is a regular file reachable under more than one
+ * name. The other names are not discoverable from this path — an inode has no
+ * location and there is no reverse inode-to-paths lookup — so a boundary check
+ * cannot prove they are inside the workspace: reading the path exposes data that
+ * also lives elsewhere, and an in-place write changes it under every name.
+ *
+ * Directories are excluded because their link count is always above one ('.',
+ * '..', and each subdirectory).
+ */
+export async function hasAdditionalHardLinks(canonicalPath: string): Promise<boolean> {
+    try {
+        const stats = await fs.promises.stat(canonicalPath)
+        return stats.isFile() && stats.nlink > 1
+    } catch {
+        // Nothing on disk yet (for example a create), so no existing data is shared.
+        return false
+    }
+}
+
+/** How a tool accesses the path, which decides the wording of the prompt. */
+export type FileAccessKind = 'read' | 'modify'
+
+export const multiplyLinkedFileWarning = (access: FileAccessKind): string =>
+    access === 'read'
+        ? 'This file is also reachable under another name on disk, which may be outside the ' +
+          'workspace. Its contents are shared with that name.'
+        : 'This file is also reachable under another name on disk, which may be outside the ' +
+          'workspace. Writing to it changes the contents under every name.'
+
+export interface PathAcceptanceOptions {
+    /**
+     * Require approval for an in-workspace path that resolves to a file with
+     * more than one hard link, because the file's other names may be outside
+     * the workspace. Set to 'modify' by tools that write the file in place and
+     * 'read' by tools that return its contents.
+     */
+    flagMultiplyLinkedFiles?: FileAccessKind
+}
+
 interface Output<Kind, Content> {
     kind: Kind
     content: Content
@@ -95,13 +147,24 @@ export interface CommandValidation {
     requiresAcceptance: boolean
     warning?: string
     commandCategory?: CommandCategory
+    /**
+     * Why acceptance is required, when the reason is not simply that the path
+     * lies outside the workspace. The confirmation prompt uses this to describe
+     * the right situation: a multiply linked path is inside the workspace, so
+     * the usual "outside of your workspace" wording would be wrong.
+     */
+    acceptanceReason?: 'multiplyLinkedFile'
 }
 
 export async function validatePath(path: string, exists: (p: string) => Promise<boolean>) {
     if (!path || path.trim().length === 0) {
         throw new Error('Path cannot be empty.')
     }
-    const pathExists = await exists(path)
+    // Check the location the tool will actually operate on. Checking the raw
+    // input instead would resolve `~` relative to the process working
+    // directory, while the approval check and the operation expand it to the
+    // home directory, so validation could pass or fail on a different file.
+    const pathExists = await exists(await resolveCanonicalPath(path))
     if (!pathExists) {
         throw new Error(`Path "${path}" does not exist or cannot be accessed.`)
     }
@@ -192,6 +255,7 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
  * @param workspace The workspace feature to get workspace folders
  * @param logging Optional logging feature for better error reporting
  * @param approvedPaths Optional map of tool names to their approved paths
+ * @param options Optional additional checks; see PathAcceptanceOptions
  * @returns CommandValidation object with requiresAcceptance flag
  */
 export async function requiresPathAcceptance(
@@ -199,18 +263,16 @@ export async function requiresPathAcceptance(
     toolName: string,
     workspace: Features['workspace'],
     logging: Features['logging'],
-    approvedPaths?: Map<string, Set<string>>
+    approvedPaths?: Map<string, Set<string>>,
+    options?: PathAcceptanceOptions
 ): Promise<CommandValidation> {
     try {
-        // Canonicalize the path in a symlink-aware way before the
-        // workspace-boundary check. This resolves symlinks at every segment,
-        // including a symlink at the leaf whose target does not exist yet
-        // (a "dangling" symlink). A string-only resolve, or an fs.realpath
-        // that silently falls back to the literal link name when the target
-        // is missing, would treat such a link as in-workspace based on its
-        // name alone even though a write or read through it would land
-        // outside the workspace.
-        const canonicalPath = await resolveSymlinkAwarePath(inputPath)
+        // Canonicalize in a symlink-aware way before the workspace-boundary
+        // check: a link whose name sits inside the workspace can point outside
+        // it, including when the target does not exist yet (a dangling link).
+        // The I/O tools resolve through the same helper, so the boundary check
+        // and the operation derive the path the same way.
+        const canonicalPath = await resolveCanonicalPath(inputPath)
 
         // Then check if the path is already approved for this specific tool
         if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
@@ -234,6 +296,20 @@ export async function requiresPathAcceptance(
         const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(workspaceFolders)
         const isInWs = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)
         if (isInWs) {
+            // Being inside the workspace by path is not sufficient for a file
+            // that has more than one name. `lstat` reports a hard link as an
+            // ordinary file, so the resolver above cannot follow it and the
+            // canonical path is the in-workspace name; the file's other names
+            // stay invisible to this check and may be outside the workspace.
+            // Reading it returns data that lives under those names too, and
+            // modifying it in place changes the contents under all of them.
+            if (options?.flagMultiplyLinkedFiles && (await hasAdditionalHardLinks(canonicalPath))) {
+                return {
+                    requiresAcceptance: true,
+                    warning: multiplyLinkedFileWarning(options.flagMultiplyLinkedFiles),
+                    acceptanceReason: 'multiplyLinkedFile',
+                }
+            }
             return { requiresAcceptance: false }
         }
 

@@ -1,12 +1,24 @@
-import { expect } from 'chai'
+﻿import { expect } from 'chai'
 import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { Readable } from 'stream'
+import got from 'got'
 import { ATXTransformHandler } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+
+// The interactive-mode cache is keyed by job id, so tests reach it through these rather than a
+// single field. Job scoping is what stops one job's mode being written into another's artifact.
+function cachedMode(handler: any, jobId: string): string | undefined {
+    return handler.interactiveModeByJob.get(jobId)?.mode
+}
+
+function setCachedMode(handler: any, jobId: string, mode: string, source = 'test'): void {
+    handler.interactiveModeByJob.set(jobId, { mode, source })
+}
 
 describe('ATXTransformHandler - Chat APIs', () => {
     let handler: ATXTransformHandler
@@ -38,6 +50,82 @@ describe('ATXTransformHandler - Chat APIs', () => {
         sinon.restore()
     })
 
+    // The beam artifact cache had no tests at all, and the LRU-victim case below is exactly the bug
+    // the cap-correction commit fixed — nothing guarded the regression.
+    describe('downloadJsonArtifact cache', () => {
+        let urlStub: sinon.SinonStub
+
+        beforeEach(() => {
+            urlStub = sinon.stub(handler as any, 'createArtifactDownloadUrl')
+        })
+
+        it('caches a NEGATIVE (not JSON) so the artifact is never re-fetched', async () => {
+            // Negatives were 1230 of the 1980 wasted fetches — the bulk of the win — and "these
+            // bytes are not JSON" is a permanent property, so it must not expire.
+            ;(handler as any).beamJsonArtifactCache.set('a1', {
+                value: null,
+                expiresAt: Number.MAX_SAFE_INTEGER,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a1')
+
+            expect(result).to.equal(null)
+            expect(urlStub.called).to.be.false
+        })
+
+        it('serves a fresh POSITIVE from cache without re-fetching', async () => {
+            ;(handler as any).beamJsonArtifactCache.set('a2', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() + 60_000,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a2')
+
+            expect(result).to.deep.equal({ repos: ['alice'] })
+            expect(urlStub.called).to.be.false
+        })
+
+        it('RE-FETCHES an expired positive — a rewritten beam-map must not be pinned', async () => {
+            // Why positives carry a TTL: web-orc re-writes the beam-map, and if a rewrite reuses the
+            // artifactId a permanent cache would hide every repo beamed after the first one until
+            // the LSP restarted.
+            ;(handler as any).beamJsonArtifactCache.set('a3', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() - 1,
+            })
+            urlStub.resolves(null) // no presigned URL — proves only that the fetch was ATTEMPTED
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a3')
+
+            expect(urlStub.calledOnce).to.be.true
+            expect(result).to.equal(null)
+        })
+
+        it('does NOT cache a missing presigned URL — that is transient', async () => {
+            urlStub.resolves(null)
+
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+
+            expect(urlStub.calledTwice).to.be.true
+            expect((handler as any).beamJsonArtifactCache.has('a4')).to.be.false
+        })
+
+        it('evicts the least-recently-USED entry, not the oldest inserted', async () => {
+            // Guards the cap-correction commit: a hit must refresh recency. Without the
+            // delete+re-insert on read, Map insertion order makes this evict 'first' — the entry
+            // just used — which is how an under-sized cap collapsed the hit rate to zero.
+            const cache = (handler as any).beamJsonArtifactCache
+            cache.set('first', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            cache.set('second', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+
+            // Touch 'first' so it becomes most-recently-used.
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'first')
+
+            expect(Array.from(cache.keys())).to.deep.equal(['second', 'first'])
+        })
+    })
+
     describe('sendMessage', () => {
         it('should send message and return response without polling', async () => {
             const mockResponse = {
@@ -51,7 +139,17 @@ describe('ATXTransformHandler - Chat APIs', () => {
                 skipPolling: true,
             })
 
-            expect(result).to.deep.equal({ success: true, data: mockResponse })
+            // skipPolling must return the SAME shape as the polling path, not the raw send result.
+            // The IDE reads data.sentMessage.messageId to seed its seen-set so the 3s chat poll does
+            // not render the server's copy as a second bubble; returning `mockResponse` verbatim
+            // left that unreadable and every beamed message appeared twice.
+            expect(result).to.deep.equal({
+                success: true,
+                data: { sentMessage: mockResponse.message, response: null },
+            })
+            // Assert the consumed path explicitly — deep.equal above would still pass if the field
+            // were renamed on both sides, but the IDE reads exactly this.
+            expect(result.data.sentMessage.messageId).to.equal('msg-123')
             expect(sendStub.calledOnce).to.be.true
         })
 
@@ -473,6 +571,59 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTaskId).to.equal('task-lbv')
     })
 
+    it('forwards the missing-packages HITL to the IDE when a plan already exists', async () => {
+        // Regression: handleExecutionPhaseHitl (taken once a plan exists) only handles step-level
+        // HITLs and dropped HitlTag/MissingPackageJsonPath, so the IDE never showed the upload dialog.
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.HitlTaskId).to.equal('task-mp')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('forwards the handle_missing_packages_hitl tag when a plan already exists', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'handle_missing_packages_hitl',
+            TaskId: 'task-mp2',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('handle_missing_packages_hitl')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('still forwards the missing-packages HITL when no plan exists yet', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp3',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
     it('should default to PLANNING-like fallthrough for unknown statuses', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -495,6 +646,30 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTag).to.equal('local-build-verification')
         expect(result?.HitlTaskId).to.equal('task-lbv')
         expect((handler as any).jobsPastLocalBuild.has('job-123')).to.be.true
+    })
+
+    it('should NOT surface a sibling repo LBV when status is PLANNING and all pending LBVs are out of the loaded scope', async () => {
+        // Beam multi-repo: the IDE loaded one repo (beamScopeStepIds = its subtree). Every pending
+        // HITL is a local-build-verification for a DIFFERENT (sibling) repo's plan step. Surfacing
+        // one would make the IDE build the loaded solution against a sibling's HITL → false-green.
+        // Mirrors the EXECUTING/getHitlAgentArtifact guard: return the plan-only view instead.
+        getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([
+            { tag: 'local-build-verification', taskId: 'task-sib1', stepId: 'sibling-step-1' },
+            { tag: 'local-build-verification', taskId: 'task-sib2', stepId: 'sibling-step-2' },
+        ])
+
+        const result = await handler.getTransformInfo({
+            ...baseRequest,
+            beamScopeStepIds: 'loaded-step-a,loaded-step-b',
+        })
+
+        // Plan-only view: original job status preserved, no HITL surfaced to the IDE.
+        expect(result?.TransformationJob.Status).to.equal('PLANNING')
+        expect(result?.HitlTag).to.be.undefined
+        expect(result?.HitlTaskId).to.be.undefined
+        expect(result?.TransformationPlan).to.deep.equal({ Root: { Children: [] } })
     })
 
     it('should filter pre-job mode-selection -checkpoint HITL before LBV has run', async () => {
@@ -570,10 +745,10 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
-    it('should default cachedInteractiveMode to Autonomous when objective is unparseable', async () => {
+    it('should default the cached mode to Autonomous when objective is unparseable', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
             objective: 'not-json',
@@ -583,7 +758,81 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    // The objective is the job-creation payload and never changes, so restoring the mode from it
+    // discards any mid-job switch. The checkpoint-settings artifact is the store every client
+    // writes when the mode changes, so it wins (V2381727290).
+    it('should prefer the checkpoint-settings artifact over the job objective', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    it('should fall back to the objective when no checkpoint-settings artifact exists', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should fall back to the objective when the artifact carries no usable mode', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        // A checkpoints-only write from before the carry-forward fix: checkpoints, no mode.
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ 'step-a': true })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should read the artifact only once, not on every poll', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        const findStub = sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+        expect(findStub.callCount).to.equal(1)
     })
 
     it('should return null when getJob throws', async () => {
@@ -753,6 +1002,58 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(node.ParentStepId).to.be.null
             expect(node.Status).to.equal('NOT_STARTED')
             expect(node.score).to.equal(0)
+        })
+
+        it('mapApiStepToNode defaults IsStatusOnly to false (structural pass assigns it)', () => {
+            // The service sends no machine-readable step label, so the per-node mapper never
+            // sets IsStatusOnly; it is assigned during tree assembly based on parent identity.
+            const node = (handler as any).mapApiStepToNode({
+                stepId: 's1',
+                stepName: 'Merge Tests',
+                status: 'IN_PROGRESS',
+            })
+            expect(node.IsStatusOnly).to.equal(false)
+        })
+    })
+
+    describe('buildTreeFromFlatList - IsStatusOnly (unit-test-generation substeps)', () => {
+        // A realistic flat plan: a "Generate Unit Tests" parent with 4 substeps, plus a
+        // sibling "Transform Projects" parent with its own substep, all under root.
+        const flatPlan = () => [
+            { stepId: 'gut', parentStepId: 'root', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'plan', parentStepId: 'gut', stepName: 'Plan Unit Test Generation', status: 'NOT_STARTED' },
+            { stepId: 'gen', parentStepId: 'gut', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'merge', parentStepId: 'gut', stepName: 'Merge Tests', status: 'NOT_STARTED' },
+            { stepId: 'cov', parentStepId: 'gut', stepName: 'Get Coverage', status: 'NOT_STARTED' },
+            { stepId: 'tp', parentStepId: 'root', stepName: 'Transform Projects', status: 'NOT_STARTED' },
+            { stepId: 'build', parentStepId: 'tp', stepName: 'Solution Build', status: 'NOT_STARTED' },
+        ]
+
+        const findById = (nodes: any[], id: string): any => {
+            for (const n of nodes) {
+                if (n.StepId === id) return n
+                const hit = findById(n.Children || [], id)
+                if (hit) return hit
+            }
+            return null
+        }
+
+        it('marks direct substeps of "Generate Unit Tests" as IsStatusOnly=true', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            for (const id of ['plan', 'gen', 'merge', 'cov']) {
+                expect(findById(roots, id).IsStatusOnly, id).to.equal(true)
+            }
+        })
+
+        it('leaves the parent "Generate Unit Tests" step interactive (IsStatusOnly=false)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'gut').IsStatusOnly).to.equal(false)
+        })
+
+        it('does not mark transformation substeps (different parent)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'tp').IsStatusOnly).to.equal(false)
+            expect(findById(roots, 'build').IsStatusOnly).to.equal(false)
         })
     })
 
@@ -1787,6 +2088,130 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('auto')
         })
 
+        // The settings artifact is full state and the agent reads a missing interactive_mode as
+        // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
+        // must not drop a mode the user already chose (V2381727290).
+        const stubUploadChain = () => {
+            sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+            sinon.stub(handler, 'createArtifactUploadUrl').resolves({
+                uploadUrl: 'u',
+                uploadId: 'upload-1',
+                requestHeaders: {},
+            } as any)
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true } as any)
+            sinon.stub(handler, 'updateHitl').resolves({ ok: true })
+        }
+
+        const settingsPathFor = (jobId: string) =>
+            path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'checkpoint-settings.json')
+
+        it('should carry forward a previously written interactive_mode when none is supplied', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true }, 'Autonomous')
+            // A periodic checkpoints-only sync: no mode to assert.
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': false })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written['step-a']).to.equal(false)
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        it('should let an explicit mode override the carried-forward one', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Interactive')
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written.interactive_mode).to.equal('interactive')
+        })
+
+        it('should prefer the mode in effect over a stale local file', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            // A switch made from this machine earlier; the mode has since changed elsewhere.
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'interactive' }))
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        // The handler outlives any single job, so an unscoped cache would let one job's mode be
+        // written into another job's settings artifact - which the agent treats as authoritative.
+        it("should not carry one job's mode into another job's artifact", async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-2'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it("should keep each job's asserted mode separate", async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, {}, 'Interactive')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-2')).to.equal('Interactive')
+        })
+
+        it('should update the cached mode when a switch is asserted', async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Interactive')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it('should omit interactive_mode when there is nothing to carry forward', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should ignore an unrecognised persisted interactive_mode rather than echo it', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'bogus' }))
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should not fail the sync when the persisted settings file is corrupt', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, '{ not json')
+
+            const result = await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            expect(result.Success).to.be.true
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written['step-a']).to.equal(true)
+        })
+
         it('should return error when uploadArtifact fails', async () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({
@@ -2002,6 +2427,47 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             const command = sendStub.firstCall.args[0]
             const objective = JSON.parse(command.input.objective)
             expect(objective.interactive_mode).to.equal('auto')
+        })
+
+        it('should include generate_unit_tests:true in objective when opted in', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: true })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(true)
+        })
+
+        it('should include generate_unit_tests:false in objective on explicit decline', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: false })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(false)
+        })
+
+        it('should omit generate_unit_tests from objective when no choice is sent', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1' })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
+
+        it('should omit generate_unit_tests when the value is not a real boolean', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            // A mistyped/non-boolean value must read as "no choice sent", not a decision.
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: 'true' as any })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
         })
     })
 
@@ -2244,7 +2710,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+            expect(cachedMode(handler, 'job-1')).to.equal('Interactive')
         })
 
         it('should default cached interactive mode to Autonomous when not specified', async () => {
@@ -2265,7 +2731,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
         })
     })
 })
@@ -3103,7 +3569,60 @@ describe('ATXTransformHandler - upload flows, polling, and small wrappers', () =
             const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', 'C:/save')
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.equal('Failed to get download URL')
+            expect(result.Error).to.contain('Failed to get download URL')
+        })
+
+        it('should stream a large artifact to disk without buffering the whole file', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                // Simulate a large payload delivered as a stream (the fix path). The old
+                // implementation buffered this in memory under a 30s whole-request timeout.
+                const payload = Buffer.alloc(5 * 1024 * 1024, 'a')
+                sinon.stub(got, 'stream').returns(Readable.from([payload]) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                const written = fs.readFileSync(path.join(saveDir, 'Transformation_Report.html'))
+                expect(written.length).to.equal(payload.length)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('should return Success=false with the error when the stream fails mid-download', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                const failing = new Readable({
+                    read() {
+                        this.destroy(new Error('socket hang up'))
+                    },
+                })
+                sinon.stub(got, 'stream').returns(failing as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
         })
     })
 
@@ -3864,12 +4383,12 @@ describe('ATXTransformHandler - final coverage push', () => {
         it('should null-out all cached HITL state', () => {
             ;(handler as any).cachedHitl = 'h'
             ;(handler as any).cachedStepHitl = 's'
-            ;(handler as any).cachedInteractiveMode = 'Interactive'
-            ;(handler as any).clearJobCache()
+            setCachedMode(handler, 'job-1', 'Interactive')
+            ;(handler as any).clearJobCache('job-1')
 
             expect((handler as any).cachedHitl).to.be.null
             expect((handler as any).cachedStepHitl).to.be.null
-            expect((handler as any).cachedInteractiveMode).to.be.null
+            expect(cachedMode(handler, 'job-1')).to.be.undefined
         })
     })
 
@@ -4122,5 +4641,252 @@ describe('ATXTransformHandler - final coverage push', () => {
 
             expect(result).to.be.null
         })
+    })
+})
+
+describe('ATXTransformHandler - Beam to IDE', () => {
+    let handler: ATXTransformHandler
+    let serviceManager: AtxTokenServiceManager
+    let workspace: Workspace
+    let logging: Logging
+    let runtime: Runtime
+    let sendStub: sinon.SinonStub
+
+    beforeEach(() => {
+        serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        workspace = {} as Workspace
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        runtime = {} as Runtime
+        handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
+        sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
+        sinon.stub(handler as any, 'addAuthToCommand').resolves()
+        sendStub = sinon.stub()
+        ;(handler as any).atxClient = { send: sendStub }
+        // No plan by default → IsLbvOpen defaults true; individual tests can restub.
+        sinon.stub(handler as any, 'getTransformationPlan').resolves(null)
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    // --- getStepId: the centralized field-coalescing helper (contract-tolerant) ---
+    describe('getStepId', () => {
+        it('coalesces stepId / planStepId / parentStepId in priority order', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g({ stepId: 'a', planStepId: 'b', parentStepId: 'c' })).to.equal('a')
+            expect(g({ planStepId: 'b', parentStepId: 'c' })).to.equal('b')
+            expect(g({ parentStepId: 'c' })).to.equal('c')
+        })
+
+        it('returns undefined for null / non-object / no matching field', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g(null)).to.be.undefined
+            expect(g(undefined)).to.be.undefined
+            expect(g('str')).to.be.undefined
+            expect(g({ other: 'x' })).to.be.undefined
+        })
+
+        it('skips an empty-string stepId and falls through to planStepId / parentStepId (|| not ??)', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            // Empty stepId must NOT short-circuit coalescing (the ??→|| hardening) — an empty
+            // string is falsy under ||, so the non-empty planStepId is returned.
+            expect(g({ stepId: '', planStepId: 'step-1' })).to.equal('step-1')
+            // Empty stepId + empty planStepId → fall all the way through to parentStepId.
+            expect(g({ stepId: '', planStepId: '', parentStepId: 'parent-1' })).to.equal('parent-1')
+        })
+    })
+
+    // --- normalizeBeamRepo: tolerant wire-shape mapping ---
+    describe('normalizeBeamRepo', () => {
+        it('maps varied key spellings to the PascalCase IDE shape', () => {
+            const nr = (handler as any).normalizeBeamRepo({
+                repositoryName: 'alice',
+                beamArtifactId: 'art-9',
+                planStepId: 'step-1',
+                tfm: 'net8.0',
+                scenario: 'transformed',
+            })
+            expect(nr.RepositoryName).to.equal('alice')
+            expect(nr.BeamArtifactId).to.equal('art-9')
+            expect(nr.BeamStepId).to.equal('step-1')
+            expect(nr.BeamTargetFramework).to.equal('net8.0')
+            expect(nr.BeamScenario).to.equal('transformed')
+        })
+
+        it('defaults empty fields and scenario=transformed on a bare object', () => {
+            const nr = (handler as any).normalizeBeamRepo({})
+            expect(nr.RepositoryName).to.equal('')
+            expect(nr.BeamScenario).to.equal('transformed')
+        })
+    })
+
+    // --- listBeamedRepos: the core discovery function (empty / beam-map / beam-status / regex) ---
+    describe('listBeamedRepos', () => {
+        const zipArtifacts = (repo: string, hash = 'abc123') => [
+            { artifactId: `zip-${repo}`, fileMetadata: { path: `${repo}_${hash}/${repo}.zip` } },
+        ]
+
+        it('returns [] when the job has no artifacts (never beamed)', async () => {
+            sendStub.resolves({ artifacts: [] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+        })
+
+        it('returns [] when only transformed zips exist but no beam-map / beam-status', async () => {
+            sendStub.resolves({ artifacts: zipArtifacts('alice') })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // A transform-only job must NOT over-list its transformed zips as "beamed".
+            expect(result).to.deep.equal([])
+        })
+
+        it('filters discovery to beam-map membership when a beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice', stepId: 's1', scenario: 'transformed' }] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('rejects malformed beam-map entries (no usable repo name)', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice' }, { junk: true }, null, 'not-an-object'] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // Only the well-formed 'alice' entry survives validation.
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('falls back to beam-status filenames when no beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('strips the -<8hex> suffix on beam-status filenames to resolve the repo', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice-0a1b2c3d.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('does not throw or mismatch when the jobId contains regex metacharacters', async () => {
+            const jobId = 'job.(v1)+[x]'
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: `beam-status-${jobId}-alice.json` } },
+                ],
+            })
+            // Without escaping, `new RegExp` would throw or mismatch on these metachars.
+            const result = await handler.listBeamedRepos('ws-1', jobId)
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('returns [] and logs on send failure (no throw)', async () => {
+            sendStub.rejects(new Error('FES down'))
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+            expect((logging.error as sinon.SinonStub).called).to.be.true
+        })
+    })
+
+    // --- downloadBeamArtifact: destDir path validation (zip-slip defense) ---
+    describe('downloadBeamArtifact', () => {
+        it('rejects a relative destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', 'relative/dir')
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+        })
+
+        it('rejects a destDir containing ".." traversal', async () => {
+            // Absolute but with an un-normalized ".." segment — must be rejected.
+            const bad = `${path.sep}root${path.sep}ws${path.sep}..${path.sep}evil`
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', bad)
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+        })
+
+        it('rejects an empty destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
+            expect(result.Success).to.be.false
+        })
+    })
+})
+
+describe('ATXTransformHandler - isRepoLbvOpen: repo node terminal with no LBV child', () => {
+    // Both directions are asserted deliberately. The gate here reads correctly either way, so a
+    // one-sided test cannot tell a working gate from an unreachable one: removing the branch and
+    // inverting it produce different failures, and only covering both catches both.
+    let handler: ATXTransformHandler
+
+    const planWith = (repoStatus: string, lbvChild?: { StepName: string; Status: string }) => ({
+        StepName: 'root',
+        Status: 'IN_PROGRESS',
+        Children: [
+            {
+                StepName: 'alice (beamed)',
+                Status: repoStatus,
+                Children: lbvChild ? [lbvChild] : [],
+            },
+        ],
+    })
+
+    const isOpen = (plan: any) => (handler as any).isRepoLbvOpen(plan, 'alice', 'job-1') as boolean
+
+    beforeEach(() => {
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            { log: sinon.stub(), error: sinon.stub() } as any,
+            {} as Runtime
+        )
+    })
+
+    afterEach(() => sinon.restore())
+
+    it('CLOSED when the repo node is terminal and has no LBV child — a reaped beam must drop off', () => {
+        // Fails if the branch is removed: without it this returns the default OPEN and the repo
+        // sits in the Transferred list forever with a disabled Load button.
+        expect(isOpen(planWith('STOPPED'))).to.be.false
+    })
+
+    it('CLOSED on a cancelled repo node with no LBV child', () => {
+        expect(isOpen(planWith('CANCELLED'))).to.be.false
+    })
+
+    it('OPEN when the repo node is still live and has no LBV child — a fresh transfer must stay', () => {
+        // Fails if the branch fires on the wrong side: over-gating here hides every repo whose
+        // sub-agent has not yet created its HITL, which is the normal state right after a beam.
+        expect(isOpen(planWith('IN_PROGRESS'))).to.be.true
+    })
+
+    it('still defers to the LBV child when one exists, terminal repo node notwithstanding', () => {
+        // The new branch must not shadow the original signal: with an LBV child present its status
+        // decides, so a repo whose build is still running stays visible even if the parent node has
+        // been marked terminal early.
+        const plan = planWith('SUCCEEDED', { StepName: 'Local Build Verification', Status: 'IN_PROGRESS' })
+        expect(isOpen(plan)).to.be.true
     })
 })
