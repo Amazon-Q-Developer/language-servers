@@ -30,11 +30,11 @@ describe('FsRead Tool', () => {
     })
 
     after(async () => {
-        tempFolder.delete()
+        await tempFolder.delete()
     })
 
     afterEach(async () => {
-        tempFolder.clear()
+        await tempFolder.clear()
     })
 
     it('invalidates empty path', async () => {
@@ -126,6 +126,41 @@ describe('FsRead Tool', () => {
             false,
             'Expected requiresAcceptance to be false for a path inside the workspace'
         )
+    })
+
+    it('should require acceptance for an in-workspace name that a hard link shares with a file outside it', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+            return
+        }
+
+        // A file outside the workspace, given a second name inside it. lstat
+        // reports that name as an ordinary file, so nothing is there for a
+        // symlink-aware resolver to follow, yet reading it returns the outside
+        // file's contents.
+        const workspaceDir = path.join(tempFolder.path, 'workspace')
+        await fs.mkdir(workspaceDir)
+        const outsideTarget = path.join(tempFolder.path, 'outside-secret.txt')
+        await fs.writeFile(outsideTarget, 'SENSITIVE')
+        const hardLinkInWorkspace = path.join(workspaceDir, 'looks-normal.txt')
+        await fs.link(outsideTarget, hardLinkInWorkspace)
+
+        const fsRead = new FsRead({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getTextDocument: async s => ({}) as TextDocument,
+                getAllWorkspaceFolders: () => [{ uri: `file://${workspaceDir}`, name: 'workspace' }],
+            },
+        })
+
+        const result = await fsRead.requiresAcceptance({ paths: [hardLinkInWorkspace] })
+        assert.equal(
+            result.requiresAcceptance,
+            true,
+            'Reading a file that is also named outside the workspace should be confirmed by the user'
+        )
+        assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
     })
 })
 
