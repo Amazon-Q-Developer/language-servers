@@ -79,27 +79,29 @@ describe('AgenticChatController', () => {
     let mcpInstanceStub: sinon.SinonStub
 
     beforeEach(() => {
+        const mockMcpTools = [
+            {
+                serverName: 'server1',
+                toolName: 'server1_tool1',
+                description: 'Mock MCP tool 1',
+                inputSchema: {},
+            },
+            {
+                serverName: 'server2',
+                toolName: 'server2_tool2',
+                description: 'Mock MCP tool 2',
+                inputSchema: {},
+            },
+            {
+                serverName: 'server3',
+                toolName: 'server3_tool3',
+                description: 'Mock MCP tool 3',
+                inputSchema: {},
+            },
+        ]
         mcpInstanceStub = sinon.stub(McpManager, 'instance').get(() => ({
-            getAllTools: () => [
-                {
-                    serverName: 'server1',
-                    toolName: 'server1_tool1',
-                    description: 'Mock MCP tool 1',
-                    inputSchema: {},
-                },
-                {
-                    serverName: 'server2',
-                    toolName: 'server2_tool2',
-                    description: 'Mock MCP tool 2',
-                    inputSchema: {},
-                },
-                {
-                    serverName: 'server3',
-                    toolName: 'server3_tool3',
-                    description: 'Mock MCP tool 3',
-                    inputSchema: {},
-                },
-            ],
+            getAllTools: () => mockMcpTools,
+            getEnabledTools: () => mockMcpTools,
             callTool: (_s: string, _t: string, _a: any) => Promise.resolve({}),
             getOriginalToolNames: () => null,
             clearToolNameMapping: () => {},
@@ -3635,6 +3637,76 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+
+        it('derives the tool name mapping from enabled tools so a disabled tool cannot claim a name', async () => {
+            testFeatures.setClientParams({
+                initializationOptions: {
+                    aws: {
+                        awsClientCapabilities: {
+                            q: { mcp: true },
+                        },
+                    },
+                },
+            } as any)
+
+            // Two servers advertise `search`. Only serverB's copy is enabled, so
+            // toolServer registers it under the bare name `search`. If the mapping
+            // were derived from all tools, the disabled serverA copy would be seen
+            // first and take `search`, pushing the enabled tool to `serverB___search`
+            // and leaving the registered name unresolvable at dispatch.
+            const all = [
+                { serverName: 'serverA', toolName: 'search', description: 'disabled copy', inputSchema: {} },
+                { serverName: 'serverB', toolName: 'search', description: 'enabled copy', inputSchema: {} },
+            ]
+            const enabled = [all[1]]
+            const setToolNameMapping = sinon.stub()
+            mcpInstanceStub.get(() => ({
+                getAllTools: () => all,
+                getEnabledTools: () => enabled,
+                setToolNameMapping,
+                clearToolNameMapping: () => {},
+                getOriginalToolNames: () => undefined,
+                callTool: sinon.stub().resolves({}),
+            }))
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: 'search', description: 'Mock tool for testing' } },
+            ])
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({})
+
+            const mockSession = { toolUseLookup: new Map(), pairProgrammingMode: true } as any
+            const mockChatResultStream = {
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            }
+
+            // Any tool use is enough to trigger #getTools, which writes the mapping.
+            await chatController.processToolUses(
+                [{ toolUseId: 'map-id', name: 'search', input: {}, stop: true }],
+                mockChatResultStream as any,
+                mockSession,
+                'tabId',
+                mockCancellationToken
+            )
+
+            sinon.assert.called(setToolNameMapping)
+            const mapping: Map<string, { serverName: string; toolName: string }> = setToolNameMapping.lastCall.args[0]
+            assert.deepStrictEqual(mapping.get('search'), { serverName: 'serverB', toolName: 'search' })
+            assert.ok(!mapping.has('serverB___search'), 'enabled tool must not be pushed to the namespaced form')
+            for (const [, v] of mapping) {
+                assert.notStrictEqual(v.serverName, 'serverA', 'disabled server must not appear in the mapping')
+            }
         })
     })
 

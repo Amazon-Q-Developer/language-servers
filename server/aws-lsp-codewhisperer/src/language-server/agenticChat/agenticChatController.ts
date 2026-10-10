@@ -4942,9 +4942,14 @@ export class AgenticChatController implements ChatHandlers {
         const builtInToolNames = getReservedBuiltInToolNames(this.#features.agent.getBuiltInToolNames())
         let mcpToolSpecNames: Set<string>
         try {
+            // Use the same enabled-tool set that toolServer registers from. Bare
+            // names are assigned by set occupancy, so deriving the mapping from
+            // every tool (including disabled ones) can hand an enabled tool a
+            // name that differs from the one it was registered under, and the
+            // mapping written below is what resolves an MCP tool at dispatch.
             mcpToolSpecNames = new Set(
                 McpManager.instance
-                    .getAllTools()
+                    .getEnabledTools()
                     .map(tool =>
                         createNamespacedToolName(
                             tool.serverName,
