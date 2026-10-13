@@ -64,7 +64,9 @@ import {
     AtxDashboardRepo,
     AtxUploadCustomPlanRequest,
     AtxUploadCustomPlanResponse,
+    AtxValidateSessionResponse,
 } from './atxModels'
+import { classifyAtxSessionValidationError } from './atxSessionValidation'
 import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
 
@@ -401,6 +403,35 @@ export class ATXTransformHandler {
         } catch (error) {
             this.logging.error(`ATX: Session verification error: ${String(error)}`)
             return false
+        }
+    }
+
+    /**
+     * Confirms the active session works against FES with one read-only ListWorkspaces call (never the create path).
+     * Used by the client to validate IAM sign-in before reporting it connected. Failures are classified here, where
+     * the typed SDK error is available; only the reason, error name and HTTP status are returned and logged.
+     */
+    async validateSession(): Promise<AtxValidateSessionResponse> {
+        if (!(await this.verifySession())) {
+            this.logging.error('ATX: ValidateSession - session not ready (credentials or tenant URL missing)')
+            return { Valid: false, Reason: 'Other', ErrorCode: 'SessionNotReady' }
+        }
+
+        try {
+            const { ListWorkspacesCommand } = await import('@amazon/elastic-gumby-frontend-client')
+            const command = new ListWorkspacesCommand({ maxResults: 1 })
+            await this.addAuthToCommand(command)
+
+            await this.atxClient!.send(command)
+            this.logging.log('ATX: ValidateSession succeeded')
+            return { Valid: true }
+        } catch (error) {
+            const failure = classifyAtxSessionValidationError(error)
+            this.logging.error(
+                `ATX: ValidateSession failed - reason=${failure.Reason}, code=${failure.ErrorCode}, ` +
+                    `status=${failure.HttpStatus ?? 'none'}`
+            )
+            return { Valid: false, ...failure }
         }
     }
 
