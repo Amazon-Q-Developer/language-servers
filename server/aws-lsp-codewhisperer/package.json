@@ -46,7 +46,7 @@
         "adm-zip": "^0.5.10",
         "archiver": "^7.0.1",
         "async-mutex": "^0.5.0",
-        "axios": "^1.8.4",
+        "axios": "^1.20.0",
         "chokidar": "^4.0.3",
         "deepmerge": "^4.3.1",
         "diff": "^7.0.0",
