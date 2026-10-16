@@ -17,6 +17,12 @@ const FALLBACK_TEXT = 'Amazon Q Developer is not available for this account.'
 const TITLE = 'Amazon Q Developer'
 
 /**
+ * Stable identifier so clients can recognise this notification without inspecting its text. Clients
+ * must not match on the message: it is the service's own copy and is expected to change.
+ */
+export const Q_DEV_ACCESS_BLOCKED_NOTIFICATION_ID = 'qDevPluginAccessBlocked'
+
+/**
  * Builds the reaction to RTS blocking Q Developer plugin access for the current identity, for use as
  * {@link CodeWhispererServiceToken.onAccessBlocked}.
  *
@@ -56,6 +62,7 @@ export function createQDevAccessBlockedNotifier(
         try {
             logging.warn(`Q Developer plugin access is blocked for this identity: ${text}`)
             notification.showNotification({
+                id: Q_DEV_ACCESS_BLOCKED_NOTIFICATION_ID,
                 type: MessageType.Error,
                 content: {
                     title: TITLE,
