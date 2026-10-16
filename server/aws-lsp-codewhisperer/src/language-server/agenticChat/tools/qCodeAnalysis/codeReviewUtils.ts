@@ -8,7 +8,7 @@
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { SKIP_DIRECTORIES, EXTENSION_TO_LANGUAGE, CODE_REVIEW_METRICS_PARENT_NAME } from './codeReviewConstants'
 import JSZip = require('jszip')
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -105,19 +105,46 @@ export class CodeReviewUtils {
     }
 
     /**
-     * Execute git command and return output
-     * @param command Git command to execute
+     * Wrap a filesystem path as a literal git pathspec.
+     *
+     * The ":(literal)" prefix tells git to match the path exactly and to NOT
+     * interpret pathspec "magic" (a leading ':') or glob wildcards ('*', '?',
+     * '[', ']') that may appear in the path. Callers always pass the result
+     * after a "--" separator so git treats it as a path, never as an option
+     * or revision.
+     *
+     * @param artifactPath Path to a file or folder
+     * @returns The path as a literal git pathspec
+     */
+    public static toLiteralPathspec(artifactPath: string): string {
+        return `:(literal)${artifactPath}`
+    }
+
+    /**
+     * Execute a git command with a fixed argument vector and return its
+     * trimmed stdout.
+     *
+     * The command runs with execFile (no shell), so every argument — including
+     * file paths that may contain shell metacharacters — is passed to git
+     * verbatim and is never re-parsed by a shell. This removes the command
+     * injection surface that string interpolation into a shell command line
+     * would create. Callers pass any artifact-derived path as a literal git
+     * pathspec (see {@link toLiteralPathspec}) after a "--" separator.
+     *
+     * @param args Argument vector passed to git (e.g. ['diff', '--', ':(literal)/repo/file.ts'])
+     * @param cwd Working directory to run git in
      * @param type Type of command for logging
      * @param logging Logging interface
-     * @returns Promise resolving to command output
+     * @returns Promise resolving to command output, or '' on failure
      */
     public static async executeGitCommand(
-        command: string,
+        args: string[],
+        cwd: string,
         type: string,
         logging: Features['logging']
     ): Promise<string> {
         return new Promise<string>(resolve => {
-            exec(command, (error: any, stdout: string, stderr: string) => {
+            execFile('git', args, { cwd }, (error: any, stdout: string, stderr: string) => {
                 if (error) {
                     logging.warn(`Git diff failed for ${type}: ${stderr || error.message}`)
                     resolve('')
@@ -138,15 +165,19 @@ export class CodeReviewUtils {
         logging.info(`Get git diff for path - ${artifactPath}`)
 
         const directoryPath = CodeReviewUtils.getFolderPath(artifactPath)
-        const gitDiffCommandUnstaged = `cd ${directoryPath} && git diff ${artifactPath}`
-        const gitDiffCommandStaged = `cd ${directoryPath} && git diff --staged ${artifactPath}`
+        const pathspec = CodeReviewUtils.toLiteralPathspec(artifactPath)
 
-        logging.info(`Running git commands - ${gitDiffCommandUnstaged} and ${gitDiffCommandStaged}`)
+        logging.info(`Running git diff (unstaged and staged) in ${directoryPath} for path - ${artifactPath}`)
 
         try {
             const [unstagedDiff, stagedDiff] = await Promise.all([
-                CodeReviewUtils.executeGitCommand(gitDiffCommandUnstaged, 'unstaged', logging),
-                CodeReviewUtils.executeGitCommand(gitDiffCommandStaged, 'staged', logging),
+                CodeReviewUtils.executeGitCommand(['diff', '--', pathspec], directoryPath, 'unstaged', logging),
+                CodeReviewUtils.executeGitCommand(
+                    ['diff', '--staged', '--', pathspec],
+                    directoryPath,
+                    'staged',
+                    logging
+                ),
             ])
 
             const combinedDiff = [unstagedDiff, stagedDiff].filter(Boolean).join('\n\n')
@@ -167,17 +198,28 @@ export class CodeReviewUtils {
         logging.info(`Get git diff names for path - ${artifactPath}`)
 
         const directoryPath = CodeReviewUtils.getFolderPath(artifactPath)
-        const gitDiffCommandUnstaged = `cd ${directoryPath} && git diff --name-only ${artifactPath}`
-        const gitDiffCommandStaged = `cd ${directoryPath} && git diff --name-only --staged ${artifactPath}`
+        const pathspec = CodeReviewUtils.toLiteralPathspec(artifactPath)
 
-        logging.info(`Running git commands - ${gitDiffCommandUnstaged} and ${gitDiffCommandStaged}`)
+        logging.info(
+            `Running git diff --name-only (unstaged and staged) in ${directoryPath} for path - ${artifactPath}`
+        )
 
         try {
             const unstagedDiff = (
-                await CodeReviewUtils.executeGitCommand(gitDiffCommandUnstaged, 'unstaged name only', logging)
+                await CodeReviewUtils.executeGitCommand(
+                    ['diff', '--name-only', '--', pathspec],
+                    directoryPath,
+                    'unstaged name only',
+                    logging
+                )
             ).split('\n')
             const stagedDiff = (
-                await CodeReviewUtils.executeGitCommand(gitDiffCommandStaged, 'staged name only', logging)
+                await CodeReviewUtils.executeGitCommand(
+                    ['diff', '--name-only', '--staged', '--', pathspec],
+                    directoryPath,
+                    'staged name only',
+                    logging
+                )
             ).split('\n')
             unstagedDiff.push(...stagedDiff)
 
