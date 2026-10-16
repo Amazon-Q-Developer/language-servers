@@ -1136,27 +1136,29 @@ describe('toolShared', () => {
                 assert.strictEqual(result.requiresAcceptance, false)
             })
 
-            it('still honors a path the user has explicitly approved', async function (this: Context) {
+            it('still honors a file the user approved, as it was when approved', async function (this: Context) {
                 if (process.platform === 'win32') {
                     this.skip()
                     return
                 }
 
-                const approvedPaths = new Map([['fsWrite', new Set([fs.realpathSync(hardLinkInWorkspace)])]])
+                const canonicalPath = fs.realpathSync(hardLinkInWorkspace)
+                const approvedFile = await mockWorkspace.fs.checkedFiles!.capture(canonicalPath)
+                assert.strictEqual(approvedFile.state, 'existing')
                 const result = await requiresPathAcceptance(
                     hardLinkInWorkspace,
                     'fsWrite',
                     mockWorkspace,
                     mockLogging as unknown as Features['logging'],
-                    approvedPaths,
-                    { flagMultiplyLinkedFiles: 'modify' }
+                    new Map([['fsWrite', new Set([canonicalPath])]]),
+                    { flagMultiplyLinkedFiles: 'modify', approvedLinkedFiles: new Map([['fsWrite', [approvedFile]]]) }
                 )
 
                 assert.strictEqual(
                     result.requiresAcceptance,
                     false,
-                    'Approval short-circuits before the hard link check, so an allowed path is not re-prompted. ' +
-                        'This is only sound because the session records approvals the user actually granted ' +
+                    'An approved file is not asked about again while it is the same file. This is only sound ' +
+                        'because the session records approvals the user actually granted ' +
                         '(see agenticChatController), not every path a tool has touched.'
                 )
             })
