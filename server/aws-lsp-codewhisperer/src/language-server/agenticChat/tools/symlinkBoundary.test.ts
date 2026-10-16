@@ -130,6 +130,7 @@ describe('workspace boundary symlink handling', () => {
             }
             const result = await requiresPathAcceptance(link, 'fsWrite', makeWorkspace(ws), noopLogging)
             assert.strictEqual(result.requiresAcceptance, true)
+            assert.deepStrictEqual(result.canonicalPaths, [await canon(target)])
         })
 
         it('does not require acceptance for a normal new in-workspace file', async () => {
@@ -140,6 +141,7 @@ describe('workspace boundary symlink handling', () => {
                 noopLogging
             )
             assert.strictEqual(result.requiresAcceptance, false)
+            assert.deepStrictEqual(result.canonicalPaths, [await canon(path.join(ws, 'notes.md'))])
         })
 
         it('still requires acceptance for a symlink to an existing outside file (regression)', async function () {
