@@ -5,6 +5,8 @@ import {
     ExplanatoryParams,
     InvokeOutput,
     isPathApproved,
+    isPathExactlyApproved,
+    needsExactApproval,
     resolveSymlinkAwarePath,
     canonicalizeWorkspaceFolders,
 } from './toolShared'
@@ -14,7 +16,7 @@ import { CancellationError, processUtils, workspaceUtils } from '@aws/lsp-core'
 import { CancellationToken } from 'vscode-languageserver'
 import { ChildProcess, ChildProcessOptions } from '@aws/lsp-core/out/util/processUtils'
 // eslint-disable-next-line import/no-nodejs-modules
-import { isAbsolute, resolve, extname } from 'path' // Safe to import on web since this is part of path-browserify
+import { isAbsolute, resolve, extname, parse } from 'path' // Safe to import on web since this is part of path-browserify
 import { Features } from '../../types'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
 // eslint-disable-next-line import/no-nodejs-modules
@@ -239,6 +241,23 @@ export class ExecuteBash {
             const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(
                 getWorkspaceFolderPaths(this.workspace)
             )
+            // The cwd, when running in it needs approval. An approval of an out-of-workspace prompt
+            // allows the cwd for later commands only for a read-only command, and not for a
+            // credential or system folder or a file system root: the card does not show the cwd.
+            const cwdNeedingApproval = params.cwd
+                ? await this.cwdNeedingApproval(params.cwd, canonicalWorkspaceFolders, approvedPaths)
+                : undefined
+            const isReadOnlyCommand = allCommands.every(
+                cmdArgs => commandCategories.get(cmdArgs[0]) === CommandCategory.ReadOnly
+            )
+            const cwdApproval =
+                cwdNeedingApproval &&
+                isReadOnlyCommand &&
+                !needsExactApproval(params.cwd!) &&
+                !needsExactApproval(cwdNeedingApproval) &&
+                parse(cwdNeedingApproval).root !== cwdNeedingApproval
+                    ? { approvalPaths: [cwdNeedingApproval] }
+                    : {}
 
             for (const cmdArgs of allCommands) {
                 if (cmdArgs.length === 0) {
@@ -252,8 +271,13 @@ export class ExecuteBash {
                     // looksLikeRelativePath additionally catches bare relative
                     // arguments such as "notes.txt" or "sub/notes.txt" that would
                     // otherwise bypass the boundary and credential checks. Flags and
-                    // plain-text tokens are intentionally not treated as paths.
-                    if (!this.looksLikePath(arg) && !this.looksLikeRelativePath(arg, params.cwd)) {
+                    // plain-text tokens are intentionally not treated as paths. With a cwd, a token
+                    // that the shell can expand to a hidden name is checked as a path too.
+                    if (
+                        !this.looksLikePath(arg) &&
+                        !this.looksLikeRelativePath(arg, params.cwd) &&
+                        !(params.cwd && ExecuteBash.canExpandToDotName(arg))
+                    ) {
                         continue
                     }
 
@@ -277,11 +301,6 @@ export class ExecuteBash {
                         candidate = resolve(arg)
                     }
                     const fullPath = await resolveSymlinkAwarePath(candidate)
-
-                    // Check if the canonical path is already approved
-                    if (approvedPaths && isPathApproved(fullPath, 'executeBash', approvedPaths)) {
-                        continue
-                    }
 
                     // Check if this is a credential or binary file that needs
                     // protection. The existence / regular-file guard stays on the
@@ -320,12 +339,18 @@ export class ExecuteBash {
                         this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
                     }
 
+                    // An approved path skips the workspace check, not the file checks above
+                    if (approvedPaths && this.isApprovedArgument(arg, candidate, fullPath, approvedPaths)) {
+                        continue
+                    }
+
                     const isInWorkspace = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, fullPath)
                     if (!isInWorkspace) {
                         return {
                             requiresAcceptance: true,
                             warning: outOfWorkspaceWarningmessage,
                             commandCategory: highestCommandCategory,
+                            ...cwdApproval,
                         }
                     }
                 }
@@ -375,31 +400,12 @@ export class ExecuteBash {
                 }
             }
             // Finally, check if the cwd is outside the workspace
-            if (params.cwd) {
-                // Canonicalize the cwd in a symlink-aware way so a symlinked cwd is
-                // compared at its real location (and any ".." is eliminated).
-                const canonicalCwd = await resolveSymlinkAwarePath(params.cwd)
-
-                // Check if the cwd is already approved (on its canonical path)
-                if (!(approvedPaths && isPathApproved(canonicalCwd, 'executeBash', approvedPaths))) {
-                    // If there are no workspace folders, we can't validate the path
-                    if (!canonicalWorkspaceFolders || canonicalWorkspaceFolders.length === 0) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: outOfWorkspaceWarningmessage,
-                            commandCategory: highestCommandCategory,
-                        }
-                    }
-
-                    // Check if the resolved cwd is inside any (canonical) workspace folder
-                    const isInWorkspace = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalCwd)
-                    if (!isInWorkspace) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: outOfWorkspaceWarningmessage,
-                            commandCategory: highestCommandCategory,
-                        }
-                    }
+            if (cwdNeedingApproval) {
+                return {
+                    requiresAcceptance: true,
+                    warning: outOfWorkspaceWarningmessage,
+                    commandCategory: highestCommandCategory,
+                    ...cwdApproval,
                 }
             }
 
@@ -409,6 +415,76 @@ export class ExecuteBash {
             this.logging.warn(`Error while checking acceptance: ${(error as Error).message}`)
             return { requiresAcceptance: true, commandCategory: CommandCategory.ReadOnly }
         }
+    }
+
+    /**
+     * The canonical cwd when it is outside the workspace and not approved, otherwise undefined. A
+     * credential or system folder needs an approval of that folder itself.
+     */
+    private async cwdNeedingApproval(
+        cwd: string,
+        canonicalWorkspaceFolders: string[],
+        approvedPaths?: Map<string, Set<string>>
+    ): Promise<string | undefined> {
+        // Canonicalize the cwd in a symlink-aware way so a symlinked cwd is
+        // compared at its real location (and any ".." is eliminated).
+        const canonicalCwd = await resolveSymlinkAwarePath(cwd)
+        const isCwdApproved =
+            approvedPaths &&
+            (needsExactApproval(cwd) || needsExactApproval(canonicalCwd)
+                ? isPathExactlyApproved(canonicalCwd, 'executeBash', approvedPaths)
+                : isPathApproved(canonicalCwd, 'executeBash', approvedPaths))
+        if (isCwdApproved) {
+            return undefined
+        }
+        // Without workspace folders the cwd cannot be validated
+        return workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalCwd) ? undefined : canonicalCwd
+    }
+
+    /**
+     * True when an approved path covers a path argument. A credential or system path needs an
+     * approval of that path itself, and an argument that the shell can expand to a name that
+     * starts with a dot, or a file that shares its data with another name on disk, is not covered
+     * by an approved folder.
+     */
+    private isApprovedArgument(
+        arg: string,
+        candidate: string,
+        fullPath: string,
+        approvedPaths: Map<string, Set<string>>
+    ): boolean {
+        if (needsExactApproval(candidate) || needsExactApproval(fullPath)) {
+            return isPathExactlyApproved(fullPath, 'executeBash', approvedPaths)
+        }
+        if (isPathExactlyApproved(fullPath, 'executeBash', approvedPaths)) {
+            return true
+        }
+        return (
+            !ExecuteBash.canExpandToDotName(arg) &&
+            !ExecuteBash.hasOtherNames(fullPath) &&
+            isPathApproved(fullPath, 'executeBash', approvedPaths)
+        )
+    }
+
+    /** True for a file that shares its data with another name on disk (a hard link) */
+    private static hasOtherNames(filePath: string): boolean {
+        try {
+            const stats = statSync(filePath, { throwIfNoEntry: false })
+            return stats !== undefined && stats.isFile() && stats.nlink > 1
+        } catch {
+            return false
+        }
+    }
+
+    /**
+     * True when the shell can expand the argument to a name that starts with a dot: a brace
+     * expansion such as {.ssh,src}, or a pattern in a name that starts with a dot such as .s*
+     */
+    private static canExpandToDotName(arg: string): boolean {
+        return (
+            /\{[^{}]*(?:,|\.\.)[^{}]*\}/.test(arg) ||
+            arg.split(/[\\/]/).some(segment => segment.startsWith('.') && /[*?[]/.test(segment))
+        )
     }
 
     private looksLikePath(arg: string): boolean {

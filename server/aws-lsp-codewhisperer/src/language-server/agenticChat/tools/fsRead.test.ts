@@ -169,6 +169,62 @@ describe('FsRead Tool', () => {
         assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
     })
 
+    describe('a multi-path read with several paths that need approval', () => {
+        let workspaceDir: string
+        let makeFsRead: () => FsRead
+
+        // A file in the workspace with a second name outside it
+        const sharedFile = async (name: string) => {
+            const outsideTarget = path.join(tempFolder.path, `outside-${name}`)
+            await fs.writeFile(outsideTarget, 'synthetic fixture only')
+            const filePath = path.join(workspaceDir, name)
+            await fs.link(outsideTarget, filePath)
+            return filePath
+        }
+
+        beforeEach(async function () {
+            if (process.platform === 'win32') {
+                return this.skip()
+            }
+            workspaceDir = path.join(tempFolder.path, 'workspace')
+            await fs.mkdir(workspaceDir)
+            makeFsRead = () =>
+                new FsRead({
+                    ...features,
+                    workspace: {
+                        ...features.workspace,
+                        getTextDocument: async s => ({}) as TextDocument,
+                        getAllWorkspaceFolders: () => [{ uri: `file://${workspaceDir}`, name: 'workspace' }],
+                    },
+                })
+        })
+
+        it("shows each path's warning", async () => {
+            const secretDir = path.join(tempFolder.path, 'secret')
+            await fs.mkdir(secretDir)
+            const outsidePath = path.join(secretDir, 'notes.txt')
+            await fs.writeFile(outsidePath, 'synthetic fixture only')
+
+            const result = await makeFsRead().requiresAcceptance({ paths: [await sharedFile('a.txt'), outsidePath] })
+
+            assert.equal(result.requiresAcceptance, true)
+            assert.ok(result.warning?.includes('another name on disk'), result.warning)
+            assert.ok(result.warning?.includes('sensitive system files'), result.warning)
+            // Not every path is in the workspace, so the prompt keeps the outside-the-workspace wording
+            assert.equal(result.acceptanceReason, undefined)
+        })
+
+        it('keeps the shared-file wording when that is why every path needs approval', async () => {
+            const result = await makeFsRead().requiresAcceptance({
+                paths: [await sharedFile('a.txt'), await sharedFile('b.txt')],
+            })
+
+            assert.equal(result.requiresAcceptance, true)
+            assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
+            assert.equal(result.warning?.split('another name on disk').length, 2, 'the warning appears once')
+        })
+    })
+
     it('does not ask again for paths the user already approved in a multi-path read', async () => {
         // Regression: fsRead takes a `paths` array, and an approval recorded
         // from a singular `path` never matched a later read of the same file.
