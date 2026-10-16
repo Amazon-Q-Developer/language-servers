@@ -1354,3 +1354,38 @@ export function createNamespacedToolName(
         duplicateNum++
     }
 }
+
+/**
+ * Default MCP tool execution timeout, in milliseconds, used when a server config
+ * does not specify one (or specifies an unusable value).
+ */
+export const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
+
+/**
+ * Largest delay that can be handed to `setTimeout` without the runtime clamping it
+ * back to 1ms and firing immediately (2^31 - 1 ms, roughly 24.8 days). The MCP SDK
+ * arms its request deadline with `setTimeout`, so an "unbounded" tool call has to be
+ * expressed as a large finite value rather than `Infinity`/`Number.MAX_SAFE_INTEGER`.
+ */
+export const MAX_TOOL_EXEC_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * A configured timeout is usable when it is a finite, positive number of milliseconds
+ * that `setTimeout` will honour. `0` is handled separately — it means "no timeout".
+ */
+export function isUsableToolExecTimeout(timeout: number | undefined): boolean {
+    return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TOOL_EXEC_TIMEOUT_MS
+}
+
+/**
+ * Resolve the timeout, in milliseconds, to hand to the MCP SDK for a tool call.
+ * - `0` (documented as "no timeout") maps to the maximum timer value, because the SDK
+ *   always applies its own 60s default when no timeout is supplied.
+ * - `undefined`, negative, non-finite, or over-large values fall back to the default.
+ */
+export function resolveMcpRequestTimeoutMs(timeout: number | undefined): number {
+    if (timeout === 0) {
+        return MAX_TOOL_EXEC_TIMEOUT_MS
+    }
+    return isUsableToolExecTimeout(timeout) ? (timeout as number) : DEFAULT_TOOL_EXEC_TIMEOUT_MS
+}

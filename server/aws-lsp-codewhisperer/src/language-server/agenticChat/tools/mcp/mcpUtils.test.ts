@@ -27,6 +27,10 @@ import {
     sanitizeName,
     convertPersonaToAgent,
     migrateToAgentConfig,
+    DEFAULT_TOOL_EXEC_TIMEOUT_MS,
+    MAX_TOOL_EXEC_TIMEOUT_MS,
+    isUsableToolExecTimeout,
+    resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
 import type { MCPServerConfig } from './mcpTypes'
 import { McpPermissionType } from './mcpTypes'
@@ -1150,5 +1154,51 @@ describe('saveServerSpecificAgentConfig', () => {
         )
 
         expect(fs.existsSync(configPath)).to.be.true
+    })
+})
+
+describe('resolveMcpRequestTimeoutMs()', () => {
+    it('returns the configured timeout when it is usable', () => {
+        expect(resolveMcpRequestTimeoutMs(300_000)).to.equal(300_000)
+        expect(resolveMcpRequestTimeoutMs(1)).to.equal(1)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('treats 0 as "no timeout" by returning the maximum timer value', () => {
+        expect(resolveMcpRequestTimeoutMs(0)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('falls back to the default for undefined, negative, non-finite and over-large values', () => {
+        expect(resolveMcpRequestTimeoutMs(undefined)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(-1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.NaN)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.POSITIVE_INFINITY)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.MAX_SAFE_INTEGER)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('never returns a value setTimeout would clamp', () => {
+        for (const candidate of [undefined, 0, -1, Number.NaN, Number.MAX_SAFE_INTEGER, 300_000]) {
+            const resolved = resolveMcpRequestTimeoutMs(candidate)
+            expect(Number.isFinite(resolved)).to.be.true
+            expect(resolved).to.be.greaterThan(0)
+            expect(resolved).to.be.at.most(MAX_TOOL_EXEC_TIMEOUT_MS)
+        }
+    })
+})
+
+describe('isUsableToolExecTimeout()', () => {
+    it('accepts finite positive values within the timer range', () => {
+        expect(isUsableToolExecTimeout(1)).to.be.true
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS)).to.be.true
+    })
+
+    it('rejects undefined, zero, negative, non-finite and over-large values', () => {
+        expect(isUsableToolExecTimeout(undefined)).to.be.false
+        expect(isUsableToolExecTimeout(0)).to.be.false
+        expect(isUsableToolExecTimeout(-1)).to.be.false
+        expect(isUsableToolExecTimeout(Number.NaN)).to.be.false
+        expect(isUsableToolExecTimeout(Number.POSITIVE_INFINITY)).to.be.false
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.be.false
     })
 })
