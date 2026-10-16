@@ -92,8 +92,63 @@ describe('OAuthClient helpers', () => {
         const actual = (OAuthClient as any).b64url(buf)
         expect(actual).to.equal('aGVsbG8')
     })
+
+    describe('validateTokenEndpoint()', () => {
+        const validate = (endpoint: string) => (OAuthClient as any).validateTokenEndpoint(endpoint)
+
+        for (const endpoint of [
+            'https://auth.example.com/token',
+            'http://localhost:8080/token',
+            'http://127.0.0.1/token',
+            'http://127.0.0.2/token',
+            'http://[::1]/token',
+        ]) {
+            it(`allows ${endpoint}`, () => {
+                expect(() => validate(endpoint)).not.to.throw()
+            })
+        }
+
+        for (const endpoint of [
+            'http://auth.example.com/token',
+            'http://localhost.example.com/token',
+            'ftp://auth.example.com/token',
+            'not a url',
+        ]) {
+            it(`rejects ${endpoint}`, () => {
+                expect(() => validate(endpoint)).to.throw()
+            })
+        }
+    })
 })
 
+describe('OAuthClient.refreshGrant()', () => {
+    let fetchStub: sinon.SinonStub
+
+    beforeEach(() => {
+        sinon.restore()
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+        fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+    })
+
+    afterEach(() => sinon.restore())
+
+    it('rejects a non-loopback HTTP endpoint before exchanging credentials', async () => {
+        const meta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'http://auth.example.com/token',
+        }
+        const reg = { client_id: 'client-id', client_secret: 'client-secret' }
+
+        try {
+            await (OAuthClient as any).refreshGrant(meta, reg, new URL('https://mcp.example.com/mcp'), 'refresh-token')
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('token endpoint must use HTTPS')
+        }
+
+        expect(fetchStub.called).to.be.false
+    })
+})
 describe('OAuthClient.selectAuthMethod()', () => {
     const selectAuthMethod = (reg: any, meta?: any) => (OAuthClient as any).selectAuthMethod(reg, meta)
 
@@ -458,6 +513,33 @@ describe('OAuthClient getValidAccessToken()', () => {
             interactive: false,
         })
         expect(token).to.be.undefined
+    })
+
+    it('does not send an expired refresh token to a non-loopback HTTP endpoint', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = {
+            client_id: 'cid',
+            client_secret: 'csecret',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        }
+        stubFileSystem(expiredToken, cachedReg)
+        sinon.stub(OAuthClient as any, 'discoverAS').resolves({
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'http://auth.example.com/token',
+        })
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.be.undefined
+        expect(fetchStub.called).to.be.false
     })
 
     it('uses scopes from discovery metadata when available', async () => {
