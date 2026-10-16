@@ -72,6 +72,7 @@ export class FsReplace {
     ): Promise<CommandValidation> {
         return requiresPathAcceptance(params.path, 'fsReplace', this.workspace, this.logging, approvedPaths, {
             flagMultiplyLinkedFiles: 'modify',
+            flagConfigFiles: true,
         })
     }
 
