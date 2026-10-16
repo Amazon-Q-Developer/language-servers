@@ -103,6 +103,43 @@ describe('init()', () => {
     })
 })
 
+describe('getResourceSources()', () => {
+    let loadStub: sinon.SinonStub
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('returns the agent configs that list each resource, as the agent config loader found them', async () => {
+        const resourceSources = new Map([['file://docs/rules.md', { global: false, configPaths: ['/ws/a.json'] }]])
+        loadStub = sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map(),
+            serverNameMapping: new Map(),
+            errors: new Map(),
+            agentConfig: {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                toolsSettings: {},
+                resources: ['file://docs/rules.md'],
+            },
+            resourceSources,
+        })
+
+        const mgr = await McpManager.init([], features)
+        await mgr.discoverAllServers()
+
+        expect(loadStub.called).to.be.true
+        expect(mgr.getResources()).to.deep.equal(['file://docs/rules.md'])
+        expect(mgr.getResourceSources()).to.deep.equal(resourceSources)
+    })
+})
+
 describe('getAllTools()', () => {
     let loadStub: sinon.SinonStub
 

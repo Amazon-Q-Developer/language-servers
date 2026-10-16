@@ -63,6 +63,14 @@ export interface MCPServerPermission {
     __configPath__?: string
 }
 
+/** The agent configs that list a resource */
+export interface AgentResourceSource {
+    /** The global agent config lists it */
+    global: boolean
+    /** The other agent config files that list it, each in a workspace folder */
+    configPaths: string[]
+}
+
 export interface AgentConfig {
     name: string // Required: Agent name
     description: string // Required: Agent description

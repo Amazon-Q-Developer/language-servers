@@ -387,13 +387,24 @@ export class AgenticChatController implements ChatHandlers {
         // Inject McpManager.getResources as a callback to avoid importing McpManager directly
         // in AdditionalContextProvider, which would pull Node.js-only MCP SDK dependencies
         // (node:process, node:stream) into the webworker webpack bundle and break packaging.
-        this.#additionalContextProvider = new AdditionalContextProvider(features, this.#chatHistoryDb, () => {
-            try {
-                return McpManager.isInitialized() ? McpManager.instance.getResources() : []
-            } catch {
-                return []
+        this.#additionalContextProvider = new AdditionalContextProvider(
+            features,
+            this.#chatHistoryDb,
+            () => {
+                try {
+                    return McpManager.isInitialized() ? McpManager.instance.getResources() : []
+                } catch {
+                    return []
+                }
+            },
+            () => {
+                try {
+                    return McpManager.isInitialized() ? McpManager.instance.getResourceSources() : new Map()
+                } catch {
+                    return new Map()
+                }
             }
-        })
+        )
         this.#contextCommandsProvider = new ContextCommandsProvider(
             this.#features.logging,
             this.#features.chat,

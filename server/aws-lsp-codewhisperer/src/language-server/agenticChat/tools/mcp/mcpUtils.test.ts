@@ -272,6 +272,94 @@ describe('loadAgentConfig', () => {
         expect(serverConfig?.args).to.deep.equal(['arg1', 'arg2'])
         expect(serverConfig?.env).to.deep.equal({ TEST_ENV: 'value' })
     })
+
+    it('ignores absolute resources from a workspace agent config', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        const config = (resources: string[]) =>
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources })
+        fs.mkdirSync(path.dirname(globalPath), { recursive: true })
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(globalPath, config(['file:///global/rules.md']))
+        fs.writeFileSync(
+            workspacePath,
+            config(['file://docs/rules.md', 'file:///other/rules.md', 'file://C:/other/rules.md'])
+        )
+        const warn = sinon.spy(logger, 'warn')
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath, globalPath], null, false)
+
+        expect(result.agentConfig.resources).to.have.members(['file://docs/rules.md', 'file:///global/rules.md'])
+        for (const resource of ['file:///other/rules.md', 'file://C:/other/rules.md']) {
+            expect(warn.calledWithMatch(sinon.match(resource)), resource).to.be.true
+        }
+    })
+
+    it('logs a dropped resource as a single quoted line', async () => {
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        const forged = 'file:///other/rules.md\n[Error] forged line'
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(
+            workspacePath,
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources: [forged] })
+        )
+        const warn = sinon.spy(logger, 'warn')
+
+        await loadAgentConfig(workspace, logger, [workspacePath], null, false)
+
+        const lines = warn.args.map(args => String(args[0]))
+        expect(
+            lines.some(line => line.includes(JSON.stringify(forged))),
+            'the dropped resource is logged, quoted'
+        ).to.be.true
+        expect(
+            lines.some(line => line.split('\n').length > 1),
+            'a newline in the resource does not forge a second log line'
+        ).to.be.false
+    })
+
+    it('keeps other workspace resource entries and skips duplicates and non-strings', async () => {
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(
+            workspacePath,
+            JSON.stringify({
+                name: 'test-agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                resources: ['docs/notes.md', 'file://docs/rules.md', 'file://docs/rules.md', 42, null],
+            })
+        )
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath], null, false)
+
+        expect(result.agentConfig.resources).to.deep.equal(['docs/notes.md', 'file://docs/rules.md'])
+    })
+
+    it('records the agent configs that list each resource', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const firstPath = path.join(tmpDir, 'first', '.amazonq', 'agents', 'default.json')
+        const secondPath = path.join(tmpDir, 'second', '.amazonq', 'agents', 'default.json')
+        const config = (resources: string[]) =>
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources })
+        for (const [configPath, resources] of [
+            [globalPath, ['file://AmazonQ.md', 'file:///global/rules.md']],
+            [firstPath, ['file://docs/rules.md', 'file://AmazonQ.md', 'file:///other/rules.md']],
+            [secondPath, ['file://docs/rules.md']],
+        ] as const) {
+            fs.mkdirSync(path.dirname(configPath), { recursive: true })
+            fs.writeFileSync(configPath, config([...resources]))
+        }
+
+        const result = await loadAgentConfig(workspace, logger, [firstPath, secondPath, globalPath], null, false)
+
+        expect(Object.fromEntries(result.resourceSources ?? [])).to.deep.equal({
+            'file://docs/rules.md': { global: false, configPaths: [firstPath, secondPath] },
+            'file://AmazonQ.md': { global: true, configPaths: [firstPath] },
+            'file:///global/rules.md': { global: true, configPaths: [] },
+        })
+    })
 })
 
 describe('path helpers', () => {
