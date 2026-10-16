@@ -2352,33 +2352,6 @@ export class AgenticChatController implements ChatHandlers {
                     }
                 }
 
-                // Record the path only when the user was actually asked and
-                // allowed it. Recording every path a tool touches turns this map
-                // into "paths the tool has seen", which then short-circuits the
-                // acceptance check on later calls — so a path that was harmless
-                // on first use (an ordinary file inside the workspace) would
-                // skip the check after it becomes something the user should be
-                // asked about, such as a name that a hard link now shares with a
-                // file outside the workspace.
-                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
-                if (toolApprovalGranted && checkedCanonicalPaths) {
-                    for (const checkedPath of checkedCanonicalPaths) {
-                        session.addApprovedPath(checkedPath, toolUse.name)
-                    }
-                } else if (inputPath && toolApprovalGranted) {
-                    session.addApprovedPath(inputPath, toolUse.name)
-                    // The acceptance check compares the canonical path, so also
-                    // record that form; otherwise an approval never matches when
-                    // the input reaches the file through a symlinked ancestor
-                    // (a symlinked home directory, or macOS /tmp) and the user is
-                    // asked again on every call. Resolved the same way as
-                    // requiresPathAcceptance.
-                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
-                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
-                        session.addApprovedPath(canonicalInputPath, toolUse.name)
-                    }
-                }
-
                 const ws = this.#getWritableStream(chatResultStream, toolUse)
                 if (checkedTargets) {
                     if (token?.isCancellationRequested) {
@@ -2403,6 +2376,34 @@ export class AgenticChatController implements ChatHandlers {
                         toolName: toolUse.name,
                         canonicalPaths: checkedCanonicalPaths,
                     })
+                }
+
+                // Record the path only when the user was actually asked and
+                // allowed it, and the tool then succeeded. Recording every path
+                // a tool touches turns this map into "paths the tool has seen",
+                // which then short-circuits the
+                // acceptance check on later calls — so a path that was harmless
+                // on first use (an ordinary file inside the workspace) would
+                // skip the check after it becomes something the user should be
+                // asked about, such as a name that a hard link now shares with a
+                // file outside the workspace.
+                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
+                if (toolApprovalGranted && checkedCanonicalPaths) {
+                    for (const checkedPath of checkedCanonicalPaths) {
+                        session.addApprovedPath(checkedPath, toolUse.name)
+                    }
+                } else if (inputPath && toolApprovalGranted) {
+                    session.addApprovedPath(inputPath, toolUse.name)
+                    // The acceptance check compares the canonical path, so also
+                    // record that form; otherwise an approval never matches when
+                    // the input reaches the file through a symlinked ancestor
+                    // (a symlinked home directory, or macOS /tmp) and the user is
+                    // asked again on every call. Resolved the same way as
+                    // requiresPathAcceptance.
+                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
+                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
+                        session.addApprovedPath(canonicalInputPath, toolUse.name)
+                    }
                 }
 
                 let toolResultContent: ToolResultContentBlock

@@ -282,6 +282,23 @@ function isSamePath(left: string, right: string): boolean {
 }
 
 /**
+ * Checks if this exact path, rather than one of its parent directories, has been approved for a specific tool
+ */
+export function isPathExactlyApproved(
+    filePath: string,
+    toolName: string,
+    approvedPaths?: Map<string, Set<string>>
+): boolean {
+    const toolPaths = approvedPaths?.get(toolName)
+    if (!toolPaths || toolPaths.size === 0) {
+        return false
+    }
+
+    const normalizedFilePath = normalizePathSeparators(filePath)
+    return [...toolPaths].some(approvedPath => isSamePath(normalizePathSeparators(approvedPath), normalizedFilePath))
+}
+
+/**
  * Checks if a path has already been approved for a specific tool
  * @param path The path to check
  * @param toolName The name of the tool requesting access
@@ -344,7 +361,8 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
 /**
  * Shared implementation to check if a file path requires user acceptance.
  * Returns true when the file is not resolvable within our workspace (i.e., is outside of our workspace).
- * If the path has already been approved (in approvedPaths), returns false.
+ * If the path or one of its parent directories has already been approved (in approvedPaths), returns false.
+ * A sensitive path returns false only when that exact path has been approved.
  *
  * @param path The file path to check
  * @param toolName The name of the tool requesting access
@@ -376,8 +394,13 @@ export async function requiresPathAcceptance(
             ? await captureCheckedTarget(workspace, canonicalPath)
             : Object.freeze({ path: canonicalPath, state: 'unverified' })
         const checked = { canonicalPaths: [canonicalPath], checkedTargets: Object.freeze([target]) }
+        const isSensitive = isSensitivePath(inputPath) || isSensitivePath(canonicalPath)
 
-        if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
+        // Sensitive paths need an approval of the exact path
+        const isApproved = isSensitive
+            ? isPathExactlyApproved(canonicalPath, toolName, approvedPaths)
+            : isPathApproved(canonicalPath, toolName, approvedPaths)
+        if (isApproved) {
             return { requiresAcceptance: false, ...checked }
         }
 
@@ -406,7 +429,7 @@ export async function requiresPathAcceptance(
             return { requiresAcceptance: false, ...checked }
         }
 
-        if (isSensitivePath(inputPath) || isSensitivePath(canonicalPath)) {
+        if (isSensitive) {
             return {
                 requiresAcceptance: true,
                 warning: 'Access to sensitive system files requires explicit approval',
@@ -426,10 +449,10 @@ export async function requiresPathAcceptance(
 
 function isSensitivePath(filePath: string): boolean {
     const sensitivePatterns = [
-        /\/\.ssh\//,
-        /\/\.aws\//,
-        /\/\.env$/,
-        /\/\.env\./,
+        /[\\/]\.ssh[\\/]/,
+        /[\\/]\.aws[\\/]/,
+        /[\\/]\.env$/,
+        /[\\/]\.env\./,
         /password/i,
         /secret/i,
         /credential/i,

@@ -273,11 +273,6 @@ export class ExecuteBash {
                     }
                     const fullPath = await resolveSymlinkAwarePath(candidate)
 
-                    // Check if the canonical path is already approved
-                    if (approvedPaths && isPathApproved(fullPath, 'executeBash', approvedPaths)) {
-                        continue
-                    }
-
                     // Check if this is a credential or binary file that needs
                     // protection. The existence / regular-file guard stays on the
                     // canonical fullPath (as before), but the sensitivity
@@ -313,6 +308,11 @@ export class ExecuteBash {
                     } catch (err) {
                         // Ignore errors for files that don't exist or can't be accessed
                         this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
+                    }
+
+                    // An approved path skips the workspace check, not the file checks above
+                    if (approvedPaths && isPathApproved(fullPath, 'executeBash', approvedPaths)) {
+                        continue
                     }
 
                     const isInWorkspace = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, fullPath)

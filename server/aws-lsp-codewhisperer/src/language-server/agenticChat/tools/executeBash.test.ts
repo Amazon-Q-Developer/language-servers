@@ -1068,6 +1068,25 @@ describe('ExecuteBash requiresAcceptance ReadOnly path handling (expanded, real 
         )
     })
 
+    it('still warns about a credential file in a directory approved for executeBash', async () => {
+        fs.writeFileSync(path.join(ws, '.env'), 'synthetic fixture only')
+        const approved = new Map([['executeBash', new Set([await fs.promises.realpath(ws)])]])
+
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat .env', cwd: ws }, approved)
+
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('does NOT require acceptance for an ordinary file in a directory approved for executeBash', async () => {
+        fs.writeFileSync(path.join(outside, 'notes.txt'), 'synthetic fixture only')
+        const approved = new Map([['executeBash', new Set([await fs.promises.realpath(outside)])]])
+
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: outside }, approved)
+
+        assert.equal(result.requiresAcceptance, false)
+    })
+
     // The sensitivity heuristic must consider BOTH the lexical argument spelling
     // and the canonical target. A link named like a credential/binary whose
     // target is an ordinary file must still warn. Authorization (canonical
