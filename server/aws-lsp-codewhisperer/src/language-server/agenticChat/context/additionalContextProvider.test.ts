@@ -1,3 +1,5 @@
+import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import * as sinon from 'sinon'
 import { URI } from 'vscode-uri'
@@ -453,6 +455,105 @@ describe('AdditionalContextProvider', () => {
 
             // Restore original path.join
             ;(path.join as sinon.SinonStub).restore()
+        })
+    })
+
+    describe('workspace rule resources (real filesystem)', () => {
+        let root: string
+        let ws: string
+        let outside: string
+
+        const trySymlink = (target: string, linkPath: string, type: 'file' | 'dir'): boolean => {
+            try {
+                fs.symlinkSync(target, linkPath, type)
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        const collectIds = async (resources: string[] = []) => {
+            const rules = await new AdditionalContextProvider(
+                testFeatures,
+                chatHistoryDb,
+                () => resources
+            ).collectWorkspaceRules()
+            return rules.map(rule => rule.id)
+        }
+
+        beforeEach(async () => {
+            root = await fs.promises.realpath(fs.mkdtempSync(path.join(os.tmpdir(), 'rule-resources-')))
+            ws = path.join(root, 'workspace')
+            outside = path.join(root, 'outside')
+            fs.mkdirSync(ws)
+            fs.mkdirSync(outside)
+            fs.writeFileSync(path.join(outside, 'notes.md'), 'synthetic fixture only')
+            testFeatures.workspace.fs.exists = async (filePath: string) => fs.existsSync(filePath)
+            testFeatures.workspace.fs.readdir = async (dirPath: string) =>
+                fs.promises.readdir(dirPath, { withFileTypes: true })
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([ws])
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('includes default rule files inside the workspace', async () => {
+            fs.writeFileSync(path.join(ws, 'AmazonQ.md'), 'synthetic fixture only')
+            fs.mkdirSync(path.join(ws, '.amazonq', 'rules'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.amazonq', 'rules', 'team.md'), 'synthetic fixture only')
+
+            const ids = await collectIds()
+
+            assert.deepStrictEqual(ids.sort(), [
+                path.join(ws, '.amazonq', 'rules', 'team.md'),
+                path.join(ws, 'AmazonQ.md'),
+            ])
+        })
+
+        it('skips a default rule file that links outside the workspace', async function () {
+            if (!trySymlink(path.join(outside, 'notes.md'), path.join(ws, 'README.md'), 'file')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [])
+        })
+
+        it('skips a rules folder that links outside the workspace', async function () {
+            fs.mkdirSync(path.join(ws, '.amazonq'))
+            if (!trySymlink(outside, path.join(ws, '.amazonq', 'rules'), 'dir')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [])
+        })
+
+        it('skips a relative resource that resolves outside the workspace', async () => {
+            fs.mkdirSync(path.join(ws, 'docs'))
+            fs.writeFileSync(path.join(ws, 'docs', 'notes.md'), 'synthetic fixture only')
+
+            const ids = await collectIds(['file://docs/notes.md', 'file://../outside/notes.md'])
+
+            assert.deepStrictEqual(ids, [path.join(ws, 'docs', 'notes.md')])
+        })
+
+        it('still includes an absolute resource, which only the global agent config can add', async () => {
+            const absolutePath = path.join(outside, 'notes.md')
+
+            // Written as in an agent config: file:///abs/path, or file://C:/abs/path on Windows
+            const ids = await collectIds(['file://' + absolutePath.replace(/\\/g, '/')])
+
+            assert.deepStrictEqual(ids, [absolutePath])
+        })
+
+        it('skips a file inside the rules folder that links outside the workspace', async function () {
+            fs.mkdirSync(path.join(ws, '.amazonq', 'rules'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.amazonq', 'rules', 'team.md'), 'synthetic fixture only')
+            if (!trySymlink(path.join(outside, 'notes.md'), path.join(ws, '.amazonq', 'rules', 'linked.md'), 'file')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [path.join(ws, '.amazonq', 'rules', 'team.md')])
         })
     })
 

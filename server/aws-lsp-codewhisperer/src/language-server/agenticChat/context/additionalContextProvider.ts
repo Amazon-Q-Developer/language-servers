@@ -34,6 +34,7 @@ import { ChatMessage, ImageBlock, ImageFormat } from '@amzn/codewhisperer-stream
 import { getRelativePathWithUri, getRelativePathWithWorkspaceFolder } from '../../workspaceContext/util'
 import { isSupportedImageExtension, MAX_IMAGE_CONTEXT_COUNT } from '../../../shared/imageVerification'
 import { MemoryBankController } from './memorybank/memoryBankController'
+import { canonicalizeWorkspaceFolders, resolveSymlinkAwarePath } from '../tools/toolShared'
 
 export const ACTIVE_EDITOR_CONTEXT_ID = 'active-editor'
 
@@ -180,6 +181,14 @@ export class AdditionalContextProvider {
     }
 
     /**
+     * True when `filePath` is inside `workspaceFolder` after following symlinks
+     */
+    private async isInWorkspaceFolder(filePath: string, workspaceFolder: string): Promise<boolean> {
+        const [canonicalFolder] = await canonicalizeWorkspaceFolders([workspaceFolder])
+        return workspaceUtils.isInWorkspace([canonicalFolder], await resolveSymlinkAwarePath(filePath))
+    }
+
+    /**
      * Internal method to collect workspace rules without tab filtering.
      * Resolves paths from agentConfig.resources when available, falling back to hardcoded defaults.
      */
@@ -218,7 +227,7 @@ export class AdditionalContextProvider {
                 if (resolved.endsWith(path.join('.amazonq', 'rules', '**', '*.md'))) {
                     const rulesPath = path.join(workspaceFolder, '.amazonq', 'rules')
                     const folderExists = await this.features.workspace.fs.exists(rulesPath)
-                    if (folderExists) {
+                    if (folderExists && (await this.isInWorkspaceFolder(rulesPath, workspaceFolder))) {
                         await this.collectMarkdownFilesRecursively(workspaceFolder, rulesPath, rulesFiles, seenIds)
                     }
                     continue
@@ -250,7 +259,7 @@ export class AdditionalContextProvider {
                     continue
                 }
                 const exists = await this.features.workspace.fs.exists(resolved)
-                if (exists) {
+                if (exists && (await this.isInWorkspaceFolder(resolved, workspaceFolder))) {
                     seenIds.add(resolved)
                     rulesFiles.push({
                         workspaceFolder,

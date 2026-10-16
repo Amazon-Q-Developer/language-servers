@@ -268,6 +268,43 @@ describe('loadAgentConfig', () => {
         expect(serverConfig?.args).to.deep.equal(['arg1', 'arg2'])
         expect(serverConfig?.env).to.deep.equal({ TEST_ENV: 'value' })
     })
+
+    it('ignores absolute resources from a workspace agent config', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        const config = (resources: string[]) =>
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources })
+        fs.mkdirSync(path.dirname(globalPath), { recursive: true })
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(globalPath, config(['file:///global/rules.md']))
+        fs.writeFileSync(
+            workspacePath,
+            config(['file://docs/rules.md', 'file:///other/rules.md', 'file://C:/other/rules.md'])
+        )
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath, globalPath], null, false)
+
+        expect(result.agentConfig.resources).to.have.members(['file://docs/rules.md', 'file:///global/rules.md'])
+    })
+
+    it('keeps other workspace resource entries and skips duplicates and non-strings', async () => {
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(
+            workspacePath,
+            JSON.stringify({
+                name: 'test-agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                resources: ['docs/notes.md', 'file://docs/rules.md', 'file://docs/rules.md', 42, null],
+            })
+        )
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath], null, false)
+
+        expect(result.agentConfig.resources).to.deep.equal(['docs/notes.md', 'file://docs/rules.md'])
+    })
 })
 
 describe('path helpers', () => {

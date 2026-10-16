@@ -232,6 +232,15 @@ const DEFAULT_PERSONA_RAW = `{
   }
 }`
 
+/** True for a file:// resource with an absolute path, such as file:///abs/path or file://C:/path */
+function isAbsoluteFileResource(resource: string): boolean {
+    if (!resource.startsWith('file://')) {
+        return false
+    }
+    const resourcePath = resource.slice('file://'.length)
+    return path.isAbsolute(resourcePath) || resourcePath.startsWith('/') || /^[a-zA-Z]:/.test(resourcePath)
+}
+
 /**
  * Load, validate, and parse agent configurations from JSON files.
  * - If both global and workspace files are missing, create a default global.
@@ -408,12 +417,17 @@ export async function loadAgentConfig(
             }
         }
 
-        // 5b) Process resources
+        // 5b) Process resources. Files outside the workspace can only come from the global config.
         if (Array.isArray(json.resources)) {
             for (const resource of json.resources) {
-                if (typeof resource === 'string' && !agentConfig.resources!.includes(resource)) {
-                    agentConfig.resources!.push(resource)
+                if (typeof resource !== 'string' || agentConfig.resources!.includes(resource)) {
+                    continue
                 }
+                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                    logging.warn(`Ignoring an absolute resource path in agent config at ${fsPath}`)
+                    continue
+                }
+                agentConfig.resources!.push(resource)
             }
         }
 
