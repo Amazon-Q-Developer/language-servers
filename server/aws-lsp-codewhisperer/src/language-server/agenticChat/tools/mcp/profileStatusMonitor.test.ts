@@ -321,6 +321,91 @@ describe('ProfileStatusMonitor', () => {
         })
     })
 
+    describe('GetProfile call coalescing', () => {
+        let mockServiceManager: any
+        let getProfileStub: sinon.SinonStub
+
+        const profileResponse = {
+            profile: {
+                optInFeatures: {
+                    mcpConfiguration: {
+                        toggle: 'ON',
+                    },
+                },
+            },
+        }
+
+        beforeEach(() => {
+            getProfileStub = sinon.stub().resolves(profileResponse)
+            mockServiceManager = {
+                getActiveProfileArn: sinon.stub().returns('arn:aws:iam::123456789012:profile/test'),
+                getCodewhispererService: sinon.stub().returns({ getProfile: getProfileStub }),
+                getConnectionType: sinon.stub().returns('builderId'),
+            }
+
+            sinon
+                .stub(AmazonQTokenServiceManagerModule.AmazonQTokenServiceManager, 'getInstance')
+                .returns(mockServiceManager as any)
+        })
+
+        it('should share a single GetProfile call between concurrent checks', async () => {
+            const first = (profileStatusMonitor as any).isMcpEnabled()
+            const second = (profileStatusMonitor as any).isMcpEnabled()
+
+            const results = await Promise.all([first, second])
+
+            expect(results).to.deep.equal([true, true])
+            expect(getProfileStub.callCount).to.equal(1)
+        })
+
+        it('should allow a new check once the previous one has completed', async () => {
+            await (profileStatusMonitor as any).isMcpEnabled()
+            await (profileStatusMonitor as any).isMcpEnabled()
+
+            expect(getProfileStub.callCount).to.equal(2)
+        })
+
+        it('should not repeat GetProfile for the same profile within the auth event cooldown', async () => {
+            await (profileStatusMonitor as any).onAuthSuccess()
+            await (profileStatusMonitor as any).onAuthSuccess()
+            await (profileStatusMonitor as any).onAuthSuccess()
+
+            expect(getProfileStub.callCount).to.equal(1)
+
+            clock.tick(ProfileStatusMonitor.AUTH_EVENT_MIN_INTERVAL_MS)
+            await (profileStatusMonitor as any).onAuthSuccess()
+
+            expect(getProfileStub.callCount).to.equal(2)
+        })
+
+        it('should check immediately when the active profile changes', async () => {
+            await (profileStatusMonitor as any).onAuthSuccess()
+            expect(getProfileStub.callCount).to.equal(1)
+
+            mockServiceManager.getActiveProfileArn.returns('arn:aws:iam::123456789012:profile/other')
+            await (profileStatusMonitor as any).onAuthSuccess()
+
+            expect(getProfileStub.callCount).to.equal(2)
+        })
+
+        it('should apply the cooldown even when the check fails', async () => {
+            const serverError = Object.assign(new Error('Internal error'), { statusCode: 500 })
+            getProfileStub.rejects(serverError)
+
+            const firstAttempt = (profileStatusMonitor as any).onAuthSuccess()
+            // retryWithBackoff waits between attempts; advance the fake clock so it can finish
+            await clock.tickAsync(5000)
+            await firstAttempt
+            const callsAfterFirstEvent = getProfileStub.callCount
+            expect(callsAfterFirstEvent).to.be.greaterThan(0)
+
+            await (profileStatusMonitor as any).onAuthSuccess()
+
+            expect(getProfileStub.callCount).to.equal(callsAfterFirstEvent)
+            expect(mockLogging.debug.calledWith(sinon.match('checked recently'))).to.be.true
+        })
+    })
+
     describe('isEnterpriseUser', () => {
         let mockServiceManager: any
 
