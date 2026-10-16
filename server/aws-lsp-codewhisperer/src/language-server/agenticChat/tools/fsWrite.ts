@@ -117,6 +117,7 @@ export class FsWrite {
         return requiresPathAcceptance(params.path, 'fsWrite', this.workspace, this.logging, approvedPaths, {
             flagMultiplyLinkedFiles: 'modify',
             approvedLinkedFiles,
+            flagConfigFiles: true,
         })
     }
 

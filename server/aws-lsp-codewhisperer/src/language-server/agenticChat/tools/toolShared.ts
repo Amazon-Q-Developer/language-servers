@@ -1,7 +1,7 @@
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { workspaceUtils } from '@aws/lsp-core'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
-import { sanitize } from '@aws/lsp-core/out/util/path'
+import { sanitize, getUserHomeDir } from '@aws/lsp-core/out/util/path'
 import * as fs from 'fs'
 import * as path from 'path'
 import { CommandCategory } from './executeBash'
@@ -197,6 +197,299 @@ export const multiplyLinkedFileWarning = (access: FileAccessKind): string =>
  */
 export type ApprovedLinkedFiles = ReadonlyMap<string, readonly ExistingFileTarget[]>
 
+export const configFileWarning = 'This file is part of the Amazon Q, editor, or Git configuration.'
+
+// Folders inside a workspace that hold Amazon Q, editor, or Git configuration
+const configFolderNames = new Set(['.amazonq', '.vscode', '.git'])
+
+// How many folder levels to search for links inside each configuration folder. Git keeps the hooks
+// of submodules three levels down (modules/<name>/hooks); its object and log folders are large and
+// hold no configuration.
+const linkSearchDepth: Record<string, number> = { '.amazonq': 8, '.vscode': 8, '.git': 3 }
+const skippedGitFolders = new Set(['objects', 'lfs', 'logs'])
+
+// The most entries to read when searching one configuration folder for links
+const maxLinkSearchEntries = 2000
+// Configuration folders whose link search stopped at that limit, logged once each
+const truncatedLinkSearches = new Set<string>()
+
+// Rules file that Amazon Q loads from the root of each workspace folder
+const rootRulesFileName = 'AmazonQ.md'
+
+// Configuration links whose target can't be resolved, logged once each
+const unresolvedConfigLinks = new Set<string>()
+
+/**
+ * Where a link in or to a configuration location resolves to, or undefined when it can't be resolved,
+ * such as a link to itself or a path through a file or a folder that can't be read. Nothing can be
+ * written at such a target, so the link is skipped.
+ */
+async function resolveConfigLinkTarget(linkPath: string, logging?: Features['logging']): Promise<string | undefined> {
+    try {
+        return await resolveSymlinkAwarePath(linkPath)
+    } catch (error) {
+        if (!unresolvedConfigLinks.has(linkPath)) {
+            unresolvedConfigLinks.add(linkPath)
+            logging?.debug(
+                `Skipping configuration link ${linkPath}, which can't be resolved: ${(error as NodeJS.ErrnoException).code ?? 'error'}`
+            )
+        }
+        return undefined
+    }
+}
+
+/**
+ * On Windows, the name that the file system opens for `name`: without trailing dots or spaces, or a
+ * `:` stream suffix. Elsewhere, `name` itself.
+ */
+function windowsFileName(name: string): string {
+    return process.platform === 'win32' ? name.replace(/:.*$/, '').replace(/[. ]+$/, '') : name
+}
+
+/** The path relative to `folder` when `filePath` is inside it, otherwise undefined */
+function pathInside(folder: string, filePath: string): string | undefined {
+    // Case-insensitive where the file system usually is, as in isSamePath
+    const comparable = (value: string) =>
+        process.platform === 'win32' || process.platform === 'darwin' ? value.toLowerCase() : value
+    const relativePath = path.relative(comparable(folder), comparable(filePath))
+    if (
+        !relativePath ||
+        relativePath === '..' ||
+        relativePath.startsWith('..' + path.sep) ||
+        path.isAbsolute(relativePath)
+    ) {
+        return undefined
+    }
+    return relativePath
+}
+
+/** The git directory that a .git file names on its `gitdir:` line */
+async function resolveGitDirFile(gitFile: string): Promise<string | undefined> {
+    try {
+        const handle = await fs.promises.open(gitFile, 'r')
+        try {
+            const buffer = Buffer.alloc(4096)
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+            const firstLine = buffer.toString('utf8', 0, bytesRead).split(/\r?\n/, 1)[0]
+            const gitDir = /^gitdir:(.*)$/.exec(firstLine)?.[1].trim()
+            return gitDir ? await resolveSymlinkAwarePath(path.resolve(path.dirname(gitFile), gitDir)) : undefined
+        } finally {
+            await handle.close()
+        }
+    } catch {
+        return undefined
+    }
+}
+
+/**
+ * Where a configuration folder entry resolves to when it is a link, or the git directory that a
+ * .git file names. Undefined for an ordinary folder or a missing entry.
+ */
+async function resolveConfigLink(entryPath: string, logging?: Features['logging']): Promise<string | undefined> {
+    let stats: fs.Stats
+    try {
+        stats = await fs.promises.lstat(entryPath)
+    } catch {
+        return undefined
+    }
+    if (stats.isSymbolicLink()) {
+        return resolveConfigLinkTarget(entryPath, logging)
+    }
+    return stats.isFile() && path.basename(entryPath) === '.git' ? resolveGitDirFile(entryPath) : undefined
+}
+
+/**
+ * Where the links inside a configuration folder resolve to, down to `depth` folder levels. The search
+ * goes breadth first, so that a large folder cannot hide the links nearest the top.
+ */
+async function linkedLocationsInside(
+    folder: string,
+    depth: number,
+    isGitFolder: boolean,
+    logging?: Features['logging']
+): Promise<string[]> {
+    const links: string[] = []
+    let remainingEntries = maxLinkSearchEntries
+    let dirs = [folder]
+    search: for (let level = 0; dirs.length > 0 && level <= depth; level++) {
+        const nextDirs: string[] = []
+        for (const dir of dirs) {
+            let entries: fs.Dirent[]
+            try {
+                entries = await fs.promises.readdir(dir, { withFileTypes: true })
+            } catch {
+                continue
+            }
+            for (const entry of entries) {
+                if (--remainingEntries < 0) {
+                    if (!truncatedLinkSearches.has(folder)) {
+                        truncatedLinkSearches.add(folder)
+                        logging?.warn(`Searched only the first ${maxLinkSearchEntries} entries of ${folder} for links`)
+                    }
+                    break search
+                }
+                const entryPath = path.join(dir, entry.name)
+                if (entry.isSymbolicLink()) {
+                    links.push(entryPath)
+                } else if (
+                    entry.isDirectory() &&
+                    level < depth &&
+                    !(isGitFolder && skippedGitFolders.has(entry.name))
+                ) {
+                    nextDirs.push(entryPath)
+                }
+            }
+        }
+        dirs = nextDirs
+    }
+    const targets = await Promise.all(links.map(link => resolveConfigLinkTarget(link, logging)))
+    return targets.filter((target): target is string => target !== undefined)
+}
+
+/** True for a Git directory: a folder with a HEAD file and objects and refs folders */
+async function isGitDirectory(dir: string): Promise<boolean> {
+    const [head, objects, refs] = await Promise.all(
+        ['HEAD', 'objects', 'refs'].map(name => fs.promises.stat(path.join(dir, name)).catch(() => undefined))
+    )
+    return !!head?.isFile() && !!objects?.isDirectory() && !!refs?.isDirectory()
+}
+
+/**
+ * Where the configuration folders of each workspace folder resolve to, including the git directory
+ * a .git file names and the targets of links inside the folders, and the global configuration
+ * folder and the targets of links inside it.
+ */
+async function configFolderLocations(
+    canonicalWorkspaceFolders: string[],
+    logging?: Features['logging']
+): Promise<string[]> {
+    const locations = await Promise.all([
+        ...canonicalWorkspaceFolders.flatMap(folder =>
+            [...configFolderNames].map(async name => {
+                const folderPath = path.join(folder, name)
+                const [location, linked] = await Promise.all([
+                    resolveConfigLinkTarget(folderPath, logging),
+                    resolveConfigLink(folderPath, logging),
+                ])
+                const searched = linked ?? location
+                if (searched === undefined) {
+                    return []
+                }
+                return [
+                    ...(location === undefined ? [] : [location]),
+                    searched,
+                    ...(await linkedLocationsInside(searched, linkSearchDepth[name], name === '.git', logging)),
+                ]
+            })
+        ),
+        resolveConfigLinkTarget(path.join(getUserHomeDir(), '.aws', 'amazonq'), logging).then(async location =>
+            location === undefined
+                ? []
+                : [location, ...(await linkedLocationsInside(location, linkSearchDepth['.amazonq'], false, logging))]
+        ),
+    ])
+    return [...new Set(locations.flat())]
+}
+
+/**
+ * Where a configuration folder in a folder below the top of a workspace folder resolves to, when it
+ * is a link or a .git file, and where the links inside it resolve to.
+ */
+async function nestedConfigFolderLocations(
+    folderPath: string,
+    name: string,
+    logging?: Features['logging']
+): Promise<string[]> {
+    const linked = await resolveConfigLink(folderPath, logging)
+    const searched = linked ?? folderPath
+    const isFolder = (await fs.promises.stat(searched).catch(() => undefined))?.isDirectory()
+    return [
+        ...(linked === undefined ? [] : [linked]),
+        ...(isFolder ? await linkedLocationsInside(searched, linkSearchDepth[name], name === '.git', logging) : []),
+    ]
+}
+
+/**
+ * Configuration locations in the folders above `canonicalPath`, inside the workspace: where
+ * configuration folders there and the links inside them resolve to, the git directory a .git file
+ * there names, and any of those folders that is itself a Git directory.
+ */
+async function configLocationsAbove(
+    canonicalPath: string,
+    canonicalWorkspaceFolders: string[],
+    logging?: Features['logging']
+): Promise<string[]> {
+    const folders: string[] = []
+    for (
+        let dir = path.dirname(canonicalPath);
+        dir !== path.dirname(dir) && canonicalWorkspaceFolders.some(folder => pathInside(folder, dir) !== undefined);
+        dir = path.dirname(dir)
+    ) {
+        folders.push(dir)
+    }
+    const locations = await Promise.all([
+        ...folders.flatMap(dir =>
+            [...configFolderNames].map(name => nestedConfigFolderLocations(path.join(dir, name), name, logging))
+        ),
+        ...folders.map(async dir => ((await isGitDirectory(dir)) ? [dir] : [])),
+    ])
+    return locations.flat()
+}
+
+/**
+ * True when `canonicalPath` is inside a workspace folder and is Amazon Q, editor, or Git configuration:
+ * - in a configuration folder there, by the name of a folder on the path, or because it is where a
+ *   top-level configuration folder, a link inside one, a configuration folder in a folder above the
+ *   path or a link inside it, or the git directory named by a .git file resolves to
+ * - in a Git directory, such as a bare repository or the Git directory of a nested repository
+ * - the AmazonQ.md rules file at the root of a workspace folder, or the file it links to
+ * - in the global Amazon Q configuration folder (~/.aws/amazonq), or where a link inside it resolves
+ *   to, when the workspace includes it
+ */
+async function isInConfigFolder(
+    inputPath: string,
+    canonicalPath: string,
+    workspaceFolders: string[],
+    canonicalWorkspaceFolders: string[],
+    logging?: Features['logging']
+): Promise<boolean> {
+    // Paths outside the workspace keep the outside-workspace prompt
+    if (!workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)) {
+        return false
+    }
+
+    const hasConfigFolderName = (folder: string, filePath: string) =>
+        pathInside(folder, filePath)
+            ?.split(/[\\/]/)
+            .some(segment => configFolderNames.has(windowsFileName(segment).toLowerCase())) ?? false
+    const inputFullPath = path.resolve(sanitize(inputPath))
+    const folders = [...new Set([...workspaceFolders, ...canonicalWorkspaceFolders])]
+    if (
+        folders.some(folder => hasConfigFolderName(folder, canonicalPath) || hasConfigFolderName(folder, inputFullPath))
+    ) {
+        return true
+    }
+
+    const [locations, linkedAbove, rootRulesFiles] = await Promise.all([
+        configFolderLocations(canonicalWorkspaceFolders, logging),
+        configLocationsAbove(canonicalPath, canonicalWorkspaceFolders, logging),
+        Promise.all(
+            canonicalWorkspaceFolders.map(folder =>
+                resolveConfigLinkTarget(path.join(folder, rootRulesFileName), logging)
+            )
+        ),
+    ])
+    const isRulesFile = (rulesFile: string | undefined) =>
+        rulesFile !== undefined &&
+        isSamePath(path.dirname(rulesFile), path.dirname(canonicalPath)) &&
+        isSamePath(path.basename(rulesFile), windowsFileName(path.basename(canonicalPath)))
+    return (
+        [...locations, ...linkedAbove].some(
+            location => isSamePath(location, canonicalPath) || pathInside(location, canonicalPath) !== undefined
+        ) || rootRulesFiles.some(isRulesFile)
+    )
+}
+
 export interface PathAcceptanceOptions {
     /**
      * Require approval for an in-workspace path that resolves to a file with
@@ -210,6 +503,11 @@ export interface PathAcceptanceOptions {
      * it is listed here for the tool: the same file, with no more names than when it was approved.
      */
     approvedLinkedFiles?: ApprovedLinkedFiles
+    /**
+     * Require approval for Amazon Q, editor, or Git configuration inside the workspace (see
+     * isInConfigFolder), unless that exact path is approved. Set by tools that modify files.
+     */
+    flagConfigFiles?: boolean
 }
 
 /**
@@ -249,10 +547,11 @@ export interface CommandValidation {
     /**
      * Why acceptance is required, when the reason is not simply that the path
      * lies outside the workspace. The confirmation prompt uses this to describe
-     * the right situation: a multiply linked path is inside the workspace, so
-     * the usual "outside of your workspace" wording would be wrong.
+     * the right situation: a multiply linked path or a configuration file is
+     * inside the workspace, so the usual "outside of your workspace" wording
+     * would be wrong.
      */
-    acceptanceReason?: 'multiplyLinkedFile'
+    acceptanceReason?: 'multiplyLinkedFile' | 'configFile'
     /**
      * The canonical on-disk paths the check evaluated, in input order. Callers
      * that go on to act on these paths must use exactly these values rather
@@ -412,6 +711,7 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
  * Returns true when the file is not resolvable within our workspace (i.e., is outside of our workspace).
  * If the path or one of its parent directories has already been approved (in approvedPaths), returns false.
  * A credential or system path (see needsExactApproval) returns false only when that exact path has been approved.
+ * With flagConfigFiles, a configuration file in the workspace returns false only when that exact path has been approved.
  * With flagMultiplyLinkedFiles, a file with more than one hard link returns true unless it is listed in
  * approvedLinkedFiles; an approval of the path or a folder above it does not cover it.
  *
@@ -458,6 +758,22 @@ export async function requiresPathAcceptance(
                     ? BigInt(target.linkCount) > 1n
                     : target.state === 'unverified' && (await hasAdditionalHardLinks(canonicalPath))
             return multiplyLinked ? multiplyLinkedFileWarning(access) : undefined
+        }
+
+        // Configuration files need an approval of the exact path
+        if (options?.flagConfigFiles && !isPathExactlyApproved(canonicalPath, toolName, approvedPaths)) {
+            const folders = getWorkspaceFolderPaths(workspace) ?? []
+            const canonicalFolders = await canonicalizeWorkspaceFolders(folders)
+            if (await isInConfigFolder(inputPath, canonicalPath, folders, canonicalFolders, logging)) {
+                // A configuration file can also share its data with another name on disk
+                const sharedFileWarning = await linkedFileWarning()
+                return {
+                    requiresAcceptance: true,
+                    warning: sharedFileWarning ? `${configFileWarning}\n\n${sharedFileWarning}` : configFileWarning,
+                    acceptanceReason: 'configFile',
+                    ...checked,
+                }
+            }
         }
 
         // Credential and system paths need an approval of the exact path

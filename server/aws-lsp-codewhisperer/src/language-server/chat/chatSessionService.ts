@@ -34,7 +34,6 @@ type DeferredHandler = {
 export class ChatSessionService {
     public pairProgrammingMode: boolean = true
     public contextListSent: boolean = false
-    public isMemoryBankGeneration: boolean = false
     #modelId: string | undefined
     #lsp?: Features['lsp']
     #abortController?: AbortController

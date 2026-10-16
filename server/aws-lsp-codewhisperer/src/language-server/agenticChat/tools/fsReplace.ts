@@ -80,6 +80,7 @@ export class FsReplace {
         return requiresPathAcceptance(params.path, 'fsReplace', this.workspace, this.logging, approvedPaths, {
             flagMultiplyLinkedFiles: 'modify',
             approvedLinkedFiles,
+            flagConfigFiles: true,
         })
     }
 
