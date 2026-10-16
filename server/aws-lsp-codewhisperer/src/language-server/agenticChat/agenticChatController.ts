@@ -2052,6 +2052,28 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     /**
+     * Approved paths for a memory bank generation request, which also include the memory
+     * bank files. The user asked for these files, so writing them does not ask again.
+     */
+    async #withMemoryBankFiles(approvedPaths: Map<string, Set<string>>): Promise<Map<string, Set<string>>> {
+        const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+        if (!workspaceFolders.length) {
+            return approvedPaths
+        }
+
+        const memoryBankFilePaths = await Promise.all(
+            this.#memoryBankController
+                .getMemoryBankFilePaths(workspaceFolders[0])
+                .map(filePath => resolveSymlinkAwarePath(sanitize(filePath)))
+        )
+        const result = new Map(approvedPaths)
+        for (const toolName of [FS_WRITE, FS_REPLACE]) {
+            result.set(toolName, new Set([...(approvedPaths.get(toolName) ?? []), ...memoryBankFilePaths]))
+        }
+        return result
+    }
+
+    /**
      * Processes tool uses by running the tools and collecting results
      */
     async processToolUses(
@@ -2142,7 +2164,9 @@ export class AgenticChatController implements ChatHandlers {
                         // const builtInPermission = permission !== 'alwaysAllow'
 
                         // Get the approved paths from the session
-                        const approvedPaths = session.approvedPaths
+                        const approvedPaths = session.isMemoryBankGeneration
+                            ? await this.#withMemoryBankFiles(session.approvedPaths)
+                            : session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
                         const {
@@ -3281,10 +3305,10 @@ export class AgenticChatController implements ChatHandlers {
         acceptanceReason?: CommandValidation['acceptanceReason']
     ): ChatResult {
         const toolName = toolType || toolUse.name
-        // A multiply linked path is inside the workspace, so the filesystem
-        // prompts below describe the shared file rather than a location outside
-        // the workspace.
-        const isMultiplyLinkedFile = acceptanceReason === 'multiplyLinkedFile'
+        // A multiply linked path or a configuration file is inside the workspace,
+        // so the filesystem prompts below do not describe a location outside the
+        // workspace.
+        const isInWorkspacePath = acceptanceReason !== undefined
         let buttons: Button[] = []
         let header: {
             body: string
@@ -3374,13 +3398,13 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
                         : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
@@ -3398,13 +3422,13 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
                         : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
@@ -3417,7 +3441,7 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'tools',
                     iconForegroundStatus: 'tools',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow read-only tools'
                             : '#### Allow read-only tools outside your workspace',
                     buttons,
@@ -3433,7 +3457,7 @@ export class AgenticChatController implements ChatHandlers {
                     const formattedPaths: string[] = []
                     paths.forEach(element => formattedPaths.push(`\`${element}\``))
                     body =
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? `I need permission to read files.\n${formattedPaths.join('\n')}`
                             : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
                 } else {

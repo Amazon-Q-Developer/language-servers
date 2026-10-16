@@ -177,6 +177,52 @@ export const multiplyLinkedFileWarning = (access: FileAccessKind): string =>
         : 'This file is also reachable under another name on disk, which may be outside the ' +
           'workspace. Writing to it changes the contents under every name.'
 
+export const configFileWarning = 'This file is part of the Amazon Q, editor, or Git configuration.'
+
+// Folders inside a workspace that hold Amazon Q, editor, or Git configuration
+const configFolderNames = new Set(['.amazonq', '.vscode', '.git'])
+
+/**
+ * True when `canonicalPath` is inside a workspace folder and in a configuration folder there: by the
+ * name of a folder on the path, or because it is where a top-level configuration folder resolves to.
+ */
+async function isInConfigFolder(
+    inputPath: string,
+    canonicalPath: string,
+    workspaceFolders: string[],
+    canonicalWorkspaceFolders: string[]
+): Promise<boolean> {
+    // Paths outside the workspace keep the outside-workspace prompt
+    if (!workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)) {
+        return false
+    }
+
+    const hasConfigFolderName = (folder: string, filePath: string) => {
+        const relativePath = path.relative(folder, filePath)
+        if (!relativePath || relativePath === '..' || relativePath.startsWith('..' + path.sep)) {
+            return false
+        }
+        return (
+            !path.isAbsolute(relativePath) &&
+            relativePath.split(/[\\/]/).some(segment => configFolderNames.has(segment.toLowerCase()))
+        )
+    }
+    const inputFullPath = path.resolve(sanitize(inputPath))
+    const folders = [...new Set([...workspaceFolders, ...canonicalWorkspaceFolders])]
+    if (
+        folders.some(folder => hasConfigFolderName(folder, canonicalPath) || hasConfigFolderName(folder, inputFullPath))
+    ) {
+        return true
+    }
+
+    const configFolderLocations = await Promise.all(
+        canonicalWorkspaceFolders.flatMap(folder =>
+            [...configFolderNames].map(name => resolveSymlinkAwarePath(path.join(folder, name)))
+        )
+    )
+    return workspaceUtils.isInWorkspace(configFolderLocations, canonicalPath)
+}
+
 export interface PathAcceptanceOptions {
     /**
      * Require approval for an in-workspace path that resolves to a file with
@@ -185,6 +231,12 @@ export interface PathAcceptanceOptions {
      * 'read' by tools that return its contents.
      */
     flagMultiplyLinkedFiles?: FileAccessKind
+    /**
+     * Require approval for a path in an Amazon Q, editor, or Git configuration
+     * folder inside the workspace, unless that exact path is approved. Set by
+     * tools that modify files.
+     */
+    flagConfigFiles?: boolean
 }
 
 interface Output<Kind, Content> {
@@ -206,10 +258,11 @@ export interface CommandValidation {
     /**
      * Why acceptance is required, when the reason is not simply that the path
      * lies outside the workspace. The confirmation prompt uses this to describe
-     * the right situation: a multiply linked path is inside the workspace, so
-     * the usual "outside of your workspace" wording would be wrong.
+     * the right situation: a multiply linked path or a configuration file is
+     * inside the workspace, so the usual "outside of your workspace" wording
+     * would be wrong.
      */
-    acceptanceReason?: 'multiplyLinkedFile'
+    acceptanceReason?: 'multiplyLinkedFile' | 'configFile'
     /**
      * The canonical on-disk paths the check evaluated, in input order. Callers
      * that go on to act on these paths must use exactly these values rather
@@ -345,6 +398,7 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
  * Shared implementation to check if a file path requires user acceptance.
  * Returns true when the file is not resolvable within our workspace (i.e., is outside of our workspace).
  * If the path has already been approved (in approvedPaths), returns false.
+ * With flagConfigFiles, a configuration file in the workspace returns false only when that exact path has been approved.
  *
  * @param path The file path to check
  * @param toolName The name of the tool requesting access
@@ -377,6 +431,20 @@ export async function requiresPathAcceptance(
             : Object.freeze({ path: canonicalPath, state: 'unverified' })
         const checked = { canonicalPaths: [canonicalPath], checkedTargets: Object.freeze([target]) }
 
+        if (options?.flagConfigFiles && !approvedPaths?.get(toolName)?.has(canonicalPath)) {
+            const folders = getWorkspaceFolderPaths(workspace) ?? []
+            const canonicalFolders = await canonicalizeWorkspaceFolders(folders)
+            if (await isInConfigFolder(inputPath, canonicalPath, folders, canonicalFolders)) {
+                return {
+                    requiresAcceptance: true,
+                    warning: configFileWarning,
+                    acceptanceReason: 'configFile',
+                    ...checked,
+                }
+            }
+        }
+
+        // Then check if the path is already approved for this specific tool
         if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
             return { requiresAcceptance: false, ...checked }
         }
