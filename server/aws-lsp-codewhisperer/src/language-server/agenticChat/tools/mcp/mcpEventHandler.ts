@@ -150,6 +150,7 @@ export class McpEventHandler {
 
         // Transform server configs into DetailedListItem objects
         const activeItems: DetailedListItem[] = []
+        const consentDeniedItems: DetailedListItem[] = []
         const disabledItems: DetailedListItem[] = []
         const builtInItems: DetailedListItem[] = []
 
@@ -197,6 +198,11 @@ export class McpEventHandler {
 
             // Check if this server has validation errors
             const hasValidationErrors = serversWithErrors.has(serverName)
+            // Keep consent denial distinct from an explicitly disabled server.
+            const consentDenied =
+                !mcpManager.isServerDisabled(serverName) &&
+                serverState?.status === McpServerStatus.DISABLED &&
+                serverState.lastError === 'consent not granted'
             const item: DetailedListItem = {
                 title: serverName,
                 description: `Command: ${config.command}`,
@@ -217,7 +223,9 @@ export class McpEventHandler {
                 ],
             }
 
-            if (mcpManager.isServerDisabled(serverName)) {
+            if (consentDenied) {
+                consentDeniedItems.push({ ...item, description: 'consent not granted' })
+            } else if (mcpManager.isServerDisabled(serverName) || serverState?.status === McpServerStatus.DISABLED) {
                 disabledItems.push(item)
             } else {
                 activeItems.push({
@@ -240,6 +248,13 @@ export class McpEventHandler {
                         text: `${activeItems.length} servers with tools`,
                     },
                 ],
+            })
+        }
+
+        if (consentDeniedItems.length > 0) {
+            groups.push({
+                groupName: 'Denied',
+                children: consentDeniedItems,
             })
         }
 
