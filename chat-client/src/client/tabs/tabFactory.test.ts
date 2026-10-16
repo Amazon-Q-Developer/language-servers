@@ -3,6 +3,8 @@ import { TabFactory } from './tabFactory'
 import * as assert from 'assert'
 import { pairProgrammingPromptInput } from '../texts/pairProgramming'
 import { modelSelection } from '../texts/modelSelection'
+import { deprecationCard } from '../texts/deprecation'
+import { ChatMessage } from '@aws/language-server-runtimes-types'
 
 describe('tabFactory', () => {
     describe('getDefaultTabData', () => {
@@ -119,6 +121,53 @@ describe('tabFactory', () => {
             const result = tabFactory.createTab(false)
 
             assert.deepStrictEqual(result.promptInputOptions, [])
+        })
+    })
+
+    describe('getChatItems', () => {
+        it('shows the deprecation card in a new chat when it is active', () => {
+            const tabFactory = new TabFactory({})
+
+            const result = tabFactory.getChatItems(true, true)
+
+            assert.deepStrictEqual(result, [deprecationCard])
+        })
+
+        it('replaces the agentic feature card in agentic mode', () => {
+            const tabFactory = new TabFactory({})
+            tabFactory.enableAgenticMode()
+
+            const result = tabFactory.getChatItems(true, true)
+
+            assert.deepStrictEqual(result, [deprecationCard])
+        })
+
+        it('hides the deprecation card after it has been acknowledged', () => {
+            const tabFactory = new TabFactory({})
+            tabFactory.enableAgenticMode()
+
+            const result = tabFactory.getChatItems(true, false)
+
+            assert.deepStrictEqual(result, [])
+        })
+
+        it('does not add welcome cards to restored chats', () => {
+            const messages: ChatMessage[] = [
+                {
+                    body: 'Restored response',
+                    type: 'answer',
+                },
+            ]
+            const tabFactory = new TabFactory({})
+
+            const result = tabFactory.getChatItems(false, true, messages)
+
+            assert.equal(result.length, 1)
+            assert.equal(result[0].body, 'Restored response')
+            assert.equal(
+                result.some(item => item.messageId === deprecationCard.messageId),
+                false
+            )
         })
     })
 })
