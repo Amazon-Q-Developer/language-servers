@@ -2,7 +2,11 @@ import { expect } from 'chai'
 import * as sinon from 'sinon'
 import { AccessDeniedException, ResourceNotFoundException } from '@amazon/elastic-gumby-frontend-client'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
-import { classifyAtxSessionValidationError, EXPIRED_TOKEN_PHRASES } from '../atxSessionValidation'
+import {
+    classifyAtxSessionValidationError,
+    EXPIRED_TOKEN_PHRASES,
+    INVALID_SESSION_PHRASES,
+} from '../atxSessionValidation'
 import { ATXTransformHandler } from '../atxTransformHandler'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 
@@ -28,8 +32,11 @@ describe('classifyAtxSessionValidationError', () => {
             expect(result.HttpStatus).to.equal(403)
         })
 
-        it('recognizes AccessDeniedException with reason INVALID_SESSION', () => {
-            const error = serviceError('AccessDeniedException', 403, { reason: 'INVALID_SESSION' })
+        it('recognizes an expired-token phrase even with reason INVALID_SESSION', () => {
+            const error = serviceError('AccessDeniedException', 403, {
+                reason: 'INVALID_SESSION',
+                message: 'The security token included in the request is expired',
+            })
             expect(classifyAtxSessionValidationError(error).Reason).to.equal('ExpiredCredentials')
         })
 
@@ -59,6 +66,57 @@ describe('classifyAtxSessionValidationError', () => {
                 $metadata: { httpStatusCode: 403 },
             })
             expect(classifyAtxSessionValidationError(error).Reason).to.equal('MissingPermission')
+        })
+    })
+
+    describe('invalid session (SigV4)', () => {
+        // The FES messages, as sent (SigV4ProfileResolutionHandler and SigV4FeatureFlagHandler).
+        const cases: Array<[string, string]> = [
+            [
+                'SigV4 access is not enabled for this profile. Enable IAM authentication in profile preferences.',
+                'IamAuthNotEnabled',
+            ],
+            ['SigV4 access is not enabled for account 111122223333', 'IamAuthNotEnabledForAccount'],
+            ['Credentials do not match the provided tenant.', 'TenantMismatch'],
+        ]
+
+        for (const [message, reason] of cases) {
+            it(`maps "${message}" to ${reason}, not ExpiredCredentials`, () => {
+                const error = new AccessDeniedException({ message, $metadata: { httpStatusCode: 403 } })
+                Object.assign(error, { reason: 'INVALID_SESSION' })
+
+                const result = classifyAtxSessionValidationError(error)
+
+                expect(result).to.deep.equal({ Reason: reason, ErrorCode: 'AccessDeniedException', HttpStatus: 403 })
+            })
+        }
+
+        it('matches every listed phrase case-insensitively', () => {
+            for (const { phrase, reason } of INVALID_SESSION_PHRASES) {
+                const error = serviceError('AccessDeniedException', 403, { message: phrase.toUpperCase() })
+                expect(classifyAtxSessionValidationError(error).Reason).to.equal(reason)
+            }
+        })
+
+        it('reports INVALID_SESSION with an unrecognized message as Other', () => {
+            const error = serviceError('AccessDeniedException', 403, { reason: 'INVALID_SESSION', message: 'Reworded' })
+            expect(classifyAtxSessionValidationError(error).Reason).to.equal('Other')
+        })
+
+        it('reports INVALID_SESSION without a message as Other', () => {
+            const error = {
+                name: 'AccessDeniedException',
+                reason: 'INVALID_SESSION',
+                $metadata: { httpStatusCode: 403 },
+            }
+            expect(classifyAtxSessionValidationError(error).Reason).to.equal('Other')
+        })
+
+        it('never returns the account ID from the message', () => {
+            const error = serviceError('AccessDeniedException', 403, {
+                message: 'SigV4 access is not enabled for account 111122223333',
+            })
+            expect(JSON.stringify(classifyAtxSessionValidationError(error))).to.not.contain('111122223333')
         })
     })
 
@@ -179,6 +237,22 @@ describe('ATXTransformHandler.validateSession', () => {
         const logged = (logging.error as sinon.SinonStub).args.map(a => String(a[0])).join('\n')
         expect(logged).to.contain('reason=ExpiredCredentials')
         expect(logged).to.not.contain('security token')
+    })
+
+    it('never logs the FES message for an INVALID_SESSION failure', async () => {
+        const error = new AccessDeniedException({
+            message: 'SigV4 access is not enabled for account 111122223333',
+            $metadata: { httpStatusCode: 403 },
+        })
+        Object.assign(error, { reason: 'INVALID_SESSION' })
+        sendStub.rejects(error)
+
+        const result = await handler.validateSession()
+
+        expect(result.Reason).to.equal('IamAuthNotEnabledForAccount')
+        const logged = (logging.error as sinon.SinonStub).args.map(a => String(a[0])).join('\n')
+        expect(logged).to.contain('reason=IamAuthNotEnabledForAccount')
+        expect(logged).to.not.contain('111122223333').and.to.not.contain('SigV4 access')
     })
 
     it('fails without calling FES when the session is not ready', async () => {
