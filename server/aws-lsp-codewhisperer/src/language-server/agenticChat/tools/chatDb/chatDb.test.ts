@@ -92,6 +92,52 @@ describe('ChatDatabase', () => {
         })
     })
 
+    describe('addMessage', () => {
+        it('persists messageId and canBeVoted on an answer', async () => {
+            await chatDb.databaseInitialize(0)
+            const tabId = 'tab-vote-1'
+
+            chatDb.addMessage(tabId, 'cwc', 'conv-1', {
+                body: 'Question',
+                type: 'prompt' as any,
+                timestamp: new Date(),
+            })
+            chatDb.addMessage(tabId, 'cwc', 'conv-1', {
+                body: 'Answer',
+                type: 'answer' as any,
+                messageId: 'message-1',
+                canBeVoted: true,
+                timestamp: new Date(),
+            })
+
+            const messages = chatDb.getMessages(tabId, 250)
+            assert.strictEqual(messages.length, 2)
+            assert.strictEqual(messages[1].messageId, 'message-1')
+            assert.strictEqual(messages[1].canBeVoted, true)
+        })
+
+        it('preserves canBeVoted false rather than dropping the flag', async () => {
+            await chatDb.databaseInitialize(0)
+            const tabId = 'tab-vote-2'
+
+            chatDb.addMessage(tabId, 'cwc', 'conv-1', {
+                body: 'Question',
+                type: 'prompt' as any,
+                timestamp: new Date(),
+            })
+            chatDb.addMessage(tabId, 'cwc', 'conv-1', {
+                body: 'Answer',
+                type: 'answer' as any,
+                messageId: 'message-2',
+                canBeVoted: false,
+                timestamp: new Date(),
+            })
+
+            const messages = chatDb.getMessages(tabId, 250)
+            assert.strictEqual(messages[1].canBeVoted, false)
+        })
+    })
+
     describe('replaceWithSummary', () => {
         it('should create a new history with summary message', async () => {
             await chatDb.databaseInitialize(0)

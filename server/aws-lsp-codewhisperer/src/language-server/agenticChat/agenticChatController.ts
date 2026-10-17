@@ -1675,6 +1675,8 @@ export class AgenticChatController implements ChatHandlers {
                     this.#chatHistoryDb.addMessage(tabId, 'cwc', conversationIdentifier ?? '', {
                         body: result.data?.chatResult.body,
                         type: 'answer' as ChatMessage['type'],
+                        messageId: result.data?.chatResult.messageId,
+                        canBeVoted: result.data?.chatResult.canBeVoted,
                         codeReference: result.data.chatResult.codeReference,
                         relatedContent:
                             result.data.chatResult.relatedContent?.content &&

@@ -124,6 +124,12 @@ export type Message = {
     timestamp?: Date
     shouldDisplayMessage?: boolean
     images?: ImageBlock[]
+    /**
+     * Whether the message can be thumbed up/down. Persisted so that restoring a conversation
+     * from history keeps its feedback controls - mynah-ui only renders the vote buttons when
+     * `canBeVoted === true` and a `messageId` is present.
+     */
+    canBeVoted?: boolean
 }
 
 /**
@@ -211,6 +217,11 @@ export function messageToChatMessage(msg: Message): ChatMessage[] {
         {
             body: msg.body,
             type: msg.type,
+            messageId: msg.messageId,
+            // History written before canBeVoted was persisted has no stored value; fall back to the
+            // same rule the live stream uses (answers are votable) so restored conversations keep
+            // their feedback controls instead of silently losing them.
+            canBeVoted: msg.canBeVoted ?? (msg.type === 'answer' && msg.messageId !== undefined),
             codeReference: msg.codeReference,
             relatedContent:
                 msg.relatedContent && msg.relatedContent?.content.length > 0 ? msg.relatedContent : undefined,

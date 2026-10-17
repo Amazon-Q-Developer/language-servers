@@ -106,6 +106,8 @@ describe('ChatDb Utilities', () => {
                 {
                     body: 'Hello',
                     type: 'prompt',
+                    messageId: undefined,
+                    canBeVoted: false,
                     codeReference: [
                         { url: 'test.js', recommendationContentSpan: { start: 10, end: 15 }, information: '' },
                     ],
@@ -127,10 +129,98 @@ describe('ChatDb Utilities', () => {
                 {
                     body: 'Hello',
                     type: 'prompt',
+                    messageId: undefined,
+                    canBeVoted: false,
                     relatedContent: undefined,
                     codeReference: undefined,
                 },
             ])
+        })
+
+        it('should restore messageId and canBeVoted for an answer', () => {
+            const message: Message = {
+                body: 'Answer',
+                type: 'answer',
+                messageId: 'message-1',
+                canBeVoted: true,
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].messageId, 'message-1')
+            assert.strictEqual(result[0].canBeVoted, true)
+        })
+
+        it('should default canBeVoted to true for answers persisted before the flag was stored', () => {
+            const message: Message = {
+                body: 'Answer',
+                type: 'answer',
+                messageId: 'message-1',
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].canBeVoted, true)
+        })
+
+        it('should not default canBeVoted to true without a messageId', () => {
+            // mynah-ui requires both canBeVoted === true and a messageId; claiming votability
+            // without an id would render nothing and misreport the message as votable.
+            const message: Message = {
+                body: 'Answer',
+                type: 'answer',
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].canBeVoted, false)
+        })
+
+        it('should honour a persisted canBeVoted of false', () => {
+            const message: Message = {
+                body: 'Answer',
+                type: 'answer',
+                messageId: 'message-1',
+                canBeVoted: false,
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].canBeVoted, false)
+        })
+
+        it('should not mark prompts as votable', () => {
+            const message: Message = {
+                body: 'Hello',
+                type: 'prompt',
+                messageId: 'message-1',
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].canBeVoted, false)
+        })
+
+        it('should keep tool messages keyed on their own toolUseId', () => {
+            const message: Message = {
+                body: 'Answer',
+                type: 'answer',
+                messageId: 'message-1',
+                canBeVoted: true,
+                toolUses: [
+                    {
+                        toolUseId: 'tool-use-1',
+                        name: 'executeBash',
+                        input: { command: 'ls' } as any,
+                    },
+                ],
+            }
+
+            const result = messageToChatMessage(message)
+
+            assert.strictEqual(result[0].messageId, 'message-1')
+            assert.strictEqual(result[1].messageId, 'tool-use-1')
+            assert.strictEqual(result[1].canBeVoted, undefined)
         })
     })
 
