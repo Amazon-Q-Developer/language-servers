@@ -199,6 +199,13 @@ export class ExecuteBash {
                 }
             }
 
+            // Tokenization does not evaluate shell expansions. Check the raw command
+            // conservatively, including quoted or escaped markers, before interpreting paths.
+            const expansionPattern = IS_WINDOWS_PLATFORM ? /[%!]/ : /[$`]/
+            if (expansionPattern.test(params.command)) {
+                return { requiresAcceptance: true }
+            }
+
             const args = split(params.command)
             if (!args || args.length === 0) {
                 return { requiresAcceptance: true }

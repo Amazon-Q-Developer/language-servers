@@ -878,6 +878,62 @@ describe('ExecuteBash requiresAcceptance ReadOnly path handling (expanded, real 
         assert.equal(result.requiresAcceptance, false)
     })
 
+    describe('shell argument handling', () => {
+        // Only the approval decision is evaluated; none of these commands are executed.
+        const commands =
+            process.platform === 'win32'
+                ? [
+                      'type %USERPROFILE%/report.txt',
+                      'type "%USERPROFILE%/report.txt"',
+                      'type !REPORT_PATH!',
+                      'type "!REPORT_PATH!"',
+                      'type %REPORT_PATH:old=new%',
+                      'dir /b %DATA_DIR%/reports',
+                      'type %REPORT_PATH%',
+                      'type ^%REPORT_PATH^%',
+                  ]
+                : [
+                      'cat $HOME/report.txt',
+                      'cat ${HOME}/report.txt',
+                      'cat "$HOME/report.txt"',
+                      'cat "${HOME}/report.txt"',
+                      'head -n 5 $DATA_DIR/report.txt',
+                      'cat $REPORT_PATH',
+                      'cat ${REPORT_PATH:-report.txt}',
+                      'cat ${!REPORT_PATH}',
+                      'ls --directory=$DATA_DIR',
+                      'cat "$(pwd)/report.txt"',
+                      'cat "`pwd`/report.txt"',
+                      'head -n $((1+1)) report.txt',
+                      "cat '$HOME/report.txt'",
+                      'cat \\$HOME/report.txt',
+                  ]
+
+        for (const command of commands) {
+            it(`requires acceptance for ${command}`, async () => {
+                const tool = makeExecBash(ws)
+                const result = await tool.requiresAcceptance({ command, cwd: ws })
+                assert.equal(result.requiresAcceptance, true)
+
+                const approvedPaths = new Map([['executeBash', new Set([ws])]])
+                const approvedResult = await tool.requiresAcceptance({ command, cwd: ws }, approvedPaths)
+                assert.equal(approvedResult.requiresAcceptance, true, 'a path approval does not resolve command text')
+            })
+        }
+
+        it('requires acceptance even without a cwd or a path-shaped argument', async () => {
+            const command = process.platform === 'win32' ? 'type %REPORT_PATH%' : 'cat $REPORT_PATH'
+            const result = await makeExecBash(ws).requiresAcceptance({ command })
+            assert.equal(result.requiresAcceptance, true)
+        })
+
+        it('requires acceptance for a later command containing expansion markers', async () => {
+            const command = process.platform === 'win32' ? 'dir && type %REPORT_PATH%' : 'pwd && cat $REPORT_PATH'
+            const result = await makeExecBash(ws).requiresAcceptance({ command, cwd: ws })
+            assert.equal(result.requiresAcceptance, true)
+        })
+    })
+
     // The same verbs must all flag a bare-relative symlink whose target escapes
     // the workspace: the boundary check runs on the canonical (resolved) target,
     // not on the in-workspace link name.

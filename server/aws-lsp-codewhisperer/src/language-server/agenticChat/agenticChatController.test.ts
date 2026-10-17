@@ -3571,6 +3571,104 @@ ${' '.repeat(8)}}
         })
     })
 
+    describe('shell command approval', () => {
+        const command = process.platform === 'win32' ? 'type %REPORT_PATH%' : 'cat $REPORT_PATH'
+        let stream: any
+        let session: any
+        let run: sinon.SinonStub
+
+        beforeEach(() => {
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: 'executeBash', description: 'shell' } },
+            ])
+            ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns(['executeBash'])
+            run = testFeatures.agent.runTool as sinon.SinonStub
+            run.resolves({ output: { kind: 'json', content: { exitStatus: '0', stdout: '', stderr: '' } } })
+            stream = {
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                getLastMessage: sinon.stub().returns(undefined),
+                getResult: sinon.stub().returns({}),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub(),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub(),
+            }
+            session = {
+                toolUseLookup: new Map(),
+                pairProgrammingMode: true,
+                approvedPaths: new Map(),
+                addApprovedPath: sinon.stub(),
+                getConversationType: () => 'AgenticChat',
+            }
+        })
+
+        const request = (command: string): ToolUse & { stop: boolean } => ({
+            name: 'executeBash',
+            toolUseId: 'shell-arguments',
+            input: { command },
+            stop: true,
+        })
+
+        it('waits for approval before executing a command with expansion markers', async () => {
+            // Exercise the real approval decision, but never launch a shell.
+            const wait = sinon.stub(chatController, 'waitForToolApproval').callsFake(async () => {
+                sinon.assert.notCalled(run)
+                await Promise.resolve()
+                sinon.assert.notCalled(run)
+            })
+            const results = await chatController.processToolUses(
+                [request(command)],
+                stream,
+                session,
+                'tabId',
+                mockCancellationToken
+            )
+            sinon.assert.calledOnce(wait)
+            sinon.assert.calledOnce(run)
+            sinon.assert.callOrder(wait, run)
+            assert.strictEqual(results[0].status, 'success')
+            const confirmation = stream.writeResultBlock.firstCall.args[0] as ChatResult
+            assert.deepStrictEqual(
+                confirmation.header?.buttons?.map(button => button.text),
+                ['Run', 'Reject']
+            )
+        })
+
+        it('does not execute a command when approval is rejected', async () => {
+            const wait = sinon.stub(chatController, 'waitForToolApproval').rejects(new ToolApprovalException())
+            await assert.rejects(
+                chatController.processToolUses([request(command)], stream, session, 'tabId', mockCancellationToken),
+                ToolApprovalException
+            )
+            sinon.assert.calledOnce(wait)
+            sinon.assert.notCalled(run)
+            sinon.assert.notCalled(session.addApprovedPath)
+        })
+
+        it('displays a plain read-only command without waiting for approval', async () => {
+            const wait = sinon.stub(chatController, 'waitForToolApproval').resolves()
+            const plainCommand = process.platform === 'win32' ? 'dir' : 'pwd'
+            const results = await chatController.processToolUses(
+                [request(plainCommand)],
+                stream,
+                session,
+                'tabId',
+                mockCancellationToken
+            )
+            sinon.assert.notCalled(wait)
+            sinon.assert.calledOnce(run)
+            assert.strictEqual(results[0].status, 'success')
+            const confirmation = stream.writeResultBlock.firstCall.args[0] as ChatResult
+            assert.deepStrictEqual(confirmation.header?.buttons, [])
+        })
+    })
+
     describe('checked filesystem execution handoff', () => {
         const target = path.resolve(__filename)
         let stream: any
