@@ -1,5 +1,6 @@
 import {
     CredentialsType,
+    IamCredentials,
     UpdateConfigurationParams,
     CancellationToken,
 } from '@aws/language-server-runtimes/server-interface'
@@ -21,6 +22,9 @@ export class AtxTokenServiceManager {
     private activeProfileArn: string | null = null
     private cachedTransformProfiles: any[] = []
     private activeApplicationUrl: string | null = null
+    // Auth mode declared by the client (aws.atx authType). Null when the client does not declare one
+    // (older clients), in which case the auth type is derived from the credentials present.
+    private activeAuthMode: 'iam' | 'bearer' | null = null
 
     // ATX service instances
     private cachedAtxCodewhispererService?: CodeWhispererServiceToken
@@ -48,6 +52,18 @@ export class AtxTokenServiceManager {
     }
 
     public handleOnCredentialsDeleted(type: CredentialsType): void {
+        // IAM sign-out (aws/credentials/iam/delete): the runtime has already cleared the IAM credentials slot.
+        // Also drop the tenant URL that came with the IAM session (sign-in repopulates it), and reset the cached
+        // FES client. The bearer token is left untouched.
+        if (type === ('iam' as CredentialsType)) {
+            this.log('ATX: IAM credentials deleted - clearing tenant URL')
+            if (this.activeAuthMode === 'iam') {
+                this.activeAuthMode = null
+            }
+            this.clearAllCaches()
+            return
+        }
+
         if (type === ('bearer' as CredentialsType)) {
             const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
             const hasAtxCredentials = atxCredentialsProvider?.hasCredentials('bearer')
@@ -69,11 +85,30 @@ export class AtxTokenServiceManager {
     ): Promise<void> {
         // Handle aws.transformProfiles, aws.atx, and aws.transform sections
         if (
-            (params.section === 'aws.transformProfiles' ||
-                params.section === 'aws.atx' ||
-                params.section === 'aws.transform') &&
-            params.settings.profileArn !== undefined
+            params.section !== 'aws.transformProfiles' &&
+            params.section !== 'aws.atx' &&
+            params.section !== 'aws.transform'
         ) {
+            return
+        }
+
+        // Auth mode declared by the client with each sign-in. Applied before the other keys so an IAM tenant URL
+        // sent in the same update is kept.
+        if (params.settings.authType !== undefined) {
+            this.setAuthMode(params.settings.authType)
+        }
+
+        // IAM path: the tenant (application) URL arrives via configuration because there is no
+        // Transform profile to look it up from. Store it directly so it can be used as the FES
+        // Origin/region. Trailing slash stripped to match the profile-derived value.
+        if (params.settings.applicationUrl !== undefined) {
+            const applicationUrl = params.settings.applicationUrl as string
+            this.activeApplicationUrl = applicationUrl ? applicationUrl.replace(/\/$/, '') : null
+            this.log(`ATX: Set application URL from configuration`)
+        }
+
+        // Bearer (IdC) path: profile selection drives the active profile and its application URL.
+        if (params.settings.profileArn !== undefined) {
             const profileArn = params.settings.profileArn as string
 
             await this.ensureProfilesLoaded()
@@ -86,6 +121,24 @@ export class AtxTokenServiceManager {
 
             // Clears Transform Handler gumby client since profile changed
             this.cacheCallbacks.forEach(callback => callback())
+        }
+    }
+
+    private setAuthMode(authType: unknown): void {
+        const mode = authType === 'iam' || authType === 'bearer' ? authType : null
+        if (mode === this.activeAuthMode) {
+            return
+        }
+
+        const previousMode = this.activeAuthMode
+        this.activeAuthMode = mode
+        this.log(`ATX: Auth mode changed from ${previousMode ?? 'none'} to ${mode ?? 'none'}`)
+
+        // Switching to bearer: drop the tenant URL left by an IAM session (the IdC profile repopulates it) and reset
+        // the cached FES client, as the IAM credentials delete does. IAM credentials still held by the runtime are
+        // ignored while in bearer mode.
+        if (mode === 'bearer') {
+            this.clearAllCaches()
         }
     }
 
@@ -317,12 +370,61 @@ export class AtxTokenServiceManager {
     }
 
     public hasValidCredentials(): boolean {
-        const runtime = (this.features as any).runtime
-        if (runtime && runtime.getAtxCredentialsProvider) {
-            const atxCredentialsProvider = runtime.getAtxCredentialsProvider()
-            return atxCredentialsProvider?.hasCredentials('bearer') || false
+        // Bearer creds live in the ATX-scoped provider; IAM creds live in the main credentials
+        // provider (populated by aws/credentials/iam/update). The ATX provider throws on any
+        // non-bearer type, so IAM presence must be checked against the main provider only.
+        const atxCredentialsProvider = (this.features as any).runtime?.getAtxCredentialsProvider?.()
+        const hasBearer = atxCredentialsProvider?.hasCredentials('bearer') || false
+        const hasIam = this.features.credentialsProvider?.hasCredentials('iam') || false
+        return hasBearer || hasIam
+    }
+
+    /**
+     * Which authentication mechanism is active for ATX FES calls.
+     * IAM is only reported once both the IAM credentials and the tenant (application) URL are
+     * present, so callers never sign a request before the Origin/region is known. Bearer (IdC)
+     * remains the default whenever an ATX bearer token is present.
+     * When the client has declared an auth mode (aws.atx authType), only that mode is reported, so
+     * stale credentials of the other type are never used.
+     */
+    public getAuthType(): 'bearer' | 'iam' | null {
+        const iamReady = Boolean(this.features.credentialsProvider?.hasCredentials('iam') && this.activeApplicationUrl)
+        const atxCredentialsProvider = this.features.runtime.getAtxCredentialsProvider?.()
+        const bearerReady = Boolean(atxCredentialsProvider?.hasCredentials('bearer'))
+
+        if (this.activeAuthMode === 'iam') {
+            return iamReady ? 'iam' : null
         }
-        return false
+        if (this.activeAuthMode === 'bearer') {
+            return bearerReady ? 'bearer' : null
+        }
+
+        if (iamReady) {
+            return 'iam'
+        }
+        if (bearerReady) {
+            return 'bearer'
+        }
+        return null
+    }
+
+    /**
+     * Read the IAM (SigV4) credentials from the main credentials provider's 'iam' slot, decrypted
+     * and stored by the runtime via aws/credentials/iam/update. Includes any expiration the client
+     * supplied as part of the credential payload.
+     */
+    public getIamCredentials(): IamCredentials {
+        const credentials = this.features.credentialsProvider?.getCredentials('iam')
+        if (!credentials || !('accessKeyId' in credentials) || !credentials.accessKeyId) {
+            this.log('ATX: No IAM credentials available in the iam slot')
+            throw new Error('No IAM credentials available for ATX')
+        }
+        // Never log the secret key or session token; the accessKeyId prefix is enough to correlate.
+        this.log(
+            `ATX: Read IAM credentials (accessKeyId=${credentials.accessKeyId.slice(0, 5)}..., ` +
+                `hasSessionToken=${Boolean(credentials.sessionToken)})`
+        )
+        return credentials
     }
 
     public async getBearerToken(): Promise<string> {

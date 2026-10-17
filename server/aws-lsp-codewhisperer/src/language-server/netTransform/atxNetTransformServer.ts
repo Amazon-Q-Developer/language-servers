@@ -50,6 +50,8 @@ const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
 // Beam to IDE
 const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
 const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
+// Read-only session check used to validate IAM sign-in
+export const AtxValidateSessionCommand = 'aws/atxTransform/validateSession'
 
 export const AtxNetTransformServerToken =
     (): Server =>
@@ -65,6 +67,9 @@ export const AtxNetTransformServerToken =
                         const request = params as AtxListOrCreateWorkspaceRequest
                         const result = await atxTransformHandler.listOrCreateWorkspace(request)
                         return result
+                    }
+                    case AtxValidateSessionCommand: {
+                        return await atxTransformHandler.validateSession()
                     }
                     case AtxListJobsCommand: {
                         const { WorkspaceId } = params as AtxListJobsRequest
@@ -349,6 +354,7 @@ export const AtxNetTransformServerToken =
                             AtxLoadOlderWorklogsCommand,
                             AtxListBeamedReposCommand,
                             AtxDownloadBeamArtifactCommand,
+                            AtxValidateSessionCommand,
                         ],
                     },
                 },

@@ -74,6 +74,18 @@ export interface AtxListOrCreateWorkspaceResponse {
 }
 
 /**
+ * Result of aws/atxTransform/validateSession: one read-only ListWorkspaces call that confirms the active
+ * credentials, tenant URL and permission work. On failure, Reason is one of AtxSessionValidationReason
+ * (see atxSessionValidation.ts); ErrorCode is the service error name. Never contains credential values.
+ */
+export interface AtxValidateSessionResponse {
+    Valid: boolean
+    Reason?: string
+    ErrorCode?: string
+    HttpStatus?: number
+}
+
+/**
  * Defines the interactive mode for transformation operations.
  * Matches C# InteractiveMode enum.
  */
