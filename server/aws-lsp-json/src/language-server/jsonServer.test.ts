@@ -15,12 +15,11 @@ import {
     JSON_FORMAT_RANGE,
 } from './testUtils'
 import { JsonServerFactory } from './jsonServer'
+import { JsonLanguageService } from '../language-service/jsonLanguageService'
 
 describe('Json Server', () => {
     let features: TestFeatures
     let server: Server
-
-    // TODO: write tests with real YAML/JSON service
     let service: StubbedInstance<AwsLanguageService>
 
     beforeEach(async () => {
@@ -59,6 +58,90 @@ describe('Json Server', () => {
         })
 
         sinon.assert.calledOnceWithExactly(service.doValidation, JSON_VALIDATION_OPEN_FILE)
+    })
+
+    for (const notification of ['open', 'change'] as const) {
+        for (const failure of ['throw', 'reject'] as const) {
+            it(`contains ${failure} failures during document ${notification} and validates the next change`, async () => {
+                if (failure === 'throw') {
+                    service.doValidation.throws(new RangeError('invalid document'))
+                } else {
+                    service.doValidation.rejects(new RangeError('invalid document'))
+                }
+
+                // TestFeatures discards notification promises, so await the registered handlers directly.
+                if (notification === 'open') {
+                    await features.lsp.onDidOpenTextDocument.firstCall.args[0]({
+                        textDocument: JSON_VALIDATION_OPEN_FILE_ITEM,
+                    })
+                } else {
+                    await features.lsp.onDidChangeTextDocument.firstCall.args[0]({
+                        textDocument: JSON_VALIDATION_FILE,
+                        contentChanges: [],
+                    })
+                }
+
+                sinon.assert.notCalled(features.lsp.publishDiagnostics)
+                sinon.assert.calledOnceWithExactly(features.logging.error, 'Document validation failed.')
+                service.doValidation.resetBehavior()
+                service.doValidation.resolves([])
+                await features.lsp.onDidChangeTextDocument.firstCall.args[0]({
+                    textDocument: JSON_VALIDATION_FILE,
+                    contentChanges: [],
+                })
+
+                sinon.assert.calledTwice(service.doValidation)
+                sinon.assert.calledOnceWithExactly(features.lsp.publishDiagnostics, {
+                    uri: JSON_VALIDATION_FILE.uri,
+                    diagnostics: [],
+                    version: JSON_VALIDATION_FILE.version,
+                })
+            })
+        }
+    }
+
+    it('contains document lookup failures', async () => {
+        features.workspace.getTextDocument.rejects(new Error('unavailable document'))
+
+        await features.lsp.onDidChangeTextDocument.firstCall.args[0]({
+            textDocument: JSON_VALIDATION_FILE,
+            contentChanges: [],
+        })
+
+        sinon.assert.notCalled(service.doValidation)
+        sinon.assert.calledOnceWithExactly(features.logging.error, 'Document validation failed.')
+    })
+
+    it('contains diagnostic publication failures', async () => {
+        service.doValidation.resolves([])
+        features.lsp.publishDiagnostics.rejects(new Error('unavailable connection'))
+
+        await features.lsp.onDidChangeTextDocument.firstCall.args[0]({
+            textDocument: JSON_VALIDATION_FILE,
+            contentChanges: [],
+        })
+
+        sinon.assert.calledOnceWithExactly(features.logging.error, 'Document validation failed.')
+    })
+
+    it('continues validating after a deeply nested document', async () => {
+        const realFeatures = new TestFeatures()
+        await realFeatures.start(JsonServerFactory(new JsonLanguageService({})))
+        const onOpen = realFeatures.lsp.onDidOpenTextDocument.firstCall.args[0]
+        const document = { ...JSON_VALIDATION_OPEN_FILE_ITEM, text: '['.repeat(10_000) + '0' + ']'.repeat(10_000) }
+
+        try {
+            await onOpen({ textDocument: document })
+            await onOpen({ textDocument: { ...document, version: document.version + 1, text: '{}' } })
+
+            sinon.assert.calledWithExactly(realFeatures.lsp.publishDiagnostics, {
+                uri: document.uri,
+                diagnostics: [],
+                version: document.version + 1,
+            })
+        } finally {
+            realFeatures.dispose()
+        }
     })
 
     it('should complete', async () => {

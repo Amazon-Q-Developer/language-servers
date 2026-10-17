@@ -122,10 +122,12 @@ export const JsonServerFactory =
             return format
         }
 
+        const onValidationError = () => logging.error('Document validation failed.')
+
         lsp.onInitialized(onInitializedHandler)
         lsp.onCompletion(onCompletionHandler)
-        lsp.onDidChangeTextDocument(onDidChangeTextDocumentHandler)
-        lsp.onDidOpenTextDocument(onDidOpenTextDocumentHandler)
+        lsp.onDidChangeTextDocument(params => onDidChangeTextDocumentHandler(params).catch(onValidationError))
+        lsp.onDidOpenTextDocument(params => onDidOpenTextDocumentHandler(params).catch(onValidationError))
         lsp.onHover(onHoverHandler)
         lsp.onDidFormatDocument(onFormatHandler)
         lsp.addInitializer(onInitializeHandler)
