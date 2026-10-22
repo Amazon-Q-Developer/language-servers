@@ -140,6 +140,10 @@ const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 // size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
 const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 
+// Name of the unit-test sub-step whose diff carries the generated tests merged into the solution.
+// The agent writes it under "Generate Unit Tests"; on a beam it sits under the repo's beam card.
+const MERGE_TESTS_STEP_NAME = 'Merge Tests'
+
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
@@ -2038,7 +2042,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 return {
@@ -2081,7 +2086,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 // If GetCheckpoints is requested, populate HasCheckpoint field on steps
@@ -2225,7 +2231,8 @@ export class ATXTransformHandler {
                         request.WorkspaceId,
                         request.TransformationJobId,
                         request.SolutionRootPath,
-                        request.IsBeam === true
+                        request.IsBeam === true,
+                        request.beamScopeStepIds
                     )
                 } catch (e) {
                     // Plan not available yet
@@ -2398,7 +2405,8 @@ export class ATXTransformHandler {
                 request.WorkspaceId,
                 request.TransformationJobId,
                 request.SolutionRootPath,
-                request.IsBeam === true
+                request.IsBeam === true,
+                request.beamScopeStepIds
             )
             return {
                 TransformationJob: {
@@ -2421,7 +2429,8 @@ export class ATXTransformHandler {
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.IsBeam === true
+            request.IsBeam === true,
+            request.beamScopeStepIds
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
@@ -3563,7 +3572,8 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        isBeam: boolean = false
+        isBeam: boolean = false,
+        beamScopeStepIds?: string
     ): Promise<AtxTransformationPlan> {
         try {
             const plan = await this.fetchPlanTree(workspaceId, jobId)
@@ -3582,10 +3592,20 @@ export class ATXTransformHandler {
             // step" and sets DiffApplyFailed on every poll, stalling the LBV loop. New
             // LBV-round diffs are surfaced via the separate diff-artifact path, which is
             // not gated here.
+            //
+            // Unit tests generated after LBV are the exception: their Merge Tests diffs are new on
+            // top of the beamed source, so they are applied, scoped to the loaded repo's steps.
             if (isBeam) {
                 this.logging.log(
                     `ATX: [BEAM] skipping completed-step artifact apply for beamed job ${jobId} — source is already transformed`
                 )
+                const scope = this.parseScopeStepIds(beamScopeStepIds)
+                if (scope.length > 0 && solutionRootPath) {
+                    const anyFailed = await this.applyBeamMergedTests(workspaceId, jobId, solutionRootPath, plan, scope)
+                    if (anyFailed && this._currentDiffContext) {
+                        this._currentDiffContext.failed = true
+                    }
+                }
                 this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
                 return plan
             }
@@ -3700,6 +3720,76 @@ export class ATXTransformHandler {
             this._applyingCheckpoints = false
         }
         return anyFailed
+    }
+
+    private parseScopeStepIds(beamScopeStepIds?: string): string[] {
+        return (beamScopeStepIds || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+    }
+
+    /**
+     * Beam to IDE: applies finished Merge Tests steps under the loaded repo's beam card, in plan
+     * order. Only nodes in the IDE's scope (the repo's subtree) and their descendants are searched,
+     * so a step added under the card after the repo was loaded is still found, and a sibling
+     * repo's tests are never applied. Already-applied steps are skipped (checkpoints-applied.json),
+     * so this is safe on every poll. Returns true when any step failed to apply.
+     */
+    private async applyBeamMergedTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        plan: AtxTransformationPlan,
+        scopeStepIds: string[]
+    ): Promise<boolean> {
+        const steps = this.findScopedMergeTestsSteps(plan.Root, new Set(scopeStepIds))
+        if (steps.length === 0) {
+            return false
+        }
+        if (this._applyingCheckpoints) {
+            this.logging.log('ATX: [BEAM] merged-tests apply already in progress, skipping')
+            return false
+        }
+        this._applyingCheckpoints = true
+        let anyFailed = false
+        try {
+            for (const step of steps) {
+                // Re-read each time: downloadDiffArtifact records the step once it is applied.
+                if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
+                    continue
+                }
+                this.logging.log(`ATX: [BEAM] applying merged unit tests from step ${step.StepId}`)
+                await this.downloadCompletedStepArtifact(workspaceId, jobId, step.StepId, solutionRootPath)
+                if (!this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
+                    this.logging.error(`ATX: [BEAM] merged unit tests from step ${step.StepId} were not applied`)
+                    anyFailed = true
+                    this._currentDiffContext?.failedStepIds.push(step.StepId)
+                }
+            }
+        } catch (error) {
+            this.logging.error(`ATX: [BEAM] applyBeamMergedTests error: ${String(error)}`)
+            anyFailed = true
+        } finally {
+            this._applyingCheckpoints = false
+        }
+        return anyFailed
+    }
+
+    /**
+     * SUCCEEDED Merge Tests steps at or below any node in scope, in DFS order (children are
+     * already sorted by plan score, so this is plan order).
+     */
+    private findScopedMergeTestsSteps(step: AtxPlanStep, scope: Set<string>, inScope: boolean = false): AtxPlanStep[] {
+        const here = inScope || scope.has(step.StepId)
+        const found: AtxPlanStep[] = []
+        if (here && step.Status === 'SUCCEEDED' && step.StepName === MERGE_TESTS_STEP_NAME) {
+            found.push(step)
+        }
+        for (const child of step.Children) {
+            found.push(...this.findScopedMergeTestsSteps(child, scope, here))
+        }
+        return found
     }
 
     /**

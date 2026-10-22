@@ -915,6 +915,100 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
     })
 
+    describe('getTransformationPlan on a beam: merged unit tests', () => {
+        const node = (StepId: string, StepName: string, Status: string, Children: any[] = []) =>
+            ({ StepId, StepName, Status, Children }) as any
+
+        // root > (Beamed) Batch > two beam cards, each with LBV and Generate Unit Tests > Merge Tests.
+        const beamPlan = () => ({
+            Root: node('root', 'root', 'IN_PROGRESS', [
+                node('repoA', 'RepoA', 'SUCCEEDED', [node('a-xform', 'Transform', 'SUCCEEDED')]),
+                node('batch', '(Beamed) Batch', 'IN_PROGRESS', [
+                    node('cardA', 'RepoA (beamed)', 'IN_PROGRESS', [
+                        node('a-lbv', 'Local Build Verification', 'SUCCEEDED'),
+                        node('a-ut', 'Generate Unit Tests', 'IN_PROGRESS', [
+                            node('a-assess', 'Assess', 'SUCCEEDED'),
+                            node('a-merge', 'Merge Tests', 'SUCCEEDED'),
+                        ]),
+                    ]),
+                    node('cardB', 'RepoB (beamed)', 'IN_PROGRESS', [
+                        node('b-ut', 'Generate Unit Tests', 'IN_PROGRESS', [
+                            node('b-merge', 'Merge Tests', 'SUCCEEDED'),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        })
+
+        let applied: string[]
+        let downloadStub: sinon.SinonStub
+        let bulkStub: sinon.SinonStub
+
+        beforeEach(() => {
+            applied = []
+            sinon.stub(handler as any, 'fetchWorklogs').resolves(undefined)
+            bulkStub = sinon.stub(handler as any, 'downloadCompletedStepArtifacts').resolves(false)
+            sinon.stub(handler as any, 'loadAppliedCheckpoints').callsFake(() => [...applied])
+            downloadStub = sinon
+                .stub(handler as any, 'downloadCompletedStepArtifact')
+                .callsFake(async (_ws: any, _job: any, stepId: any) => {
+                    applied.push(stepId)
+                })
+        })
+
+        it("applies only the loaded repo's finished Merge Tests step", async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA,a-lbv')
+
+            expect(downloadStub.callCount).to.equal(1)
+            expect(downloadStub.firstCall.args[2]).to.equal('a-merge')
+            // The general completed-step pass stays skipped on a beam.
+            expect(bulkStub.called).to.be.false
+        })
+
+        it('applies nothing without a scope or a solution path', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', '', true, 'cardA')
+
+            expect(downloadStub.called).to.be.false
+        })
+
+        it('skips a step already applied and one not finished yet', async () => {
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[1].Children[0].Children[0].Status = 'IN_PROGRESS'
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+            applied = ['a-merge']
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoB', true, 'cardB')
+
+            expect(downloadStub.called).to.be.false
+        })
+
+        it('marks the diff context failed when a step is not applied', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => {})
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+
+            expect((handler as any)._currentDiffContext).to.deep.equal({ failed: true, failedStepIds: ['a-merge'] })
+        })
+
+        it('does nothing when the beam plan has no unit test step', async () => {
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.pop()
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+
+            expect(downloadStub.called).to.be.false
+        })
+    })
+
     describe('buildTreeFromFlatList', () => {
         it('should build a parent-child tree from flat list', () => {
             const flat = [
