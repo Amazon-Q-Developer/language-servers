@@ -20,6 +20,8 @@ import { DEFAULT_AWS_Q_ENDPOINT_URL, DEFAULT_AWS_Q_REGION } from '../../../share
 import { Readable } from 'stream'
 import { ArtifactManager } from '../artifactManager'
 import path = require('path')
+import * as os from 'os'
+import AdmZip = require('adm-zip')
 import { IZipEntry } from 'adm-zip'
 import { AmazonQTokenServiceManager } from '../../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 
@@ -411,8 +413,8 @@ describe('Test Transform handler ', () => {
             }
 
             await transformHandler.extractAllEntriesTo(pathContainingArchive, zipEntries)
-            expect(mockedLogging.log.args.flat()).to.include(
-                'Attempted to extract a file that does not exist : file1.txt'
+            expect(mockedLogging.error.args.flat()).to.include(
+                'Attempted to extract a file that does not exist: file1.txt'
             )
         })
 
@@ -488,12 +490,12 @@ describe('Test Transform handler ', () => {
             sinon.assert.calledWith(mkdirStub, '/test/path/dir1')
         })
 
-        it('should handle invalid entry paths', async () => {
+        it('should throw directory creation errors', async () => {
             const pathContainingArchive = '/test/path'
             const invalidError = new Error('Invalid path') as NodeJS.ErrnoException
             invalidError.code = 'EINVAL'
 
-            const zipEntries = [createMockZipEntry('invalid/../../file.txt', false, 'content')]
+            const zipEntries = [createMockZipEntry('invalid/file.txt', false, 'content')]
 
             ;(fs.promises.mkdir as sinon.SinonStub).rejects(invalidError)
 
@@ -505,6 +507,100 @@ describe('Test Transform handler ', () => {
                 .catch(error => {
                     expect(error.message).to.equal('Invalid path')
                 })
+        })
+
+        it('should only extract entries inside the destination folder', async () => {
+            const pathContainingArchive = '/test/path'
+            const outsideEntryNames = ['../file1.txt', 'dir1/../../file2.txt', '../path-other/file3.txt']
+            const zipEntries = [
+                ...outsideEntryNames.map(entryName => createMockZipEntry(entryName, false, 'content')),
+                createMockZipEntry('../path-other/', true),
+                createMockZipEntry('dir1/file4.txt', false, 'content'),
+            ]
+
+            await transformHandler.extractAllEntriesTo(pathContainingArchive, zipEntries)
+
+            sinon.assert.calledOnce(writeFileStub)
+            sinon.assert.calledWith(writeFileStub, '/test/path/dir1/file4.txt')
+            sinon.assert.calledOnce(mkdirStub)
+            sinon.assert.calledWith(mkdirStub, '/test/path/dir1')
+            const errors = mockedLogging.error.args.flat()
+            for (const entryName of [...outsideEntryNames, '../path-other/']) {
+                expect(errors).to.include(`Blocked zip entry escaping extraction directory: ${entryName}`)
+            }
+        })
+    })
+
+    describe('archivePathGenerator', () => {
+        let tmpDir: string
+        let saveToDir: string
+
+        beforeEach(() => {
+            tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'transform-archive-'))
+            saveToDir = path.join(tmpDir, 'solution', 'artifactWorkspace')
+            mockedLogging.error.resetHistory()
+        })
+
+        afterEach(() => {
+            fs.rmSync(tmpDir, { recursive: true, force: true })
+        })
+
+        // An archive with these file entries. adm-zip changes some entry names when it writes an
+        // archive, so each name is written as a placeholder of the same length and then replaced.
+        function archiveWithEntries(entries: Record<string, string>): Buffer {
+            const zip = new AdmZip()
+            const names = Object.keys(entries)
+            const placeholders = names.map((name, i) => `${i}`.padStart(name.length, 'Q'))
+            names.forEach((name, i) => zip.addFile(placeholders[i], Buffer.from(entries[name])))
+            const archive = zip.toBuffer()
+            names.forEach((name, i) => {
+                const placeholder = Buffer.from(placeholders[i])
+                for (let at = archive.indexOf(placeholder); at !== -1; at = archive.indexOf(placeholder, at + 1)) {
+                    Buffer.from(name).copy(archive, at)
+                }
+            })
+            return archive
+        }
+
+        it('should only extract the entries of an archive that are inside the job folder', async () => {
+            const outsideEntryNames = ['../escape1.txt', 'nested/../../escape2.txt']
+            const archive = archiveWithEntries({
+                [outsideEntryNames[0]]: 'outside',
+                [outsideEntryNames[1]]: 'outside',
+                'inside.txt': 'inside',
+                'dir/inside.txt': 'inside',
+            })
+
+            const result = await transformHandler.archivePathGenerator('job-1', [archive], saveToDir)
+
+            const jobFolder = path.join(saveToDir, 'job-1')
+            expect(result).to.equal(jobFolder)
+            expect(fs.readFileSync(path.join(jobFolder, 'inside.txt'), 'utf-8')).to.equal('inside')
+            expect(fs.readFileSync(path.join(jobFolder, 'dir', 'inside.txt'), 'utf-8')).to.equal('inside')
+            expect(fs.readdirSync(saveToDir)).to.deep.equal(['job-1'])
+            const errors = mockedLogging.error.args.flat()
+            for (const entryName of outsideEntryNames) {
+                expect(errors).to.include(`Blocked zip entry escaping extraction directory: ${entryName}`)
+            }
+        })
+
+        it('should not extract an archive for a job ID that is not a folder name', async () => {
+            const archive = archiveWithEntries({ 'inside.txt': 'inside' })
+
+            for (const jobId of [
+                '',
+                '.',
+                '..',
+                path.join('..', 'job-2'),
+                ['job-1', '..', '..', 'job-2'].join(path.sep),
+            ]) {
+                const rejected = await transformHandler.archivePathGenerator(jobId, [archive], saveToDir).then(
+                    () => false,
+                    () => true
+                )
+                expect(rejected, jobId).to.be.true
+            }
+            expect(fs.readdirSync(tmpDir)).to.deep.equal([])
         })
     })
 })
