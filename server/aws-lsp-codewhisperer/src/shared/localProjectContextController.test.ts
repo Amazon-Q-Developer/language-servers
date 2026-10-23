@@ -311,3 +311,109 @@ function createMockDirent(name: string, isDirectory: boolean): Dirent {
         isSymbolicLink: () => false,
     } as Dirent
 }
+
+describe('LocalProjectContextController ignore file patterns (real filesystem)', () => {
+    let root: string
+    let folder: { uri: string; name: string }
+    let vecLib: any
+    let logging: LoggingMock
+
+    const makeController = () => new LocalProjectContextController('testClient', [folder], logging as any)
+    const initWith = (controller: LocalProjectContextController, ignoreFilePatterns?: string[]) =>
+        controller.init({ vectorLib: { start: stub().resolves(vecLib) }, ignoreFilePatterns })
+    const relativePaths = (files: string[]) => files.map(file => path.relative(root, file).split(path.sep).join('/'))
+
+    beforeEach(() => {
+        root = fs.realpathSync.native(fs.mkdtempSync(path.join(require('os').tmpdir(), 'index-ignore-')))
+        for (const file of ['src/a.ts', 'secrets/config.yaml', 'config/credentials.json', 'data/run.local.json']) {
+            fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+            fs.writeFileSync(path.join(root, file), 'synthetic fixture only')
+        }
+        folder = { uri: URI.file(root).toString(), name: 'ws' }
+        logging = new LoggingMock()
+        vecLib = {
+            buildIndex: stub().resolves(),
+            updateIndexV2: stub().resolves(),
+            getContextCommandItems: stub().resolves([]),
+            getIndexSequenceNumber: stub().resolves(1),
+        }
+    })
+
+    afterEach(() => {
+        restore()
+        fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    const patterns = ['secrets/', '*.local.json', 'config/credentials.json']
+    const extensions = ['.ts', '.yaml', '.json']
+
+    it('leaves the files that the patterns match out of the index', async () => {
+        const controller = makeController()
+        await initWith(controller, patterns)
+
+        const files = await controller.processWorkspaceFolders([folder], extensions, 10, 100)
+
+        assert.deepStrictEqual(relativePaths(files), ['src/a.ts'])
+    })
+
+    it('indexes every file without patterns', async () => {
+        const controller = makeController()
+        await initWith(controller)
+
+        const files = await controller.processWorkspaceFolders([folder], extensions, 10, 100)
+
+        assert.deepStrictEqual(relativePaths(files).sort(), [
+            'config/credentials.json',
+            'data/run.local.json',
+            'secrets/config.yaml',
+            'src/a.ts',
+        ])
+    })
+
+    it('does not add or update files that the patterns match', async () => {
+        const controller = makeController()
+        await initWith(controller, patterns)
+        const allFiles = ['src/a.ts', 'secrets/config.yaml', 'data/run.local.json'].map(file => path.join(root, file))
+
+        await controller.updateIndex(allFiles, 'add')
+        await controller.updateIndex(allFiles, 'update')
+        await controller.updateIndex([path.join(root, 'secrets', 'config.yaml')], 'add')
+        await controller.updateIndex(allFiles, 'remove')
+
+        sinonAssert.callCount(vecLib.updateIndexV2, 3)
+        sinonAssert.calledWith(vecLib.updateIndexV2.firstCall, [path.join(root, 'src', 'a.ts')], 'add')
+        sinonAssert.calledWith(vecLib.updateIndexV2.secondCall, [path.join(root, 'src', 'a.ts')], 'update')
+        sinonAssert.calledWith(vecLib.updateIndexV2.thirdCall, allFiles, 'remove')
+    })
+
+    it('builds the index again when the patterns change', async () => {
+        const controller = makeController()
+        await initWith(controller, patterns)
+        await new Promise(resolve => setTimeout(resolve, 50))
+        const buildsBefore = vecLib.buildIndex.callCount
+
+        await initWith(controller, patterns)
+        await new Promise(resolve => setTimeout(resolve, 50))
+        const buildsWithSamePatterns = vecLib.buildIndex.callCount
+        await initWith(controller, ['secrets/'])
+        await new Promise(resolve => setTimeout(resolve, 50))
+
+        assert.strictEqual(buildsWithSamePatterns, buildsBefore)
+        assert.strictEqual(vecLib.buildIndex.callCount, buildsBefore + 1)
+        assert.deepStrictEqual(relativePaths(vecLib.buildIndex.lastCall.args[0]).sort(), [
+            'config/credentials.json',
+            'data/run.local.json',
+            'src/a.ts',
+        ])
+    })
+
+    it('builds the index from the files the patterns leave when a workspace folder is added', async () => {
+        const controller = new LocalProjectContextController('testClient', [], logging as any)
+        await initWith(controller, patterns)
+
+        await controller.updateWorkspaceFolders([folder], [])
+
+        sinonAssert.notCalled(vecLib.updateIndexV2)
+        assert.deepStrictEqual(relativePaths(vecLib.buildIndex.lastCall.args[0]), ['src/a.ts'])
+    })
+})

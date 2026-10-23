@@ -18,6 +18,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 
 import { pathToFileURL } from 'url'
+import * as ignore from 'ignore'
 import { getFileExtensionName, listFilesWithGitignore } from './utils'
 
 const LIBRARY_DIR = (() => {
@@ -54,6 +55,8 @@ export class LocalProjectContextController {
     private readonly log: Logging
     private _isIndexingInProgress: boolean = false
     private ignoreFilePatterns?: string[]
+    // Matches the configured ignore patterns, built when first needed
+    private ignoreMatcher?: ReturnType<typeof ignore>
     private includeSymlinks?: boolean
     private maxFileSizeMB?: number
     private maxIndexSizeMB?: number
@@ -102,16 +105,25 @@ export class LocalProjectContextController {
     }: LocalProjectContextInitializationOptions = {}): Promise<void> {
         try {
             // update states according to configuration
+            const ignoreFilePatternsChanged =
+                JSON.stringify(ignoreFilePatterns) !== JSON.stringify(this.ignoreFilePatterns ?? [])
             this.includeSymlinks = includeSymlinks
             this.maxFileSizeMB = maxFileSizeMB
             this.maxIndexSizeMB = maxIndexSizeMB
             this.respectUserGitIgnores = respectUserGitIgnores
             this.ignoreFilePatterns = ignoreFilePatterns
+            this.ignoreMatcher = undefined
 
             this.log.info('Initializing local project context')
 
             // skip re-init if vecLib already loaded
             if (this._vecLib) {
+                // Files indexed before the ignore patterns changed may now be excluded
+                if (ignoreFilePatternsChanged) {
+                    this.buildIndex().catch(e => {
+                        this.log.error(`Error building index after the ignore patterns changed: ${e}`)
+                    })
+                }
                 return
             }
 
@@ -163,10 +175,48 @@ export class LocalProjectContextController {
 
     public async updateIndex(filePaths: string[], operation: UpdateMode, workspaceFolders?: string[]): Promise<void> {
         try {
-            await this._vecLib?.updateIndexV2(filePaths, operation, workspaceFolders)
+            const indexablePaths = this.indexablePaths(filePaths, operation)
+            // Nothing to do when the ignore patterns exclude every file
+            if (indexablePaths.length === 0 && filePaths.length > 0 && !workspaceFolders?.length) {
+                return
+            }
+            await this._vecLib?.updateIndexV2(indexablePaths, operation, workspaceFolders)
         } catch (error) {
             this.log.error(`Error updating index: ${error}`)
         }
+    }
+
+    /** The files to pass on for an index update: an add or update leaves out files that the ignore patterns exclude */
+    private indexablePaths(filePaths: string[], operation: UpdateMode): string[] {
+        if (operation !== 'add' && operation !== 'update') {
+            return filePaths
+        }
+        const folderPaths = this.workspaceFolders.map(folder => path.resolve(URI.parse(folder.uri).fsPath))
+        return filePaths.filter(filePath => !this.isIgnoredFile(filePath, folderPaths))
+    }
+
+    /**
+     * True when a configured ignore pattern matches the file. The patterns follow .gitignore
+     * syntax and apply relative to each workspace folder that contains the file.
+     */
+    private isIgnoredFile(filePath: string, folderPaths: string[]): boolean {
+        if (!this.ignoreFilePatterns?.length) {
+            return false
+        }
+        this.ignoreMatcher ??= ignore().add(this.ignoreFilePatterns)
+        const matcher = this.ignoreMatcher
+        return folderPaths.some(folderPath => {
+            const relativePath = path.relative(folderPath, path.resolve(filePath))
+            if (
+                !relativePath ||
+                relativePath === '..' ||
+                relativePath.startsWith('..' + path.sep) ||
+                path.isAbsolute(relativePath)
+            ) {
+                return false
+            }
+            return matcher.ignores(relativePath.split(path.sep).join('/'))
+        })
     }
 
     // public for test
@@ -223,7 +273,17 @@ export class LocalProjectContextController {
 
                 if (actualAdditions.length > 0) {
                     const addedPaths = actualAdditions.map(folder => URI.parse(folder.uri).fsPath)
-                    await this.updateIndexAndContextCommand([], true, addedPaths)
+                    if (this.ignoreFilePatterns?.length) {
+                        // The index library lists the files of an added folder itself, without the
+                        // ignore patterns, so build the index again from the files they leave
+                        await this.buildIndex()
+                        const contextItems = await this.getContextCommandItems()
+                        if (this.onContextItemsUpdated && contextItems.length > 0) {
+                            await this.onContextItemsUpdated(contextItems)
+                        }
+                    } else {
+                        await this.updateIndexAndContextCommand([], true, addedPaths)
+                    }
                 }
             }
         } catch (error) {
@@ -271,6 +331,14 @@ export class LocalProjectContextController {
 
     public async tryUpdateIndex(filePaths: string[], isAdd: boolean, workspaceFolders?: string[]): Promise<boolean> {
         try {
+            // Nothing to wait for when the ignore patterns exclude every file
+            if (
+                filePaths.length > 0 &&
+                !workspaceFolders?.length &&
+                this.indexablePaths(filePaths, isAdd ? 'add' : 'remove').length === 0
+            ) {
+                return false
+            }
             const indexSeqNum = await this._vecLib?.getIndexSequenceNumber()
             await this.updateIndex(filePaths, isAdd ? 'add' : 'remove', workspaceFolders)
             await waitUntil(
@@ -359,7 +427,11 @@ export class LocalProjectContextController {
             const filesUnderFolder = await listFilesWithGitignore(absoluteFolderPath)
             for (const file of filesUnderFolder) {
                 const fileExtName = '.' + getFileExtensionName(file)
-                if (!uniqueFilesToIndex.has(file) && fileExtensions?.includes(fileExtName)) {
+                if (
+                    !uniqueFilesToIndex.has(file) &&
+                    fileExtensions?.includes(fileExtName) &&
+                    !this.isIgnoredFile(file, [absoluteFolderPath])
+                ) {
                     try {
                         const fileSize = fs.statSync(file).size
                         if (fileSize < sizeConstraints.maxFileSize) {
