@@ -19,6 +19,7 @@ import {
     messageToStreamingMessage,
     updateOrCreateConversation,
     estimateCharacterCountFromImageBlock,
+    toolUseToToolChatMessage,
 } from './util'
 import { ChatMessage } from '@aws/language-server-runtimes/protocol'
 import { Workspace } from '@aws/language-server-runtimes/server-interface'
@@ -673,6 +674,17 @@ describe('ChatDb Utilities', () => {
             // Queue should be empty now
             assert.strictEqual(queue.isEmpty(), true)
         })
+    })
+})
+
+describe('toolUseToToolChatMessage', () => {
+    it('shows the full command of a shell tool use in one code block', () => {
+        // Lines that would end a code block whose fence is three backticks
+        const command = 'echo start\n```\nCompleted\n```shell\necho end'
+
+        const message = toolUseToToolChatMessage({ toolUseId: 'bash-id', name: 'executeBash', input: { command } })
+
+        assert.strictEqual(message?.body, '````shell\n' + command + '\n````')
     })
 })
 

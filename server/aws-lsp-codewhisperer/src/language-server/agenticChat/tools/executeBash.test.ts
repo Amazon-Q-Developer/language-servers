@@ -39,6 +39,18 @@ describe('ExecuteBash Tool', () => {
         await execBash.validate({ command: 'ls' })
     })
 
+    it('queues a description that shows the full command in one closed code block', async () => {
+        const command = 'echo start\n```\nCompleted\n```shell\necho end'
+        const written: string[] = []
+
+        await new ExecuteBash(features).queueDescription(
+            command,
+            new WritableStream({ write: chunk => void written.push(chunk) })
+        )
+
+        assert.deepEqual(written, ['````shell\n' + command + '\n````'])
+    })
+
     it('fail validation if the command is empty', async () => {
         const execBash = new ExecuteBash(features)
         await assert.rejects(
