@@ -26,6 +26,7 @@ import {
 } from '@amzn/codewhisperer-streaming'
 import { Workspace } from '@aws/language-server-runtimes/server-interface'
 import { activeFileCmd } from '../../context/additionalContextProvider'
+import { shellCommandBlock } from '../../textFormatting'
 import { PriorityQueue } from 'typescript-collections'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as crypto from 'crypto'
@@ -588,7 +589,7 @@ export function toolUseToToolChatMessage(toolUse: ToolUse): ChatMessage | undefi
             return {
                 type: 'tool',
                 messageId: toolUse.toolUseId,
-                body: '```shell\n' + command + '\n```',
+                body: shellCommandBlock(command),
                 header: {
                     body: 'shell',
                     status: {

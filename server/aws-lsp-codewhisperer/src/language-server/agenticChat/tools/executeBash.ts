@@ -20,6 +20,7 @@ import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
 // eslint-disable-next-line import/no-nodejs-modules
 import { existsSync, statSync, lstatSync } from 'fs'
 import { parseBaseCommands } from '../utils/commandParser'
+import { shellCommandBlock } from '../textFormatting'
 import { BashCommandEvent, ChatTelemetryEventName } from '../../../shared/telemetry/types'
 
 export enum CommandCategory {
@@ -881,7 +882,7 @@ export class ExecuteBash {
 
     public async queueDescription(command: string, updates: WritableStream) {
         const writer = updates.getWriter()
-        await writer.write('```shell\n' + command + '\n```')
+        await writer.write(shellCommandBlock(command))
         await writer.close()
         writer.releaseLock()
     }

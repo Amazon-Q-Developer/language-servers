@@ -151,7 +151,13 @@ import {
 } from './agenticChatEventParser'
 import { ChatSessionService } from '../chat/chatSessionService'
 import { AgenticChatResultStream, progressPrefix, ResultStreamWriter } from './agenticChatResultStream'
-import { toolResultMessage } from './textFormatting'
+import {
+    codeBlockLines,
+    codeFence,
+    shellCommandBlock,
+    shellCommandBlockStart,
+    toolResultMessage,
+} from './textFormatting'
 import {
     AdditionalContentEntryAddition,
     AgenticChatTriggerContext,
@@ -304,6 +310,8 @@ export class AgenticChatController implements ChatHandlers {
     #contextCommandsProvider: ContextCommandsProvider
     #memoryBankController: MemoryBankController
     #stoppedToolUses = new Set<string>()
+    // Shell command cards whose output stream has written the fence that closes the command's code block
+    #closedShellCommandBlocks = new Set<string>()
     #userWrittenCodeTracker: UserWrittenCodeTracker | undefined
     #toolUseStartTimes: Record<string, number> = {}
     #toolUseLatencies: Array<{ toolName: string; toolUseId: string; latency: number }> = []
@@ -2772,7 +2780,7 @@ export class AgenticChatController implements ChatHandlers {
                     const completedErrorResult = {
                         type: 'tool',
                         messageId: toolUse.toolUseId,
-                        body: `\`\`\`shell\n${command}\n\`\`\``,
+                        body: shellCommandBlock(command),
                         header: {
                             body: 'shell',
                             status: {
@@ -2783,9 +2791,25 @@ export class AgenticChatController implements ChatHandlers {
                             buttons: [],
                         },
                     } as ChatResult
+                    // Output the stream has not written yet is not shown, so it cannot land after the fence below
+                    this.#stoppedToolUses.add(toolUse.toolUseId)
 
-                    if (existingCard) {
-                        await chatResultStream.overwriteResultBlock(completedErrorResult, existingCard)
+                    if (existingCard !== undefined) {
+                        // Output written so far follows the card's first block, so open the code block
+                        // there and close it after the output
+                        await chatResultStream.overwriteResultBlock(
+                            { ...completedErrorResult, body: shellCommandBlockStart(command) },
+                            existingCard
+                        )
+                        if (!this.#closedShellCommandBlocks.has(toolUse.toolUseId)) {
+                            await chatResultStream.writeResultBlock({
+                                type: 'tool',
+                                messageId: toolUse.toolUseId,
+                                body: codeFence(command),
+                                header: completedErrorResult.header,
+                            })
+                            this.#closedShellCommandBlocks.add(toolUse.toolUseId)
+                        }
                     } else {
                         this.#features.chat.sendChatUpdate({
                             tabId,
@@ -2795,7 +2819,6 @@ export class AgenticChatController implements ChatHandlers {
                             },
                         })
                     }
-                    this.#stoppedToolUses.add(toolUse.toolUseId)
                 }
                 const errMsg = err instanceof Error ? err.message : 'unknown error'
                 this.#log(`Error running tool ${toolUse.name}:`, errMsg)
@@ -3012,7 +3035,8 @@ export class AgenticChatController implements ChatHandlers {
                 await chatResultStream.writeResultBlock({
                     type: 'tool',
                     messageId: toolMsgId,
-                    body: chunk,
+                    // The output is shown inside the code block that the card opened for the command
+                    body: chunk === undefined || chunk === null ? chunk : codeBlockLines(String(chunk)),
                     header: headerEmitted ? undefined : initialHeader,
                 })
 
@@ -3025,10 +3049,12 @@ export class AgenticChatController implements ChatHandlers {
                 await chatResultStream.writeResultBlock({
                     type: 'tool',
                     messageId: toolMsgId,
-                    body: '```',
+                    // Closes the code block that the card opened for the command
+                    body: codeFence((toolUse.input as unknown as ExecuteBashParams).command),
                     header: completedHeader,
                 })
 
+                this.#closedShellCommandBlocks.add(toolMsgId)
                 this.#stoppedToolUses.add(toolMsgId)
             },
         })
@@ -3059,7 +3085,9 @@ export class AgenticChatController implements ChatHandlers {
             return {
                 messageId: toolUse.toolUseId,
                 type: 'tool',
-                body: '```shell\n' + (toolUse.input as unknown as ExecuteBashParams).command,
+                body: isAccept
+                    ? shellCommandBlockStart((toolUse.input as unknown as ExecuteBashParams).command)
+                    : shellCommandBlock((toolUse.input as unknown as ExecuteBashParams).command),
                 header: {
                     body: 'shell',
                     ...(isAccept
@@ -3162,7 +3190,7 @@ export class AgenticChatController implements ChatHandlers {
                     {
                         messageId,
                         type: 'tool',
-                        body: `\`\`\`shell\n${command}\n\`\`\``,
+                        body: shellCommandBlock(command),
                         header: {
                             body: 'shell',
                             status: {
@@ -3382,7 +3410,7 @@ export class AgenticChatController implements ChatHandlers {
                     body: 'shell',
                     buttons,
                 }
-                body = '```shell\n' + commandString
+                body = shellCommandBlockStart(commandString)
                 break
             }
 
@@ -4627,7 +4655,7 @@ export class AgenticChatController implements ChatHandlers {
                         {
                             messageId: toolUseId,
                             type: 'tool',
-                            body: `\`\`\`shell\n${command}\n\`\`\``,
+                            body: shellCommandBlock(command),
                             header: {
                                 body: 'shell',
                                 status: { icon: 'block', text: 'Ignored' },
