@@ -75,6 +75,15 @@ import { BrowserInfo } from './models'
 export const ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY = 'generate_integration_tests'
 export const ATX_OBJECTIVE_BROWSER_KEY = 'browser'
 
+// LS-side feature flag for the ITGen (integration test generation) plumbing. Off unless the env
+// var is exactly 'true'; while off, the LS behaves exactly as before ITGen.
+// TODO: row 18 replaces this with the real feature flag - change it here only.
+export const ATX_ITGEN_ENABLED_ENV_VAR = 'ATX_ITGEN_ENABLED'
+
+export function isItGenEnabled(): boolean {
+    return process.env[ATX_ITGEN_ENABLED_ENV_VAR] === 'true'
+}
+
 /**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
  */
@@ -3647,10 +3656,16 @@ export class ATXTransformHandler {
         this._applyingCheckpoints = true
 
         try {
-            const completedSteps = this.findCompletedSteps(plan.Root)
+            let completedSteps: (AtxPlanStep & { score?: number })[]
+            if (isItGenEnabled()) {
+                // Already in application order (tree post-order).
+                completedSteps = await this.findCompletedStepsAnyDepth(workspaceId, jobId, solutionRootPath, plan.Root)
+            } else {
+                completedSteps = this.findCompletedSteps(plan.Root)
 
-            // Sort by score to ensure correct application order
-            completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+                // Sort by score to ensure correct application order
+                completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+            }
 
             this.logging.log(`ATX: Found ${completedSteps.length} completed steps to check for artifacts`)
 
@@ -3805,6 +3820,101 @@ export class ATXTransformHandler {
         }
 
         return completedSteps
+    }
+
+    /**
+     * ITGen variant of findCompletedSteps: the not-yet-applied SUCCEEDED steps at ANY depth that
+     * have a diff to apply, i.e. a checkpoint folder on disk or a step-tagged CUSTOMER_OUTPUT
+     * artifact. With integration tests on, the agent nests LBV under local-verification, so the
+     * LBV error-fix rounds move to depth 3 and the nested LBV step itself (depth 2) has no diff.
+     * Keying on the artifact rather than the depth applies the rounds, and skips the LBV step
+     * instead of reporting it as a failed apply on every poll. A step whose artifact isn't
+     * listed yet is left out and picked up on a later poll.
+     *
+     * Returned in tree post-order (score-sorted siblings, children before their parent): a
+     * parent finishes after its children, and checkpoints overwrite whole files, so a parent's
+     * diff must land last.
+     */
+    private async findCompletedStepsAnyDepth(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        root: AtxPlanStep
+    ): Promise<AtxPlanStep[]> {
+        const applied = new Set(this.loadAppliedCheckpoints(solutionRootPath, jobId))
+        const pending = this.findSucceededStepsPostOrder(root).filter(step => !applied.has(step.StepId))
+        const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
+        const isDownloaded = (step: AtxPlanStep) => fs.existsSync(path.join(checkpointsDir, step.StepId))
+
+        // Only list artifacts when some pending step still needs a download.
+        if (pending.every(isDownloaded)) {
+            return pending
+        }
+
+        const stepIdsWithArtifact = await this.listStepIdsWithCustomerOutput(workspaceId, jobId)
+        if (!stepIdsWithArtifact) {
+            // Listing failed: apply what is already on disk and retry the rest on the next poll.
+            return pending.filter(isDownloaded)
+        }
+        return pending.filter(step => isDownloaded(step) || stepIdsWithArtifact.has(step.StepId))
+    }
+
+    /**
+     * All SUCCEEDED steps below the root, children before their parent. Siblings are already
+     * sorted by score (buildTreeFromFlatList).
+     */
+    private findSucceededStepsPostOrder(step: AtxPlanStep, depth: number = 0): AtxPlanStep[] {
+        const steps: AtxPlanStep[] = []
+        for (const child of step.Children) {
+            steps.push(...this.findSucceededStepsPostOrder(child, depth + 1))
+        }
+        if (depth > 0 && step.Status === 'SUCCEEDED') {
+            steps.push(step)
+        }
+        return steps
+    }
+
+    /**
+     * The plan step IDs that have at least one CUSTOMER_OUTPUT artifact for this job, from one
+     * paginated job-wide ListArtifacts. Job-level deliverables carry no planStepId and are
+     * ignored. Returns null on error.
+     */
+    private async listStepIdsWithCustomerOutput(workspaceId: string, jobId: string): Promise<Set<string> | null> {
+        try {
+            if (!this.atxClient && !(await this.initializeAtxClient())) {
+                this.logging.error('ATX: Failed to initialize client for listStepIdsWithCustomerOutput')
+                return null
+            }
+
+            const stepIds = new Set<string>()
+            let nextToken: string | undefined
+            do {
+                const command = new ListArtifactsCommand({
+                    workspaceId: workspaceId,
+                    jobFilter: {
+                        jobId: jobId,
+                        categoryType: 'CUSTOMER_OUTPUT',
+                    },
+                    ...(nextToken && { nextToken }),
+                })
+
+                await this.addAuthToCommand(command)
+                const result = await this.atxClient!.send(command)
+
+                for (const artifact of result?.artifacts || []) {
+                    if (artifact.planStepId) {
+                        stepIds.add(artifact.planStepId)
+                    }
+                }
+                nextToken = result?.nextToken
+            } while (nextToken)
+
+            this.logging.log(`ATX: ${stepIds.size} plan step(s) have CUSTOMER_OUTPUT artifacts for job: ${jobId}`)
+            return stepIds
+        } catch (error) {
+            this.logging.error(`ATX: listStepIdsWithCustomerOutput error: ${String(error)}`)
+            return null
+        }
     }
 
     /**
