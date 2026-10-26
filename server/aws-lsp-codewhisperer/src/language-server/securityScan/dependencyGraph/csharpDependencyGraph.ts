@@ -4,7 +4,7 @@ import * as CodeWhispererConstants from './constants'
 import { DependencyGraph, Truncation } from './dependencyGraph'
 import path = require('path')
 
-export const importRegex = /((global\s+)?using\s+(static\s+)?)([A-Z]\w*\s*?=\s*)?([A-Z]\w*(.[A-Z]\w*)*);/gm
+export const importRegex = /((global\s+)?using\s+(static\s+)?)([A-Z]\w*\s*?=\s*)?([A-Z]\w*(\.[A-Z]\w*)*);/gm
 
 export class CsharpDependencyGraph extends DependencyGraph {
     // This contains a dictionary of namespace name and the set of filepaths, where namespace has been defined.
@@ -24,7 +24,7 @@ export class CsharpDependencyGraph extends DependencyGraph {
 
         const csharpFiles = await this.filterFiles(workspacePath, files)
 
-        const searchRegEx = new RegExp('namespace ([A-Z]\\w*(.[A-Z]\\w*)*)', 'g')
+        const searchRegEx = new RegExp('namespace ([A-Z]\\w*(\\.[A-Z]\\w*)*)', 'g')
         for (const filePath of csharpFiles) {
             const content = await this.workspace.fs.readFile(filePath)
             if (!content) {
@@ -114,7 +114,7 @@ export class CsharpDependencyGraph extends DependencyGraph {
         const lineBreakRegex = new RegExp('\\r?\\n', 'g')
         this._totalLines += content.split(lineBreakRegex).length
         const importNamespaceRegex = new RegExp(
-            '(\\s*(global\\s+)?using\\s+(static\\s+)?)([A-Z]\\w*\\s*?=\\s*)?([A-Z]\\w*(.[A-Z]\\w*)*);',
+            '(\\s*(global\\s+)?using\\s+(static\\s+)?)([A-Z]\\w*\\s*?=\\s*)?([A-Z]\\w*(\\.[A-Z]\\w*)*);',
             'g'
         )
         const imports: string[] = []
