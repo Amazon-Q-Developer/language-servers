@@ -151,6 +151,29 @@ export interface AtxGetTransformInfoResponse {
     // Surfaced so the IDE can restore the correct mode instead of relying on its local
     // settings store, which may be missing/stale (e.g. cold restart on another machine).
     InteractiveMode?: InteractiveMode
+    // ITGen (ATX_ITGEN_ENABLED only): every HITL open this poll, so a test-run HITL can't be
+    // hidden behind the one HitlTag/HitlTaskId picks. Absent when the poll didn't list HITLs.
+    OpenHitls?: AtxOpenHitl[]
+}
+
+/**
+ * One open HITL task (contract v0 §3). Matches C# AtxOpenHitl class.
+ */
+export interface AtxOpenHitl {
+    TaskId: string
+    Tag?: string
+    // The plan step the task belongs to (for ITGen: the test project's step)
+    StepId?: string
+    ExpiryTimestampUTC?: string
+    // integ-app-launch / integ-test-run only: absolute path of the downloaded request.json
+    // (artifactWorkspace/<job>/hitl/<taskId>/request.json). Absent when the request is missing,
+    // can't be downloaded, or is rejected (RequestError says why).
+    RequestPath?: string
+    RequestError?: string
+    // integ-test-run only: absolute path of the extracted repo artifact holding the generated test
+    // projects (artifactWorkspace/<job>/itgen/<runId>/tests); the request's tests.projectPath is
+    // relative to it. Downloaded again for every test-run task.
+    TestsPath?: string
 }
 
 /**
@@ -276,6 +299,20 @@ export interface AtxCompleteLocalBuildHitlRequest extends ExecuteCommandParams {
     TransformationJobId: string
     TaskId: string
     BuildResultJson: string
+    SolutionRootPath: string
+}
+
+/**
+ * Completes an integ-test-run HITL (contract v0 §5: summary.json, plus trx/<project>/<runId>.trx
+ * or build-errors.json) or an integ-app-launch HITL (§6: launch-result.json, plus the startup
+ * log): uploads the result ZIP and submits the task by ID.
+ * ResultZipPath may be absolute or relative to SolutionRootPath.
+ */
+export interface AtxCompleteHitlWithTestResultsRequest extends ExecuteCommandParams {
+    WorkspaceId: string
+    TransformationJobId: string
+    TaskId: string
+    ResultZipPath: string
     SolutionRootPath: string
 }
 
