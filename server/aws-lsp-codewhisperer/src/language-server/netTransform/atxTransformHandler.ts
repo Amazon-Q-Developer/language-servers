@@ -143,6 +143,10 @@ const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 // Name of the unit-test sub-step whose diff carries the generated tests merged into the solution.
 // The agent writes it under "Generate Unit Tests"; on a beam it sits under the repo's beam card.
 const MERGE_TESTS_STEP_NAME = 'Merge Tests'
+// A beam card is named "<repo> (beamed)" by the web orchestrator. Unit test steps sit under the card
+// where the run was started: a web transform's under the repo's transform card (its tests are already
+// in the beamed zip), a run started from the IDE under the beam card. Only the latter are applied.
+const BEAM_CARD_NAME_SUFFIX = ' (beamed)'
 
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
@@ -3777,17 +3781,23 @@ export class ATXTransformHandler {
     }
 
     /**
-     * SUCCEEDED Merge Tests steps at or below any node in scope, in DFS order (children are
-     * already sorted by plan score, so this is plan order).
+     * SUCCEEDED Merge Tests steps at or below any node in scope and under a beam card, in DFS order
+     * (children are already sorted by plan score, so this is plan order).
      */
-    private findScopedMergeTestsSteps(step: AtxPlanStep, scope: Set<string>, inScope: boolean = false): AtxPlanStep[] {
+    private findScopedMergeTestsSteps(
+        step: AtxPlanStep,
+        scope: Set<string>,
+        inScope: boolean = false,
+        underBeamCard: boolean = false
+    ): AtxPlanStep[] {
         const here = inScope || scope.has(step.StepId)
+        const onBeamCard = underBeamCard || step.StepName.endsWith(BEAM_CARD_NAME_SUFFIX)
         const found: AtxPlanStep[] = []
-        if (here && step.Status === 'SUCCEEDED' && step.StepName === MERGE_TESTS_STEP_NAME) {
+        if (here && onBeamCard && step.Status === 'SUCCEEDED' && step.StepName === MERGE_TESTS_STEP_NAME) {
             found.push(step)
         }
         for (const child of step.Children) {
-            found.push(...this.findScopedMergeTestsSteps(child, scope, here))
+            found.push(...this.findScopedMergeTestsSteps(child, scope, here, onBeamCard))
         }
         return found
     }

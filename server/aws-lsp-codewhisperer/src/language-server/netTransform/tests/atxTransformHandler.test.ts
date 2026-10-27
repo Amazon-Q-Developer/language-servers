@@ -919,10 +919,16 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         const node = (StepId: string, StepName: string, Status: string, Children: any[] = []) =>
             ({ StepId, StepName, Status, Children }) as any
 
-        // root > (Beamed) Batch > two beam cards, each with LBV and Generate Unit Tests > Merge Tests.
+        // root > RepoA's transform card (with the web transform's own unit test run) and
+        // (Beamed) Batch > two beam cards, each with LBV and Generate Unit Tests > Merge Tests.
         const beamPlan = () => ({
             Root: node('root', 'root', 'IN_PROGRESS', [
-                node('repoA', 'RepoA', 'SUCCEEDED', [node('a-xform', 'Transform', 'SUCCEEDED')]),
+                node('repoA', 'RepoA', 'SUCCEEDED', [
+                    node('a-xform', 'Transform', 'SUCCEEDED'),
+                    node('a-web-ut', 'Generate Unit Tests', 'SUCCEEDED', [
+                        node('a-web-merge', 'Merge Tests', 'SUCCEEDED'),
+                    ]),
+                ]),
                 node('batch', '(Beamed) Batch', 'IN_PROGRESS', [
                     node('cardA', 'RepoA (beamed)', 'IN_PROGRESS', [
                         node('a-lbv', 'Local Build Verification', 'SUCCEEDED'),
@@ -965,6 +971,29 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(downloadStub.firstCall.args[2]).to.equal('a-merge')
             // The general completed-step pass stays skipped on a beam.
             expect(bulkStub.called).to.be.false
+        })
+
+        it("skips the web transform's Merge Tests even when the scope includes its card", async () => {
+            // Those tests are already in the beamed zip; only runs started on the beam card apply.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'repoA,cardA')
+
+            expect(downloadStub.callCount).to.equal(1)
+            expect(downloadStub.firstCall.args[2]).to.equal('a-merge')
+        })
+
+        it('applies each run started on the beam card once, in plan order', async () => {
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge', 'a-merge2'])
         })
 
         it('applies nothing without a scope or a solution path', async () => {
