@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import * as Loki from 'lokijs'
+import * as fs from 'fs'
 import * as path from 'path'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import {
@@ -279,6 +280,27 @@ export class ChatHistoryMaintainer {
     }
 
     /**
+     * Deletes empty database files from the filesystem
+     * @param emptyDbFiles Array of database file names that are empty
+     */
+    private async deleteEmptyDbFiles(emptyDbFiles: string[]) {
+        for (const dbFile of emptyDbFiles) {
+            if (dbFile === this.#dbName) {
+                // Never delete the current workspace database
+                continue
+            }
+
+            try {
+                const filePath = path.join(this.#dbDirectory, dbFile)
+                await fs.promises.unlink(filePath)
+                this.#features.logging.info(`Deleted empty database file: ${dbFile}`)
+            } catch (err) {
+                this.#features.logging.error(`Error deleting empty database file ${dbFile}: ${err}`)
+            }
+        }
+    }
+
+    /**
      * Safely saves a database with proper error handling
      * @param db The Loki database instance to save
      * @param dbName The name of the database for logging purposes
@@ -319,7 +341,9 @@ export class ChatHistoryMaintainer {
                 if (!this.isEmptyCollection(collection)) {
                     allDbsMap.set(dbFile, { collection: collection, db: db })
                 } else {
-                    this.#features.logging.info(`No ${TabCollection} collection found in database ${dbFile}`)
+                    this.#features.logging.debug(`Empty database file found: ${dbFile}, will be deleted`)
+                    db.close()
+                    await this.deleteEmptyDbFiles([dbFile])
                 }
             } catch (err) {
                 this.#features.logging.error(`Error loading DB file ${dbFile}: ${err}`)
