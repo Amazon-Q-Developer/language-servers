@@ -112,6 +112,29 @@ describe('AtxTokenServiceManager', () => {
             assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
         })
 
+        it('stores only the origin of a tenant URL pasted with a path', async () => {
+            await setTenantUrl(`${tenantUrl}/signin/`)
+            assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
+        })
+
+        for (const invalidUrl of [
+            'https://evil.example.com',
+            'http://tenant.transform.ap-northeast-2.on.aws',
+            'https://tenant.transform.ap-northeast-2.on.aws.evil.com',
+            'https://tenant.transform.evil-region-x.on.aws',
+        ]) {
+            it(`rejects a tenant URL that isn't an AWS Transform URL (${invalidUrl}), so IAM isn't active`, async () => {
+                stubIam(true)
+                stubBearer(false)
+                await setTenantUrl(tenantUrl)
+
+                await setTenantUrl(invalidUrl)
+
+                assert.strictEqual(manager.getActiveApplicationUrl(), null)
+                assert.strictEqual(manager.getAuthType(), null)
+            })
+        }
+
         it('getAuthType is iam only once both IAM credentials and the tenant URL are present', async () => {
             stubIam(true)
             stubBearer(false)

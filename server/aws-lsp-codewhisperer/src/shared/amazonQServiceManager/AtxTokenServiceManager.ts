@@ -10,6 +10,7 @@ import { TransformConfigurationServer } from '../../language-server/configuratio
 import { CodeWhispererServiceToken } from '../codeWhispererService'
 import { StreamingClientServiceToken } from '../streamingClientService'
 import { getAtxEndPointByRegion } from '../constants'
+import { parseAtxTenantUrl } from '../atxTenantUrl'
 import { AmazonQDeveloperProfile } from './qDeveloperProfiles'
 import { parse } from '@aws-sdk/util-arn-parser'
 import { getUserAgent, makeUserContextObject } from '../telemetryUtils'
@@ -99,12 +100,18 @@ export class AtxTokenServiceManager {
         }
 
         // IAM path: the tenant (application) URL arrives via configuration because there is no
-        // Transform profile to look it up from. Store it directly so it can be used as the FES
-        // Origin/region. Trailing slash stripped to match the profile-derived value.
+        // Transform profile to look it up from. Only an https AWS Transform URL in a region with an AWS Transform
+        // endpoint is kept, reduced to its origin (the FES Origin header and region); anything else clears it, so
+        // the IAM session isn't usable until the client sends a valid one.
         if (params.settings.applicationUrl !== undefined) {
-            const applicationUrl = params.settings.applicationUrl as string
-            this.activeApplicationUrl = applicationUrl ? applicationUrl.replace(/\/$/, '') : null
-            this.log(`ATX: Set application URL from configuration`)
+            const applicationUrl = params.settings.applicationUrl
+            const tenantUrl = applicationUrl ? parseAtxTenantUrl(applicationUrl) : undefined
+            this.activeApplicationUrl = tenantUrl?.origin ?? null
+            if (applicationUrl && !tenantUrl) {
+                this.log('ATX: Rejected application URL from configuration: not an AWS Transform web application URL')
+            } else {
+                this.log(`ATX: Set application URL from configuration`)
+            }
         }
 
         // Bearer (IdC) path: profile selection drives the active profile and its application URL.

@@ -124,6 +124,36 @@ describe('ATXTransformHandler - addAuthToCommand auth branching', () => {
             expect(headers['authorization']).to.match(/^AWS4-HMAC-SHA256 /)
             expect(headers['x-amz-security-token']).to.equal(undefined)
         })
+
+        for (const tenantUrl of [
+            'https://evil.example.com',
+            'http://tenant.transform.ap-northeast-2.on.aws',
+            'https://attacker.com/x.transform.us-east-1.on.aws/callback',
+            'https://tenant.transform.evil-region-x.on.aws',
+        ]) {
+            it(`refuses to sign with an invalid tenant URL (${tenantUrl})`, async () => {
+                serviceManager.getAuthType.returns('iam')
+                serviceManager.getActiveApplicationUrl.returns(tenantUrl)
+                const add = sinon.stub()
+
+                let threw = false
+                try {
+                    await handler['addAuthToCommand']({ middlewareStack: { add } })
+                } catch (e) {
+                    threw = true
+                    expect(String(e)).to.match(/No valid AWS Transform application URL/)
+                }
+                expect(threw, 'addAuthToCommand should reject an invalid tenant URL').to.equal(true)
+                expect(add.called, 'no signing middleware is registered').to.equal(false)
+            })
+        }
+
+        it('has no region for an invalid tenant URL instead of falling back to the default', async () => {
+            serviceManager.getAuthType.returns('iam')
+            serviceManager.getActiveApplicationUrl.returns('https://evil.example.com')
+
+            expect(await handler['getRegionFromProfile']()).to.equal(undefined)
+        })
     })
 
     describe('no active auth', () => {

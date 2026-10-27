@@ -7,6 +7,7 @@ import * as crypto from 'crypto'
 import { pipeline } from 'stream/promises'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { SignatureV4 } from '@smithy/signature-v4'
+import { parseAtxTenantUrl } from '../../shared/atxTenantUrl'
 import { Sha256 } from '@aws-crypto/sha256-js'
 import AdmZip = require('adm-zip')
 import { ArtifactManager } from './artifactManager'
@@ -260,6 +261,12 @@ export class ATXTransformHandler {
             const atxServiceManager = AtxTokenServiceManager.getInstance()
             const applicationUrl = atxServiceManager.getActiveApplicationUrl()
 
+            // IAM: the tenant URL comes from the client, so only a valid AWS Transform URL gives a region; no
+            // fallback to the default region.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                return parseAtxTenantUrl(applicationUrl)?.region
+            }
+
             if (applicationUrl) {
                 // Extract region from applicationURL: https://xxx.transform.REGION.on.aws
                 const urlMatch = applicationUrl.match(/\.transform(?:-gamma)?\.([^.]+)\.on\.aws/)
@@ -333,18 +340,19 @@ export class ATXTransformHandler {
 
     /**
      * SigV4-sign an ATX FES command using the active IAM credentials (service name `transform`).
-     * Region is derived from the tenant URL exactly like the bearer path (getRegionFromProfile), and
-     * the tenant URL is attached as the Origin header, matching the bearer path.
+     * Region and the Origin header come from the tenant URL, which must be a valid AWS Transform URL
+     * (parseAtxTenantUrl); the request itself always goes to the region's FES endpoint.
      */
     private async addSigV4AuthToCommand(command: any): Promise<void> {
         const iamCredentials = this.serviceManager.getIamCredentials()
-        const region = (await this.getRegionFromProfile()) || DEFAULT_ATX_FES_REGION
-        const applicationUrl = await this.getActiveTransformProfileApplicationUrl()
-        const cleanOrigin = applicationUrl
-            ? applicationUrl.endsWith('/')
-                ? applicationUrl.slice(0, -1)
-                : applicationUrl
-            : undefined
+
+        // Never sign without a valid AWS Transform tenant URL: it gives the region and the Origin header.
+        const tenantUrl = parseAtxTenantUrl(await this.getActiveTransformProfileApplicationUrl())
+        if (!tenantUrl) {
+            throw new Error('ATX: No valid AWS Transform application URL for IAM (SigV4) auth')
+        }
+        const region = tenantUrl.region
+        const cleanOrigin = tenantUrl.origin
 
         const signer = new SignatureV4({
             service: 'transform',
