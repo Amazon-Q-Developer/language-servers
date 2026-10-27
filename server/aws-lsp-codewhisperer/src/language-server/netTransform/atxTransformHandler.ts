@@ -1768,8 +1768,9 @@ export class ATXTransformHandler {
      * (contract v0 §5 / §6) — upload it as a HITL_FROM_USER ZIP, then submit the task by ID, like
      * completeHitlWithBuildResults. The ZIP must hold a summary.json (test run) or a
      * launch-result.json (app launch) with a supported schemaVersion; anything else is refused
-     * before upload so the agent never receives a result it can't read. No size limit here: the
-     * limit is an IDE constant (C13).
+     * before upload so the agent never receives a result it can't read. On the transformed side the
+     * customer's changed files are added as workspace/ (addCustomerChangesToResultZip). No size
+     * limit here: the limit is an IDE constant (C13).
      */
     async completeHitlWithTestResults(
         workspaceId: string,
@@ -1792,17 +1793,23 @@ export class ATXTransformHandler {
                 return { Success: false, Error: `Result ZIP not found: ${zipPath}` }
             }
 
-            const summaryError = this.validateTestResultZip(zipPath)
-            if (summaryError) {
-                return { Success: false, Error: summaryError }
+            const resultFile = this.readTestResultZip(zipPath)
+            if ('error' in resultFile) {
+                return { Success: false, Error: resultFile.error }
             }
+            // The customer can change code at any time on the transformed side; the original copy
+            // is never sent back to the agent.
+            const uploadPath =
+                resultFile.result?.side === 'transformed'
+                    ? this.addCustomerChangesToResultZip(zipPath, solutionRootPath, jobId)
+                    : zipPath
 
             // HITL_FROM_USER for the same reason as completeHitlWithBuildResults: the submit
             // fails with ResourceNotFoundException for any other category.
             const uploadResponse = await this.createArtifactUploadUrl(
                 workspaceId,
                 jobId,
-                zipPath,
+                uploadPath,
                 CategoryType.HITL_FROM_USER,
                 FileType.ZIP
             )
@@ -1812,7 +1819,7 @@ export class ATXTransformHandler {
 
             const uploadSuccess = await Utils.uploadArtifact(
                 uploadResponse.uploadUrl,
-                zipPath,
+                uploadPath,
                 uploadResponse.requestHeaders,
                 this.logging
             )
@@ -1840,27 +1847,62 @@ export class ATXTransformHandler {
     }
 
     /**
-     * Returns why an ITGen result ZIP can't be submitted, or null when its result file is usable:
-     * summary.json for a test run, else launch-result.json for an app launch.
+     * Reads an ITGen result ZIP's result file (summary.json for a test run, else launch-result.json
+     * for an app launch), or says why the ZIP can't be submitted.
      */
-    private validateTestResultZip(zipPath: string): string | null {
+    private readTestResultZip(zipPath: string): { result: any } | { error: string } {
         let fileName: string
         let result: any
         try {
             const zip = new AdmZip(zipPath)
             const entry = zip.getEntry('summary.json') || zip.getEntry('launch-result.json')
             if (!entry) {
-                return 'Result ZIP has neither summary.json nor launch-result.json at its root'
+                return { error: 'Result ZIP has neither summary.json nor launch-result.json at its root' }
             }
             fileName = entry.entryName
             result = JSON.parse(entry.getData().toString('utf-8'))
         } catch (error) {
-            return `Result ZIP is unreadable: ${String(error)}`
+            return { error: `Result ZIP is unreadable: ${String(error)}` }
         }
         if (!isSupportedAtxTestRunSchemaVersion(result?.schemaVersion)) {
-            return `Unsupported ${fileName} schemaVersion: ${result?.schemaVersion}`
+            return { error: `Unsupported ${fileName} schemaVersion: ${result?.schemaVersion}` }
         }
-        return null
+        return { result }
+    }
+
+    /**
+     * ITGen (contract v0 §6): adds the customer's changed files to a transformed-side result ZIP as
+     * workspace/metadata.json ({ filesUpdated }) plus workspace/<relative path>, with the same scan
+     * and metadata as updateWorkspace: every tracked file modified since job start. metadata.json is
+     * written even when nothing changed, so the agent can tell "no changes" from an old IDE. The
+     * IDE's ZIP is left as it is: the result goes to a copy next to it, whose path is returned. A
+     * ZIP that already has workspace/ is returned unchanged.
+     */
+    private addCustomerChangesToResultZip(zipPath: string, solutionRootPath: string, jobId: string): string {
+        const zip = new AdmZip(zipPath)
+        if (zip.getEntries().some(entry => entry.entryName.startsWith('workspace/'))) {
+            return zipPath
+        }
+
+        const filesUpdated: string[] = []
+        for (const filePath of this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId, true)) {
+            const relativePath = path.relative(solutionRootPath, filePath)
+            if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+                continue
+            }
+            try {
+                zip.addFile(`workspace/${relativePath.split(path.sep).join('/')}`, fs.readFileSync(filePath))
+                filesUpdated.push(relativePath)
+            } catch (error) {
+                this.logging.error(`ATX: could not add ${filePath} to the result ZIP: ${String(error)}`)
+            }
+        }
+        zip.addFile('workspace/metadata.json', Buffer.from(JSON.stringify({ filesUpdated }, null, 2)))
+
+        const uploadPath = zipPath.replace(/\.zip$/i, '') + '.with-workspace.zip'
+        zip.writeZip(uploadPath)
+        this.logging.log(`ATX: added ${filesUpdated.length} customer-changed file(s) to ${uploadPath}`)
+        return uploadPath
     }
 
     /**

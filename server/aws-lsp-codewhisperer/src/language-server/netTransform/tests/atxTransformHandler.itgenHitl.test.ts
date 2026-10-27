@@ -408,6 +408,93 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(result.Error).to.contain('Result ZIP not found')
         })
 
+        describe('customer changes (workspace/) on the transformed side', () => {
+            // The updateWorkspace manifest: tracked files, and the job start as the baseline.
+            const seedManifest = (files: Record<string, string>, jobStartMsAgo = 60_000) => {
+                const checkpoints = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
+                fs.mkdirSync(checkpoints, { recursive: true })
+                const absolute = Object.keys(files).map(rel => path.join(tmpRoot, rel))
+                for (const [rel, content] of Object.entries(files)) {
+                    fs.mkdirSync(path.dirname(path.join(tmpRoot, rel)), { recursive: true })
+                    fs.writeFileSync(path.join(tmpRoot, rel), content)
+                }
+                fs.writeFileSync(
+                    path.join(checkpoints, 'source-files.json'),
+                    JSON.stringify({
+                        createdAt: new Date(Date.now() - jobStartMsAgo).toISOString(),
+                        sourceFiles: absolute,
+                    })
+                )
+            }
+            const uploaded = () => new AdmZip(uploadStub.firstCall.args[1])
+            const launchResult = (side: string) =>
+                JSON.stringify({ schemaVersion: '1.1', side, status: 'APP_NOT_STARTED', attempt: 2 })
+
+            it('adds the files the customer changed since job start, in the updateWorkspace format', async () => {
+                seedManifest({ 'Web/appsettings.json': '{ "fixed": true }' })
+                const full = writeZip('launch.zip', {
+                    'launch-result.json': launchResult('transformed'),
+                    'app-startup.log': 'boom',
+                })
+
+                const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(result).to.deep.equal({ Success: true })
+                expect(uploadStub.firstCall.args[1]).to.equal(full.replace(/\.zip$/, '.with-workspace.zip'))
+                const zip = uploaded()
+                expect(JSON.parse(zip.getEntry('workspace/metadata.json')!.getData().toString())).to.deep.equal({
+                    filesUpdated: [path.join('Web', 'appsettings.json')],
+                })
+                expect(zip.getEntry('workspace/Web/appsettings.json')!.getData().toString()).to.equal(
+                    '{ "fixed": true }'
+                )
+                // The IDE's own entries are kept, and its ZIP isn't modified.
+                expect(zip.getEntry('app-startup.log')).to.not.be.null
+                expect(new AdmZip(full).getEntry('workspace/metadata.json')).to.be.null
+            })
+
+            it('adds them to transformed-side test-run results too', async () => {
+                seedManifest({ 'Web/Controllers/BookController.cs': '// customer edit between runs' })
+                const summaryJson = JSON.stringify({ schemaVersion: '1.1', side: 'transformed', status: 'COMPLETED' })
+                const full = writeZip('results.zip', { 'summary.json': summaryJson })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+                expect(uploaded().getEntry('workspace/Web/Controllers/BookController.cs')).to.not.be.null
+            })
+
+            it('sends an empty filesUpdated when nothing changed', async () => {
+                const full = writeZip('launch.zip', { 'launch-result.json': launchResult('transformed') })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                const metadata = uploaded().getEntry('workspace/metadata.json')!.getData().toString()
+                expect(JSON.parse(metadata)).to.deep.equal({ filesUpdated: [] })
+            })
+
+            it('sends nothing back on the original side', async () => {
+                seedManifest({ 'Web/appsettings.json': '{}' })
+                const full = writeZip('launch.zip', { 'launch-result.json': launchResult('original') })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(uploadStub.firstCall.args[1]).to.equal(full)
+                expect(uploaded().getEntry('workspace/metadata.json')).to.be.null
+            })
+
+            it('keeps a workspace/ the IDE already added', async () => {
+                seedManifest({ 'Web/appsettings.json': '{}' })
+                const full = writeZip('launch.zip', {
+                    'launch-result.json': launchResult('transformed'),
+                    'workspace/metadata.json': JSON.stringify({ filesUpdated: [] }),
+                })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(uploadStub.firstCall.args[1]).to.equal(full)
+            })
+        })
+
         it('accepts an app-launch result ZIP (launch-result.json + startup log)', async () => {
             const launchResult = JSON.stringify({ schemaVersion: '1.0', status: 'APP_NOT_STARTED', attempt: 1 })
             const full = writeZip('launch.zip', { 'launch-result.json': launchResult, 'app-startup.log': 'boom' })

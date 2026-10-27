@@ -383,16 +383,18 @@ export interface AtxLoadOlderWorklogsRequest extends ExecuteCommandParams {
     nextToken?: string
 }
 
-// ITGen test-run HITL payloads (ITGen–IDE contract v0, schema 1.0). Draft: names follow the v0
+// ITGen test-run HITL payloads (ITGen–IDE contract v0, schema 1.1). Draft: names follow the v0
 // proposal and match C# AtxTestRunRequest / AtxTestRunSummary / AtxAppLaunchRequest /
 // AtxAppLaunchResult in the VS extension.
 
-export const ATX_TEST_RUN_SCHEMA_VERSION = '1.0'
+// 1.1 (10/26) added launch-result launchedBy and dropped NOT_LOCALHOST; 1.0 payloads are still accepted
+export const ATX_TEST_RUN_SCHEMA_VERSION = '1.1'
 export const ATX_TEST_RUN_BASE_URL_ENV = 'AB_BASE_URL'
 
 export type AtxTestRunSide = 'original' | 'transformed'
 
-export type AtxTestRunStatus = 'COMPLETED' | 'TEST_BUILD_FAILED' | 'TIMED_OUT' | 'NOT_LOCALHOST'
+// NOT_LOCALHOST was removed in 1.1: published URLs are allowed on the original side
+export type AtxTestRunStatus = 'COMPLETED' | 'TEST_BUILD_FAILED' | 'TIMED_OUT'
 
 /**
  * Request from the Transform agent to run one test project (request.json of an integ-test-run HITL)
@@ -405,8 +407,8 @@ export interface AtxTestRunRequest {
     schemaVersion: string
     // Names the TRX file (trx/<project>/<runId>.trx) and is echoed in the summary
     runId: string
-    // Also says where the app runs from: original = the copy uploaded at job start
-    // (artifactWorkspace/<upload folder>/artifact/sourceCode), transformed = the customer's solution
+    // Also says where the app runs from: original = the copy of the original solution the IDE takes
+    // at job start (artifactWorkspace/before/), transformed = the customer's solution
     side: AtxTestRunSide
     project: string
     // The repo artifact the agent rewrites, holding the generated test projects: one per repo,
@@ -435,6 +437,9 @@ export interface AtxAppLaunchApp {
 
 export type AtxAppLaunchStatus = 'STARTED' | 'APP_NOT_STARTED'
 
+// Who started the app: the IDE, or the customer (who started it themselves or gave a URL)
+export type AtxAppLaunchedBy = 'ide' | 'customer'
+
 /**
  * Request from the Transform agent to start one web project (request.json of an integ-app-launch HITL),
  * one per launch attempt. Contract v0 defines only the result, so this shape is a proposal. Like LBV's
@@ -459,6 +464,9 @@ export interface AtxAppLaunchResult {
     project: string
     attempt: number
     status: AtxAppLaunchStatus
+    // Since 1.1; absent means ide. For customer, appUrl is the URL the customer gave: localhost or
+    // published on the original side, localhost only on the transformed side
+    launchedBy?: AtxAppLaunchedBy
     appUrl?: string
     // The last health check; httpStatus is absent when the app didn't answer
     healthCheck?: {
