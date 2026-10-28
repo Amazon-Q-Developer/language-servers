@@ -5009,6 +5009,12 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const nr = (handler as any).normalizeBeamRepo({})
             expect(nr.RepositoryName).to.equal('')
             expect(nr.BeamScenario).to.equal('transformed')
+            expect(nr.OriginalArtifactId).to.equal('')
+        })
+
+        it('maps originalArtifactId to OriginalArtifactId', () => {
+            const nr = (handler as any).normalizeBeamRepo({ repoName: 'alice', originalArtifactId: 'orig-1' })
+            expect(nr.OriginalArtifactId).to.equal('orig-1')
         })
     })
 
@@ -5044,6 +5050,21 @@ describe('ATXTransformHandler - Beam to IDE', () => {
                 .resolves({ repos: [{ repoName: 'alice', stepId: 's1', scenario: 'transformed' }] })
             const result = await handler.listBeamedRepos('ws-1', 'job-1')
             expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+            // No original saved for this repo → empty, never undefined (the C# side binds it).
+            expect(result[0].OriginalArtifactId).to.equal('')
+        })
+
+        it('carries the original-source artifact id from the beam-map entry (ITGen row 22/15)', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [{ repoName: 'alice', stepId: 's1', originalArtifactId: 'orig-alice' }],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result[0].OriginalArtifactId).to.equal('orig-alice')
+            // The transformed source stays the beam artifact; the original never replaces it.
             expect(result[0].BeamArtifactId).to.equal('zip-alice')
         })
 
@@ -5122,6 +5143,152 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         it('rejects an empty destDir', async () => {
             const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
             expect(result.Success).to.be.false
+        })
+    })
+
+    // --- downloadOriginalCode: ITGen original source by artifact id (row 15, contract C6) ---
+    describe('downloadOriginalCode', () => {
+        let root: string
+        const originalDir = () => path.join(root, workspaceFolderName, 'before')
+        const stagingDir = () => path.join(root, workspaceFolderName, 'before.partial')
+        const marker = () => path.join(originalDir(), '.atx-itgen-job')
+        const presigned = () =>
+            sinon
+                .stub(handler, 'createArtifactDownloadUrl')
+                .resolves({ s3PresignedUrl: 'https://s3/original.zip', requestHeaders: {} } as any)
+        // Stand-in for the real download+extract: writes what extractArchiveFromBuffer leaves
+        // behind (the extracted tree plus the downloaded zip itself) into the target folder.
+        const fakeExtract =
+            (files: Record<string, string>) =>
+            async (...args: any[]): Promise<string> => {
+                const [, , dir, name] = args as [string, any, string, string]
+                for (const [rel, content] of Object.entries(files)) {
+                    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
+                    fs.writeFileSync(path.join(dir, rel), content)
+                }
+                fs.writeFileSync(path.join(dir, name), 'PK-zip-bytes')
+                return dir
+            }
+
+        beforeEach(() => {
+            root = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-original-'))
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('rejects a relative or traversing solution root', async () => {
+            for (const bad of ['relative/dir', `${path.sep}root${path.sep}..${path.sep}evil`, '']) {
+                const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', bad)
+                expect(result.Success).to.be.false
+                expect(result.Error).to.match(/Invalid solution root/)
+            }
+        })
+
+        it('rejects a job id that could escape artifactWorkspace', async () => {
+            for (const bad of ['../x', 'a/b', 'a\\b', '']) {
+                const result = await handler.downloadOriginalCode('ws-1', bad, 'orig-1', root)
+                expect(result.Success).to.be.false
+                expect(result.Error).to.match(/Invalid job id/)
+            }
+        })
+
+        it('downloads and extracts into artifactWorkspace/before, dropping the zip and staging folder', async () => {
+            const urlStub = presigned()
+            const utilsModule = require('../utils')
+            sinon
+                .stub(utilsModule.Utils, 'downloadAndExtractArchive')
+                .callsFake(fakeExtract({ 'App/App.csproj': '<Project/>', 'App/Program.cs': 'class P {}' }))
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: false })
+            expect(urlStub.calledOnceWith('ws-1', 'job-1', 'orig-1')).to.be.true
+            expect(fs.readFileSync(path.join(originalDir(), 'App', 'Program.cs'), 'utf8')).to.equal('class P {}')
+            expect(fs.existsSync(path.join(originalDir(), 'original-source.zip'))).to.be.false
+            expect(fs.existsSync(stagingDir())).to.be.false
+            expect(fs.readFileSync(marker(), 'utf8')).to.equal('job-1')
+        })
+
+        it('stubs the MSBuild walk-up files the original lacks and keeps the ones it has', async () => {
+            presigned()
+            const utilsModule = require('../utils')
+            sinon
+                .stub(utilsModule.Utils, 'downloadAndExtractArchive')
+                .callsFake(fakeExtract({ 'App.sln': '', 'Directory.Build.props': '<Project><!-- repo --></Project>' }))
+
+            await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            const read = (name: string) => fs.readFileSync(path.join(originalDir(), name), 'utf8')
+            expect(read('Directory.Build.props')).to.contain('repo')
+            expect(read('Directory.Build.targets')).to.contain('AWS Transform')
+            expect(read('Directory.Packages.props')).to.contain('AWS Transform')
+        })
+
+        it("reuses this job's copy without downloading again", async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(path.join(originalDir(), 'App.sln'), '')
+            fs.writeFileSync(marker(), 'job-1')
+            const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: true })
+            expect(urlStub.called).to.be.false
+        })
+
+        it("replaces another job's copy, and a copy with no marker", async () => {
+            presigned()
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'downloadAndExtractArchive').callsFake(fakeExtract({ 'App.sln': '' }))
+            for (const previous of ['job-0', null]) {
+                fs.rmSync(originalDir(), { recursive: true, force: true })
+                fs.mkdirSync(originalDir(), { recursive: true })
+                fs.writeFileSync(path.join(originalDir(), 'Stale.cs'), '')
+                if (previous) {
+                    fs.writeFileSync(marker(), previous)
+                }
+
+                const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+                expect(result.Success).to.be.true
+                expect(result.AlreadyPresent).to.be.false
+                expect(fs.existsSync(path.join(originalDir(), 'Stale.cs'))).to.be.false
+                expect(fs.readFileSync(marker(), 'utf8')).to.equal('job-1')
+            }
+        })
+
+        it('fails without creating an original folder when there is no presigned URL', async () => {
+            sinon.stub(handler, 'createArtifactDownloadUrl').resolves(null)
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/No presigned URL/)
+            expect(fs.existsSync(originalDir())).to.be.false
+        })
+
+        it('never leaves a half-extracted original behind, and a retry starts clean', async () => {
+            presigned()
+            const utilsModule = require('../utils')
+            const extract = sinon.stub(utilsModule.Utils, 'downloadAndExtractArchive')
+            extract.onFirstCall().callsFake(async (...args: any[]) => {
+                const dir = args[2] as string
+                fs.mkdirSync(dir, { recursive: true })
+                fs.writeFileSync(path.join(dir, 'half-written.cs'), '')
+                throw new Error('socket hang up')
+            })
+            extract.onSecondCall().callsFake(fakeExtract({ 'App.sln': '' }))
+
+            const failed = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            expect(failed.Success).to.be.false
+            expect(fs.existsSync(originalDir())).to.be.false
+
+            const retried = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            expect(retried.Success).to.be.true
+            expect(fs.existsSync(path.join(originalDir(), 'App.sln'))).to.be.true
+            expect(fs.existsSync(path.join(originalDir(), 'half-written.cs'))).to.be.false
         })
     })
 })

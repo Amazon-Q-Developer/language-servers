@@ -65,6 +65,7 @@ import {
     AtxUploadCustomPlanResponse,
     AtxOpenHitl,
     isSupportedAtxTestRunSchemaVersion,
+    AtxDownloadOriginalCodeResponse,
 } from './atxModels'
 import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
@@ -107,6 +108,15 @@ interface DiffApplyContext {
     failedStepIds: string[]
 }
 
+// ITGen original code, shared with the IDE's OriginalCodeBackup: artifactWorkspace/before holds one
+// copy per solution, tagged with the id of the job that made it.
+const ORIGINAL_CODE_FOLDER = 'before'
+const ORIGINAL_CODE_JOB_MARKER = '.atx-itgen-job'
+// MSBuild walks up from a project until it finds these; an empty stub stops the walk.
+const ORIGINAL_CODE_WALK_UP_FILES = ['Directory.Build.props', 'Directory.Build.targets', 'Directory.Packages.props']
+const ORIGINAL_CODE_STUB =
+    "<Project>\r\n  <!-- Created by AWS Transform so this copy doesn't import the files above it. -->\r\n</Project>\r\n"
+
 /**
  * Beam to IDE wire/shape types. These pin the shapes flowing through beam discovery so the
  * compiler catches drift instead of `any` silently accepting anything.
@@ -128,6 +138,9 @@ interface BeamMapRepo {
     tfm?: string
     target_framework?: string
     scenario?: string
+    // ITGen: the repo's ORIGINAL (pre-transformation) source zip, saved by the web job before
+    // transforming. The IDE builds and starts it to record the test baseline.
+    originalArtifactId?: string
 }
 
 /** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
@@ -137,6 +150,8 @@ interface BeamedRepoInfo {
     BeamStepId: string
     BeamTargetFramework: string
     BeamScenario: string
+    // '' when the web job didn't save an original (tests not requested, or flag off).
+    OriginalArtifactId: string
     IsLbvOpen: boolean
     // Beamed but LBV HITL not created yet (no beamed node / no LBV child / no plan). IDE shows Load
     // only when IsLbvOpen && !IsLbvPending, so a repo can't be Loaded before its HITL exists.
@@ -909,6 +924,7 @@ export class ATXTransformHandler {
                         BeamStepId: nr.BeamStepId || '',
                         BeamTargetFramework: nr.BeamTargetFramework || '',
                         BeamScenario: nr.BeamScenario || 'transformed',
+                        OriginalArtifactId: nr.OriginalArtifactId || '',
                         IsLbvOpen: lbvOpen,
                         IsLbvPending: lbvPending,
                     })
@@ -965,6 +981,8 @@ export class ATXTransformHandler {
                             BeamStepId: '',
                             BeamTargetFramework: '',
                             BeamScenario: 'transformed',
+                            // Beam-status fallback has no beam-map entry, so no original id.
+                            OriginalArtifactId: '',
                             IsLbvOpen: lbvOpen,
                             IsLbvPending: lbvPending,
                         })
@@ -1040,6 +1058,7 @@ export class ATXTransformHandler {
             BeamStepId: this.getStepId(o) ?? '',
             BeamTargetFramework: o.targetFramework ?? o.tfm ?? o.target_framework ?? '',
             BeamScenario: o.scenario ?? 'transformed',
+            OriginalArtifactId: o.originalArtifactId ?? '',
         }
     }
 
@@ -1224,6 +1243,74 @@ export class ATXTransformHandler {
             return { Success: true, ExtractedPath: extractedPath }
         } catch (error) {
             this.logging.error(`[BEAM-PKG] downloadBeamArtifact error: ${String(error)}`)
+            return { Success: false, Error: String(error) }
+        }
+    }
+
+    /**
+     * ITGen — download a beamed repo's ORIGINAL (pre-transformation) source by its artifact id and
+     * extract it into `<SolutionRootPath>/artifactWorkspace/before`, the same folder the IDE copies a
+     * local job's original to, so the original-side app launches and test runs find it in one place.
+     *
+     * One copy per solution: this job's copy (job marker) is reused, another job's is replaced.
+     * Extraction goes to a sibling staging folder that is renamed into place only after it fully
+     * succeeds, so a crash or failed download never leaves a half-extracted copy that a later call
+     * would treat as complete. Keep the marker and stubs in step with the IDE's OriginalCodeBackup.
+     */
+    async downloadOriginalCode(
+        workspaceId: string,
+        jobId: string,
+        codeArtifactId: string,
+        solutionRootPath: string
+    ): Promise<AtxDownloadOriginalCodeResponse> {
+        try {
+            if (!solutionRootPath || !path.isAbsolute(solutionRootPath) || solutionRootPath.includes('..')) {
+                return { Success: false, Error: 'Invalid solution root path for original code' }
+            }
+            // jobId becomes a folder name: refuse anything that could leave artifactWorkspace.
+            if (!jobId || /[\\/]|\.\./.test(jobId)) {
+                return { Success: false, Error: 'Invalid job id for original code' }
+            }
+            const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
+            const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
+            if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === jobId) {
+                this.logging.log(`ATX: downloadOriginalCode: reusing this job's original at ${originalDir}`)
+                return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
+            }
+
+            this.logging.log(`ATX: downloadOriginalCode ${codeArtifactId} -> ${originalDir}`)
+            const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, codeArtifactId)
+            if (!dl?.s3PresignedUrl) {
+                return { Success: false, Error: 'No presigned URL for original code artifact' }
+            }
+
+            const stagingDir = `${originalDir}.partial`
+            fs.rmSync(stagingDir, { recursive: true, force: true })
+            const archiveName = 'original-source.zip'
+            await Utils.downloadAndExtractArchive(
+                dl.s3PresignedUrl,
+                dl.requestHeaders,
+                stagingDir,
+                archiveName,
+                this.logging
+            )
+            // extractArchiveFromBuffer leaves the zip next to its contents; it isn't source.
+            fs.rmSync(path.join(stagingDir, archiveName), { force: true })
+            // The copy sits inside the transformed solution: without these at its root, MSBuild would
+            // walk up and import the transformed solution's files.
+            for (const name of ORIGINAL_CODE_WALK_UP_FILES) {
+                const file = path.join(stagingDir, name)
+                if (!fs.existsSync(file)) {
+                    fs.writeFileSync(file, ORIGINAL_CODE_STUB)
+                }
+            }
+            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), jobId)
+            fs.rmSync(originalDir, { recursive: true, force: true })
+            fs.renameSync(stagingDir, originalDir)
+            this.logging.log(`ATX: downloadOriginalCode extracted -> ${originalDir}`)
+            return { Success: true, OriginalPath: originalDir, AlreadyPresent: false }
+        } catch (error) {
+            this.logging.error(`ATX: downloadOriginalCode error: ${String(error)}`)
             return { Success: false, Error: String(error) }
         }
     }
