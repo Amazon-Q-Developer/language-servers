@@ -14,7 +14,7 @@ import { ProfileStatusMonitor } from './profileStatusMonitor'
 const fakeLogging = {
     log: () => {},
     info: () => {},
-    warn: () => {},
+    warn: (_message: string) => {},
     error: () => {},
     debug: () => {},
 }
@@ -220,6 +220,79 @@ describe('callTool()', () => {
         const res = await mgr.callTool('s1', 'tool1', { foo: 1 })
         expect(callToolStub.calledOnceWith({ name: 'tool1', arguments: { foo: 1 } })).to.be.true
         expect(res).to.equal('ok')
+    })
+
+    describe('request timeout passthrough', () => {
+        const initWithTimeout = async (timeout: number | undefined) => {
+            const cfg: MCPServerConfig = { ...enabledCfg, timeout } as MCPServerConfig
+            loadStub = sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+                servers: new Map([['s1', cfg]]),
+                serverNameMapping: new Map(),
+                errors: new Map(),
+                agentConfig: {
+                    name: 'test-agent',
+                    description: 'Test agent',
+                    mcpServers: { s1: cfg },
+                    tools: ['@s1'],
+                    allowedTools: [],
+                    toolsSettings: {},
+                    includedFiles: [],
+                    resources: [],
+                },
+            })
+            const mgr = await McpManager.init(['p.json'], features)
+            await mgr.discoverAllServers()
+            ;(mgr as any).clients.set('s1', new Client({ name: 'x', version: 'v' }))
+            return mgr
+        }
+
+        const optionsOfFirstCall = () => callToolStub.firstCall.args[2]
+
+        it('forwards the configured timeout to the SDK so it is not capped at 60s', async () => {
+            const mgr = await initWithTimeout(300_000)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: 300_000 })
+        })
+
+        it('forwards the default timeout when none is configured', async () => {
+            const mgr = await initWithTimeout(undefined)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+        })
+
+        it('maps timeout 0 to the maximum timer value instead of the SDK default', async () => {
+            const mgr = await initWithTimeout(0)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            const options = optionsOfFirstCall()
+            expect(options).to.deep.equal({ timeout: mcpUtils.MAX_TOOL_EXEC_TIMEOUT_MS })
+            // Must stay a finite value setTimeout can honour, otherwise the deadline fires at once.
+            expect(Number.isFinite(options.timeout)).to.be.true
+        })
+
+        it('falls back to the default and warns on an unusable timeout', async () => {
+            const spyWarn = sinon.spy(fakeLogging, 'warn')
+            const mgr = await initWithTimeout(-5)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+            expect(spyWarn.calledOnce).to.be.true
+            expect(spyWarn.firstCall.args[0]).to.contain('invalid timeout')
+        })
+
+        it('falls back to the default when the timeout exceeds the maximum timer value', async () => {
+            const mgr = await initWithTimeout(mcpUtils.MAX_TOOL_EXEC_TIMEOUT_MS + 1)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+        })
     })
 
     it('times out and logs error', async () => {

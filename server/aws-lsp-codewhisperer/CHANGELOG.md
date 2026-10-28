@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.132](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.131...lsp-codewhisperer/v0.0.132) (2026-10-21)
+
+
+### Bug Fixes
+
+* mcp and path resolver ([#2957](https://github.com/Amazon-Q-Developer/language-servers/issues/2957)) ([96372c0](https://github.com/Amazon-Q-Developer/language-servers/commit/96372c0e11a85404dbff254f334d38fd21e9b13f))
+
 ## [0.0.131](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.130...lsp-codewhisperer/v0.0.131) (2026-10-15)
 
 
