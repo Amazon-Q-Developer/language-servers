@@ -5,7 +5,7 @@
 
 import * as crypto from 'crypto'
 import * as fs from 'fs/promises'
-import { constants as fsConstants } from 'fs'
+import { constants as fsConstants, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'fs'
 import * as os from 'os'
 import { URI } from 'vscode-uri'
 import { newAgent } from '@aws/language-server-runtimes/runtimes/agent'
@@ -72,6 +72,8 @@ import { LocalProjectContextController } from '../../shared/localProjectContextC
 import { CancellationError } from '@aws/lsp-core'
 import { CommandValidation, ToolApprovalException, requireResolvedTargets } from './tools/toolShared'
 import { FsRead } from './tools/fsRead'
+import { ListDirectory } from './tools/listDirectory'
+import { ExecuteBash } from './tools/executeBash'
 import * as constants from './constants/constants'
 import { GENERIC_ERROR_MS } from './constants/constants'
 import { TokenLimitsCalculator } from './utils/tokenLimitsCalculator'
@@ -3781,7 +3783,7 @@ ${' '.repeat(8)}}
                     requireResolvedTargets(input, name, 1).map(target => target.path),
                     [target]
                 )
-                throw new Error('fixture execution ended')
+                return { output: { kind: 'json', content: [] } }
             })
             const toolUse = request()
             await chatController.processToolUses([toolUse], stream, session, 'tabId', mockCancellationToken)
@@ -4567,6 +4569,167 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+
+        describe('approved paths', () => {
+            let tmpDir: string
+            let mockSession: any
+            let runToolStub: sinon.SinonStub
+
+            const createChatResultStream = () => ({
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            })
+
+            const processListDirectory = () =>
+                chatController.processToolUses(
+                    [{ toolUseId: 'list-id', name: 'listDirectory', input: { path: tmpDir }, stop: true }],
+                    createChatResultStream() as any,
+                    mockSession,
+                    'tabId',
+                    mockCancellationToken
+                )
+
+            beforeEach(() => {
+                tmpDir = mkdtempSync(path.join(os.tmpdir(), 'approved-paths-'))
+                ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                    { toolSpecification: { name: 'listDirectory', description: 'List directory' } },
+                ])
+                sinon.stub(ListDirectory.prototype, 'requiresAcceptance').resolves({
+                    requiresAcceptance: true,
+                    canonicalPaths: [tmpDir],
+                    checkedTargets: [{ path: tmpDir, state: 'unverified' }],
+                })
+                sinon.stub(chatController, 'waitForToolApproval').resolves()
+                runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.reset()
+                mockSession = {
+                    toolUseLookup: new Map(),
+                    pairProgrammingMode: true,
+                    approvedPaths: new Map(),
+                    addApprovedPath: sinon.stub(),
+                }
+            })
+
+            afterEach(() => {
+                rmSync(tmpDir, { recursive: true, force: true })
+            })
+
+            it('records the path after an approved tool use succeeds', async () => {
+                runToolStub.resolves('')
+
+                await processListDirectory()
+
+                sinon.assert.calledWith(mockSession.addApprovedPath, tmpDir, 'listDirectory')
+            })
+
+            it('does not record the path when an approved tool use fails', async () => {
+                runToolStub.rejects(new Error('Tool failed'))
+
+                await processListDirectory()
+
+                sinon.assert.calledOnce(runToolStub)
+                sinon.assert.notCalled(mockSession.addApprovedPath)
+            })
+
+            describe('executeBash', () => {
+                const processExecuteBash = (cwd: string) =>
+                    chatController.processToolUses(
+                        [{ toolUseId: 'bash-id', name: 'executeBash', input: { command: 'ls', cwd }, stop: true }],
+                        createChatResultStream() as any,
+                        mockSession,
+                        'tabId',
+                        mockCancellationToken
+                    )
+
+                let requiresAcceptanceStub: sinon.SinonStub
+
+                beforeEach(() => {
+                    ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                        { toolSpecification: { name: 'executeBash', description: 'Run command' } },
+                    ])
+                    requiresAcceptanceStub = sinon
+                        .stub(ExecuteBash.prototype, 'requiresAcceptance')
+                        .resolves({ requiresAcceptance: true, approvalPaths: [tmpDir] })
+                    mockSession.getConversationType = sinon.stub().returns('AgenticChat')
+                })
+
+                it('records the working directory after an approved command succeeds', async () => {
+                    runToolStub.resolves('')
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledWith(mockSession.addApprovedPath, tmpDir, 'executeBash')
+                })
+
+                it('records the working directory as the check resolved it', async function () {
+                    const link = path.join(tmpDir, 'link')
+                    const target = path.join(tmpDir, 'target')
+                    mkdirSync(target)
+                    try {
+                        symlinkSync(target, link, 'dir')
+                    } catch {
+                        return this.skip()
+                    }
+                    const resolvedTarget = await fs.realpath(target)
+                    requiresAcceptanceStub.resolves({ requiresAcceptance: true, approvalPaths: [resolvedTarget] })
+                    runToolStub.resolves('')
+
+                    await processExecuteBash(link)
+
+                    sinon.assert.calledOnceWithExactly(mockSession.addApprovedPath, resolvedTarget, 'executeBash')
+                })
+
+                it('does not record the working directory when the prompt was for another reason', async () => {
+                    requiresAcceptanceStub.resolves({ requiresAcceptance: true, warning: 'destructive' })
+                    runToolStub.resolves('')
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledOnce(runToolStub)
+                    sinon.assert.notCalled(mockSession.addApprovedPath)
+                })
+
+                it('does not record the working directory when an approved command fails', async () => {
+                    runToolStub.rejects(new Error('Command failed'))
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledOnce(runToolStub)
+                    sinon.assert.notCalled(mockSession.addApprovedPath)
+                })
+
+                it('does not record the working directory when an approved command exits with an error', async () => {
+                    runToolStub.resolves({
+                        output: { kind: 'json', content: { exitStatus: '2', stdout: '', stderr: 'not found' } },
+                    })
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledOnce(runToolStub)
+                    sinon.assert.notCalled(mockSession.addApprovedPath)
+                })
+
+                it('records the working directory when an approved command exits normally', async () => {
+                    runToolStub.resolves({
+                        output: { kind: 'json', content: { exitStatus: '0', stdout: 'ok', stderr: 'warning' } },
+                    })
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledWith(mockSession.addApprovedPath, tmpDir, 'executeBash')
+                })
+            })
         })
     })
 })

@@ -788,6 +788,111 @@ describe('ExecuteBash Tool', () => {
             const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat alias.txt', cwd: ws })
             assert.equal(result.requiresAcceptance, false, 'in-workspace symlink target should not require acceptance')
         })
+
+        describe('what an approval allows for later commands', () => {
+            it('allows the cwd after an approval of the cwd prompt', async () => {
+                const result = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd: outside })
+
+                assert.equal(result.warning, outOfWorkspaceWarningmessage)
+                assert.deepStrictEqual(result.approvalPaths, [fs.realpathSync.native(outside)])
+            })
+
+            it('allows the cwd after an approval of an argument outside the workspace in that cwd', async () => {
+                fs.writeFileSync(path.join(outside, 'notes.txt'), 'data')
+
+                const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: outside })
+
+                assert.equal(result.warning, outOfWorkspaceWarningmessage)
+                assert.deepStrictEqual(result.approvalPaths, [fs.realpathSync.native(outside)])
+            })
+
+            it('does not allow the cwd after a prompt for another reason', async () => {
+                fs.writeFileSync(path.join(outside, '.env'), 'synthetic fixture only')
+
+                const destructive = await makeExecBash(ws).requiresAcceptance({ command: 'rm -rf build', cwd: outside })
+                const credential = await makeExecBash(ws).requiresAcceptance({ command: 'cat .env', cwd: outside })
+
+                assert.equal(destructive.requiresAcceptance, true)
+                assert.equal(destructive.approvalPaths, undefined)
+                assert.equal(credential.requiresAcceptance, true)
+                assert.equal(credential.approvalPaths, undefined)
+            })
+
+            it('does not allow the cwd after an out-of-workspace prompt for a command that is not read-only', async () => {
+                fs.mkdirSync(path.join(outside, 'build'))
+
+                const result = await makeExecBash(ws).requiresAcceptance({ command: 'rm -rf build', cwd: outside })
+
+                assert.equal(result.warning, outOfWorkspaceWarningmessage)
+                assert.equal(result.approvalPaths, undefined)
+            })
+
+            it('does not allow a credential or system folder, or a file system root, as the cwd', async () => {
+                const sshFolder = path.join(outside, '.ssh')
+                fs.mkdirSync(sshFolder)
+
+                for (const cwd of [sshFolder, path.parse(outside).root]) {
+                    const result = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd })
+
+                    assert.equal(result.requiresAcceptance, true, cwd)
+                    assert.equal(result.approvalPaths, undefined, cwd)
+                }
+            })
+
+            it('allows the cwd as the check resolved it', async function () {
+                const linkCwd = path.join(root, 'linkcwd')
+                if (!trySymlink(outside, linkCwd)) {
+                    return this.skip()
+                }
+
+                const result = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd: linkCwd })
+
+                assert.deepStrictEqual(result.approvalPaths, [fs.realpathSync.native(outside)])
+            })
+
+            it('asks for a file that shares its data with another name on disk under an approved cwd', async function () {
+                fs.writeFileSync(path.join(root, 'other.txt'), 'synthetic fixture only')
+                fs.writeFileSync(path.join(outside, 'notes.txt'), 'synthetic fixture only')
+                try {
+                    fs.linkSync(path.join(root, 'other.txt'), path.join(outside, 'alias.txt'))
+                } catch {
+                    return this.skip()
+                }
+                const approvedPaths = new Map([['executeBash', new Set([fs.realpathSync.native(outside)])]])
+
+                const linked = await makeExecBash(ws).requiresAcceptance(
+                    { command: 'cat alias.txt', cwd: outside },
+                    approvedPaths
+                )
+                const ordinary = await makeExecBash(ws).requiresAcceptance(
+                    { command: 'cat notes.txt', cwd: outside },
+                    approvedPaths
+                )
+
+                assert.equal(linked.requiresAcceptance, true)
+                assert.equal(ordinary.requiresAcceptance, false)
+            })
+
+            it('allows nothing when only an argument is outside the workspace', async () => {
+                // Quoted, so that the shell parser keeps the backslashes of a Windows path
+                const result = await makeExecBash(ws).requiresAcceptance({
+                    command: `cat '${path.join(outside, 'notes.txt')}'`,
+                    cwd: ws,
+                })
+
+                assert.equal(result.warning, outOfWorkspaceWarningmessage)
+                assert.equal(result.approvalPaths, undefined)
+            })
+
+            it('does not ask again in a cwd that an approval allowed', async () => {
+                const first = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd: outside })
+                const approvedPaths = new Map([['executeBash', new Set(first.approvalPaths)]])
+
+                const second = await makeExecBash(ws).requiresAcceptance({ command: 'ls', cwd: outside }, approvedPaths)
+
+                assert.equal(second.requiresAcceptance, false)
+            })
+        })
     })
 })
 
@@ -1198,6 +1303,106 @@ describe('ExecuteBash requiresAcceptance ReadOnly path handling (expanded, real 
             true,
             'an approval scoped to another tool must not apply to executeBash'
         )
+    })
+
+    it('still warns about a credential file in a directory approved for executeBash', async () => {
+        fs.writeFileSync(path.join(ws, '.env'), 'synthetic fixture only')
+        const approved = new Map([['executeBash', new Set([await fs.promises.realpath(ws)])]])
+
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat .env', cwd: ws }, approved)
+
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('does NOT require acceptance for an ordinary file in a directory approved for executeBash', async () => {
+        fs.writeFileSync(path.join(outside, 'notes.txt'), 'synthetic fixture only')
+        const approved = new Map([['executeBash', new Set([await fs.promises.realpath(outside)])]])
+
+        const result = await makeExecBash(ws).requiresAcceptance({ command: 'cat notes.txt', cwd: outside }, approved)
+
+        assert.equal(result.requiresAcceptance, false)
+    })
+
+    describe('in a directory approved for executeBash', () => {
+        let home: string
+        let approved: Map<string, Set<string>>
+
+        beforeEach(async () => {
+            home = await fs.promises.realpath(outside)
+            fs.mkdirSync(path.join(home, '.ssh'))
+            fs.writeFileSync(path.join(home, '.ssh', 'known_hosts'), 'synthetic fixture only')
+            fs.mkdirSync(path.join(home, 'project'))
+            fs.writeFileSync(path.join(home, 'project', 'notes.txt'), 'synthetic fixture only')
+            approved = new Map([['executeBash', new Set([home])]])
+        })
+
+        it('requires acceptance to run a command in a credential folder in it', async () => {
+            const result = await makeExecBash(ws).requiresAcceptance(
+                { command: 'cat *', cwd: path.join(home, '.ssh') },
+                approved
+            )
+
+            assert.equal(result.requiresAcceptance, true)
+        })
+
+        it('does NOT require acceptance to run a command in a credential folder that was itself approved', async () => {
+            approved.get('executeBash')!.add(path.join(home, '.ssh'))
+
+            const result = await makeExecBash(ws).requiresAcceptance(
+                { command: 'ls', cwd: path.join(home, '.ssh') },
+                approved
+            )
+
+            assert.equal(result.requiresAcceptance, false)
+        })
+
+        for (const command of [
+            'cat .ssh/*',
+            'cat .s*/known_hosts',
+            'cat {.ssh,project}/known_hosts',
+            'cat project/.e*',
+            'cat .*',
+        ]) {
+            it(`requires acceptance for an argument that can reach a credential folder: ${command}`, async () => {
+                const result = await makeExecBash(ws).requiresAcceptance({ command, cwd: home }, approved)
+
+                assert.equal(result.requiresAcceptance, true)
+            })
+        }
+
+        it('requires acceptance for an argument in a credential folder next to the cwd', async () => {
+            const result = await makeExecBash(ws).requiresAcceptance(
+                { command: 'cat ../.ssh/*', cwd: path.join(home, 'project') },
+                approved
+            )
+
+            assert.equal(result.requiresAcceptance, true)
+        })
+
+        it('requires acceptance for a brace argument, which could expand to a hidden name, that is not itself approved', async () => {
+            // An ordinary comma brace: a brace argument is never covered by an approved ancestor folder,
+            // because the shell could expand it to a name that starts with a dot.
+            const result = await makeExecBash(ws).requiresAcceptance(
+                { command: 'cat {project,docs}/notes.txt', cwd: home },
+                approved
+            )
+
+            assert.equal(result.requiresAcceptance, true)
+        })
+
+        it('does NOT require acceptance for ordinary paths and patterns', async () => {
+            for (const command of [
+                'cat project/notes.txt',
+                'cat project/*.txt',
+                'ls project/*',
+                'cat project/{notes}.txt',
+            ]) {
+                const result = await makeExecBash(ws).requiresAcceptance({ command, cwd: home }, approved)
+
+                assert.equal(result.requiresAcceptance, false, command)
+            }
+        })
     })
 
     // The sensitivity heuristic must consider BOTH the lexical argument spelling
