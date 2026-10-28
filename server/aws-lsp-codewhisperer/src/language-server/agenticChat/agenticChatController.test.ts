@@ -4486,6 +4486,266 @@ ${' '.repeat(8)}}
         })
     })
 
+    describe('shell command cards', () => {
+        // Lines that would end a code block whose fence is three backticks
+        const command = 'echo start\n```\nCompleted\n```shell\necho end'
+        const fence = '````'
+
+        it('shows the full command in one code block in the approval card and after it runs, and closes the block after the output', async () => {
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: 'executeBash', description: 'Run command' } },
+            ])
+            ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns(['executeBash'])
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.reset()
+            runToolStub.callsFake(async (_name: string, _input: unknown, _token: unknown, updates: WritableStream) => {
+                const writer = updates.getWriter()
+                await writer.write('output')
+                await writer.close()
+                return { output: { kind: 'json', content: { exitStatus: '0', stdout: 'output', stderr: '' } } }
+            })
+            const chatResultStream = {
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            }
+            const mockSession = {
+                toolUseLookup: new Map(),
+                pairProgrammingMode: true,
+                approvedPaths: new Map(),
+                addApprovedPath: sinon.stub(),
+                getConversationType: sinon.stub().returns('AgenticChat'),
+                // The user runs the command as soon as the card asks
+                setDeferredToolExecution: (_toolUseId: string, resolve: () => void) => resolve(),
+            } as any
+
+            await chatController.processToolUses(
+                [{ toolUseId: 'bash-id', name: 'executeBash', input: { command }, stop: true }],
+                chatResultStream as any,
+                mockSession,
+                'tabId',
+                mockCancellationToken
+            )
+
+            const bodies = chatResultStream.writeResultBlock
+                .getCalls()
+                .map(call => call.args[0])
+                .filter(block => block.messageId === 'bash-id')
+                .map(block => block.body)
+            // The approval card, then the card after the user runs the command
+            assert.strictEqual(bodies[0], `${fence}shell\n${command}`)
+            assert.strictEqual(
+                chatResultStream.overwriteResultBlock.firstCall.args[0].body,
+                `${fence}shell\n${command}`
+            )
+            assert.strictEqual(bodies[bodies.length - 1], fence)
+        })
+
+        it('shows the full command in one code block in the card of a stopped command', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('bash-id', { toolUseId: 'bash-id', name: 'executeBash', input: { command } })
+
+            await chatController.onButtonClick({
+                buttonId: 'stop-shell-command',
+                messageId: 'bash-id',
+                tabId: mockTabId,
+            })
+
+            const card = (testFeatures.chat.sendChatUpdate as sinon.SinonStub).lastCall.args[0].data.messages[0]
+            assert.strictEqual(card.body, `${fence}shell\n${command}\n${fence}`)
+        })
+
+        // The stubbed result stream the cards are written to
+        const makeStream = () => ({
+            removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+            writeResultBlock: sinon.stub().resolves(1),
+            overwriteResultBlock: sinon.stub().resolves(),
+            removeResultBlock: sinon.stub().resolves(),
+            getMessageBlockId: sinon.stub().returns(undefined),
+            hasMessage: sinon.stub().returns(false),
+            updateOngoingProgressResult: sinon.stub().resolves(),
+            getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+            setMessageIdToUpdateForTool: sinon.stub(),
+            getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+            addMessageOperation: sinon.stub(),
+            getMessageOperation: sinon.stub().returns(undefined),
+        })
+
+        const runBash = async (chatResultStream: any, approval: 'accept' | 'reject') => {
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: 'executeBash', description: 'Run command' } },
+            ])
+            ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns(['executeBash'])
+            const mockSession = {
+                toolUseLookup: new Map(),
+                pairProgrammingMode: true,
+                approvedPaths: new Map(),
+                addApprovedPath: sinon.stub(),
+                getConversationType: sinon.stub().returns('AgenticChat'),
+                setDeferredToolExecution: (_toolUseId: string, resolve: () => void, reject: (e: Error) => void) =>
+                    approval === 'accept'
+                        ? resolve()
+                        : reject(new ToolApprovalException('Command was rejected.', false)),
+            } as any
+
+            await chatController
+                .processToolUses(
+                    [{ toolUseId: 'bash-id', name: 'executeBash', input: { command }, stop: true }],
+                    chatResultStream as any,
+                    mockSession,
+                    'tabId',
+                    mockCancellationToken
+                )
+                .catch((e: unknown) => {
+                    // Rejecting the tool throws after the rejected card is rendered; that is expected
+                    if (approval === 'accept') {
+                        throw e
+                    }
+                })
+        }
+
+        it('shows the full command in one closed code block in the card of a rejected command', async () => {
+            const chatResultStream = makeStream()
+
+            await runBash(chatResultStream, 'reject')
+
+            const rejected = chatResultStream.overwriteResultBlock
+                .getCalls()
+                .map(call => call.args[0])
+                .find(block => block.header?.status?.text === 'Rejected')
+            assert.strictEqual(rejected.body, `${fence}shell\n${command}\n${fence}`)
+        })
+
+        it('shows the full command in one closed code block when the command errors', async () => {
+            const chatResultStream = makeStream()
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.reset()
+            runToolStub.rejects(new Error('boom'))
+
+            await runBash(chatResultStream, 'accept')
+
+            const card = (testFeatures.chat.sendChatUpdate as sinon.SinonStub).lastCall.args[0].data.messages[0]
+            assert.strictEqual(card.body, `${fence}shell\n${command}\n${fence}`)
+        })
+
+        // The body of the card, as the result stream joins the blocks written for it
+        const joinedBlocks = (chatResultStream: ReturnType<typeof makeStream>) => {
+            const blocks = chatResultStream.writeResultBlock
+                .getCalls()
+                .map(call => call.args[0])
+                .filter(block => block.messageId === 'bash-id')
+            for (const call of chatResultStream.overwriteResultBlock.getCalls()) {
+                blocks[call.args[1]] = call.args[0]
+            }
+            return blocks
+        }
+        const joinedBody = (chatResultStream: ReturnType<typeof makeStream>) =>
+            joinedBlocks(chatResultStream)
+                .map(block => block.body)
+                .join('\n')
+        // The card's header: the last block that sets one
+        const joinedHeader = (chatResultStream: ReturnType<typeof makeStream>) =>
+            joinedBlocks(chatResultStream)
+                .filter(block => block.header !== undefined)
+                .pop()?.header
+
+        for (const closesStream of [false, true]) {
+            it(`keeps output already shown inside the code block when the command errors${closesStream ? ' after its output stream closes' : ''}`, async () => {
+                const chatResultStream = makeStream()
+                // The card is the first block written for the command
+                chatResultStream.writeResultBlock.callsFake(async () => chatResultStream.writeResultBlock.callCount - 1)
+                chatResultStream.getMessageBlockId.returns(0)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.reset()
+                runToolStub.callsFake(
+                    async (_name: string, _input: unknown, _token: unknown, updates: WritableStream) => {
+                        const writer = updates.getWriter()
+                        await writer.write('partial output')
+                        if (closesStream) {
+                            await writer.close()
+                        }
+                        throw new Error('boom')
+                    }
+                )
+
+                await runBash(chatResultStream, 'accept')
+
+                assert.strictEqual(joinedBody(chatResultStream), `${fence}shell\n${command}\npartial output\n${fence}`)
+                assert.strictEqual(joinedHeader(chatResultStream)?.status?.text, 'Completed')
+            })
+        }
+
+        it('shows no output after the code block when the command errors with output still to be written', async () => {
+            const chatResultStream = makeStream()
+            // Like the real stream, each block waits for the client before the next one is written
+            const later = <T>(value: T) => new Promise<T>(resolve => setImmediate(() => resolve(value)))
+            chatResultStream.writeResultBlock.callsFake(() => later(chatResultStream.writeResultBlock.callCount - 1))
+            chatResultStream.overwriteResultBlock.callsFake(() => later(undefined))
+            chatResultStream.getMessageBlockId.returns(0)
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.reset()
+            runToolStub.callsFake(async (_name: string, _input: unknown, _token: unknown, updates: WritableStream) => {
+                const writer = updates.getWriter()
+                for (const chunk of ['first', 'second', 'third']) {
+                    void writer.write(chunk)
+                }
+                throw new Error('boom')
+            })
+
+            await runBash(chatResultStream, 'accept')
+            await new Promise(resolve => setTimeout(resolve, 50))
+
+            const body = joinedBody(chatResultStream)
+            assert.ok(body.startsWith(`${fence}shell\n${command}\n`), body)
+            assert.ok(body.endsWith(`\n${fence}`), body)
+        })
+
+        it('shows output lines that start with a backtick inside the code block', async () => {
+            const chatResultStream = makeStream()
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.reset()
+            runToolStub.callsFake(async (_name: string, _input: unknown, _token: unknown, updates: WritableStream) => {
+                const writer = updates.getWriter()
+                await writer.write('````\n**Completed**')
+                await writer.close()
+                return { output: { kind: 'json', content: { exitStatus: '0', stdout: '', stderr: '' } } }
+            })
+
+            await runBash(chatResultStream, 'accept')
+
+            const bodies = chatResultStream.writeResultBlock
+                .getCalls()
+                .map(call => call.args[0])
+                .filter(block => block.messageId === 'bash-id')
+                .map(block => block.body)
+            assert.ok(bodies.includes('    ````\n**Completed**'), JSON.stringify(bodies))
+        })
+
+        it('shows the full command in one closed code block in the card of a command that a new prompt ignores', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('bash-id', { toolUseId: 'bash-id', name: 'executeBash', input: { command } })
+
+            await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt: 'Hello' } }, mockCancellationToken)
+
+            const ignored = (testFeatures.chat.sendChatUpdate as sinon.SinonStub)
+                .getCalls()
+                .flatMap(call => call.args[0].data?.messages ?? [])
+                .find(message => message.messageId === 'bash-id' && message.header?.status?.text === 'Ignored')
+            assert.strictEqual(ignored?.body, `${fence}shell\n${command}\n${fence}`)
+        })
+    })
+
     describe('processToolUses', () => {
         it('filters rule artifacts from additionalContext for CodeReview tool', async () => {
             const mockAdditionalContext = [
