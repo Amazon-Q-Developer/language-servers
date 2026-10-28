@@ -10,6 +10,7 @@ import {
     ATX_HITL_TAG_INTEG_APP_LAUNCH,
     ATX_HITL_TAG_INTEG_TEST_RUN,
     ATX_ITGEN_ENABLED_ENV_VAR,
+    itGenTestProjectDir,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -87,7 +88,8 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         downloadJsonStub = sinon
             .stub(handler as any, 'downloadJsonArtifact')
             .callsFake(async (...args: any[]) => requestsByArtifact[args[2]] ?? null)
-        // The tests artifact: "extract" one test project file plus the ZIP the real code leaves behind.
+        // The tests artifact is the whole repo: app source, a root build file and the test project, plus the
+        // ZIP the real code leaves behind.
         downloadUrlStub = sinon
             .stub(handler, 'createArtifactDownloadUrl')
             .callsFake(async (...args: any[]) => ({ s3PresignedUrl: `url-${args[2]}`, requestHeaders: {} }))
@@ -96,6 +98,9 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             .callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
                 fs.mkdirSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi'), { recursive: true })
                 fs.writeFileSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'Tests.csproj'), '<Project/>')
+                fs.mkdirSync(path.join(saveToDir, 'SampleWebApi'), { recursive: true })
+                fs.writeFileSync(path.join(saveToDir, 'SampleWebApi', 'Program.cs'), '// app')
+                fs.writeFileSync(path.join(saveToDir, 'Directory.Build.props'), '<Project/>')
                 fs.writeFileSync(path.join(saveToDir, exportName), 'zip')
                 return saveToDir
             })
@@ -243,6 +248,55 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(downloadUrlStub.firstCall.args[2]).to.equal('repo-artifact')
             expect(fs.existsSync(path.join(expectedTests, 'GeneratedApiTests.SampleWebApi', 'Tests.csproj'))).to.be.true
             expect(fs.existsSync(path.join(expectedTests, 'tests-artifact.zip'))).to.be.false
+            // Only the test project's folder is kept, not the rest of the repo.
+            expect(fs.readdirSync(expectedTests)).to.deep.equal(['GeneratedApiTests.SampleWebApi'])
+            expect(fs.existsSync(path.join(path.dirname(expectedTests), 'tests-download'))).to.be.false
+        })
+
+        it('keeps the whole artifact when the test project folder is not in it', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ tests: { projectPath: 'Other/Other.csproj' } })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(fs.readdirSync(open.TestsPath!).sort()).to.deep.equal([
+                'Directory.Build.props',
+                'GeneratedApiTests.SampleWebApi',
+                'SampleWebApi',
+            ])
+            expect((logging.warn as sinon.SinonStub).calledWithMatch(/Other isn't in tests artifact/)).to.be.true
+        })
+
+        it('refuses a tests.projectPath that is rooted or climbs out of the artifact', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ tests: { projectPath: '../outside/Evil.csproj' } })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.TestsPath).to.be.undefined
+            expect(open.RequestError).to.contain('Unsafe integ-test-run tests.projectPath')
+            expect(zipDownloadStub.called).to.be.false
+        })
+
+        it('removes the tests of earlier runs of the same project, and only those', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            requestsByArtifact['art-run'] = testRunRequest({ runId: 'r1' })
+            requestsByArtifact['art-admin'] = testRunRequest({ runId: 'r5', project: 'SampleWebApi.Admin' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+            await poll()
+            hitls = [{ ...testRunHitl, taskId: 'task-admin', agentArtifact: { artifactId: 'art-admin' } }]
+            await poll()
+            // The IDE's result ZIP for r1 sits next to its tests.
+            fs.writeFileSync(path.join(itgen, 'r1', 'results.zip'), 'zip')
+
+            requestsByArtifact['art-run-2'] = testRunRequest({ runId: 'r2' })
+            hitls = [{ ...testRunHitl, taskId: 'task-run-2', agentArtifact: { artifactId: 'art-run-2' } }]
+            await poll()
+
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.false
+            expect(fs.existsSync(path.join(itgen, 'r1', 'results.zip'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'r5', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
         })
 
         it('downloads a task request and its tests once and reuses ListHitls (one call per poll)', async () => {
@@ -539,6 +593,34 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
 
             expect(result).to.deep.equal({ Success: false, Error: 'Failed to submit HITL task' })
+        })
+    })
+
+    describe('itGenTestProjectDir', () => {
+        it('returns the project folder, with or without nesting', () => {
+            expect(
+                itGenTestProjectDir('GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj')
+            ).to.equal('GeneratedApiTests.SampleWebApi')
+            expect(itGenTestProjectDir('tests\\Api\\Api.csproj')).to.equal(path.join('tests', 'Api'))
+            expect(itGenTestProjectDir('./Api/Api.csproj')).to.equal('Api')
+        })
+
+        it('returns an empty folder for a project at the artifact root', () => {
+            expect(itGenTestProjectDir('Api.csproj')).to.equal('')
+        })
+
+        it('refuses missing, rooted and climbing paths', () => {
+            for (const bad of [
+                undefined,
+                '',
+                '   ',
+                '/abs/Api.csproj',
+                'C:\\x\\Api.csproj',
+                'a/../../Api.csproj',
+                42,
+            ]) {
+                expect(itGenTestProjectDir(bad), String(bad)).to.be.undefined
+            }
         })
     })
 })

@@ -100,6 +100,27 @@ function isSafePathSegment(value: unknown): value is string {
 }
 
 /**
+ * ITGen: the folder of a test-run request's tests.projectPath, relative to the tests artifact, or ''
+ * when the project file sits at the artifact root. Undefined for a missing, rooted or climbing path.
+ */
+export function itGenTestProjectDir(projectPath: unknown): string | undefined {
+    if (typeof projectPath !== 'string' || projectPath.trim() === '') {
+        return undefined
+    }
+    const segments = projectPath.split(/[\\/]+/).filter(s => s !== '' && s !== '.')
+    if (
+        path.isAbsolute(projectPath) ||
+        /^[A-Za-z]:/.test(projectPath) ||
+        segments.length === 0 ||
+        segments.includes('..')
+    ) {
+        return undefined
+    }
+    const dirs = segments.slice(0, -1)
+    return dirs.length > 0 ? path.join(...dirs) : ''
+}
+
+/**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
  */
 interface DiffApplyContext {
@@ -2016,7 +2037,12 @@ export class ATXTransformHandler {
         if (!isSafePathSegment(request.runId)) {
             return { RequestError: `Unsafe integ-test-run runId: ${request.runId}` }
         }
-        const runDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen', request.runId)
+        const projectDir = itGenTestProjectDir(request.tests?.projectPath)
+        if (projectDir === undefined) {
+            return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
+        }
+        const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
+        const runDir = path.join(itgenDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
         if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8') === taskId && fs.existsSync(testsPath)) {
@@ -2027,19 +2053,66 @@ export class ATXTransformHandler {
         if (!downloadInfo) {
             return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
         }
+        // The repo artifact can hold the whole repo; keep only the test project's folder, so each run
+        // folder isn't a full copy of the repo (and its root build files don't apply to the tests).
+        const stagingPath = path.join(runDir, 'tests-download')
         fs.rmSync(testsPath, { recursive: true, force: true })
+        fs.rmSync(stagingPath, { recursive: true, force: true })
         const zipName = 'tests-artifact.zip'
         await Utils.downloadAndExtractArchive(
             downloadInfo.s3PresignedUrl,
             downloadInfo.requestHeaders,
-            testsPath,
+            stagingPath,
             zipName,
             this.logging
         )
-        fs.rmSync(path.join(testsPath, zipName), { force: true })
+        fs.rmSync(path.join(stagingPath, zipName), { force: true })
+        const projectSource = projectDir ? path.join(stagingPath, projectDir) : stagingPath
+        if (projectDir && fs.existsSync(projectSource)) {
+            fs.mkdirSync(path.dirname(path.join(testsPath, projectDir)), { recursive: true })
+            fs.renameSync(projectSource, path.join(testsPath, projectDir))
+            fs.rmSync(stagingPath, { recursive: true, force: true })
+        } else {
+            if (projectDir) {
+                this.logging.warn(
+                    `ATX: ${projectDir} isn't in tests artifact ${request.artifactId}; keeping the whole artifact for run ${request.runId}`
+                )
+            }
+            fs.renameSync(stagingPath, testsPath)
+        }
         fs.writeFileSync(markerPath, taskId)
+        const projectKey = `${request.side}|${request.project}`
+        fs.writeFileSync(path.join(runDir, 'tests.project'), projectKey)
+        this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
         this.logging.log(`ATX: tests artifact ${request.artifactId} for run ${request.runId} extracted to ${testsPath}`)
         return { TestsPath: testsPath }
+    }
+
+    /**
+     * ITGen: keeps only the latest run's tests per side and project. The agent opens a project's next
+     * run only after the IDE submitted the previous one, so an older run's tests are no longer needed.
+     * The run folder itself (with the IDE's result ZIP) stays.
+     */
+    private removeOlderItGenTests(itgenDir: string, currentRunId: string, projectKey: string): void {
+        for (const entry of fs.readdirSync(itgenDir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || entry.name === currentRunId) {
+                continue
+            }
+            const keyPath = path.join(itgenDir, entry.name, 'tests.project')
+            const oldTests = path.join(itgenDir, entry.name, 'tests')
+            try {
+                if (
+                    fs.existsSync(oldTests) &&
+                    fs.existsSync(keyPath) &&
+                    fs.readFileSync(keyPath, 'utf-8') === projectKey
+                ) {
+                    fs.rmSync(oldTests, { recursive: true, force: true })
+                    this.logging.log(`ATX: removed the tests of earlier run ${entry.name} (${projectKey})`)
+                }
+            } catch (error) {
+                this.logging.warn(`ATX: couldn't remove the tests of earlier run ${entry.name}: ${String(error)}`)
+            }
+        }
     }
 
     async getHitl(workspaceId: string, jobId: string, taskId: string): Promise<any | null> {
