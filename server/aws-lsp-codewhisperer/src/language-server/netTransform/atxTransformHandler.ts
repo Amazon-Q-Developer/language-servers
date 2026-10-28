@@ -100,24 +100,20 @@ function isSafePathSegment(value: unknown): value is string {
 }
 
 /**
- * ITGen: the folder of a test-run request's tests.projectPath, relative to the tests artifact, or ''
- * when the project file sits at the artifact root. Undefined for a missing, rooted or climbing path.
+ * ITGen: true when a test-run request's tests.projectPath is a relative path that stays inside the
+ * tests artifact (not missing, not rooted, no '..').
  */
-export function itGenTestProjectDir(projectPath: unknown): string | undefined {
+export function isSafeRelativeProjectPath(projectPath: unknown): projectPath is string {
     if (typeof projectPath !== 'string' || projectPath.trim() === '') {
-        return undefined
+        return false
     }
     const segments = projectPath.split(/[\\/]+/).filter(s => s !== '' && s !== '.')
-    if (
-        path.isAbsolute(projectPath) ||
-        /^[A-Za-z]:/.test(projectPath) ||
-        segments.length === 0 ||
-        segments.includes('..')
-    ) {
-        return undefined
-    }
-    const dirs = segments.slice(0, -1)
-    return dirs.length > 0 ? path.join(...dirs) : ''
+    return (
+        !path.isAbsolute(projectPath) &&
+        !/^[A-Za-z]:/.test(projectPath) &&
+        segments.length > 0 &&
+        !segments.includes('..')
+    )
 }
 
 /**
@@ -2037,8 +2033,7 @@ export class ATXTransformHandler {
         if (!isSafePathSegment(request.runId)) {
             return { RequestError: `Unsafe integ-test-run runId: ${request.runId}` }
         }
-        const projectDir = itGenTestProjectDir(request.tests?.projectPath)
-        if (projectDir === undefined) {
+        if (!isSafeRelativeProjectPath(request.tests?.projectPath)) {
             return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
         }
         const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
@@ -2053,32 +2048,24 @@ export class ATXTransformHandler {
         if (!downloadInfo) {
             return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
         }
-        // The repo artifact can hold the whole repo; keep only the test project's folder, so each run
-        // folder isn't a full copy of the repo (and its root build files don't apply to the tests).
-        const stagingPath = path.join(runDir, 'tests-download')
+        // The whole artifact is kept, in its own layout: a test project can reference projects
+        // elsewhere in it (for example a common library) and rely on its root build files
+        // (Directory.Build.props, Directory.Packages.props, nuget.config). Disk use is bounded by
+        // removing earlier runs' tests below.
         fs.rmSync(testsPath, { recursive: true, force: true })
-        fs.rmSync(stagingPath, { recursive: true, force: true })
         const zipName = 'tests-artifact.zip'
         await Utils.downloadAndExtractArchive(
             downloadInfo.s3PresignedUrl,
             downloadInfo.requestHeaders,
-            stagingPath,
+            testsPath,
             zipName,
             this.logging
         )
-        fs.rmSync(path.join(stagingPath, zipName), { force: true })
-        const projectSource = projectDir ? path.join(stagingPath, projectDir) : stagingPath
-        if (projectDir && fs.existsSync(projectSource)) {
-            fs.mkdirSync(path.dirname(path.join(testsPath, projectDir)), { recursive: true })
-            fs.renameSync(projectSource, path.join(testsPath, projectDir))
-            fs.rmSync(stagingPath, { recursive: true, force: true })
-        } else {
-            if (projectDir) {
-                this.logging.warn(
-                    `ATX: ${projectDir} isn't in tests artifact ${request.artifactId}; keeping the whole artifact for run ${request.runId}`
-                )
-            }
-            fs.renameSync(stagingPath, testsPath)
+        fs.rmSync(path.join(testsPath, zipName), { force: true })
+        if (!fs.existsSync(path.join(testsPath, request.tests.projectPath))) {
+            this.logging.warn(
+                `ATX: ${request.tests.projectPath} isn't in tests artifact ${request.artifactId} (run ${request.runId})`
+            )
         }
         fs.writeFileSync(markerPath, taskId)
         const projectKey = `${request.side}|${request.project}`
@@ -2089,9 +2076,10 @@ export class ATXTransformHandler {
     }
 
     /**
-     * ITGen: keeps only the latest run's tests per side and project. The agent opens a project's next
-     * run only after the IDE submitted the previous one, so an older run's tests are no longer needed.
-     * The run folder itself (with the IDE's result ZIP) stays.
+     * ITGen: keeps only the latest run's tests per side and project, so a job holds at most one copy of
+     * the artifact per project instead of one per run. The agent opens a project's next run only after
+     * the IDE submitted the previous one, so an older run's tests are no longer needed. The run folder
+     * itself (with the IDE's result ZIP) stays.
      */
     private removeOlderItGenTests(itgenDir: string, currentRunId: string, projectKey: string): void {
         for (const entry of fs.readdirSync(itgenDir, { withFileTypes: true })) {

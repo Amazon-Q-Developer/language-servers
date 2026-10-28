@@ -10,7 +10,7 @@ import {
     ATX_HITL_TAG_INTEG_APP_LAUNCH,
     ATX_HITL_TAG_INTEG_TEST_RUN,
     ATX_ITGEN_ENABLED_ENV_VAR,
-    itGenTestProjectDir,
+    isSafeRelativeProjectPath,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -97,7 +97,10 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             .stub(Utils, 'downloadAndExtractArchive')
             .callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
                 fs.mkdirSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi'), { recursive: true })
-                fs.writeFileSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'Tests.csproj'), '<Project/>')
+                fs.writeFileSync(
+                    path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj'),
+                    '<Project/>'
+                )
                 fs.mkdirSync(path.join(saveToDir, 'SampleWebApi'), { recursive: true })
                 fs.writeFileSync(path.join(saveToDir, 'SampleWebApi', 'Program.cs'), '// app')
                 fs.writeFileSync(path.join(saveToDir, 'Directory.Build.props'), '<Project/>')
@@ -246,25 +249,31 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(JSON.parse(fs.readFileSync(expectedPath, 'utf-8'))).to.deep.equal(testRunRequest())
             // The repo artifact named in the request, extracted with its ZIP removed.
             expect(downloadUrlStub.firstCall.args[2]).to.equal('repo-artifact')
-            expect(fs.existsSync(path.join(expectedTests, 'GeneratedApiTests.SampleWebApi', 'Tests.csproj'))).to.be.true
+            expect(
+                fs.existsSync(
+                    path.join(expectedTests, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj')
+                )
+            ).to.be.true
             expect(fs.existsSync(path.join(expectedTests, 'tests-artifact.zip'))).to.be.false
-            // Only the test project's folder is kept, not the rest of the repo.
-            expect(fs.readdirSync(expectedTests)).to.deep.equal(['GeneratedApiTests.SampleWebApi'])
-            expect(fs.existsSync(path.join(path.dirname(expectedTests), 'tests-download'))).to.be.false
+            // The whole artifact is kept in its own layout, so the test project's references to other
+            // projects (a common library) and the root build files still resolve.
+            expect(fs.readdirSync(expectedTests).sort()).to.deep.equal([
+                'Directory.Build.props',
+                'GeneratedApiTests.SampleWebApi',
+                'SampleWebApi',
+            ])
+            expect((logging.warn as sinon.SinonStub).called).to.be.false
         })
 
-        it('keeps the whole artifact when the test project folder is not in it', async () => {
+        it('warns when tests.projectPath is not in the artifact', async () => {
             requestsByArtifact['art-run'] = testRunRequest({ tests: { projectPath: 'Other/Other.csproj' } })
             hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
 
             const [open] = (await poll())!.OpenHitls!
 
-            expect(fs.readdirSync(open.TestsPath!).sort()).to.deep.equal([
-                'Directory.Build.props',
-                'GeneratedApiTests.SampleWebApi',
-                'SampleWebApi',
-            ])
-            expect((logging.warn as sinon.SinonStub).calledWithMatch(/Other isn't in tests artifact/)).to.be.true
+            expect(open.TestsPath).to.not.be.undefined
+            expect((logging.warn as sinon.SinonStub).calledWithMatch(/Other\/Other.csproj isn't in tests artifact/)).to
+                .be.true
         })
 
         it('refuses a tests.projectPath that is rooted or climbs out of the artifact', async () => {
@@ -596,17 +605,16 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
     })
 
-    describe('itGenTestProjectDir', () => {
-        it('returns the project folder, with or without nesting', () => {
-            expect(
-                itGenTestProjectDir('GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj')
-            ).to.equal('GeneratedApiTests.SampleWebApi')
-            expect(itGenTestProjectDir('tests\\Api\\Api.csproj')).to.equal(path.join('tests', 'Api'))
-            expect(itGenTestProjectDir('./Api/Api.csproj')).to.equal('Api')
-        })
-
-        it('returns an empty folder for a project at the artifact root', () => {
-            expect(itGenTestProjectDir('Api.csproj')).to.equal('')
+    describe('isSafeRelativeProjectPath', () => {
+        it('accepts relative paths inside the artifact', () => {
+            for (const good of [
+                'GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj',
+                'tests\\Api\\Api.csproj',
+                './Api/Api.csproj',
+                'Api.csproj',
+            ]) {
+                expect(isSafeRelativeProjectPath(good), good).to.be.true
+            }
         })
 
         it('refuses missing, rooted and climbing paths', () => {
@@ -619,7 +627,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
                 'a/../../Api.csproj',
                 42,
             ]) {
-                expect(itGenTestProjectDir(bad), String(bad)).to.be.undefined
+                expect(isSafeRelativeProjectPath(bad), String(bad)).to.be.false
             }
         })
     })
