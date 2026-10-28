@@ -41,7 +41,7 @@
         "@aws/chat-client-ui-types": "0.1.71",
         "@aws/language-server-runtimes": "0.3.22",
         "@aws/lsp-core": "^0.0.22",
-        "@modelcontextprotocol/sdk": "^1.23.0",
+        "@modelcontextprotocol/sdk": "^1.32.2",
         "@mozilla/readability": "^0.6.0",
         "@smithy/node-http-handler": "^2.5.0",
         "@smithy/signature-v4": "5.3.11",
