@@ -1,6 +1,15 @@
 import { CONFIG_PREFIX_SEPARATOR } from '@smithy/shared-ini-file-loader'
 import { IniSectionType } from '@smithy/types'
 
+// Each serialized section header or setting is exactly one line
+function assertSingleLine(line: string): string {
+    if (/[\r\n]/.test(line)) {
+        throw new Error('Shared config entries cannot contain line breaks.')
+    }
+
+    return line
+}
+
 export enum IniFileType {
     config,
     credentials,
@@ -16,7 +25,7 @@ export class SectionHeader {
     toIniSectionName(filetype: IniFileType): string {
         const showType =
             filetype === IniFileType.config && !(this.type == IniSectionType.PROFILE && this.name === 'default')
-        return '[' + (showType ? this.type + ' ' : '') + this.name + ']' + (this.comment ?? '')
+        return assertSingleLine('[' + (showType ? this.type + ' ' : '') + this.name + ']' + (this.comment ?? ''))
     }
 
     static fromParsedSectionName(parsedSectionName: string): SectionHeader {
@@ -71,11 +80,11 @@ export class Setting {
     }
 
     toIniSubsectionHeaderLine(): string {
-        return `${this.subsection} =${this.comment || ''}`
+        return assertSingleLine(`${this.subsection} =${this.comment || ''}`)
     }
 
     toIniSettingLine(): string {
         const indent = this.subsection ? this.indent || Setting.defaultIndent : ''
-        return `${indent}${this.name} = ${this.value}${this.comment || ''}`
+        return assertSingleLine(`${indent}${this.name} = ${this.value}${this.comment || ''}`)
     }
 }

@@ -155,26 +155,30 @@ export interface CharDiffResult {
 }
 
 /**
- * Find longest common subsequence length between two strings
+ * Largest LCS table, in cells, that is computed exactly (about 10 ms). The table grows with the product of both
+ * lengths, so larger inputs are approximated.
  */
-function lcsLength(str1: string, str2: string): number[][] {
-    const m = str1.length
-    const n = str2.length
-    const dp = Array(m + 1)
-        .fill(null)
-        .map(() => Array(n + 1).fill(0))
+export const MAX_LCS_CELLS = 1_000_000
 
-    for (let i = 1; i <= m; i++) {
-        for (let j = 1; j <= n; j++) {
+/**
+ * Find longest common subsequence length between two strings, in O(m * n) time and O(n) memory
+ */
+function lcsLength(str1: string, str2: string): number {
+    let previous = new Uint32Array(str2.length + 1)
+    let current = new Uint32Array(str2.length + 1)
+
+    for (let i = 1; i <= str1.length; i++) {
+        for (let j = 1; j <= str2.length; j++) {
             if (str1[i - 1] === str2[j - 1]) {
-                dp[i][j] = dp[i - 1][j - 1] + 1
+                current[j] = previous[j - 1] + 1
             } else {
-                dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1])
+                current[j] = Math.max(previous[j], current[j - 1])
             }
         }
+        ;[previous, current] = [current, previous]
     }
 
-    return dp
+    return previous[str2.length]
 }
 
 /**
@@ -192,8 +196,27 @@ export function getCharacterDifferences(addedLines: string[], deletedLines: stri
         return { charactersAdded: addedText.length, charactersRemoved: 0 }
     }
 
-    const lcsTable = lcsLength(deletedText, addedText)
-    const lcsLen = lcsTable[deletedText.length][addedText.length]
+    // A common prefix and suffix are always part of the LCS, so only the text between them needs the table
+    const shorterLength = Math.min(addedText.length, deletedText.length)
+    let prefixLength = 0
+    while (prefixLength < shorterLength && addedText[prefixLength] === deletedText[prefixLength]) {
+        prefixLength++
+    }
+    let suffixLength = 0
+    while (
+        suffixLength < shorterLength - prefixLength &&
+        addedText[addedText.length - 1 - suffixLength] === deletedText[deletedText.length - 1 - suffixLength]
+    ) {
+        suffixLength++
+    }
+
+    const addedMiddle = addedText.slice(prefixLength, addedText.length - suffixLength)
+    const deletedMiddle = deletedText.slice(prefixLength, deletedText.length - suffixLength)
+
+    // Above the cap, count the middle as entirely replaced
+    const middleLcsLength =
+        addedMiddle.length * deletedMiddle.length <= MAX_LCS_CELLS ? lcsLength(deletedMiddle, addedMiddle) : 0
+    const lcsLen = prefixLength + suffixLength + middleLcsLength
 
     return {
         charactersAdded: addedText.length - lcsLen,

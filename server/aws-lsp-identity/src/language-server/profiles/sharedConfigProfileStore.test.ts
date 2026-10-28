@@ -3,12 +3,19 @@ import mock = require('mock-fs')
 import { getHomeDir, SharedConfigInit } from '@smithy/shared-ini-file-loader'
 import { DirectoryItems } from 'mock-fs/lib/filesystem'
 import { join } from 'path'
+import { readFile } from 'fs/promises'
 import { SharedConfigProfileStore } from './sharedConfigProfileStore'
 import { expect, use } from 'chai'
 import { ProfileData } from './profileService'
-import { Logging, ProfileKind, Telemetry } from '@aws/language-server-runtimes/server-interface'
+import {
+    AwsErrorCodes,
+    Logging,
+    ProfileKind,
+    SsoSession,
+    Telemetry,
+} from '@aws/language-server-runtimes/server-interface'
 import { StubbedInstance, stubInterface } from 'ts-sinon'
-import { Observability } from '@aws/lsp-core'
+import { AwsError, Observability } from '@aws/lsp-core'
 
 // eslint-disable-next-line
 use(require('chai-as-promised'))
@@ -403,4 +410,119 @@ describe('SharedConfigProfileStore', async () => {
             ],
         })
     })
+})
+
+describe('SharedConfigProfileStore save validation', () => {
+    const ssoSession = {
+        name: 'test-sso-session',
+        settings: { sso_region: 'us-west-2', sso_start_url: 'https://nowhere' },
+    }
+
+    function profile(name: string, settings: object = { sso_session: 'test-sso-session' }) {
+        return { kinds: [ProfileKind.SsoTokenProfile], name, settings } as ProfileData['profiles'][number]
+    }
+
+    async function readFiles(): Promise<string[]> {
+        return [await readFile(join(dir, 'config'), 'utf-8'), await readFile(join(dir, 'credentials'), 'utf-8')]
+    }
+
+    async function expectRejectedWithoutChanges(data: ProfileData, awsErrorCode: string): Promise<void> {
+        const before = await readFiles()
+
+        const error = await expect(sut.save(data)).rejectedWith(AwsError)
+
+        expect(error.awsErrorCode).to.equal(awsErrorCode)
+        expect(await readFiles()).to.deep.equal(before)
+    }
+
+    beforeEach(() => {
+        observability = stubInterface<Observability>()
+        observability.logging = stubInterface<Logging>()
+        observability.telemetry = stubInterface<Telemetry>()
+
+        sut = new SharedConfigProfileStore(observability)
+        setupTest(config, credentials)
+    })
+
+    afterEach(() => {
+        mock.restore()
+    })
+
+    for (const name of ['x]\n[default]\ny = z\n[profile w', 'x]\r[default', 'x] # comment', 'x y', ' x', 'x\t', '']) {
+        it(`rejects profile name ${JSON.stringify(name)} without changing files`, async () => {
+            await expectRejectedWithoutChanges(
+                { profiles: [profile(name)], ssoSessions: [] },
+                AwsErrorCodes.E_INVALID_PROFILE
+            )
+        })
+    }
+
+    it('rejects an sso-session name with a line break without changing files', async () => {
+        await expectRejectedWithoutChanges(
+            {
+                profiles: [],
+                ssoSessions: [{ ...ssoSession, name: 'x]\n[default]\ny = z\n[sso-session w' }],
+            },
+            AwsErrorCodes.E_INVALID_SSO_SESSION
+        )
+    })
+
+    // Names that are valid characters but parse back as a different section, or as an Object.prototype member
+    for (const name of [
+        'sso-session.test-sso-session',
+        'services.s3-specific',
+        'profile.default',
+        '__proto__',
+        'toString',
+    ]) {
+        it(`rejects profile name ${name} that does not read back as the same profile`, async () => {
+            await expectRejectedWithoutChanges(
+                { profiles: [profile(name)], ssoSessions: [] },
+                AwsErrorCodes.E_INVALID_PROFILE
+            )
+        })
+    }
+
+    for (const setting of ['output', 'cli_pager', 'region\nx']) {
+        it(`rejects unsupported profile setting ${JSON.stringify(setting)} without changing files`, async () => {
+            await expectRejectedWithoutChanges(
+                {
+                    profiles: [profile('default', { sso_session: 'test-sso-session', [setting]: 'value' })],
+                    ssoSessions: [],
+                },
+                AwsErrorCodes.E_INVALID_PROFILE
+            )
+        })
+    }
+
+    it('rejects unsupported sso-session settings without changing files', async () => {
+        await expectRejectedWithoutChanges(
+            {
+                profiles: [],
+                ssoSessions: [
+                    {
+                        ...ssoSession,
+                        settings: { ...ssoSession.settings, output: 'json' } as SsoSession['settings'],
+                    },
+                ],
+            },
+            AwsErrorCodes.E_INVALID_SSO_SESSION
+        )
+    })
+
+    for (const name of ['default', 'team.dev', 'team-profile_1', 'team@work', 'a+b%c:d/e']) {
+        it(`saves profile name ${name} and reads it back`, async () => {
+            await sut.save({
+                profiles: [profile(name, { sso_session: 'test-sso-session', region: 'us-east-1' })],
+                ssoSessions: [],
+            })
+
+            const actual = await sut.load()
+
+            expect(actual.profiles.find(p => p.name === name)?.settings).to.deep.equal({
+                region: 'us-east-1',
+                sso_session: 'test-sso-session',
+            })
+        })
+    }
 })

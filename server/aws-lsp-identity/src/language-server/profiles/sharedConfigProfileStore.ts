@@ -2,7 +2,9 @@ import {
     normalizeSettingList,
     ProfileData,
     profileDuckTypers,
+    ProfileFields,
     ProfileStore,
+    SsoSessionFields,
     ssoSessionDuckTyper,
 } from './profileService'
 import { parseKnownFiles, SharedConfigInit } from '@smithy/shared-ini-file-loader'
@@ -21,6 +23,16 @@ type Section = { name: string; settings?: object }
 
 // eslint-disable-next-line no-control-regex
 const controlCharsRegex = /[\x00-\x1F\x7F-\x9F]/
+
+// Characters the AWS SDK accepts in a typed section name such as [profile name] or [sso-session name]
+// https://github.com/smithy-lang/smithy-typescript/blob/main/packages/shared-ini-file-loader/src/parseIni.ts
+const sectionNameRegex = /^[\w\-@+.%:/]+$/
+
+// Only settings that load() returns may be written
+const allowedSettings: Record<IniSectionType.PROFILE | IniSectionType.SSO_SESSION, ReadonlySet<string>> = {
+    [IniSectionType.PROFILE]: new Set(Object.values(ProfileFields)),
+    [IniSectionType.SSO_SESSION]: new Set(Object.values(SsoSessionFields)),
+}
 
 export class SharedConfigProfileStore implements ProfileStore {
     constructor(
@@ -165,7 +177,21 @@ export class SharedConfigProfileStore implements ProfileStore {
                 throwAwsError('Section name is required.')
             }
 
+            if (typeof section.name !== 'string' || !sectionNameRegex.test(section.name)) {
+                throwAwsError('Section name contains invalid characters.')
+            }
+
             const parsedSectionName = new SectionHeader(section.name, sectionType).toParsedSectionName()
+
+            // The name must read back as the same section, and must not collide with Object.prototype members
+            const parsedSectionHeader = SectionHeader.fromParsedSectionName(parsedSectionName)
+            if (
+                parsedSectionHeader.type !== sectionType ||
+                parsedSectionHeader.name !== section.name ||
+                Object.hasOwn(Object.prototype, parsedSectionName)
+            ) {
+                throwAwsError('Section name is invalid.')
+            }
 
             // Remove sections that have no settings
             if (
@@ -186,6 +212,10 @@ export class SharedConfigProfileStore implements ProfileStore {
 
             // eslint-disable-next-line prefer-const
             for (let [name, value] of Object.entries(section.settings)) {
+                if (!allowedSettings[sectionType].has(name)) {
+                    throwAwsError(`Setting [${name}] is not supported.`)
+                }
+
                 if (Array.isArray(value)) {
                     value = normalizeSettingList(value)?.join(',') ?? ''
                 }
