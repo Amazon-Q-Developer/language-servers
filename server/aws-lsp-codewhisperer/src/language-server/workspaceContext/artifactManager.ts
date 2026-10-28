@@ -4,7 +4,7 @@ import path = require('path')
 import { URI } from 'vscode-uri'
 import JSZip = require('jszip')
 import { EclipseConfigGenerator, JavaProjectAnalyzer } from './javaManager'
-import { resolveSymlink, isDirectory, isEmptyDirectory } from './util'
+import { resolvePathInside, isDirectory, isEmptyDirectory } from './util'
 import glob = require('fast-glob')
 import {
     CodewhispererLanguage,
@@ -181,7 +181,7 @@ export class ArtifactManager {
                 cwd: filePath,
                 dot: false,
                 ignore: IGNORE_DEPENDENCY_PATTERNS,
-                followSymbolicLinks: true,
+                followSymbolicLinks: false,
                 absolute: false,
                 onlyFiles: true,
             })
@@ -192,7 +192,12 @@ export class ArtifactManager {
                 }
                 const relativePath = entry.toString()
                 try {
-                    const fullPath = resolveSymlink(path.join(filePath, relativePath))
+                    // A link inside a dependency must not pull in files from outside that dependency
+                    const fullPath = resolvePathInside(path.join(filePath, relativePath), filePath)
+                    if (fullPath === undefined) {
+                        this.logging.warn(`Skipping ${relativePath}: it resolves outside ${filePath}`)
+                        continue
+                    }
                     const fileMetadata = await this.createFileMetadata(
                         fullPath,
                         path.join(filePathInZipOverride !== undefined ? filePathInZipOverride : '', relativePath),

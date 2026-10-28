@@ -5,6 +5,7 @@ import * as fs from 'fs'
 import * as crypto from 'crypto'
 import * as path from 'path'
 import axios from 'axios'
+import { workspaceUtils } from '@aws/lsp-core'
 
 export const findWorkspaceRootFolder = (
     fileUri: string,
@@ -63,13 +64,18 @@ export const isDirectory = (path: string): boolean => {
     return fs.statSync(URI.parse(path).path).isDirectory()
 }
 
-export const resolveSymlink = (dependencyPath: string): string => {
-    let truePath: string = dependencyPath
-    if (fs.lstatSync(dependencyPath).isSymbolicLink()) {
-        // Get the real path (resolves all symlinks in the path)
-        truePath = fs.realpathSync(dependencyPath)
+/**
+ * Real path of filePath if it is strictly inside rootPath once symlinks in both are resolved, otherwise
+ * undefined. Also undefined when either path does not exist.
+ */
+export const resolvePathInside = (filePath: string, rootPath: string): string | undefined => {
+    try {
+        const realRoot = fs.realpathSync(rootPath)
+        const realPath = fs.realpathSync(filePath)
+        return workspaceUtils.isParentFolder(realRoot, realPath) ? realPath : undefined
+    } catch {
+        return undefined
     }
-    return truePath
 }
 
 export const isEmptyDirectory = (path: string): boolean => {

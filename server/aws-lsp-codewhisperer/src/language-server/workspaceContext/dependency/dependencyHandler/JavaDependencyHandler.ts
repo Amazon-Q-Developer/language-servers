@@ -156,6 +156,17 @@ export class JavaDependencyHandler extends LanguageDependencyHandler<JavaDepende
             const name = match[1]
             const version = match[2] || 'unknown'
             if (fs.existsSync(dependencyPath) && path.isAbsolute(dependencyPath)) {
+                // A .jar name can be a link to any file, so check what it resolves to
+                let realPath: string
+                try {
+                    realPath = fs.realpathSync(dependencyPath)
+                } catch {
+                    return
+                }
+                if (path.extname(realPath).toLowerCase() !== '.jar' || !fs.statSync(realPath).isFile()) {
+                    this.logging.warn(`Skipping dependency ${dependencyName}: it is not a jar file`)
+                    return
+                }
                 dependencyMap.set(name, {
                     name,
                     version,
