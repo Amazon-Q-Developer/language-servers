@@ -5186,6 +5186,18 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             }
         })
 
+        it("accepts a folder name that merely contains '..'", async () => {
+            presigned()
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'downloadAndExtractArchive').callsFake(fakeExtract({ 'App.sln': '' }))
+            const dotted = path.join(root, 'Foo..Bar')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', dotted)
+
+            expect(result.Success).to.be.true
+            expect(result.OriginalPath).to.equal(path.join(dotted, workspaceFolderName, 'before'))
+        })
+
         it('rejects a job id that could escape artifactWorkspace', async () => {
             for (const bad of ['../x', 'a/b', 'a\\b', '']) {
                 const result = await handler.downloadOriginalCode('ws-1', bad, 'orig-1', root)

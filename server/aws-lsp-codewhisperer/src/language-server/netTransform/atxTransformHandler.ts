@@ -1264,7 +1264,12 @@ export class ATXTransformHandler {
         solutionRootPath: string
     ): Promise<AtxDownloadOriginalCodeResponse> {
         try {
-            if (!solutionRootPath || !path.isAbsolute(solutionRootPath) || solutionRootPath.includes('..')) {
+            // A '..' segment could aim the copy elsewhere; a folder like 'Foo..Bar' is fine.
+            if (
+                !solutionRootPath ||
+                !path.isAbsolute(solutionRootPath) ||
+                solutionRootPath.split(/[\\/]/).includes('..')
+            ) {
                 return { Success: false, Error: 'Invalid solution root path for original code' }
             }
             // jobId becomes a folder name: refuse anything that could leave artifactWorkspace.
