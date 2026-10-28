@@ -21,6 +21,7 @@ import {
     AtxListArtifactsRequest,
     AtxDownloadArtifactRequest,
     AtxCompleteLocalBuildHitlRequest,
+    AtxCompleteHitlWithTestResultsRequest,
     AtxGetJobDashboardRequest,
     AtxGetJobReportRequest,
     AtxUploadCustomPlanRequest,
@@ -43,6 +44,8 @@ const AtxBatchGetMessagesCommand = 'aws/atxTransform/batchGetMessages'
 const AtxListArtifactsCommand = 'aws/atxTransform/listArtifacts'
 const AtxDownloadArtifactCommand = 'aws/atxTransform/downloadArtifact'
 const AtxCompleteLocalBuildHitlCommand = 'aws/atxTransform/completeLocalBuildHitl'
+// ITGen; the handler refuses it unless ATX_ITGEN_ENABLED is on
+const AtxCompleteHitlWithTestResultsCommand = 'aws/atxTransform/completeHitlWithTestResults'
 const AtxGetJobDashboardCommand = 'aws/atxTransform/getJobDashboard'
 const AtxGetJobReportCommand = 'aws/atxTransform/getJobReport'
 const AtxUploadCustomPlanCommand = 'aws/atxTransform/uploadCustomPlan'
@@ -237,6 +240,22 @@ export const AtxNetTransformServerToken =
                             SolutionRootPath
                         )
                     }
+                    case AtxCompleteHitlWithTestResultsCommand: {
+                        const { WorkspaceId, TransformationJobId, TaskId, ResultZipPath, SolutionRootPath } =
+                            params as AtxCompleteHitlWithTestResultsRequest
+
+                        logging.log(
+                            `ATX: completeHitlWithTestResults received — jobId=${TransformationJobId} taskId=${TaskId} zip=${ResultZipPath}`
+                        )
+
+                        return await atxTransformHandler.completeHitlWithTestResults(
+                            WorkspaceId,
+                            TransformationJobId,
+                            TaskId,
+                            ResultZipPath,
+                            SolutionRootPath
+                        )
+                    }
                     case AtxGetJobDashboardCommand: {
                         const { WorkspaceId, JobId } = params as AtxGetJobDashboardRequest
 
@@ -343,6 +362,7 @@ export const AtxNetTransformServerToken =
                             AtxListArtifactsCommand,
                             AtxDownloadArtifactCommand,
                             AtxCompleteLocalBuildHitlCommand,
+                            AtxCompleteHitlWithTestResultsCommand,
                             AtxGetJobDashboardCommand,
                             AtxGetJobReportCommand,
                             AtxUploadCustomPlanCommand,

@@ -1103,6 +1103,197 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
     })
 
+    describe('downloadCompletedStepArtifacts - ITGen any-depth apply', () => {
+        const JOB_ID = 'job-itgen'
+        let tmpRoot: string
+        let checkpointsDir: string
+        let sendStub: sinon.SinonStub
+        let downloadStub: sinon.SinonStub
+        let applyStub: sinon.SinonStub
+
+        // ITGen plan shape: LBV nested under local-verification, so the error-fix rounds sit at
+        // depth 3 and the nested LBV step (depth 2) has no diff of its own.
+        const itGenPlan = () => ({
+            Root: {
+                StepId: 'root',
+                Status: 'IN_PROGRESS',
+                Children: [
+                    {
+                        StepId: 'tp',
+                        Status: 'SUCCEEDED',
+                        Children: [{ StepId: 'proj-a', Status: 'SUCCEEDED', Children: [] }],
+                    },
+                    {
+                        StepId: 'lv',
+                        Status: 'SUCCEEDED',
+                        Children: [
+                            {
+                                StepId: 'lbv',
+                                Status: 'SUCCEEDED',
+                                Children: [
+                                    { StepId: 'round-1', Status: 'SUCCEEDED', Children: [] },
+                                    { StepId: 'round-2', Status: 'SUCCEEDED', Children: [] },
+                                    { StepId: 'round-3', Status: 'IN_PROGRESS', Children: [] },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        })
+
+        // Artifacts tagged to proj-a and the two finished rounds, plus a job-level deliverable.
+        const listedArtifacts = () => ({
+            artifacts: [
+                { artifactId: 'a-proj', planStepId: 'proj-a' },
+                { artifactId: 'a-r1', planStepId: 'round-1' },
+                { artifactId: 'a-r2', planStepId: 'round-2' },
+                { artifactId: 'a-final' },
+            ],
+        })
+
+        const appliedOrder = () => applyStub.getCalls().map(c => path.basename(c.args[0]))
+
+        beforeEach(() => {
+            process.env.ATX_ITGEN_ENABLED = 'true'
+            tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-apply-'))
+            checkpointsDir = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
+            sendStub = (handler as any).atxClient.send
+            sinon.stub(handler as any, 'addAuthToCommand').resolves()
+            // Materialize the step's checkpoint folder, as a real download would.
+            downloadStub = sinon
+                .stub(handler as any, 'downloadCompletedStepArtifact')
+                .callsFake(async (...args: any[]) => {
+                    fs.mkdirSync(path.join(checkpointsDir, args[2]), { recursive: true })
+                })
+            applyStub = sinon.stub(handler as any, 'applyChanges').resolves({ success: true })
+            sinon.stub(handler as any, 'saveLastAppliedTimestamp')
+        })
+
+        afterEach(() => {
+            delete process.env.ATX_ITGEN_ENABLED
+            fs.rmSync(tmpRoot, { recursive: true, force: true })
+        })
+
+        it('applies SUCCEEDED steps with an artifact at any depth, children before parents', async () => {
+            // Give the nested LBV a diff too, to pin that a parent lands after its children.
+            const listed = listedArtifacts()
+            listed.artifacts.push({ artifactId: 'a-lbv', planStepId: 'lbv' })
+            sendStub.resolves(listed)
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(appliedOrder()).to.deep.equal(['proj-a', 'round-1', 'round-2', 'lbv'])
+            expect(downloadStub.callCount).to.equal(4)
+        })
+
+        it('skips SUCCEEDED steps with no artifact instead of reporting a failed apply', async () => {
+            sendStub.resolves(listedArtifacts())
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            // tp / lv / lbv have no diff: never downloaded, never flagged.
+            const downloaded = downloadStub.getCalls().map(c => c.args[2])
+            expect(downloaded).to.not.include.members(['tp', 'lv', 'lbv'])
+            expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal([])
+        })
+
+        it('pages through ListArtifacts', async () => {
+            sendStub
+                .onFirstCall()
+                .resolves({ artifacts: [{ artifactId: 'a-r1', planStepId: 'round-1' }], nextToken: 't' })
+            sendStub.onSecondCall().resolves({ artifacts: [{ artifactId: 'a-r2', planStepId: 'round-2' }] })
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            expect(sendStub.callCount).to.equal(2)
+            expect(sendStub.secondCall.args[0].input.nextToken).to.equal('t')
+            expect(appliedOrder()).to.deep.equal(['round-1', 'round-2'])
+        })
+
+        it('does not list artifacts once every SUCCEEDED step is applied', async () => {
+            fs.mkdirSync(checkpointsDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(checkpointsDir, 'checkpoints-applied.json'),
+                JSON.stringify({ appliedSteps: ['tp', 'proj-a', 'lv', 'lbv', 'round-1', 'round-2'] })
+            )
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(sendStub.called).to.be.false
+            expect(applyStub.called).to.be.false
+        })
+
+        it('applies already-downloaded checkpoints without listing', async () => {
+            fs.mkdirSync(checkpointsDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(checkpointsDir, 'checkpoints-applied.json'),
+                JSON.stringify({ appliedSteps: ['tp', 'proj-a', 'lv', 'lbv', 'round-1'] })
+            )
+            fs.mkdirSync(path.join(checkpointsDir, 'round-2'))
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            expect(sendStub.called).to.be.false
+            expect(appliedOrder()).to.deep.equal(['round-2'])
+        })
+
+        it('retries on the next poll when ListArtifacts fails, without reporting a failure', async () => {
+            sendStub.rejects(new Error('throttled'))
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(downloadStub.called).to.be.false
+            expect(applyStub.called).to.be.false
+        })
+
+        it('reports a failure when a step with an artifact cannot be downloaded', async () => {
+            sendStub.resolves({ artifacts: [{ artifactId: 'a-r1', planStepId: 'round-1' }] })
+            downloadStub.callsFake(async () => {})
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.true
+            expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal(['round-1'])
+        })
+
+        it('keeps the depth-2-only behavior when the flag is off', async () => {
+            delete process.env.ATX_ITGEN_ENABLED
+            sendStub.resolves(listedArtifacts())
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            // Depth 2 only: proj-a and the nested lbv (attempted even without an artifact).
+            expect(downloadStub.getCalls().map(c => c.args[2])).to.deep.equal(['proj-a', 'lbv'])
+            expect(sendStub.called).to.be.false
+        })
+    })
+
     describe('mapApiStatus', () => {
         it('should pass through valid statuses', () => {
             expect((handler as any).mapApiStatus('SUCCEEDED')).to.equal('SUCCEEDED')

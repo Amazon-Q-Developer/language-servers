@@ -63,6 +63,8 @@ import {
     AtxDashboardRepo,
     AtxUploadCustomPlanRequest,
     AtxUploadCustomPlanResponse,
+    AtxOpenHitl,
+    isSupportedAtxTestRunSchemaVersion,
 } from './atxModels'
 import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
@@ -74,6 +76,28 @@ import { BrowserInfo } from './models'
 // TODO: key name pending confirmation from the Transform agent (C1) - change it here only.
 export const ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY = 'generate_integration_tests'
 export const ATX_OBJECTIVE_BROWSER_KEY = 'browser'
+
+// LS-side feature flag for the ITGen (integration test generation) plumbing. Off unless the env
+// var is exactly 'true'; while off, the LS behaves exactly as before ITGen.
+// TODO: row 18 replaces this with the real feature flag - change it here only.
+export const ATX_ITGEN_ENABLED_ENV_VAR = 'ATX_ITGEN_ENABLED'
+
+export function isItGenEnabled(): boolean {
+    return process.env[ATX_ITGEN_ENABLED_ENV_VAR] === 'true'
+}
+
+// ITGen HITL tags (contract v0 §3). The IDE answers both; one task per launch attempt / test run.
+export const ATX_HITL_TAG_INTEG_APP_LAUNCH = 'integ-app-launch'
+export const ATX_HITL_TAG_INTEG_TEST_RUN = 'integ-test-run'
+
+export function isItGenHitlTag(tag: unknown): boolean {
+    return tag === ATX_HITL_TAG_INTEG_APP_LAUNCH || tag === ATX_HITL_TAG_INTEG_TEST_RUN
+}
+
+// Agent-supplied ids (task id, runId) become folder names; refuse anything that could leave the folder.
+function isSafePathSegment(value: unknown): value is string {
+    return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..')
+}
 
 /**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
@@ -164,6 +188,10 @@ export class ATXTransformHandler {
     private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
+    // The last ListHitls result of the getTransformInfo call in progress (undefined = not listed
+    // yet), reused to build OpenHitls without a second ListHitls call. Same lifetime as
+    // _currentDiffContext.
+    private _currentPollHitls: any[] | undefined = undefined
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -1591,7 +1619,11 @@ export class ATXTransformHandler {
             const result = await this.atxClient!.send(command)
 
             this.logging.log(`ATX: ListHitls completed - Found ${result.hitlTasks?.length || 0} tasks`)
-            return result.hitlTasks || []
+            const hitls = result.hitlTasks || []
+            if (this._currentDiffContext && isItGenEnabled()) {
+                this._currentPollHitls = hitls
+            }
+            return hitls
         } catch (error) {
             this.logging.error(`ATX: ListHitls error: ${String(error)}`)
             return null
@@ -1731,6 +1763,285 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * ITGen: completes an integ-test-run or integ-app-launch HITL with the IDE's result ZIP
+     * (contract v0 §5 / §6) — upload it as a HITL_FROM_USER ZIP, then submit the task by ID, like
+     * completeHitlWithBuildResults. The ZIP must hold a summary.json (test run) or a
+     * launch-result.json (app launch) with a supported schemaVersion; anything else is refused
+     * before upload so the agent never receives a result it can't read. On the transformed side the
+     * customer's changed files are added as workspace/ (addCustomerChangesToResultZip). No size
+     * limit here: the limit is an IDE constant (C13).
+     */
+    async completeHitlWithTestResults(
+        workspaceId: string,
+        jobId: string,
+        taskId: string,
+        resultZipPath: string,
+        solutionRootPath: string
+    ): Promise<{ Success: boolean; Error?: string }> {
+        try {
+            if (!isItGenEnabled()) {
+                return { Success: false, Error: `completeHitlWithTestResults requires ${ATX_ITGEN_ENABLED_ENV_VAR}` }
+            }
+            if (!taskId) {
+                return { Success: false, Error: 'TaskId is required' }
+            }
+
+            const zipPath = path.resolve(solutionRootPath || '', resultZipPath || '')
+            this.logging.log(`ATX: Completing HITL ${taskId} with test results ${zipPath}`)
+            if (!resultZipPath || !fs.existsSync(zipPath) || !fs.statSync(zipPath).isFile()) {
+                return { Success: false, Error: `Result ZIP not found: ${zipPath}` }
+            }
+
+            const resultFile = this.readTestResultZip(zipPath)
+            if ('error' in resultFile) {
+                return { Success: false, Error: resultFile.error }
+            }
+            // The customer can change code at any time on the transformed side; the original copy
+            // is never sent back to the agent.
+            const uploadPath =
+                resultFile.result?.side === 'transformed'
+                    ? this.addCustomerChangesToResultZip(zipPath, solutionRootPath, jobId)
+                    : zipPath
+
+            // HITL_FROM_USER for the same reason as completeHitlWithBuildResults: the submit
+            // fails with ResourceNotFoundException for any other category.
+            const uploadResponse = await this.createArtifactUploadUrl(
+                workspaceId,
+                jobId,
+                uploadPath,
+                CategoryType.HITL_FROM_USER,
+                FileType.ZIP
+            )
+            if (!uploadResponse?.uploadUrl) {
+                return { Success: false, Error: 'Failed to create artifact upload URL' }
+            }
+
+            const uploadSuccess = await Utils.uploadArtifact(
+                uploadResponse.uploadUrl,
+                uploadPath,
+                uploadResponse.requestHeaders,
+                this.logging
+            )
+            if (!uploadSuccess) {
+                return { Success: false, Error: 'Failed to upload test results' }
+            }
+
+            const completeResponse = await this.completeArtifactUpload(workspaceId, jobId, uploadResponse.uploadId)
+            if (!completeResponse?.success) {
+                return { Success: false, Error: 'Failed to complete artifact upload' }
+            }
+
+            // integ-test-run is a CRITICAL HITL like LBV, so the critical submit closes it directly.
+            const submitResult = await this.submitHitl(workspaceId, jobId, taskId, uploadResponse.uploadId)
+            if (!submitResult) {
+                return { Success: false, Error: 'Failed to submit HITL task' }
+            }
+
+            this.logging.log(`ATX: HITL ${taskId} completed with test results successfully`)
+            return { Success: true }
+        } catch (error) {
+            this.logging.error(`ATX: completeHitlWithTestResults error: ${String(error)}`)
+            return { Success: false, Error: String(error) }
+        }
+    }
+
+    /**
+     * Reads an ITGen result ZIP's result file (summary.json for a test run, else launch-result.json
+     * for an app launch), or says why the ZIP can't be submitted.
+     */
+    private readTestResultZip(zipPath: string): { result: any } | { error: string } {
+        let fileName: string
+        let result: any
+        try {
+            const zip = new AdmZip(zipPath)
+            const entry = zip.getEntry('summary.json') || zip.getEntry('launch-result.json')
+            if (!entry) {
+                return { error: 'Result ZIP has neither summary.json nor launch-result.json at its root' }
+            }
+            fileName = entry.entryName
+            result = JSON.parse(entry.getData().toString('utf-8'))
+        } catch (error) {
+            return { error: `Result ZIP is unreadable: ${String(error)}` }
+        }
+        if (!isSupportedAtxTestRunSchemaVersion(result?.schemaVersion)) {
+            return { error: `Unsupported ${fileName} schemaVersion: ${result?.schemaVersion}` }
+        }
+        return { result }
+    }
+
+    /**
+     * ITGen (contract v0 §6): adds the customer's changed files to a transformed-side result ZIP as
+     * workspace/metadata.json ({ filesUpdated }) plus workspace/<relative path>, with the same scan
+     * and metadata as updateWorkspace: every tracked file modified since job start. metadata.json is
+     * written even when nothing changed, so the agent can tell "no changes" from an old IDE. The
+     * IDE's ZIP is left as it is: the result goes to a copy next to it, whose path is returned. A
+     * ZIP that already has workspace/ is returned unchanged.
+     */
+    private addCustomerChangesToResultZip(zipPath: string, solutionRootPath: string, jobId: string): string {
+        const zip = new AdmZip(zipPath)
+        if (zip.getEntries().some(entry => entry.entryName.startsWith('workspace/'))) {
+            return zipPath
+        }
+
+        const filesUpdated: string[] = []
+        for (const filePath of this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId, true)) {
+            const relativePath = path.relative(solutionRootPath, filePath)
+            if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+                continue
+            }
+            try {
+                zip.addFile(`workspace/${relativePath.split(path.sep).join('/')}`, fs.readFileSync(filePath))
+                filesUpdated.push(relativePath)
+            } catch (error) {
+                this.logging.error(`ATX: could not add ${filePath} to the result ZIP: ${String(error)}`)
+            }
+        }
+        zip.addFile('workspace/metadata.json', Buffer.from(JSON.stringify({ filesUpdated }, null, 2)))
+
+        const uploadPath = zipPath.replace(/\.zip$/i, '') + '.with-workspace.zip'
+        zip.writeZip(uploadPath)
+        this.logging.log(`ATX: added ${filesUpdated.length} customer-changed file(s) to ${uploadPath}`)
+        return uploadPath
+    }
+
+    /**
+     * ITGen: the first open integ-app-launch, else integ-test-run HITL in the pool. Undefined when
+     * ATX_ITGEN_ENABLED is off, so every selection site keeps today's order.
+     */
+    private findItGenHitl(pool: any[]): any | undefined {
+        if (!isItGenEnabled()) {
+            return undefined
+        }
+        return (
+            pool.find(h => h.tag === ATX_HITL_TAG_INTEG_APP_LAUNCH) ||
+            pool.find(h => h.tag === ATX_HITL_TAG_INTEG_TEST_RUN)
+        )
+    }
+
+    /**
+     * ITGen: OpenHitls for the response (contract v0 §3), one per HITL listed this poll. For
+     * integ-* HITLs the agent's request is downloaded once per task to
+     * artifactWorkspace/<job>/hitl/<taskId>/request.json (a task's request never changes; each
+     * launch attempt or run is a new task) and its schemaVersion checked.
+     */
+    private async buildOpenHitls(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        hitls: any[]
+    ): Promise<AtxOpenHitl[]> {
+        const openHitls: AtxOpenHitl[] = []
+        for (const hitl of hitls) {
+            if (!hitl?.taskId) {
+                continue
+            }
+            const openHitl: AtxOpenHitl = { TaskId: hitl.taskId }
+            if (hitl.tag) {
+                openHitl.Tag = hitl.tag
+            }
+            const stepId = this.getStepId(hitl)
+            if (stepId) {
+                openHitl.StepId = stepId
+            }
+            if (hitl.expiredAt) {
+                openHitl.ExpiryTimestampUTC = new Date(hitl.expiredAt).toISOString()
+            }
+            if (isItGenHitlTag(hitl.tag)) {
+                Object.assign(openHitl, await this.downloadItGenHitlRequest(workspaceId, jobId, solutionRootPath, hitl))
+            }
+            openHitls.push(openHitl)
+        }
+        return openHitls
+    }
+
+    private async downloadItGenHitlRequest(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        hitl: any
+    ): Promise<Pick<AtxOpenHitl, 'RequestPath' | 'RequestError' | 'TestsPath'>> {
+        if (!isSafePathSegment(hitl.taskId)) {
+            return { RequestError: `Unsafe task id: ${hitl.taskId}` }
+        }
+        const requestPath = path.join(solutionRootPath, workspaceFolderName, jobId, 'hitl', hitl.taskId, 'request.json')
+        try {
+            let request: any
+            if (fs.existsSync(requestPath)) {
+                request = JSON.parse(fs.readFileSync(requestPath, 'utf-8'))
+            } else {
+                const artifactId = hitl.agentArtifact?.artifactId
+                if (!artifactId) {
+                    return { RequestError: `${hitl.tag} HITL has no agent artifact` }
+                }
+                request = await this.downloadJsonArtifact(workspaceId, jobId, artifactId)
+                if (!request) {
+                    return { RequestError: `Could not download the ${hitl.tag} request` }
+                }
+                await Utils.directoryExists(path.dirname(requestPath))
+                fs.writeFileSync(requestPath, JSON.stringify(request, null, 2))
+                this.logging.log(`ATX: ${hitl.tag} request for task ${hitl.taskId} saved to ${requestPath}`)
+            }
+            if (!isSupportedAtxTestRunSchemaVersion(request?.schemaVersion)) {
+                return { RequestError: `Unsupported ${hitl.tag} request schemaVersion: ${request?.schemaVersion}` }
+            }
+            if (hitl.tag !== ATX_HITL_TAG_INTEG_TEST_RUN) {
+                return { RequestPath: requestPath }
+            }
+            const tests = await this.downloadItGenTests(workspaceId, jobId, solutionRootPath, hitl.taskId, request)
+            return { RequestPath: requestPath, ...tests }
+        } catch (error) {
+            this.logging.error(`ATX: downloadItGenHitlRequest error for task ${hitl.taskId}: ${String(error)}`)
+            return { RequestError: String(error) }
+        }
+    }
+
+    /**
+     * ITGen: downloads the repo artifact holding the generated test projects (request.artifactId)
+     * into artifactWorkspace/<job>/itgen/<runId>/tests, for tests.projectPath to resolve against
+     * (contract v0 §4). The agent rewrites that artifact under the same id on every test fix, so
+     * it's downloaded again for every test-run task and never reused by id; a marker file holding
+     * the task id keeps one task's later polls from downloading it again.
+     */
+    private async downloadItGenTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        taskId: string,
+        request: any
+    ): Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>> {
+        if (!request?.artifactId) {
+            return { RequestError: 'integ-test-run request has no artifactId' }
+        }
+        if (!isSafePathSegment(request.runId)) {
+            return { RequestError: `Unsafe integ-test-run runId: ${request.runId}` }
+        }
+        const runDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen', request.runId)
+        const testsPath = path.join(runDir, 'tests')
+        const markerPath = path.join(runDir, 'tests.task')
+        if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8') === taskId && fs.existsSync(testsPath)) {
+            return { TestsPath: testsPath }
+        }
+
+        const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, request.artifactId)
+        if (!downloadInfo) {
+            return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
+        }
+        fs.rmSync(testsPath, { recursive: true, force: true })
+        const zipName = 'tests-artifact.zip'
+        await Utils.downloadAndExtractArchive(
+            downloadInfo.s3PresignedUrl,
+            downloadInfo.requestHeaders,
+            testsPath,
+            zipName,
+            this.logging
+        )
+        fs.rmSync(path.join(testsPath, zipName), { force: true })
+        fs.writeFileSync(markerPath, taskId)
+        this.logging.log(`ATX: tests artifact ${request.artifactId} for run ${request.runId} extracted to ${testsPath}`)
+        return { TestsPath: testsPath }
+    }
+
     async getHitl(workspaceId: string, jobId: string, taskId: string): Promise<any | null> {
         try {
             this.logging.log(`ATX: Getting Hitl task: ${taskId}`)
@@ -1859,6 +2170,7 @@ export class ATXTransformHandler {
                 scopedLbv ||
                 fallbackPool.find(h => h.tag === 'local-build-verification') ||
                 fallbackPool.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
+                this.findItGenHitl(fallbackPool) ||
                 fallbackPool[0]
             if (!hitl) {
                 this.logging.log(
@@ -1887,6 +2199,18 @@ export class ATXTransformHandler {
                 )
                 return lbvStepId !== undefined
                     ? { HitlTag: hitlTag, TaskId: hitl.taskId, StepId: lbvStepId }
+                    : { HitlTag: hitlTag, TaskId: hitl.taskId }
+            }
+
+            // ITGen: the IDE answers these too. The agent artifact is request.json, not a plan ZIP;
+            // it's downloaded per task for OpenHitls (buildOpenHitls), not here.
+            if (isItGenEnabled() && isItGenHitlTag(hitlTag)) {
+                const itGenStepId = this.getStepId(hitl)
+                this.logging.log(
+                    `ATX: ${hitlTag} HITL — returning tag for IDE to handle | stepId=${itGenStepId ?? '<none>'}`
+                )
+                return itGenStepId !== undefined
+                    ? { HitlTag: hitlTag, TaskId: hitl.taskId, StepId: itGenStepId }
                     : { HitlTag: hitlTag, TaskId: hitl.taskId }
             }
 
@@ -1987,9 +2311,20 @@ export class ATXTransformHandler {
             if (result && resolvedMode) {
                 result.InteractiveMode = resolvedMode
             }
+            // ITGen: every open HITL, from the ListHitls this poll already made (terminal job
+            // statuses don't list HITLs, so they get no OpenHitls).
+            if (result && isItGenEnabled() && this._currentPollHitls !== undefined) {
+                result.OpenHitls = await this.buildOpenHitls(
+                    request.WorkspaceId,
+                    request.TransformationJobId,
+                    request.SolutionRootPath,
+                    this._currentPollHitls
+                )
+            }
             return result
         } finally {
             this._currentDiffContext = null
+            this._currentPollHitls = undefined
         }
     }
 
@@ -2191,6 +2526,7 @@ export class ATXTransformHandler {
                         execFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
+                        this.findItGenHitl(execFallbackPool) ||
                         execFallbackPool.find(h => String(h.tag).endsWith('-checkpoint')) ||
                         execFallbackPool[0]
                     if (!execHitl) {
@@ -2295,6 +2631,7 @@ export class ATXTransformHandler {
                         planFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
+                        this.findItGenHitl(planFallbackPool) ||
                         planFallbackPool[0]
                     this.logging.log(`ATX: Found HITL task - tag: ${hitl.tag}, hasArtifact: ${!!hitl.agentArtifact}`)
                     // For missing packages HITL, try to download artifact if available
@@ -2339,6 +2676,23 @@ export class ATXTransformHandler {
                             HitlTag: hitl.tag,
                             HitlTaskId: hitl.taskId,
                             StepInformation: planLbvStepId ? { StepId: planLbvStepId } : undefined,
+                            TransformationPlan: plan,
+                        } as AtxGetTransformInfoResponse
+                    }
+                    if (isItGenEnabled() && isItGenHitlTag(hitl.tag)) {
+                        const itGenStepId = this.getStepId(hitl)
+                        this.logging.log(
+                            `ATX: ${jobStatus} job has pending ${hitl.tag} HITL — taskId=${hitl.taskId} stepId=${itGenStepId ?? '<none>'}; surfacing AWAITING_HUMAN_INPUT to IDE`
+                        )
+                        return {
+                            TransformationJob: {
+                                WorkspaceId: request.WorkspaceId,
+                                JobId: request.TransformationJobId,
+                                Status: 'AWAITING_HUMAN_INPUT',
+                            } as AtxTransformationJob,
+                            HitlTag: hitl.tag,
+                            HitlTaskId: hitl.taskId,
+                            StepInformation: itGenStepId ? { StepId: itGenStepId } : undefined,
                             TransformationPlan: plan,
                         } as AtxGetTransformInfoResponse
                     }
@@ -2438,6 +2792,27 @@ export class ATXTransformHandler {
                 // only the loaded repo's HITL and skips siblings'. Undefined on single-repo/untagged
                 // jobs → IDE falls back to answering it (prior behavior).
                 StepInformation: hitlResponse.StepId ? { StepId: hitlResponse.StepId } : undefined,
+            } as AtxGetTransformInfoResponse
+        }
+
+        // ITGen app-launch / test-run HITLs: the IDE handles them, like LBV (the request is in OpenHitls).
+        if (isItGenEnabled() && isItGenHitlTag(hitlResponse?.HitlTag)) {
+            const plan = await this.getTransformationPlan(
+                request.WorkspaceId,
+                request.TransformationJobId,
+                request.SolutionRootPath,
+                request.IsBeam === true
+            )
+            return {
+                TransformationJob: {
+                    WorkspaceId: request.WorkspaceId,
+                    JobId: request.TransformationJobId,
+                    Status: 'AWAITING_HUMAN_INPUT',
+                } as any,
+                TransformationPlan: plan,
+                HitlTag: hitlResponse!.HitlTag,
+                HitlTaskId: hitlResponse!.TaskId,
+                StepInformation: hitlResponse!.StepId ? { StepId: hitlResponse!.StepId } : undefined,
             } as AtxGetTransformInfoResponse
         }
 
@@ -3647,10 +4022,16 @@ export class ATXTransformHandler {
         this._applyingCheckpoints = true
 
         try {
-            const completedSteps = this.findCompletedSteps(plan.Root)
+            let completedSteps: (AtxPlanStep & { score?: number })[]
+            if (isItGenEnabled()) {
+                // Already in application order (tree post-order).
+                completedSteps = await this.findCompletedStepsAnyDepth(workspaceId, jobId, solutionRootPath, plan.Root)
+            } else {
+                completedSteps = this.findCompletedSteps(plan.Root)
 
-            // Sort by score to ensure correct application order
-            completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+                // Sort by score to ensure correct application order
+                completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+            }
 
             this.logging.log(`ATX: Found ${completedSteps.length} completed steps to check for artifacts`)
 
@@ -3805,6 +4186,101 @@ export class ATXTransformHandler {
         }
 
         return completedSteps
+    }
+
+    /**
+     * ITGen variant of findCompletedSteps: the not-yet-applied SUCCEEDED steps at ANY depth that
+     * have a diff to apply, i.e. a checkpoint folder on disk or a step-tagged CUSTOMER_OUTPUT
+     * artifact. With integration tests on, the agent nests LBV under local-verification, so the
+     * LBV error-fix rounds move to depth 3 and the nested LBV step itself (depth 2) has no diff.
+     * Keying on the artifact rather than the depth applies the rounds, and skips the LBV step
+     * instead of reporting it as a failed apply on every poll. A step whose artifact isn't
+     * listed yet is left out and picked up on a later poll.
+     *
+     * Returned in tree post-order (score-sorted siblings, children before their parent): a
+     * parent finishes after its children, and checkpoints overwrite whole files, so a parent's
+     * diff must land last.
+     */
+    private async findCompletedStepsAnyDepth(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        root: AtxPlanStep
+    ): Promise<AtxPlanStep[]> {
+        const applied = new Set(this.loadAppliedCheckpoints(solutionRootPath, jobId))
+        const pending = this.findSucceededStepsPostOrder(root).filter(step => !applied.has(step.StepId))
+        const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
+        const isDownloaded = (step: AtxPlanStep) => fs.existsSync(path.join(checkpointsDir, step.StepId))
+
+        // Only list artifacts when some pending step still needs a download.
+        if (pending.every(isDownloaded)) {
+            return pending
+        }
+
+        const stepIdsWithArtifact = await this.listStepIdsWithCustomerOutput(workspaceId, jobId)
+        if (!stepIdsWithArtifact) {
+            // Listing failed: apply what is already on disk and retry the rest on the next poll.
+            return pending.filter(isDownloaded)
+        }
+        return pending.filter(step => isDownloaded(step) || stepIdsWithArtifact.has(step.StepId))
+    }
+
+    /**
+     * All SUCCEEDED steps below the root, children before their parent. Siblings are already
+     * sorted by score (buildTreeFromFlatList).
+     */
+    private findSucceededStepsPostOrder(step: AtxPlanStep, depth: number = 0): AtxPlanStep[] {
+        const steps: AtxPlanStep[] = []
+        for (const child of step.Children) {
+            steps.push(...this.findSucceededStepsPostOrder(child, depth + 1))
+        }
+        if (depth > 0 && step.Status === 'SUCCEEDED') {
+            steps.push(step)
+        }
+        return steps
+    }
+
+    /**
+     * The plan step IDs that have at least one CUSTOMER_OUTPUT artifact for this job, from one
+     * paginated job-wide ListArtifacts. Job-level deliverables carry no planStepId and are
+     * ignored. Returns null on error.
+     */
+    private async listStepIdsWithCustomerOutput(workspaceId: string, jobId: string): Promise<Set<string> | null> {
+        try {
+            if (!this.atxClient && !(await this.initializeAtxClient())) {
+                this.logging.error('ATX: Failed to initialize client for listStepIdsWithCustomerOutput')
+                return null
+            }
+
+            const stepIds = new Set<string>()
+            let nextToken: string | undefined
+            do {
+                const command = new ListArtifactsCommand({
+                    workspaceId: workspaceId,
+                    jobFilter: {
+                        jobId: jobId,
+                        categoryType: 'CUSTOMER_OUTPUT',
+                    },
+                    ...(nextToken && { nextToken }),
+                })
+
+                await this.addAuthToCommand(command)
+                const result = await this.atxClient!.send(command)
+
+                for (const artifact of result?.artifacts || []) {
+                    if (artifact.planStepId) {
+                        stepIds.add(artifact.planStepId)
+                    }
+                }
+                nextToken = result?.nextToken
+            } while (nextToken)
+
+            this.logging.log(`ATX: ${stepIds.size} plan step(s) have CUSTOMER_OUTPUT artifacts for job: ${jobId}`)
+            return stepIds
+        } catch (error) {
+            this.logging.error(`ATX: listStepIdsWithCustomerOutput error: ${String(error)}`)
+            return null
+        }
     }
 
     /**
