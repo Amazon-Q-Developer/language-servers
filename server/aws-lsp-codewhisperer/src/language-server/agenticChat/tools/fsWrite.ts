@@ -109,6 +109,7 @@ export class FsWrite {
     ): Promise<CommandValidation> {
         return requiresPathAcceptance(params.path, 'fsWrite', this.workspace, this.logging, approvedPaths, {
             flagMultiplyLinkedFiles: 'modify',
+            flagConfigFiles: true,
         })
     }
 

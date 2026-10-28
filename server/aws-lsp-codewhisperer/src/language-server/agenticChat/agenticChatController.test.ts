@@ -5,7 +5,7 @@
 
 import * as crypto from 'crypto'
 import * as fs from 'fs/promises'
-import { constants as fsConstants } from 'fs'
+import { constants as fsConstants, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'fs'
 import * as os from 'os'
 import { URI } from 'vscode-uri'
 import { newAgent } from '@aws/language-server-runtimes/runtimes/agent'
@@ -65,12 +65,19 @@ import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/A
 import { AmazonQIAMServiceManager } from '../../shared/amazonQServiceManager/AmazonQIAMServiceManager'
 import { TabBarController } from './tabBarController'
 import { getUserPromptsDirectory, promptFileExtension } from './context/contextUtils'
+import { MemoryBankController } from './context/memorybank/memoryBankController'
 import { AdditionalContextProvider } from './context/additionalContextProvider'
 import { ContextCommandsProvider } from './context/contextCommandsProvider'
 import { ChatDatabase } from './tools/chatDb/chatDb'
 import { LocalProjectContextController } from '../../shared/localProjectContextController'
-import { CancellationError } from '@aws/lsp-core'
-import { CommandValidation, ToolApprovalException, requireResolvedTargets } from './tools/toolShared'
+import { CancellationError, workspaceUtils } from '@aws/lsp-core'
+import {
+    CommandValidation,
+    configFileWarning,
+    ToolApprovalException,
+    requireResolvedTargets,
+    requiresPathAcceptance,
+} from './tools/toolShared'
 import { FsRead } from './tools/fsRead'
 import * as constants from './constants/constants'
 import { GENERIC_ERROR_MS } from './constants/constants'
@@ -545,6 +552,62 @@ describe('AgenticChatController', () => {
                 const promptId = setCurrentPromptIdStub.firstCall.args[0]
                 assert.strictEqual(typeof promptId, 'string')
                 assert.ok(promptId.length > 0)
+            })
+        })
+
+        describe('memory bank generation', () => {
+            const toolUseResponse: ChatResponseStream[] = [
+                { messageMetadataEvent: { conversationId: mockConversationId } },
+                { toolUseEvent: { toolUseId: 'tool-use-1', name: 'fsWrite', input: JSON.stringify({}), stop: true } },
+            ]
+
+            beforeEach(() => {
+                sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([path.join(os.tmpdir(), 'mb-workspace')])
+                sinon.stub(MemoryBankController.prototype, 'memoryBankExists').resolves(false)
+            })
+
+            // Runs one prompt whose model response asks for a tool use. Returns whether the agent loop ran
+            // that tool use as part of memory bank generation.
+            const memoryBankFlagForPrompt = async (prompt: string): Promise<boolean | undefined> => {
+                const processToolUsesStub = sinon.stub(chatController, 'processToolUses').resolves([])
+                generateAssistantResponseStub.restore()
+                generateAssistantResponseStub = sinon.stub(
+                    CodeWhispererStreaming.prototype,
+                    'generateAssistantResponse'
+                )
+                generateAssistantResponseStub.onFirstCall().resolves({
+                    $metadata: { requestId: mockMessageId },
+                    generateAssistantResponseResponse: createIterableResponse(toolUseResponse),
+                })
+                generateAssistantResponseStub.resolves({
+                    $metadata: { requestId: mockMessageId },
+                    generateAssistantResponseResponse: createIterableResponse(mockChatResponseList),
+                })
+
+                await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt } }, mockCancellationToken)
+
+                sinon.assert.calledOnce(processToolUsesStub)
+                return processToolUsesStub.firstCall.args[6]
+            }
+
+            it('runs the tool uses of a memory bank request as memory bank generation', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .resolves('Write the memory bank files')
+
+                assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), true)
+            })
+
+            it('does not run the tool uses of an ordinary request as memory bank generation', async () => {
+                assert.strictEqual(await memoryBankFlagForPrompt('Hello'), false)
+            })
+
+            it('does not run the tool uses as memory bank generation when the preparation fails', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .rejects(new Error('preparation failed'))
+
+                assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), false)
             })
         })
 
@@ -4567,6 +4630,367 @@ ${' '.repeat(8)}}
             assert.strictEqual(toolInput.ruleArtifacts.length, 2)
             assert.strictEqual(toolInput.ruleArtifacts[0].path, '/test/rule1.json')
             assert.strictEqual(toolInput.ruleArtifacts[1].path, '/test/rule2.json')
+        })
+
+        describe('configuration files', () => {
+            let workspaceDir: string
+            let requiresAcceptanceStub: sinon.SinonStub
+            let replaceAcceptanceStub: sinon.SinonStub
+            let getWorkspaceFolderPathsStub: sinon.SinonStub
+            let mockSession: any
+
+            const createChatResultStream = () => ({
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            })
+
+            const toolInputs = {
+                fsWrite: (filePath: string) => ({ command: 'create', path: filePath, fileText: 'content' }),
+                fsReplace: (filePath: string) => ({ path: filePath, diffs: [{ oldStr: '{}', newStr: '{ }' }] }),
+            }
+
+            // Whether the tool uses run as part of a memory bank generation request
+            let isMemoryBankGeneration = false
+
+            const processWriteTool = (
+                filePath: string,
+                chatResultStream = createChatResultStream(),
+                toolName: keyof typeof toolInputs = 'fsWrite'
+            ) =>
+                chatController.processToolUses(
+                    [{ toolUseId: 'write-id', name: toolName, input: toolInputs[toolName](filePath), stop: true }],
+                    chatResultStream as any,
+                    mockSession,
+                    'tabId',
+                    mockCancellationToken,
+                    undefined,
+                    isMemoryBankGeneration
+                )
+
+            // The acceptance check returns the checked target, which filesystem tools need to run
+            const resolveAcceptance = (result: CommandValidation, stub = requiresAcceptanceStub) =>
+                stub.callsFake(async (input: { path: string }) => ({
+                    ...result,
+                    canonicalPaths: [input.path],
+                    checkedTargets: [{ path: input.path, state: 'unverified' }],
+                }))
+
+            beforeEach(async () => {
+                isMemoryBankGeneration = false
+                workspaceDir = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'config-files-')))
+                ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                    { toolSpecification: { name: 'fsWrite', description: 'Write file' } },
+                    { toolSpecification: { name: 'fsReplace', description: 'Replace in file' } },
+                ])
+                ;(testFeatures.agent.runTool as sinon.SinonStub).resolves('')
+                ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns(['fsRead', 'fsWrite', 'fsReplace'])
+                requiresAcceptanceStub = sinon.stub(FsWrite.prototype, 'requiresAcceptance')
+                replaceAcceptanceStub = sinon.stub(FsReplace.prototype, 'requiresAcceptance')
+                getWorkspaceFolderPathsStub = sinon
+                    .stub(workspaceUtils, 'getWorkspaceFolderPaths')
+                    .returns([workspaceDir])
+                sinon.stub(chatController, 'waitForToolApproval').resolves()
+                mockSession = {
+                    toolUseLookup: new Map(),
+                    pairProgrammingMode: true,
+                    approvedPaths: new Map(),
+                    addApprovedPath: sinon.stub(),
+                    getConversationType: sinon.stub().returns('AgenticChat'),
+                }
+            })
+
+            afterEach(() => {
+                rmSync(workspaceDir, { recursive: true, force: true })
+            })
+
+            for (const toolName of ['fsWrite', 'fsReplace'] as const) {
+                it(`asks before ${toolName} modifies a configuration file, without describing it as outside the workspace`, async () => {
+                    resolveAcceptance(
+                        { requiresAcceptance: true, warning: configFileWarning, acceptanceReason: 'configFile' },
+                        toolName === 'fsWrite' ? requiresAcceptanceStub : replaceAcceptanceStub
+                    )
+                    const filePath = path.join(workspaceDir, '.amazonq', 'mcp.json')
+                    mkdirSync(path.dirname(filePath))
+                    writeFileSync(filePath, '{}')
+                    const chatResultStream = createChatResultStream()
+
+                    await processWriteTool(filePath, chatResultStream, toolName)
+
+                    const prompt = chatResultStream.writeResultBlock
+                        .getCalls()
+                        .map(call => call.args[0])
+                        .find(result => result.header?.body?.startsWith('#### Allow file modification'))
+                    assert.strictEqual(prompt.header.body, '#### Allow file modification')
+                    assert.ok(prompt.body.startsWith(configFileWarning))
+                    assert.ok(!prompt.body.includes('Requested as'), prompt.body)
+                })
+            }
+
+            describe('a configuration file prompt for a path that reaches another file', () => {
+                const target = () => path.join(workspaceDir, 'docs', 'rules', 'team.md')
+                const requested = () => path.join(workspaceDir, '.amazonq', 'rules', 'team.md')
+
+                // The prompt for a write to the requested path that the check resolved to the target
+                const promptBody = async (result: CommandValidation) => {
+                    requiresAcceptanceStub.resolves({
+                        ...result,
+                        canonicalPaths: [target()],
+                        checkedTargets: [{ path: target(), state: 'unverified' }],
+                    })
+                    const chatResultStream = createChatResultStream()
+
+                    await processWriteTool(requested(), chatResultStream)
+
+                    return chatResultStream.writeResultBlock
+                        .getCalls()
+                        .map(call => call.args[0])
+                        .find(result => result.header?.body?.startsWith('#### Allow file modification')).body as string
+                }
+
+                it('names the requested path as well as the file', async () => {
+                    const body = await promptBody({
+                        requiresAcceptance: true,
+                        warning: configFileWarning,
+                        acceptanceReason: 'configFile',
+                    })
+
+                    assert.ok(body.includes(`\`${target()}\``), body)
+                    assert.ok(body.endsWith(`\nRequested as \`${requested()}\``), body)
+                })
+
+                it('names only the file in prompts for other reasons', async () => {
+                    const body = await promptBody({ requiresAcceptance: true })
+
+                    assert.ok(body.includes(`\`${target()}\``), body)
+                    assert.ok(!body.includes('Requested as'), body)
+                })
+
+                it('names the requested path without the segments that `..` cancels', async () => {
+                    requiresAcceptanceStub.resolves({
+                        requiresAcceptance: true,
+                        warning: configFileWarning,
+                        acceptanceReason: 'configFile',
+                        canonicalPaths: [target()],
+                        checkedTargets: [{ path: target(), state: 'unverified' }],
+                    })
+                    const chatResultStream = createChatResultStream()
+                    // Joined as text, so the segment that `..` cancels stays in the requested path
+                    const requestedPath = [
+                        workspaceDir,
+                        'x`\n\n**Allowed**\n\n`',
+                        '..',
+                        '.amazonq',
+                        'rules',
+                        'team.md',
+                    ].join(path.sep)
+
+                    await processWriteTool(requestedPath, chatResultStream)
+
+                    const body = chatResultStream.writeResultBlock
+                        .getCalls()
+                        .map(call => call.args[0])
+                        .find(result => result.header?.body?.startsWith('#### Allow file modification')).body as string
+                    assert.ok(body.endsWith(`\nRequested as \`${requested()}\``), body)
+                    assert.ok(!body.includes('**Allowed**'), body)
+                })
+            })
+
+            it('treats the memory bank files as approved during memory bank generation', async () => {
+                resolveAcceptance({ requiresAcceptance: false })
+                isMemoryBankGeneration = true
+                const memoryBankFile = path.join(workspaceDir, '.amazonq', 'rules', 'memory-bank', 'product.md')
+
+                await processWriteTool(memoryBankFile)
+
+                // The approved paths given to the tool let the real check skip the configuration file prompt
+                const approvedPaths: Map<string, Set<string>> = requiresAcceptanceStub.firstCall.args[1]
+                const workspace = {
+                    getAllWorkspaceFolders: () => [{ uri: URI.file(workspaceDir).toString(), name: 'ws' }],
+                } as any
+                const memoryBankResult = await requiresPathAcceptance(
+                    memoryBankFile,
+                    'fsWrite',
+                    workspace,
+                    testFeatures.logging,
+                    approvedPaths,
+                    { flagConfigFiles: true }
+                )
+                const otherResult = await requiresPathAcceptance(
+                    path.join(workspaceDir, '.amazonq', 'mcp.json'),
+                    'fsWrite',
+                    workspace,
+                    testFeatures.logging,
+                    approvedPaths,
+                    { flagConfigFiles: true }
+                )
+                assert.strictEqual(memoryBankResult.requiresAcceptance, false)
+                assert.strictEqual(otherResult.acceptanceReason, 'configFile')
+                assert.strictEqual(mockSession.approvedPaths.size, 0)
+            })
+
+            it('does not add memory bank files when there is no workspace folder', async () => {
+                resolveAcceptance({ requiresAcceptance: false })
+                isMemoryBankGeneration = true
+                getWorkspaceFolderPathsStub.returns([])
+
+                await processWriteTool(path.join(workspaceDir, '.amazonq', 'rules', 'memory-bank', 'product.md'))
+
+                assert.strictEqual(requiresAcceptanceStub.firstCall.args[1], mockSession.approvedPaths)
+            })
+
+            it('exempts only the first workspace folder of a multi-root workspace', async () => {
+                const secondRoot = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'config-files-2-')))
+                try {
+                    resolveAcceptance({ requiresAcceptance: false })
+                    isMemoryBankGeneration = true
+                    getWorkspaceFolderPathsStub.returns([workspaceDir, secondRoot])
+                    const secondMemoryBankFile = path.join(secondRoot, '.amazonq', 'rules', 'memory-bank', 'product.md')
+
+                    await processWriteTool(secondMemoryBankFile)
+
+                    // The second root's memory bank file is not pre-approved, so the real check still prompts
+                    const approvedPaths: Map<string, Set<string>> = requiresAcceptanceStub.firstCall.args[1]
+                    const workspace = {
+                        getAllWorkspaceFolders: () => [
+                            { uri: URI.file(workspaceDir).toString(), name: 'ws' },
+                            { uri: URI.file(secondRoot).toString(), name: 'ws2' },
+                        ],
+                    } as any
+                    const result = await requiresPathAcceptance(
+                        secondMemoryBankFile,
+                        'fsWrite',
+                        workspace,
+                        testFeatures.logging,
+                        approvedPaths,
+                        { flagConfigFiles: true }
+                    )
+                    assert.strictEqual(result.acceptanceReason, 'configFile')
+                } finally {
+                    rmSync(secondRoot, { recursive: true, force: true })
+                }
+            })
+
+            it('does not treat the memory bank files as approved otherwise', async () => {
+                resolveAcceptance({ requiresAcceptance: false })
+
+                await processWriteTool(path.join(workspaceDir, '.amazonq', 'rules', 'memory-bank', 'product.md'))
+
+                assert.strictEqual(requiresAcceptanceStub.firstCall.args[1], mockSession.approvedPaths)
+            })
+
+            describe('memory bank files that resolve elsewhere', () => {
+                let outsideDir: string
+                const memoryBankDir = () => path.join(workspaceDir, '.amazonq', 'rules', 'memory-bank')
+
+                beforeEach(() => {
+                    outsideDir = realpathSync.native(mkdtempSync(path.join(os.tmpdir(), 'memory-bank-outside-')))
+                })
+
+                afterEach(() => {
+                    rmSync(outsideDir, { recursive: true, force: true })
+                })
+
+                // The approved paths that a write during memory bank generation gets
+                const memoryBankApprovedPaths = async (filePath: string): Promise<Map<string, Set<string>>> => {
+                    resolveAcceptance({ requiresAcceptance: false })
+                    isMemoryBankGeneration = true
+
+                    await processWriteTool(filePath)
+
+                    return requiresAcceptanceStub.firstCall.args[1]
+                }
+
+                // The real check, with those approved paths
+                const checkWrite = (filePath: string, approvedPaths: Map<string, Set<string>>) =>
+                    requiresPathAcceptance(
+                        filePath,
+                        'fsWrite',
+                        {
+                            getAllWorkspaceFolders: () => [{ uri: URI.file(workspaceDir).toString(), name: 'ws' }],
+                        } as any,
+                        testFeatures.logging,
+                        approvedPaths,
+                        { flagConfigFiles: true }
+                    )
+
+                it('does not treat the files as approved when the memory bank folder links outside the workspace', async function () {
+                    await fs.mkdir(path.dirname(memoryBankDir()), { recursive: true })
+                    try {
+                        await fs.symlink(outsideDir, memoryBankDir(), 'dir')
+                    } catch {
+                        return this.skip()
+                    }
+                    const memoryBankFile = path.join(memoryBankDir(), 'product.md')
+
+                    const approvedPaths = await memoryBankApprovedPaths(memoryBankFile)
+                    const result = await checkWrite(memoryBankFile, approvedPaths)
+
+                    assert.deepStrictEqual([...(approvedPaths.get('fsWrite') ?? [])], [])
+                    assert.strictEqual(result.requiresAcceptance, true)
+                    assert.deepStrictEqual(result.canonicalPaths, [path.join(outsideDir, 'product.md')])
+                })
+
+                it('does not treat the files that memory bank files link to in the workspace as approved', async function () {
+                    await fs.mkdir(memoryBankDir(), { recursive: true })
+                    const configFile = path.join(workspaceDir, '.amazonq', 'mcp.json')
+                    writeFileSync(configFile, '{}')
+                    // A link to a file that does not exist yet
+                    const hook = path.join(workspaceDir, '.git', 'hooks', 'pre-commit')
+                    await fs.mkdir(path.dirname(hook), { recursive: true })
+                    try {
+                        await fs.symlink(configFile, path.join(memoryBankDir(), 'tech.md'), 'file')
+                        await fs.symlink(hook, path.join(memoryBankDir(), 'guidelines.md'), 'file')
+                    } catch {
+                        return this.skip()
+                    }
+
+                    const approvedPaths = await memoryBankApprovedPaths(path.join(memoryBankDir(), 'tech.md'))
+
+                    const fsWritePaths = approvedPaths.get('fsWrite') ?? new Set()
+                    assert.ok(fsWritePaths.has(path.join(memoryBankDir(), 'product.md')))
+                    assert.ok(!fsWritePaths.has(configFile))
+                    assert.ok(!fsWritePaths.has(hook))
+                    for (const filePath of [
+                        configFile,
+                        hook,
+                        path.join(memoryBankDir(), 'tech.md'),
+                        path.join(memoryBankDir(), 'guidelines.md'),
+                    ]) {
+                        const result = await checkWrite(filePath, approvedPaths)
+                        assert.strictEqual(result.acceptanceReason, 'configFile', filePath)
+                    }
+                })
+
+                it('does not treat a memory bank file with another name on disk as approved', async function () {
+                    const outsideFile = path.join(outsideDir, 'notes.md')
+                    writeFileSync(outsideFile, 'notes')
+                    await fs.mkdir(memoryBankDir(), { recursive: true })
+                    const memoryBankFile = path.join(memoryBankDir(), 'product.md')
+                    try {
+                        await fs.link(outsideFile, memoryBankFile)
+                    } catch {
+                        return this.skip()
+                    }
+
+                    const approvedPaths = await memoryBankApprovedPaths(memoryBankFile)
+                    const result = await checkWrite(memoryBankFile, approvedPaths)
+
+                    const fsWritePaths = approvedPaths.get('fsWrite') ?? new Set()
+                    assert.ok(fsWritePaths.has(path.join(memoryBankDir(), 'tech.md')))
+                    assert.ok(!fsWritePaths.has(memoryBankFile))
+                    assert.strictEqual(result.requiresAcceptance, true)
+                })
+            })
         })
     })
 })
