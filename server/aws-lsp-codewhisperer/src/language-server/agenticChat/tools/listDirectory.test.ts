@@ -37,7 +37,7 @@ describe('ListDirectory Tool', () => {
     it('invalidates empty path', async () => {
         const listDirectory = new ListDirectory(testFeatures)
         await assert.rejects(
-            listDirectory.validate({ path: '', maxDepth: 0 }),
+            listDirectory.validate({ path: '', maxDepth: 0 }, ''),
             /Path cannot be empty/i,
             'Expected an error about empty path'
         )
@@ -46,7 +46,7 @@ describe('ListDirectory Tool', () => {
     it('invalidates negative maxDepth', async () => {
         const listDirectory = new ListDirectory(testFeatures)
         await assert.rejects(
-            listDirectory.validate({ path: '~', maxDepth: -1 }),
+            listDirectory.validate({ path: '~', maxDepth: -1 }, tempFolder.path),
             /MaxDepth cannot be negative/i,
             'Expected an error about negative maxDepth'
         )
@@ -57,7 +57,7 @@ describe('ListDirectory Tool', () => {
         await tempFolder.write('fileA.txt', 'fileA content')
 
         const listDirectory = new ListDirectory(testFeatures)
-        const result = await listDirectory.invoke({ path: tempFolder.path, maxDepth: 0 })
+        const result = await listDirectory.invoke({ path: tempFolder.path, maxDepth: 0 }, tempFolder.path)
 
         assert.strictEqual(result.output.kind, 'text')
         const hasFileA = result.output.content.includes('`-- fileA.txt')
@@ -73,7 +73,7 @@ describe('ListDirectory Tool', () => {
         await tempFolder.write(path.join('subfolder', 'fileB.md'), '# fileB')
 
         const listDirectory = new ListDirectory(testFeatures)
-        const result = await listDirectory.invoke({ path: tempFolder.path })
+        const result = await listDirectory.invoke({ path: tempFolder.path }, tempFolder.path)
 
         assert.strictEqual(result.output.kind, 'text')
         const hasFileA = result.output.content.includes('`-- fileA.txt')
@@ -90,8 +90,8 @@ describe('ListDirectory Tool', () => {
         await nestedFolder.write('fileC.md', '# fileC')
 
         const listDirectory = new ListDirectory(testFeatures)
-        await listDirectory.validate({ path: tempFolder.path })
-        const result = await listDirectory.invoke({ path: tempFolder.path })
+        await listDirectory.validate({ path: tempFolder.path }, tempFolder.path)
+        const result = await listDirectory.invoke({ path: tempFolder.path }, tempFolder.path)
 
         assert.strictEqual(result.output.kind, 'text')
         const hasNodeModules = result.output.content.includes('node_modules/\n')
@@ -106,8 +106,8 @@ describe('ListDirectory Tool', () => {
         await nestedFolder.write('output.md', 'this is some text')
 
         const listDirectory = new ListDirectory(testFeatures)
-        await listDirectory.validate({ path: tempFolder.path })
-        const result = await listDirectory.invoke({ path: tempFolder.path })
+        await listDirectory.validate({ path: tempFolder.path }, tempFolder.path)
+        const result = await listDirectory.invoke({ path: tempFolder.path }, tempFolder.path)
         assert.strictEqual(result.output.kind, 'text')
         const hasOutput = result.output.content.includes('`-- output.md')
 
@@ -118,12 +118,14 @@ describe('ListDirectory Tool', () => {
         const missingPath = path.join(tempFolder.path, 'no_such_file.txt')
         const listDirectory = new ListDirectory(testFeatures)
 
-        await assert.rejects(listDirectory.invoke({ path: missingPath, maxDepth: 0 }))
+        await assert.rejects(listDirectory.invoke({ path: missingPath, maxDepth: 0 }, missingPath))
     })
 
-    it('expands ~ path', async () => {
+    it('uses the expanded home path returned by acceptance', async () => {
         const listDirectory = new ListDirectory(testFeatures)
-        const result = await listDirectory.invoke({ path: '~', maxDepth: 0 })
+        const decision = await listDirectory.requiresAcceptance({ path: '~', maxDepth: 0 })
+        assert.ok(decision.canonicalPaths?.length)
+        const result = await listDirectory.invoke({ path: '~', maxDepth: 0 }, decision.canonicalPaths[0])
 
         assert.strictEqual(result.output.kind, 'text')
         assert.ok(result.output.content.length > 0)
