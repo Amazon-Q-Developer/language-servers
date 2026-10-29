@@ -36,34 +36,8 @@ export class YamlLanguageService implements AwsLanguageService {
             workspaceContext,
         })
 
-        this.yamlService.configure({ schemas: [{ fileMatch: ['*'], uri: this.props.defaultSchemaUri }] })
-    }
-
-    public isSupported(document: TextDocument): boolean {
-        return document.languageId === 'yaml'
-    }
-
-    public doValidation(document: TextDocument): Promise<Diagnostic[]> {
-        this.updateSchemaMapping(document.uri)
-        return this.yamlService.doValidation(document, false)
-    }
-
-    public doComplete(document: TextDocument, position: Position): Promise<CompletionList> {
-        this.updateSchemaMapping(document.uri)
-        return this.yamlService.doComplete(document, position, false)
-    }
-
-    public doHover(document: TextDocument, position: Position): Promise<Hover | null> {
-        this.updateSchemaMapping(document.uri)
-        return this.yamlService.doHover(document, position)
-    }
-
-    public format(document: TextDocument, range: Range, options: YamlFormattingOptions): TextEdit[] {
-        this.updateSchemaMapping(document.uri)
-        return this.yamlService.doFormat(document, options)
-    }
-
-    private updateSchemaMapping(documentUri: string): void {
+        // Configure once: every configure() call clears the schema cache, so the
+        // schema would otherwise be downloaded and parsed again for each request.
         this.yamlService.configure({
             hover: true,
             hoverSettings: { showSource: false, showTitle: false },
@@ -73,13 +47,33 @@ export class YamlLanguageService implements AwsLanguageService {
             customTags: [],
             schemas: [
                 {
-                    fileMatch: [documentUri],
+                    fileMatch: ['*'],
                     uri: this.props.defaultSchemaUri,
                     name: this.props.displayName,
                     description: 'some description,',
                 },
             ],
         })
+    }
+
+    public isSupported(document: TextDocument): boolean {
+        return document.languageId === 'yaml'
+    }
+
+    public doValidation(document: TextDocument): Promise<Diagnostic[]> {
+        return this.yamlService.doValidation(document, false)
+    }
+
+    public doComplete(document: TextDocument, position: Position): Promise<CompletionList> {
+        return this.yamlService.doComplete(document, position, false)
+    }
+
+    public doHover(document: TextDocument, position: Position): Promise<Hover | null> {
+        return this.yamlService.doHover(document, position)
+    }
+
+    public format(document: TextDocument, range: Range, options: YamlFormattingOptions): TextEdit[] {
+        return this.yamlService.doFormat(document, options)
     }
 }
 
