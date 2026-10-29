@@ -126,6 +126,54 @@ describe('McpMynahUi', () => {
             assert.strictEqual(callArgs.detailedList.list[0].children[0].actions[1].id, 'open-mcp-server')
         })
 
+        it('opens consent details for denied servers in their own section', () => {
+            mcpMynahUi.listMcpServers({
+                list: [
+                    {
+                        groupName: 'Denied',
+                        children: [
+                            {
+                                title: 'Denied server',
+                                description: 'consent not granted',
+                                children: [
+                                    {
+                                        groupName: 'serverInformation',
+                                        children: [
+                                            { title: 'status', description: 'DISABLED' },
+                                            { title: 'toolcount', description: '0' },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            })
+
+            const { detailedList, events } = (mynahUi.openDetailedList as sinon.SinonStub).firstCall.args[0]
+            const row = detailedList.list[0].children[0]
+            assert.strictEqual(detailedList.list[0].groupName, 'Denied')
+            assert.strictEqual(row.description, undefined)
+            assert.strictEqual(row.iconForegroundStatus, 'warning')
+            sinon.assert.calledWith(toMynahIconStub, 'block')
+            assert.strictEqual(row.actions.length, 1)
+            assert.strictEqual(row.actions[0].id, 'open-mcp-server')
+            assert.strictEqual(row.actions[0].text, undefined)
+            assert.strictEqual(row.actions[0].description, 'View consent status and server configuration')
+            sinon.assert.calledWith(toMynahIconStub, 'right-open')
+            assert.notStrictEqual(row.actions[0].disabled, true)
+
+            // Mouse, keyboard and the explicit action all open details, never Enable.
+            events.onItemClick(row)
+            events.onItemSelect(row)
+            events.onActionClick(row.actions[0], row)
+            const clickStub = messager.onMcpServerClick as sinon.SinonStub
+            sinon.assert.calledThrice(clickStub)
+            for (const call of clickStub.getCalls()) {
+                assert.deepStrictEqual(call.args, ['open-mcp-server', 'Denied server'])
+            }
+        })
+
         it('should handle disabled servers correctly', () => {
             // Create mock params with a disabled server
             const params: ListMcpServersResult = {

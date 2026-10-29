@@ -35,6 +35,9 @@ import {
     getGlobalMcpConfigPath,
     getGlobalPersonaConfigPath,
     normalizePathFromUri,
+    DEFAULT_TOOL_EXEC_TIMEOUT_MS,
+    isUsableToolExecTimeout,
+    resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
 import { AgenticChatError } from '../../errors'
 import { EventEmitter } from 'events'
@@ -42,7 +45,14 @@ import { Mutex } from 'async-mutex'
 import path = require('path')
 import { URI } from 'vscode-uri'
 import { MessageType } from '@aws/language-server-runtimes/protocol'
-import { hasApproval, recordApproval, removeApproval, fingerprintServerConfig } from './mcpConsentStore'
+import {
+    hasApproval,
+    recordApproval,
+    removeApproval,
+    fingerprintServerConfig,
+    effectiveEnv,
+    effectiveHeaders,
+} from './mcpConsentStore'
 import { sanitizeInput } from '../../../../shared/utils'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import { OAuthClient } from './mcpOauthClient'
@@ -55,6 +65,15 @@ export const AGENT_TOOLS_CHANGED = 'agentToolsChanged'
 export enum AuthIntent {
     Interactive = 'interactive',
     Silent = 'silent',
+}
+
+const MCP_CONSENT_PREVIEW_MAX_LENGTH = 200
+const MCP_CONSENT_TRUNCATION_CUE = ' { ... }'
+
+function formatConsentPreview(value: string): string {
+    return value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
+        ? `${value.slice(0, MCP_CONSENT_PREVIEW_MAX_LENGTH)}${MCP_CONSENT_TRUNCATION_CUE}`
+        : value
 }
 
 /**
@@ -439,40 +458,77 @@ export class McpManager {
                 configPath
             )
             if (!approved) {
-                const cmdLine = [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').slice(0, 200)
+                const cmdLine = formatConsentPreview(
+                    [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ')
+                )
+                // Surface the environment variables and headers the server will actually be
+                // launched with. Names only, never values: a config may legitimately hold
+                // tokens, and this string is shown in a dialog and written to logs. Values are
+                // covered by the fingerprint, so any value change re-prompts.
+                const envKeys = Object.keys(effectiveEnv(cfg))
+                const headerNames = Object.keys(effectiveHeaders(cfg))
+                const envLine =
+                    envKeys.length > 0
+                        ? `Environment variables: ${formatConsentPreview(envKeys.join(', '))}\n`
+                        : `Environment variables: (none)\n`
+                const headerLine =
+                    headerNames.length > 0 ? `Headers: ${formatConsentPreview(headerNames.join(', '))}\n` : ''
                 const allowBtn = { title: 'Allow for this server' }
                 const denyBtn = { title: 'Deny' }
-                let choice: { title: string } | null | undefined
-                try {
-                    choice = await this.features.lsp.window.showMessageRequest({
-                        type: MessageType.Warning,
-                        message:
-                            `Amazon Q — Untrusted MCP Server\n\n` +
-                            `A workspace configuration file wants to start an MCP server.\n` +
-                            `Server: ${serverName}\n` +
-                            `Command: ${cmdLine}\n` +
-                            `Source: ${configPath}\n\n` +
-                            `Running this server executes the above command on your machine. ` +
-                            `Only allow if you trust the authors of this workspace.\n\n` +
-                            `Your choice will be remembered for this workspace. ` +
-                            `If you allow, you won't be asked again unless the server configuration changes.`,
-                        actions: [allowBtn, denyBtn],
-                    })
-                } catch (e: any) {
-                    this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
-                    this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
-                    return
+                const reviewBtn = { title: 'View full configuration' }
+
+                while (true) {
+                    let choice: { title: string } | null | undefined
+                    try {
+                        choice = await this.features.lsp.window.showMessageRequest({
+                            type: MessageType.Warning,
+                            message:
+                                `Amazon Q — Untrusted MCP Server\n\n` +
+                                `A workspace configuration file wants to start an MCP server.\n` +
+                                `Server: ${serverName}\n` +
+                                `Command: ${cmdLine}\n` +
+                                envLine +
+                                headerLine +
+                                `• Source: ${configPath}\n\n` +
+                                `Running this server executes the above command on your machine, ` +
+                                `with the environment variables listed above. ` +
+                                `Use View full configuration to inspect the source before allowing. ` +
+                                `Variables such as NODE_OPTIONS can cause additional code to run. ` +
+                                `Only allow if you trust the authors of this workspace.\n\n` +
+                                `Your choice will be remembered for this workspace. ` +
+                                `If you allow, you won't be asked again unless the server configuration changes.`,
+                            actions: [reviewBtn, allowBtn, denyBtn],
+                        })
+                    } catch (e: any) {
+                        this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
+                        this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
+                        return
+                    }
+                    if (choice?.title === reviewBtn.title) {
+                        try {
+                            await this.features.lsp.window.showDocument({
+                                uri: URI.file(configPath).toString(),
+                                takeFocus: true,
+                            })
+                        } catch (e: any) {
+                            this.features.logging.warn(
+                                `MCP: failed to open configuration for '${serverName}': ${e?.message}`
+                            )
+                        }
+                        continue
+                    }
+                    if (choice?.title !== allowBtn.title) {
+                        this.features.logging.info(
+                            `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
+                        )
+                        this.sessionDeniedConsent.add(denyKey)
+                        this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
+                        return
+                    }
+                    await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
+                    this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
+                    break
                 }
-                if (choice?.title !== allowBtn.title) {
-                    this.features.logging.info(
-                        `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
-                    )
-                    this.sessionDeniedConsent.add(denyKey)
-                    this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
-                    return
-                }
-                await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
-                this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
             }
         }
 
@@ -855,8 +911,6 @@ export class McpManager {
      * @throws if server or tool is missing, disabled, or disconnected(shouldn't happen).
      */
     public async callTool(server: string, tool: string, args: any): Promise<any> {
-        const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
-
         const cfg = this.mcpServers.get(server)
         if (!cfg) throw new Error(`MCP: server '${server}' is not configured`)
         if (this.isServerDisabled(server)) throw new Error(`MCP: server '${server}' is disabled`)
@@ -872,14 +926,24 @@ export class McpManager {
         if (!client) throw new Error(`MCP: server '${server}' not connected`)
 
         const timeoutCfg = cfg.timeout
-        const callPromise = client.callTool({ name: tool, arguments: args })
+        // The MCP SDK applies its own DEFAULT_REQUEST_TIMEOUT_MSEC (60s) when no RequestOptions
+        // are supplied, so the configured timeout has to be handed to the SDK as well. Without it
+        // the SDK cancels the request at 60s and the outer race below can only ever shorten,
+        // never extend, the effective deadline.
+        const sdkTimeout = resolveMcpRequestTimeoutMs(timeoutCfg)
+        if (timeoutCfg !== undefined && timeoutCfg !== 0 && !isUsableToolExecTimeout(timeoutCfg)) {
+            this.features.logging.warn(
+                `MCP: server '${server}' has an invalid timeout (${timeoutCfg}); falling back to ${DEFAULT_TOOL_EXEC_TIMEOUT_MS} ms`
+            )
+        }
+        const callPromise = client.callTool({ name: tool, arguments: args }, undefined, { timeout: sdkTimeout })
 
         // 0 -> no timeout
         if (timeoutCfg === 0) {
             return await callPromise
         }
 
-        const execTimeout = timeoutCfg ?? DEFAULT_TOOL_EXEC_TIMEOUT_MS
+        const execTimeout = sdkTimeout
         const timeoutPromise = new Promise<never>((_, reject) => {
             const timer = setTimeout(
                 () =>
