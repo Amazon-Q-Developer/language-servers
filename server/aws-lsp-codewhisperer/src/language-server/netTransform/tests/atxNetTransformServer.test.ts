@@ -259,6 +259,40 @@ describe('AtxNetTransformServer - routing', () => {
         })
     })
 
+    describe('error result', () => {
+        const serviceError = () =>
+            Object.assign(new Error('User arn:aws:sts::123456789012:assumed-role/r/s is not authorized'), {
+                name: 'AccessDeniedException',
+                $metadata: { httpStatusCode: 403 },
+            })
+
+        it('adds the service error code and HTTP status', async () => {
+            sinon.stub(ATXTransformHandler.prototype, 'listMessages').rejects(serviceError())
+
+            const result = await executeCommandHandler(
+                { command: 'aws/atxTransform/listMessages', workspaceId: 'ws-1', jobId: 'job-1' } as any,
+                {} as any
+            )
+
+            expect(result.error).to.be.true
+            expect(result.errorCode).to.equal('AccessDeniedException')
+            expect(result.statusCode).to.equal(403)
+        })
+
+        it('has no error code or status for a plain error', async () => {
+            sinon.stub(ATXTransformHandler.prototype, 'listMessages').rejects(new Error('client not initialized'))
+
+            const result = await executeCommandHandler(
+                { command: 'aws/atxTransform/listMessages', workspaceId: 'ws-1' } as any,
+                {} as any
+            )
+
+            expect(result.error).to.be.true
+            expect(result.errorCode).to.be.undefined
+            expect(result.statusCode).to.be.undefined
+        })
+    })
+
     describe('routing log messages', () => {
         it('should log NEW handler routing decision for startTransform', async () => {
             await executeCommandHandler(
