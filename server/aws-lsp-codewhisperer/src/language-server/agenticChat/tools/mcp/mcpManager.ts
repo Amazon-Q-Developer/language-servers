@@ -35,6 +35,9 @@ import {
     getGlobalMcpConfigPath,
     getGlobalPersonaConfigPath,
     normalizePathFromUri,
+    DEFAULT_TOOL_EXEC_TIMEOUT_MS,
+    isUsableToolExecTimeout,
+    resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
 import { AgenticChatError } from '../../errors'
 import { EventEmitter } from 'events'
@@ -908,8 +911,6 @@ export class McpManager {
      * @throws if server or tool is missing, disabled, or disconnected(shouldn't happen).
      */
     public async callTool(server: string, tool: string, args: any): Promise<any> {
-        const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
-
         const cfg = this.mcpServers.get(server)
         if (!cfg) throw new Error(`MCP: server '${server}' is not configured`)
         if (this.isServerDisabled(server)) throw new Error(`MCP: server '${server}' is disabled`)
@@ -925,14 +926,24 @@ export class McpManager {
         if (!client) throw new Error(`MCP: server '${server}' not connected`)
 
         const timeoutCfg = cfg.timeout
-        const callPromise = client.callTool({ name: tool, arguments: args })
+        // The MCP SDK applies its own DEFAULT_REQUEST_TIMEOUT_MSEC (60s) when no RequestOptions
+        // are supplied, so the configured timeout has to be handed to the SDK as well. Without it
+        // the SDK cancels the request at 60s and the outer race below can only ever shorten,
+        // never extend, the effective deadline.
+        const sdkTimeout = resolveMcpRequestTimeoutMs(timeoutCfg)
+        if (timeoutCfg !== undefined && timeoutCfg !== 0 && !isUsableToolExecTimeout(timeoutCfg)) {
+            this.features.logging.warn(
+                `MCP: server '${server}' has an invalid timeout (${timeoutCfg}); falling back to ${DEFAULT_TOOL_EXEC_TIMEOUT_MS} ms`
+            )
+        }
+        const callPromise = client.callTool({ name: tool, arguments: args }, undefined, { timeout: sdkTimeout })
 
         // 0 -> no timeout
         if (timeoutCfg === 0) {
             return await callPromise
         }
 
-        const execTimeout = timeoutCfg ?? DEFAULT_TOOL_EXEC_TIMEOUT_MS
+        const execTimeout = sdkTimeout
         const timeoutPromise = new Promise<never>((_, reject) => {
             const timer = setTimeout(
                 () =>
