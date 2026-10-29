@@ -11,6 +11,8 @@ export function injectJSDOM() {
     global.window = dom.window as unknown as Window & typeof globalThis
     global.document = dom.window.document
     global.self = dom.window as unknown as Window & typeof globalThis
+    // MynahUI.destroy() exercises browser DOM cleanup that expects Node to be global.
+    global.Node = dom.window.Node
     global.Element = dom.window.Element
     global.HTMLElement = dom.window.HTMLElement
     global.CustomEvent = dom.window.CustomEvent
