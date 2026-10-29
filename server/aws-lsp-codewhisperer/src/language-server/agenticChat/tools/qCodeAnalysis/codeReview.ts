@@ -14,6 +14,7 @@ import { randomUUID } from 'crypto'
 import * as crypto from 'crypto'
 import * as path from 'path'
 import * as JSZip from 'jszip'
+import * as fs from 'fs'
 import { existsSync, statSync } from 'fs'
 import { CancellationToken } from '@aws/language-server-runtimes/server-interface'
 import { InvokeOutput } from '../toolShared'
@@ -22,6 +23,7 @@ import {
     FileArtifacts,
     FolderArtifacts,
     RuleArtifacts,
+    ValidatedArtifact,
     ValidateInputAndSetupResult,
     PrepareAndUploadArtifactsResult,
     StartCodeAnalysisResult,
@@ -30,7 +32,7 @@ import {
     FailedMetricName,
     SuccessMetricName,
 } from './codeReviewTypes'
-import { CancellationError } from '@aws/lsp-core'
+import { CancellationError, workspaceUtils } from '@aws/lsp-core'
 import { Origin } from '@amzn/codewhisperer-streaming'
 
 export class CodeReview {
@@ -58,6 +60,17 @@ export class CodeReview {
             `Code analysis failed for jobId - ${jobId} due to ${message}`,
         SCAN_FAILED: 'Code scan failed',
         TIMEOUT: `Code review timed out. Ask user to provide a smaller size of code to scan.`,
+        NO_WORKSPACE: `Cannot run ${CODE_REVIEW_TOOL_NAME}: no workspace folder is open. Ask the user to open the folder that contains the code to review.`,
+        ARTIFACT_NOT_ABSOLUTE: (artifactPath: string) =>
+            `Cannot review "${artifactPath}": provide an absolute path inside an open workspace folder.`,
+        ARTIFACT_UNRESOLVABLE: (artifactPath: string) =>
+            `Cannot review "${artifactPath}": it does not exist or cannot be resolved. Provide an existing path inside an open workspace folder.`,
+        ARTIFACT_OUTSIDE_WORKSPACE: (artifactPath: string) =>
+            `Cannot review "${artifactPath}": only paths inside an open workspace folder can be reviewed.`,
+        ARTIFACT_NOT_A_FILE: (artifactPath: string) => `Cannot review "${artifactPath}": it is not a regular file.`,
+        ARTIFACT_NOT_A_DIRECTORY: (artifactPath: string) => `Cannot review "${artifactPath}": it is not a directory.`,
+        ARTIFACT_MULTIPLY_LINKED: (artifactPath: string) =>
+            `Cannot review "${artifactPath}": it has more than one hard link, so its contents may also exist outside the workspace.`,
     }
 
     private readonly credentialsProvider: Features['credentialsProvider']
@@ -591,6 +604,206 @@ export class CodeReview {
     }
 
     /**
+     * Canonicalize the open workspace folder roots with a STRICT realpath.
+     *
+     * A root that cannot be resolved on disk, or that resolves to something
+     * other than a directory, is dropped rather than kept as a lexical path
+     * (unlike the permissive shared canonicalizeWorkspaceFolders, which falls
+     * back to path.resolve on failure): a root that is not a resolvable
+     * directory cannot anchor a trustworthy containment check, so excluding it
+     * can only make the boundary stricter. Callers treat an empty result as
+     * "no workspace" and reject the request.
+     * @returns Canonical, on-disk workspace root directories
+     */
+    private async getCanonicalWorkspaceRoots(): Promise<string[]> {
+        const roots: string[] = []
+        for (const folder of workspaceUtils.getWorkspaceFolderPaths(this.workspace)) {
+            try {
+                const resolved = await fs.promises.realpath(folder)
+                // Strict stat: retain the root only when it resolves to a real
+                // directory. A missing root throws here; a non-directory root
+                // is skipped, since it cannot contain any artifact.
+                const stats = await fs.promises.stat(resolved)
+                if (stats.isDirectory()) {
+                    roots.push(resolved)
+                } else {
+                    this.logging.warn(`Ignoring a workspace folder that is not a directory on disk: ${folder}`)
+                }
+            } catch (error) {
+                this.logging.warn(`Ignoring a workspace folder that could not be resolved on disk: ${error}`)
+            }
+        }
+        return roots
+    }
+
+    /**
+     * Validate every submitted artifact (files, folders, and rules) against the
+     * open workspace before ANY artifact content is read or any Git command
+     * runs. Each path must be absolute, resolve on disk with a strict realpath,
+     * be the expected type (regular file for files/rules, directory for
+     * folders), have a single hard link when it is a regular file, and
+     * canonicalize to a location inside a canonical workspace root. Any
+     * violation throws CodeReviewValidationError and aborts the whole request.
+     * @param fileArtifacts Submitted file artifacts
+     * @param folderArtifacts Submitted folder artifacts
+     * @param ruleArtifacts Submitted rule artifacts
+     * @returns Canonical workspace roots and the validated artifacts with canonical paths
+     */
+    private async validateArtifactsWithinWorkspace(
+        fileArtifacts: FileArtifacts,
+        folderArtifacts: FolderArtifacts,
+        ruleArtifacts: RuleArtifacts
+    ): Promise<{
+        canonicalWorkspaceRoots: string[]
+        fileArtifacts: ValidatedArtifact[]
+        folderArtifacts: ValidatedArtifact[]
+        ruleArtifacts: ValidatedArtifact[]
+    }> {
+        const canonicalWorkspaceRoots = await this.getCanonicalWorkspaceRoots()
+        if (canonicalWorkspaceRoots.length === 0) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.NO_WORKSPACE)
+        }
+
+        // Validate all three arrays up front so a bad path in any one of them
+        // aborts before the first content read or Git call on any of them.
+        const validatedFiles: ValidatedArtifact[] = []
+        for (const artifact of fileArtifacts) {
+            validatedFiles.push(await this.validateArtifactPath(artifact.path, 'file', canonicalWorkspaceRoots))
+        }
+        const validatedFolders: ValidatedArtifact[] = []
+        for (const artifact of folderArtifacts) {
+            validatedFolders.push(await this.validateArtifactPath(artifact.path, 'folder', canonicalWorkspaceRoots))
+        }
+        const validatedRules: ValidatedArtifact[] = []
+        for (const artifact of ruleArtifacts) {
+            validatedRules.push(await this.validateArtifactPath(artifact.path, 'file', canonicalWorkspaceRoots))
+        }
+
+        return {
+            canonicalWorkspaceRoots,
+            fileArtifacts: validatedFiles,
+            folderArtifacts: validatedFolders,
+            ruleArtifacts: validatedRules,
+        }
+    }
+
+    /**
+     * Validate one submitted artifact path and return both the path as
+     * submitted (kept to preserve the caller's intended name and extension
+     * filter) and its strict canonical location (used for the read and Git).
+     * @param submittedPath Path exactly as submitted by the caller
+     * @param kind Whether the path must be a regular file or a directory
+     * @param canonicalWorkspaceRoots Canonical workspace roots to contain the path
+     * @returns The validated artifact
+     * @throws CodeReviewValidationError on any boundary violation
+     */
+    private async validateArtifactPath(
+        submittedPath: string,
+        kind: 'file' | 'folder',
+        canonicalWorkspaceRoots: string[]
+    ): Promise<ValidatedArtifact> {
+        // Absolute only: rejects relative paths and a leading "~", which is not
+        // expanded here on purpose so a tilde path cannot smuggle in a home path.
+        if (typeof submittedPath !== 'string' || !path.isAbsolute(submittedPath)) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_NOT_ABSOLUTE(String(submittedPath)))
+        }
+
+        // Strict canonicalization: realpath throws for a missing, dangling, or
+        // cyclic path, and that failure rejects (no permissive lexical fallback).
+        let canonicalPath: string
+        try {
+            canonicalPath = await fs.promises.realpath(submittedPath)
+        } catch {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_UNRESOLVABLE(submittedPath))
+        }
+
+        const stats = await this.strictStat(canonicalPath, submittedPath)
+
+        if (kind === 'file' && !stats.isFile()) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_NOT_A_FILE(submittedPath))
+        }
+        if (kind === 'folder' && !stats.isDirectory()) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_NOT_A_DIRECTORY(submittedPath))
+        }
+
+        // A regular file reachable under more than one name may also live
+        // outside the workspace; directories legitimately have a link count
+        // above one ('.', '..', and each subdirectory), so only files are
+        // rejected for multiple links.
+        if (stats.isFile() && stats.nlink > 1) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_MULTIPLY_LINKED(submittedPath))
+        }
+
+        if (!workspaceUtils.isInWorkspace(canonicalWorkspaceRoots, canonicalPath)) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_OUTSIDE_WORKSPACE(submittedPath))
+        }
+
+        return { path: submittedPath, canonicalPath }
+    }
+
+    /**
+     * Strict stat that rejects on failure (fail closed) instead of reporting a
+     * benign default the way the shared hasAdditionalHardLinks does when stat
+     * throws. Used both up front and immediately before each read.
+     * @param canonicalPath Canonical path to stat
+     * @param submittedPath Submitted path, used only for the error message
+     * @returns The fs.Stats for the canonical path
+     * @throws CodeReviewValidationError when the path cannot be stat'd
+     */
+    private async strictStat(canonicalPath: string, submittedPath: string): Promise<fs.Stats> {
+        try {
+            return await fs.promises.stat(canonicalPath)
+        } catch {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_UNRESOLVABLE(submittedPath))
+        }
+    }
+
+    /**
+     * Re-validate a resolved file immediately before its contents are read and
+     * return the path that the read and Git must use. The stored canonical
+     * input is re-resolved with a strict realpath, then the resolved path is
+     * required to be a single-linked regular file inside the workspace. Running
+     * the realpath, the stat, and the checks together right before the read (and
+     * returning the same resolved path for the read and Git) keeps the check and
+     * the use pinned to one location, rather than trusting a path string
+     * resolved earlier. This runs for every file, including each file discovered
+     * during a folder walk, so a folder traversal cannot read a hard-linked or
+     * out-of-workspace file that an earlier check missed. This narrows, but does
+     * not eliminate, the window between the check and the read (no full TOCTOU
+     * immunity).
+     * @param canonicalPath Canonical path recorded at validation time
+     * @param submittedPath Path used only for the error message
+     * @param canonicalWorkspaceRoots Canonical workspace roots to contain the path
+     * @returns The freshly resolved path to use for the read and Git
+     * @throws CodeReviewValidationError on any boundary violation
+     */
+    private async assertFileReadableWithinWorkspace(
+        canonicalPath: string,
+        submittedPath: string,
+        canonicalWorkspaceRoots: string[]
+    ): Promise<string> {
+        // Re-resolve the stored canonical input right before use so the type,
+        // link, and boundary checks below act on the current on-disk location.
+        let resolvedPath: string
+        try {
+            resolvedPath = await fs.promises.realpath(canonicalPath)
+        } catch {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_UNRESOLVABLE(submittedPath))
+        }
+        const stats = await this.strictStat(resolvedPath, submittedPath)
+        if (!stats.isFile()) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_NOT_A_FILE(submittedPath))
+        }
+        if (stats.nlink > 1) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_MULTIPLY_LINKED(submittedPath))
+        }
+        if (!workspaceUtils.isInWorkspace(canonicalWorkspaceRoots, resolvedPath)) {
+            throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_OUTSIDE_WORKSPACE(submittedPath))
+        }
+        return resolvedPath
+    }
+
+    /**
      * Create a zip archive of the files and folders to be scanned and calculate MD5 hash
      * @param fileArtifacts Array of file artifacts containing path and programming language
      * @param folderArtifacts Array of folder artifacts containing path
@@ -618,14 +831,27 @@ export class CodeReview {
                 `Preparing ${fileArtifacts.length} files and ${folderArtifacts.length} folders for upload`
             )
 
+            // Validate every submitted artifact (files, folders, and rules)
+            // against the open workspace BEFORE any content is read or any Git
+            // command runs. A single violation throws here, which aborts the
+            // whole request before createUploadUrl, the upload PUT, and
+            // startCodeAnalysis are ever reached. The validated result carries
+            // strict canonical paths that the reads and Git calls below use.
+            const validatedArtifacts = await this.validateArtifactsWithinWorkspace(
+                fileArtifacts,
+                folderArtifacts,
+                ruleArtifacts
+            )
+
             const codeArtifactZip = new JSZip()
             const customerCodeZip = new JSZip()
 
             // Process files and folders
             const { codeDiff, programmingLanguages, codeDiffFiles } = await this.processArtifacts(
-                fileArtifacts,
-                folderArtifacts,
-                ruleArtifacts,
+                validatedArtifacts.fileArtifacts,
+                validatedArtifacts.folderArtifacts,
+                validatedArtifacts.ruleArtifacts,
+                validatedArtifacts.canonicalWorkspaceRoots,
                 customerCodeZip,
                 !isFullReviewRequest
             )
@@ -686,48 +912,58 @@ export class CodeReview {
 
     /**
      * Processes file, folder, and rule artifacts for inclusion in the zip archive
-     * @param fileArtifacts Array of file artifacts to process
-     * @param folderArtifacts Array of folder artifacts to process
-     * @param ruleArtifacts Array of rule artifacts to process
+     * @param fileArtifacts Validated file artifacts to process
+     * @param folderArtifacts Validated folder artifacts to process
+     * @param ruleArtifacts Validated rule artifacts to process
+     * @param canonicalWorkspaceRoots Canonical workspace roots used for the pre-read re-checks
      * @param customerCodeZip JSZip instance for the customer code
      * @param isCodeDiffScan Whether this is a code diff scan
      * @returns Combined code diff string from all artifacts
      */
     private async processArtifacts(
-        fileArtifacts: FileArtifacts,
-        folderArtifacts: FolderArtifacts,
-        ruleArtifacts: RuleArtifacts,
+        fileArtifacts: ValidatedArtifact[],
+        folderArtifacts: ValidatedArtifact[],
+        ruleArtifacts: ValidatedArtifact[],
+        canonicalWorkspaceRoots: string[],
         customerCodeZip: JSZip,
         isCodeDiffScan: boolean
     ): Promise<{ codeDiff: string; programmingLanguages: Set<string>; codeDiffFiles: Set<string> }> {
         // Process files
         let { codeDiff, programmingLanguages, codeDiffFiles } = await this.processFileArtifacts(
             fileArtifacts,
+            canonicalWorkspaceRoots,
             customerCodeZip,
             isCodeDiffScan
         )
 
         // Process folders
-        const folderResult = await this.processFolderArtifacts(folderArtifacts, customerCodeZip, isCodeDiffScan)
+        const folderResult = await this.processFolderArtifacts(
+            folderArtifacts,
+            canonicalWorkspaceRoots,
+            customerCodeZip,
+            isCodeDiffScan
+        )
         codeDiff += folderResult.codeDiff
         folderResult.programmingLanguages.forEach(item => programmingLanguages.add(item))
         folderResult.codeDiffFiles.forEach(item => codeDiffFiles.add(item))
 
         // Process rule artifacts
-        await this.processRuleArtifacts(ruleArtifacts, customerCodeZip)
+        await this.processRuleArtifacts(ruleArtifacts, canonicalWorkspaceRoots, customerCodeZip)
 
         return { codeDiff, programmingLanguages, codeDiffFiles }
     }
 
     /**
      * Processes file artifacts for inclusion in the zip archive
-     * @param fileArtifacts Array of file artifacts to process
+     * @param fileArtifacts Validated file artifacts to process
+     * @param canonicalWorkspaceRoots Canonical workspace roots used for the pre-read re-check
      * @param customerCodeZip JSZip instance for the customer code
      * @param isCodeDiffScan Whether this is a code diff scan
      * @returns Combined code diff string from file artifacts
      */
     private async processFileArtifacts(
-        fileArtifacts: FileArtifacts,
+        fileArtifacts: ValidatedArtifact[],
+        canonicalWorkspaceRoots: string[],
         customerCodeZip: JSZip,
         isCodeDiffScan: boolean
     ): Promise<{ codeDiff: string; programmingLanguages: Set<string>; codeDiffFiles: Set<string> }> {
@@ -736,34 +972,63 @@ export class CodeReview {
         let codeDiffFiles: Set<string> = new Set()
 
         for (const artifact of fileArtifacts) {
+            // The dot/extension filter gates BOTH the zip entry and the Git
+            // diff: a filtered-out file is neither read nor diffed, so its
+            // content cannot reach the upload through customerCode OR codeDiff.
+            // Existence and type are already guaranteed by the up-front
+            // validation; the zip entry name and this filter decision use the
+            // path as submitted, so a symlink whose name is in the workspace
+            // cannot broaden or narrow the extension allowlist through canonical
+            // renaming.
+            const fileName = path.basename(artifact.path)
+            if (fileName.startsWith('.') || CodeReviewUtils.shouldSkipFile(fileName)) {
+                this.logging.info(`Skipping file - ${artifact.path}`)
+                continue
+            }
+
+            let readPath: string | undefined
             await CodeReviewUtils.withErrorHandling(
                 async () => {
-                    let fileName = path.basename(artifact.path)
-                    if (
-                        !fileName.startsWith('.') &&
-                        !CodeReviewUtils.shouldSkipFile(fileName) &&
-                        existsSync(artifact.path)
-                    ) {
-                        const fileLanguage = CodeReviewUtils.getFileLanguage(fileName)
-                        const fileContent = await this.workspace.fs.readFile(artifact.path)
-                        let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(artifact.path)
-                        customerCodeZip.file(
-                            `${CodeReview.CUSTOMER_CODE_BASE_PATH}${normalizedArtifactPath}`,
-                            fileContent
-                        )
-                        programmingLanguages.add(fileLanguage)
-                    } else {
-                        this.logging.info(`Skipping file - ${artifact.path}`)
-                    }
+                    // Re-validate the resolved path immediately before reading
+                    // it, and read from the same freshly resolved location.
+                    readPath = await this.assertFileReadableWithinWorkspace(
+                        artifact.canonicalPath,
+                        artifact.path,
+                        canonicalWorkspaceRoots
+                    )
+                    const fileLanguage = CodeReviewUtils.getFileLanguage(fileName)
+                    const fileContent = await this.workspace.fs.readFile(readPath)
+                    let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(artifact.path)
+                    customerCodeZip.file(`${CodeReview.CUSTOMER_CODE_BASE_PATH}${normalizedArtifactPath}`, fileContent)
+                    programmingLanguages.add(fileLanguage)
                 },
                 'Failed to read file',
                 this.logging,
                 artifact.path
             )
 
-            const artifactFileDiffs = await CodeReviewUtils.getGitDiffNames(artifact.path, this.logging)
-            artifactFileDiffs.forEach(filepath => codeDiffFiles.add(filepath))
-            codeDiff += await CodeReviewUtils.processArtifactWithDiff(artifact, isCodeDiffScan, this.logging)
+            // Git runs ONLY for a code-diff scan; a full review performs no Git
+            // at all. This removes the previous name-only call that ran for
+            // every file even in a full review, whose Set result was never
+            // consumed there. For a code-diff scan, the changed-file set and
+            // the diff text both derive from the SAME per-file getGitDiff
+            // result (there is no separate name-only call), and the path is the
+            // SAME resolved, in-workspace, single-linked file that was read into
+            // the zip, so the diff never carries content from an unread,
+            // filtered, or out-of-workspace file. codeDiffFiles is consumed only
+            // for its count, so a file is counted exactly when its own diff is
+            // non-empty.
+            if (isCodeDiffScan && readPath !== undefined) {
+                const fileDiff = await CodeReviewUtils.processArtifactWithDiff(
+                    { path: readPath },
+                    isCodeDiffScan,
+                    this.logging
+                )
+                if (fileDiff.length > 0) {
+                    codeDiffFiles.add(readPath)
+                    codeDiff += fileDiff
+                }
+            }
         }
 
         return { codeDiff, programmingLanguages, codeDiffFiles }
@@ -771,13 +1036,15 @@ export class CodeReview {
 
     /**
      * Processes folder artifacts for inclusion in the zip archive
-     * @param folderArtifacts Array of folder artifacts to process
+     * @param folderArtifacts Validated folder artifacts to process
+     * @param canonicalWorkspaceRoots Canonical workspace roots used for the per-file re-checks
      * @param customerCodeZip JSZip instance for the customer code
      * @param isCodeDiffScan Whether this is a code diff scan
      * @returns Combined code diff string from folder artifacts
      */
     private async processFolderArtifacts(
-        folderArtifacts: FolderArtifacts,
+        folderArtifacts: ValidatedArtifact[],
+        canonicalWorkspaceRoots: string[],
         customerCodeZip: JSZip,
         isCodeDiffScan: boolean
     ): Promise<{ codeDiff: string; programmingLanguages: Set<string>; codeDiffFiles: Set<string> }> {
@@ -786,12 +1053,23 @@ export class CodeReview {
         let codeDiffFiles: Set<string> = new Set()
 
         for (const folderArtifact of folderArtifacts) {
+            // Collect the canonical paths of the files actually read into the
+            // zip — those that passed the same dot/extension/skip-directory
+            // filters, are single-linked regular files, and resolve inside the
+            // workspace. The folder's Git diff is derived ONLY from these files;
+            // there is no whole-folder git request, so a skipped dotfile or
+            // non-allowlisted file cannot contribute diff text to the uploaded
+            // codeDiff.
+            const includedFiles = new Set<string>()
             await CodeReviewUtils.withErrorHandling(
                 async () => {
                     let languages = await this.addFolderToZip(
                         customerCodeZip,
-                        folderArtifact.path,
-                        CodeReview.CUSTOMER_CODE_BASE_PATH
+                        folderArtifact.canonicalPath,
+                        CodeReview.CUSTOMER_CODE_BASE_PATH,
+                        canonicalWorkspaceRoots,
+                        includedFiles,
+                        folderArtifact.path
                     )
                     languages.forEach(item => programmingLanguages.add(item))
                 },
@@ -800,10 +1078,27 @@ export class CodeReview {
                 folderArtifact.path
             )
 
-            const artifactFileDiffs = await CodeReviewUtils.getGitDiffNames(folderArtifact.path, this.logging)
-            artifactFileDiffs.forEach(filepath => codeDiffFiles.add(filepath))
-
-            codeDiff += await CodeReviewUtils.processArtifactWithDiff(folderArtifact, isCodeDiffScan, this.logging)
+            // Per-file Git, over the included files only, and ONLY for a
+            // code-diff scan (a full review performs no Git). Each path is the
+            // same resolved, in-workspace, single-linked file that was read into
+            // the zip, so the diff never carries content from a skipped or
+            // out-of-workspace file, and there is no whole-folder Git request.
+            // The changed-file set and the diff text both derive from the SAME
+            // per-file getGitDiff result (no separate name-only call);
+            // codeDiffFiles is consumed only for its count.
+            if (isCodeDiffScan) {
+                for (const includedFile of includedFiles) {
+                    const fileDiff = await CodeReviewUtils.processArtifactWithDiff(
+                        { path: includedFile },
+                        isCodeDiffScan,
+                        this.logging
+                    )
+                    if (fileDiff.length > 0) {
+                        codeDiffFiles.add(includedFile)
+                        codeDiff += fileDiff
+                    }
+                }
+            }
         }
 
         return { codeDiff, programmingLanguages, codeDiffFiles }
@@ -811,25 +1106,34 @@ export class CodeReview {
 
     /**
      * Processes rule artifacts for inclusion in the zip archive
-     * @param ruleArtifacts Array of rule artifacts to process
+     * @param ruleArtifacts Validated rule artifacts to process
+     * @param canonicalWorkspaceRoots Canonical workspace roots used for the pre-read re-check
      * @param customerCodeZip JSZip instance for the customer code
      */
-    private async processRuleArtifacts(ruleArtifacts: RuleArtifacts, customerCodeZip: JSZip): Promise<void> {
+    private async processRuleArtifacts(
+        ruleArtifacts: ValidatedArtifact[],
+        canonicalWorkspaceRoots: string[],
+        customerCodeZip: JSZip
+    ): Promise<void> {
         let ruleNameSet = new Set<string>()
         for (const artifact of ruleArtifacts) {
             await CodeReviewUtils.withErrorHandling(
                 async () => {
+                    // The rule file name (and its allowlist decision) comes from
+                    // the submitted path; existence and type are guaranteed by
+                    // the up-front validation.
                     let fileName = path.basename(artifact.path)
-                    if (
-                        !fileName.startsWith('.') &&
-                        !CodeReviewUtils.shouldSkipFile(fileName) &&
-                        existsSync(artifact.path)
-                    ) {
+                    if (!fileName.startsWith('.') && !CodeReviewUtils.shouldSkipFile(fileName)) {
+                        const readPath = await this.assertFileReadableWithinWorkspace(
+                            artifact.canonicalPath,
+                            artifact.path,
+                            canonicalWorkspaceRoots
+                        )
                         if (ruleNameSet.has(fileName)) {
                             fileName = fileName.split('.')[0] + '_' + crypto.randomUUID() + '.' + fileName.split('.')[1]
                         }
                         ruleNameSet.add(fileName)
-                        const fileContent = await this.workspace.fs.readFile(artifact.path)
+                        const fileContent = await this.workspace.fs.readFile(readPath)
                         customerCodeZip.file(
                             `${CodeReview.CUSTOMER_CODE_BASE_PATH}/${CodeReview.RULE_ARTIFACT_PATH}/${fileName}`,
                             fileContent
@@ -848,36 +1152,102 @@ export class CodeReview {
     /**
      * Recursively add a folder and its contents to a zip archive
      * @param zip JSZip instance to add files to
-     * @param folderPath Path to the folder to add
+     * @param folderPath Canonical path to the folder currently being scanned
      * @param zipPath Relative path within the zip archive
+     * @param canonicalWorkspaceRoots Canonical workspace roots used for the per-entry re-checks
+     * @param includedFiles Accumulator of the canonical file paths actually read
+     *   into the zip; the caller derives the folder's Git diff only from these,
+     *   so a skipped or out-of-workspace file never contributes diff text.
+     * @param archiveFolderPath Submitted-layout path for this directory. Used
+     *   only for ZIP entry names and finding paths, never for filesystem reads.
      */
-    private async addFolderToZip(zip: JSZip, folderPath: string, zipPath: string): Promise<Set<string>> {
+    private async addFolderToZip(
+        zip: JSZip,
+        folderPath: string,
+        zipPath: string,
+        canonicalWorkspaceRoots: string[],
+        includedFiles: Set<string>,
+        archiveFolderPath: string
+    ): Promise<Set<string>> {
         try {
             let programmingLanguages = new Set<string>()
             const entries = await this.workspace.fs.readdir(folderPath)
 
             for (const entry of entries) {
                 const name = entry.name
-                const fullPath = path.join(entry.parentPath, name)
+                // Build the child path from the canonical directory we control,
+                // NOT from entry.parentPath, so a crafted or mis-reported dirent
+                // cannot redirect the walk outside the folder being scanned.
+                const fullPath = path.join(folderPath, name)
 
                 if (entry.isFile()) {
-                    if (name.startsWith('.') || CodeReviewUtils.shouldSkipFile(name) || !existsSync(fullPath)) {
+                    if (name.startsWith('.') || CodeReviewUtils.shouldSkipFile(name)) {
                         this.logging.info(`Skipping file - ${fullPath}`)
                         continue
                     }
 
+                    // Resolve and re-validate every discovered file before
+                    // reading it: a folder walk must not become a way to read a
+                    // hard-linked or out-of-workspace file. A realpath failure
+                    // rejects (fail closed) and aborts the whole request; the
+                    // rejected path is never read. The read and the recorded
+                    // path both use the freshly resolved location.
+                    let canonicalFile: string
+                    try {
+                        canonicalFile = await fs.promises.realpath(fullPath)
+                    } catch {
+                        throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_UNRESOLVABLE(fullPath))
+                    }
+                    const readPath = await this.assertFileReadableWithinWorkspace(
+                        canonicalFile,
+                        fullPath,
+                        canonicalWorkspaceRoots
+                    )
+
                     const fileLanguage = CodeReviewUtils.getFileLanguage(name)
-                    const content = await this.workspace.fs.readFile(fullPath)
-                    let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(fullPath)
+                    const content = await this.workspace.fs.readFile(readPath)
+                    // Preserve the submitted directory layout for archive names
+                    // without using it for reads. The content and Git path remain
+                    // the checked canonical location.
+                    const displayPath = path.join(archiveFolderPath, name)
+                    let normalizedArtifactPath = CodeReviewUtils.convertToUnixPath(displayPath)
                     zip.file(`${zipPath}${normalizedArtifactPath}`, content)
                     programmingLanguages.add(fileLanguage)
+                    // Record the exact location read into the zip so the folder's
+                    // Git diff is computed only over the files it actually included.
+                    includedFiles.add(readPath)
                 } else if (entry.isDirectory()) {
                     if (CodeReviewUtils.shouldSkipDirectory(name)) {
                         this.logging.info(`Skipping directory - ${fullPath}`)
                         continue
                     }
 
-                    let languages = await this.addFolderToZip(zip, fullPath, zipPath)
+                    // Resolve the subdirectory and confirm it stays inside the
+                    // workspace before recursing into it. A symlinked entry is
+                    // already skipped above because a symlink dirent is neither a
+                    // file nor a directory, so the walk never follows a link out
+                    // of the workspace; this containment check is defense in
+                    // depth against a mis-reported dirent.
+                    let canonicalDir: string
+                    try {
+                        canonicalDir = await fs.promises.realpath(fullPath)
+                    } catch {
+                        throw new CodeReviewValidationError(CodeReview.ERROR_MESSAGES.ARTIFACT_UNRESOLVABLE(fullPath))
+                    }
+                    if (!workspaceUtils.isInWorkspace(canonicalWorkspaceRoots, canonicalDir)) {
+                        throw new CodeReviewValidationError(
+                            CodeReview.ERROR_MESSAGES.ARTIFACT_OUTSIDE_WORKSPACE(fullPath)
+                        )
+                    }
+
+                    let languages = await this.addFolderToZip(
+                        zip,
+                        canonicalDir,
+                        zipPath,
+                        canonicalWorkspaceRoots,
+                        includedFiles,
+                        path.join(archiveFolderPath, name)
+                    )
                     languages.forEach(item => programmingLanguages.add(item))
                 }
             }
