@@ -1,7 +1,7 @@
+import { CheckedTarget, updateCheckedFile } from './checkedFileIo'
 import { CommandValidation, ExplanatoryParams, InvokeOutput, requiresPathAcceptance } from './toolShared'
 import { EmptyPathError, EmptyDiffsError, FileNotExistsError, TextNotFoundError, MultipleMatchesError } from '../errors'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import * as os from 'os'
 
 interface BaseParams extends ExplanatoryParams {
@@ -30,26 +30,35 @@ export class FsReplace {
         this.lsp = features.lsp
     }
 
-    public async validate(params: FsReplaceParams): Promise<void> {
+    /**
+     * `targetPath` is the canonical path the approval check evaluated for
+     * `params.path`; `params.path` is never resolved here.
+     */
+    public async validate(params: FsReplaceParams, targetPath: CheckedTarget): Promise<void> {
         if (!params.path) {
             throw new EmptyPathError()
         }
         if (!params.diffs || params.diffs.length === 0) {
             throw new EmptyDiffsError()
         }
-        const sanitizedPath = sanitize(params.path)
-        const fileExists = await this.workspace.fs.exists(sanitizedPath)
+        const fileExists =
+            targetPath.state === 'unverified'
+                ? await this.workspace.fs.exists(targetPath.path)
+                : targetPath.state === 'existing'
         if (!fileExists) {
             throw new FileNotExistsError()
         }
     }
 
-    public async invoke(params: FsReplaceParams): Promise<InvokeOutput> {
-        const sanitizedPath = sanitize(params.path)
-
-        await this.handleReplace(params, sanitizedPath)
+    /**
+     * Rewrites `targetPath`, the canonical path the approval check evaluated.
+     * The requested `params.path` is not resolved again.
+     */
+    public async invoke(params: FsReplaceParams, targetPath: CheckedTarget): Promise<InvokeOutput> {
+        const fileUpdate = await this.handleReplace(params, targetPath)
 
         return {
+            fileUpdate,
             output: {
                 kind: 'text',
                 content: 'File updated successfully',
@@ -61,13 +70,19 @@ export class FsReplace {
         params: FsReplaceParams,
         approvedPaths?: Map<string, Set<string>>
     ): Promise<CommandValidation> {
-        return requiresPathAcceptance(params.path, 'fsReplace', this.workspace, this.logging, approvedPaths)
+        return requiresPathAcceptance(params.path, 'fsReplace', this.workspace, this.logging, approvedPaths, {
+            flagMultiplyLinkedFiles: 'modify',
+        })
     }
 
-    private async handleReplace(params: ReplaceParams, sanitizedPath: string): Promise<void> {
-        const fileContent = await this.workspace.fs.readFile(sanitizedPath)
-        const newContent = getReplaceContent(params, fileContent)
-        await this.workspace.fs.writeFile(sanitizedPath, newContent)
+    private async handleReplace(params: ReplaceParams, targetPath: CheckedTarget) {
+        return updateCheckedFile(
+            this.workspace,
+            targetPath,
+            fileContent => getReplaceContent(params, fileContent),
+            {},
+            this.logging
+        )
     }
 
     public getSpec() {

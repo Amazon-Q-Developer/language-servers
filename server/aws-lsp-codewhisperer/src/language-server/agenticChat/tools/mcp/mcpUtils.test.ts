@@ -27,6 +27,12 @@ import {
     sanitizeName,
     convertPersonaToAgent,
     migrateToAgentConfig,
+    restoreServerScopedPermissions,
+    isPermissionForServer,
+    DEFAULT_TOOL_EXEC_TIMEOUT_MS,
+    MAX_TOOL_EXEC_TIMEOUT_MS,
+    isUsableToolExecTimeout,
+    resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
 import type { MCPServerConfig } from './mcpTypes'
 import { McpPermissionType } from './mcpTypes'
@@ -1150,5 +1156,244 @@ describe('saveServerSpecificAgentConfig', () => {
         )
 
         expect(fs.existsSync(configPath)).to.be.true
+    })
+})
+
+describe('loadAgentConfig server-scoped permission restore', () => {
+    let tmpDir: string
+    let workspace: any
+    let logger: any
+
+    const writeJson = async (p: string, value: unknown) => {
+        await workspace.fs.mkdir(path.dirname(p), { recursive: true })
+        await workspace.fs.writeFile(p, JSON.stringify(value))
+    }
+
+    beforeEach(() => {
+        sinon.restore()
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentPermRestoreTest-'))
+        workspace = {
+            fs: {
+                exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
+                mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
+                getUserHomeDir: () => tmpDir,
+            },
+            getAllWorkspaceFolders: () => [],
+        }
+        logger = { warn: () => {}, info: () => {}, error: () => {}, debug: () => {} }
+    })
+
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('restores "Always Allow" for a server declared in a legacy mcp.json', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { jira: { command: 'jira-mcp', args: [] } },
+        })
+        // This is the shape saveServerSpecificAgentConfig writes for a legacy server: the
+        // permissions are persisted, but the server definition deliberately is not.
+        await writeJson(agentPath, {
+            name: 'test-agent',
+            mcpServers: {},
+            tools: ['@jira'],
+            allowedTools: ['@jira/jira_get_issue'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.servers.has('jira')).to.be.true
+        expect(result.agentConfig.tools).to.include('@jira')
+        expect(result.agentConfig.allowedTools).to.include('@jira/jira_get_issue')
+    })
+
+    it('restores permissions written to a duplicate config that was skipped', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        const wsAgentPath = path.join(wsRoot, '.amazonq', 'agents', 'default.json')
+        const globalAgentPath = getGlobalAgentConfigPath(tmpDir)
+
+        await writeJson(wsAgentPath, {
+            mcpServers: { dup: { command: 'dup-mcp', args: [] } },
+            tools: ['@dup'],
+            allowedTools: [],
+        })
+        // Global declares the same server, so it is skipped as a duplicate before the per-server
+        // permission pass - its allowedTools entry must still survive.
+        await writeJson(globalAgentPath, {
+            mcpServers: { dup: { command: 'dup-mcp', args: [] } },
+            tools: ['@dup'],
+            allowedTools: ['@dup/some_tool'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+        expect(result.servers.has('dup')).to.be.true
+        expect(result.agentConfig.allowedTools).to.include('@dup/some_tool')
+    })
+
+    it('does not restore permissions for a server that no longer loads', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['@removed'],
+            allowedTools: ['@removed/tool'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.servers.size).to.equal(0)
+        expect(result.agentConfig.tools).to.not.include('@removed')
+        expect(result.agentConfig.allowedTools).to.not.include('@removed/tool')
+    })
+
+    it('keeps non server-scoped permissions untouched', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['fsRead', 'executeBash'],
+            allowedTools: ['fsRead'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.agentConfig.tools).to.deep.equal(['fsRead', 'executeBash'])
+        expect(result.agentConfig.allowedTools).to.deep.equal(['fsRead'])
+    })
+
+    it('does not leak permissions between servers with a shared name prefix', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { jira: { command: 'jira-mcp', args: [] } },
+        })
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['@jira'],
+            allowedTools: ['@jira/jira_get_issue', '@jira2/other_tool', '@jirax'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.agentConfig.allowedTools).to.include('@jira/jira_get_issue')
+        expect(result.agentConfig.allowedTools).to.not.include('@jira2/other_tool')
+        expect(result.agentConfig.allowedTools).to.not.include('@jirax')
+    })
+})
+
+describe('restoreServerScopedPermissions()', () => {
+    const baseAgentConfig = () =>
+        ({
+            name: 'a',
+            description: 'd',
+            mcpServers: {},
+            tools: [] as string[],
+            allowedTools: [] as string[],
+            toolsSettings: {},
+            resources: [],
+        }) as any
+
+    it('restores only entries belonging to a loaded server', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            ['@srv', '@srv/tool', '@gone'],
+            ['@srv/tool', '@gone/tool']
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@srv', '@srv/tool'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('matches on the original (unsanitized) server name', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['my_server', 'my-server']])
+
+        restoreServerScopedPermissions(agentConfig, mapping, ['@my-server'], ['@my-server/tool'])
+
+        expect(agentConfig.tools).to.deep.equal(['@my-server'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@my-server/tool'])
+    })
+
+    it('does not duplicate entries already applied', () => {
+        const agentConfig = baseAgentConfig()
+        agentConfig.tools.push('@srv')
+        agentConfig.allowedTools.push('@srv/tool')
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(agentConfig, mapping, ['@srv'], ['@srv/tool'])
+
+        expect(agentConfig.tools).to.deep.equal(['@srv'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('is a no-op when no servers loaded', () => {
+        const agentConfig = baseAgentConfig()
+
+        restoreServerScopedPermissions(agentConfig, new Map(), ['@srv'], ['@srv/tool'])
+
+        expect(agentConfig.tools).to.be.empty
+        expect(agentConfig.allowedTools).to.be.empty
+    })
+})
+
+describe('isPermissionForServer()', () => {
+    it('matches the server prefix and its tools only', () => {
+        expect(isPermissionForServer('@jira', 'jira')).to.be.true
+        expect(isPermissionForServer('@jira/jira_get_issue', 'jira')).to.be.true
+        expect(isPermissionForServer('@jira2', 'jira')).to.be.false
+        expect(isPermissionForServer('@jira2/tool', 'jira')).to.be.false
+        expect(isPermissionForServer('@jirax', 'jira')).to.be.false
+        expect(isPermissionForServer('fsRead', 'jira')).to.be.false
+    })
+})
+
+describe('resolveMcpRequestTimeoutMs()', () => {
+    it('returns the configured timeout when it is usable', () => {
+        expect(resolveMcpRequestTimeoutMs(300_000)).to.equal(300_000)
+        expect(resolveMcpRequestTimeoutMs(1)).to.equal(1)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('treats 0 as "no timeout" by returning the maximum timer value', () => {
+        expect(resolveMcpRequestTimeoutMs(0)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('falls back to the default for undefined, negative, non-finite and over-large values', () => {
+        expect(resolveMcpRequestTimeoutMs(undefined)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(-1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.NaN)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.POSITIVE_INFINITY)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.MAX_SAFE_INTEGER)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('never returns a value setTimeout would clamp', () => {
+        for (const candidate of [undefined, 0, -1, Number.NaN, Number.MAX_SAFE_INTEGER, 300_000]) {
+            const resolved = resolveMcpRequestTimeoutMs(candidate)
+            expect(Number.isFinite(resolved)).to.be.true
+            expect(resolved).to.be.greaterThan(0)
+            expect(resolved).to.be.at.most(MAX_TOOL_EXEC_TIMEOUT_MS)
+        }
+    })
+})
+
+describe('isUsableToolExecTimeout()', () => {
+    it('accepts finite positive values within the timer range', () => {
+        expect(isUsableToolExecTimeout(1)).to.be.true
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS)).to.be.true
+    })
+
+    it('rejects undefined, zero, negative, non-finite and over-large values', () => {
+        expect(isUsableToolExecTimeout(undefined)).to.be.false
+        expect(isUsableToolExecTimeout(0)).to.be.false
+        expect(isUsableToolExecTimeout(-1)).to.be.false
+        expect(isUsableToolExecTimeout(Number.NaN)).to.be.false
+        expect(isUsableToolExecTimeout(Number.POSITIVE_INFINITY)).to.be.false
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.be.false
     })
 })
