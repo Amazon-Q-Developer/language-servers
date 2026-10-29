@@ -2,7 +2,7 @@ import * as assert from 'assert'
 import * as sinon from 'sinon'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
-import { CredentialsType } from '@aws/language-server-runtimes/server-interface'
+import { CancellationToken, CredentialsType } from '@aws/language-server-runtimes/server-interface'
 
 describe('AtxTokenServiceManager', () => {
     let features: TestFeatures
@@ -64,6 +64,236 @@ describe('AtxTokenServiceManager', () => {
             manager['clearAllCaches']()
 
             assert(callback.calledOnce)
+        })
+    })
+
+    describe('IAM credentials support', () => {
+        const iamCredentials = { accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'secret', sessionToken: 'token' }
+        const tenantUrl = 'https://tenant.transform.ap-northeast-2.on.aws'
+
+        // The runtime's ATX-scoped provider is bearer-only and throws on 'iam'; IAM creds live in
+        // the main credentialsProvider. These helpers mirror that split.
+        const stubIam = (present: boolean) => {
+            features.credentialsProvider.hasCredentials.callsFake((type: CredentialsType) => type === 'iam' && present)
+            features.credentialsProvider.getCredentials.callsFake((type: CredentialsType) =>
+                type === 'iam' && present ? (iamCredentials as any) : undefined
+            )
+        }
+        const stubBearer = (present: boolean) => {
+            features.runtime.getAtxCredentialsProvider.returns({
+                hasCredentials: (type: string) => type === 'bearer' && present,
+                getCredentials: () => (present ? { token: 'bearer-token' } : undefined),
+            } as any)
+        }
+        const setTenantUrl = async (url: string) =>
+            manager.handleOnUpdateConfiguration(
+                { section: 'aws.atx', settings: { applicationUrl: url } } as any,
+                {} as CancellationToken
+            )
+
+        it('getIamCredentials returns the credentials stored in the iam slot', () => {
+            stubIam(true)
+            assert.deepStrictEqual(manager.getIamCredentials(), iamCredentials)
+        })
+
+        it('getIamCredentials throws when no IAM credentials are present', () => {
+            stubIam(false)
+            assert.throws(() => manager.getIamCredentials(), /No IAM credentials/)
+        })
+
+        it('hasValidCredentials is true when only IAM credentials are present', () => {
+            stubIam(true)
+            stubBearer(false)
+            assert.strictEqual(manager.hasValidCredentials(), true)
+        })
+
+        it('stores the tenant URL from aws.atx configuration with the trailing slash stripped', async () => {
+            await setTenantUrl(`${tenantUrl}/`)
+            assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
+        })
+
+        it('stores only the origin of a tenant URL pasted with a path', async () => {
+            await setTenantUrl(`${tenantUrl}/signin/`)
+            assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
+        })
+
+        for (const invalidUrl of [
+            'https://evil.example.com',
+            'http://tenant.transform.ap-northeast-2.on.aws',
+            'https://tenant.transform.ap-northeast-2.on.aws.evil.com',
+            'https://tenant.transform.evil-region-x.on.aws',
+        ]) {
+            it(`rejects a tenant URL that isn't an AWS Transform URL (${invalidUrl}), so IAM isn't active`, async () => {
+                stubIam(true)
+                stubBearer(false)
+                await setTenantUrl(tenantUrl)
+
+                await setTenantUrl(invalidUrl)
+
+                assert.strictEqual(manager.getActiveApplicationUrl(), null)
+                assert.strictEqual(manager.getAuthType(), null)
+            })
+        }
+
+        it('getAuthType is iam only once both IAM credentials and the tenant URL are present', async () => {
+            stubIam(true)
+            stubBearer(false)
+            assert.strictEqual(manager.getAuthType(), null)
+
+            await setTenantUrl(tenantUrl)
+            assert.strictEqual(manager.getAuthType(), 'iam')
+        })
+
+        it('getAuthType is bearer when only a bearer token is present', () => {
+            stubIam(false)
+            stubBearer(true)
+            assert.strictEqual(manager.getAuthType(), 'bearer')
+        })
+
+        it('getAuthType prefers iam over bearer when both are present and the tenant URL is set', async () => {
+            stubIam(true)
+            stubBearer(true)
+            await setTenantUrl(tenantUrl)
+            assert.strictEqual(manager.getAuthType(), 'iam')
+        })
+
+        it('getAuthType is null when no credentials are present', () => {
+            stubIam(false)
+            stubBearer(false)
+            assert.strictEqual(manager.getAuthType(), null)
+        })
+
+        describe('auth mode declared by the client (aws.atx authType)', () => {
+            const setAuthType = async (authType: string | null) =>
+                manager.handleOnUpdateConfiguration(
+                    { section: 'aws.atx', settings: { authType } } as any,
+                    {} as CancellationToken
+                )
+            const signInWithIam = async () =>
+                manager.handleOnUpdateConfiguration(
+                    { section: 'aws.atx', settings: { authType: 'iam', applicationUrl: tenantUrl } } as any,
+                    {} as CancellationToken
+                )
+
+            it('bearer sign-in over a stale IAM session reports bearer and drops the IAM tenant URL', async () => {
+                stubIam(true)
+                stubBearer(false)
+                await signInWithIam()
+                assert.strictEqual(manager.getAuthType(), 'iam')
+                const cacheCallback = sinon.stub()
+                manager.registerCacheCallback(cacheCallback)
+
+                // IdC sign-in: the bearer arrives and the client declares bearer. The stale IAM credentials
+                // remain in the runtime slot (only the client can delete them) but are no longer used.
+                stubBearer(true)
+                await setAuthType('bearer')
+
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+                assert.strictEqual(manager.getActiveApplicationUrl(), null)
+                assert(cacheCallback.calledOnce)
+            })
+
+            it('keeps the IdC tenant URL when bearer is declared again (token refresh)', async () => {
+                stubIam(false)
+                stubBearer(true)
+                await setAuthType('bearer')
+                await setTenantUrl(tenantUrl)
+
+                await setAuthType('bearer')
+
+                assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+            })
+
+            it('IAM sign-in over a stale bearer token reports iam and keeps the tenant URL from the same update', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await setAuthType('bearer')
+
+                await signInWithIam()
+
+                assert.strictEqual(manager.getActiveApplicationUrl(), tenantUrl)
+                assert.strictEqual(manager.getAuthType(), 'iam')
+            })
+
+            it('reports nothing when the declared mode has no credentials, rather than falling back', async () => {
+                stubIam(true)
+                stubBearer(false)
+                await setTenantUrl(tenantUrl)
+                await setAuthType('bearer')
+                assert.strictEqual(manager.getAuthType(), null)
+
+                stubIam(false)
+                stubBearer(true)
+                await signInWithIam()
+                assert.strictEqual(manager.getAuthType(), null)
+            })
+
+            it('an update without authType leaves the declared mode unchanged', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await setAuthType('bearer')
+
+                await setTenantUrl(tenantUrl)
+
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+            })
+
+            it('a null authType clears the declared mode', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await setAuthType('bearer')
+                await setTenantUrl(tenantUrl)
+
+                await setAuthType(null)
+
+                // Derived from the credentials present, as for clients that never declare a mode.
+                assert.strictEqual(manager.getAuthType(), 'iam')
+            })
+
+            it('IAM credentials delete clears a declared iam mode', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await signInWithIam()
+
+                stubIam(false)
+                manager.handleOnCredentialsDeleted('iam' as CredentialsType)
+
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+            })
+        })
+
+        describe('IAM credentials deleted (aws/credentials/iam/delete)', () => {
+            it('clears the IAM session: no credentials, no tenant URL, no auth type', async () => {
+                stubIam(true)
+                stubBearer(false)
+                await setTenantUrl(tenantUrl)
+                assert.strictEqual(manager.getAuthType(), 'iam')
+                const cacheCallback = sinon.stub()
+                manager.registerCacheCallback(cacheCallback)
+
+                // The runtime clears its IAM slot, then notifies the server.
+                stubIam(false)
+                manager.handleOnCredentialsDeleted('iam' as CredentialsType)
+
+                assert.throws(() => manager.getIamCredentials(), /No IAM credentials/)
+                assert.strictEqual(manager.getActiveApplicationUrl(), null)
+                assert.strictEqual(manager.getAuthType(), null)
+                // The cached FES client is reset.
+                assert(cacheCallback.calledOnce)
+            })
+
+            it('leaves an existing bearer token untouched', async () => {
+                stubIam(true)
+                stubBearer(true)
+                await setTenantUrl(tenantUrl)
+
+                stubIam(false)
+                manager.handleOnCredentialsDeleted('iam' as CredentialsType)
+
+                assert.strictEqual(manager.getAuthType(), 'bearer')
+                assert.strictEqual(await manager.getBearerToken(), 'bearer-token')
+            })
         })
     })
 })

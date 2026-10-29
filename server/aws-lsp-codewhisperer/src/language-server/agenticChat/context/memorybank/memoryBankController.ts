@@ -17,6 +17,32 @@ const MEMORY_BANK_FILES = {
 } as const
 
 /**
+ * Longest stretch of synchronous analysis work before yielding to the event loop, so the
+ * language server keeps handling other messages (for example, opening a new chat tab).
+ */
+const ANALYSIS_YIELD_INTERVAL_MS = 30
+
+/** Sparse TF-IDF vector: non-zero weights only, plus its precomputed L2 norm */
+interface TfidfVector {
+    weights: Map<string, number>
+    norm: number
+}
+
+/**
+ * Returns a function that yields to the event loop once at least `intervalMs` has passed since
+ * the previous yield. Uses setTimeout so it also works in the web worker runtime.
+ */
+function createEventLoopYielder(intervalMs: number = ANALYSIS_YIELD_INTERVAL_MS): () => Promise<void> {
+    let lastYield = Date.now()
+    return async () => {
+        if (Date.now() - lastYield >= intervalMs) {
+            await new Promise<void>(resolve => setTimeout(resolve, 0))
+            lastYield = Date.now()
+        }
+    }
+}
+
+/**
  * Controller for Memory Bank functionality
  * Handles memory bank creation detection and prompt generation
  */
@@ -177,7 +203,7 @@ export class MemoryBankController {
     async discoverAllSourceFiles(
         workspaceFolderUri: string,
         extensions: string[]
-    ): Promise<Array<{ path: string; size: number }>> {
+    ): Promise<Array<{ path: string; size: number; characters: number }>> {
         try {
             // Recursively discover all source files
             const allWorkspaceFolders = this.features.workspace.getAllWorkspaceFolders()
@@ -199,15 +225,15 @@ export class MemoryBankController {
 
             // OPTIMIZATION: Parallel file size calculation with batching
             const batchSize = 10 // Process 10 files at a time
-            const files: Array<{ path: string; size: number }> = []
+            const files: Array<{ path: string; size: number; characters: number }> = []
 
             for (let i = 0; i < allSourceFiles.length; i += batchSize) {
                 const batch = allSourceFiles.slice(i, i + batchSize)
                 const batchResults = await Promise.all(
-                    batch.map(async filePath => ({
-                        path: filePath,
-                        size: await this.calculateFileLineCount(filePath),
-                    }))
+                    batch.map(async filePath => {
+                        const { lines, characters } = await this.readFileStats(filePath)
+                        return { path: filePath, size: lines, characters }
+                    })
                 )
                 files.push(...batchResults)
             }
@@ -223,12 +249,19 @@ export class MemoryBankController {
      * line counting
      */
     async calculateFileLineCount(filePath: string): Promise<number> {
+        return (await this.readFileStats(filePath)).lines
+    }
+
+    /**
+     * Line and character counts of a file; both are 0 if the file cannot be read
+     */
+    private async readFileStats(filePath: string): Promise<{ lines: number; characters: number }> {
         try {
             const content = await this.features.workspace.fs.readFile(filePath)
-            return content.split('\n').length
+            return { lines: content.split('\n').length, characters: content.length }
         } catch (error) {
             this.features.logging.error(`Error reading file ${filePath}: ${error}`)
-            return 0
+            return { lines: 0, characters: 0 }
         }
     }
 
@@ -273,30 +306,18 @@ export class MemoryBankController {
                 return files.map(f => ({ ...f, dissimilarity: 0.85 }))
             }
 
-            // Step 2: Get the TF-IDF vectors for each file (equivalent to sklearn's TfidfVectorizer)
-            const tfidfMatrix = this.createTfidfMatrix(fileContents)
+            // Step 2: Build sparse TF-IDF vectors for each file (TfidfVectorizer-style weighting)
+            const tfidfVectors = await this.createTfidfVectors(fileContents)
 
-            // Step 3: Get the cosine similarity of each file (equivalent to sklearn's cosine_similarity)
-            const cosineSimilarities = this.calculateCosineSimilarityMatrix(tfidfMatrix)
+            // Step 3: Mean cosine similarity of each file to all files, including itself
+            const meanSimilarities = await this.calculateMeanCosineSimilarities(tfidfVectors)
 
-            // Step 4: Get the lexical dissimilarity of each file (1 - similarity)
-            const lexicalDissimilarities: Array<{ path: string; size: number; dissimilarity: number }> = []
-            for (let i = 0; i < cosineSimilarities.length; i++) {
-                // Calculate mean similarity for this file with all files (including itself)
-                const meanSimilarity =
-                    cosineSimilarities[i].reduce((sum, sim) => sum + sim, 0) / cosineSimilarities[i].length
-
-                // Dissimilarity = 1 - mean_similarity (exactly like Python code)
-                const dissimilarity = 1 - meanSimilarity
-
-                lexicalDissimilarities.push({
-                    path: files[i].path,
-                    size: files[i].size,
-                    dissimilarity: Math.max(0.0, Math.min(1.0, dissimilarity)), // Ensure bounds [0,1]
-                })
-            }
-
-            return lexicalDissimilarities
+            // Step 4: Lexical dissimilarity of each file (1 - mean similarity)
+            return files.map((file, i) => ({
+                path: file.path,
+                size: file.size,
+                dissimilarity: Math.max(0.0, Math.min(1.0, 1 - meanSimilarities[i])), // Ensure bounds [0,1]
+            }))
         } catch (error) {
             this.features.logging.error(`Error in calculateLexicalDissimilarity: ${error}`)
             // Fallback to reasonable defaults if TF-IDF calculation fails
@@ -305,96 +326,94 @@ export class MemoryBankController {
     }
 
     /**
-     * Create TF-IDF matrix, Returns array of TF-IDF vectors, where each vector is a Map<term, tfidf_score>
+     * Create sparse TF-IDF vectors (tf * ln(numDocs / df)), one per document.
+     *
+     * Only non-zero weights are stored, so cost scales with the tokens in each document rather
+     * than with the size of the combined vocabulary. Terms present in every document have an IDF
+     * of 0 and are omitted, which leaves dot products and norms unchanged.
      */
-    private createTfidfMatrix(documents: string[]): Map<string, number>[] {
-        // Step 1: Tokenize all documents and build vocabulary
-        const tokenizedDocs = documents.map(doc => this.tokenizeDocument(doc))
-        const vocabulary = new Set<string>()
-        tokenizedDocs.forEach(tokens => tokens.forEach(token => vocabulary.add(token)))
-
-        const vocabArray = Array.from(vocabulary)
+    private async createTfidfVectors(documents: string[]): Promise<TfidfVector[]> {
+        const yieldIfNeeded = createEventLoopYielder()
         const numDocs = documents.length
 
-        // Step 2: Calculate document frequencies (DF)
+        // Term frequencies per document, and document frequencies across all documents
+        const termFrequencies: Map<string, number>[] = []
         const documentFrequencies = new Map<string, number>()
-        vocabArray.forEach(term => {
-            const df = tokenizedDocs.filter(tokens => tokens.includes(term)).length
-            documentFrequencies.set(term, df)
-        })
-
-        // Step 3: Calculate TF-IDF for each document
-        const tfidfMatrix: Map<string, number>[] = []
-        for (let docIndex = 0; docIndex < numDocs; docIndex++) {
-            const tokens = tokenizedDocs[docIndex]
-            const tfidfVector = new Map<string, number>()
-
-            // Calculate term frequencies for this document
-            const termFrequencies = new Map<string, number>()
-            tokens.forEach(token => {
-                termFrequencies.set(token, (termFrequencies.get(token) || 0) + 1)
-            })
-
-            // Calculate TF-IDF for each term in vocabulary
-            vocabArray.forEach(term => {
-                const tf = termFrequencies.get(term) || 0
-                const df = documentFrequencies.get(term) || 1
-                const idf = Math.log(numDocs / df)
-                const tfidf = tf * idf
-                tfidfVector.set(term, tfidf)
-            })
-
-            tfidfMatrix.push(tfidfVector)
-        }
-
-        return tfidfMatrix
-    }
-
-    /**
-     * Calculate cosine similarity matrix
-     */
-    private calculateCosineSimilarityMatrix(tfidfMatrix: Map<string, number>[]): number[][] {
-        const numDocs = tfidfMatrix.length
-        const similarities: number[][] = []
-
-        for (let i = 0; i < numDocs; i++) {
-            const row: number[] = []
-            for (let j = 0; j < numDocs; j++) {
-                const similarity = this.calculateCosineSimilarity(tfidfMatrix[i], tfidfMatrix[j])
-                row.push(similarity)
+        for (const document of documents) {
+            const frequencies = new Map<string, number>()
+            for (const token of this.tokenizeDocument(document)) {
+                frequencies.set(token, (frequencies.get(token) ?? 0) + 1)
             }
-            similarities.push(row)
+            for (const term of frequencies.keys()) {
+                documentFrequencies.set(term, (documentFrequencies.get(term) ?? 0) + 1)
+            }
+            termFrequencies.push(frequencies)
+            await yieldIfNeeded()
         }
 
-        return similarities
+        const vectors: TfidfVector[] = []
+        for (const frequencies of termFrequencies) {
+            const weights = new Map<string, number>()
+            let squaredNorm = 0
+            for (const [term, tf] of frequencies) {
+                const weight = tf * Math.log(numDocs / (documentFrequencies.get(term) ?? numDocs))
+                if (weight !== 0) {
+                    weights.set(term, weight)
+                    squaredNorm += weight * weight
+                }
+            }
+            vectors.push({ weights, norm: Math.sqrt(squaredNorm) })
+            await yieldIfNeeded()
+        }
+        return vectors
     }
 
     /**
-     * Calculate cosine similarity between two TF-IDF vectors
+     * Mean cosine similarity of each vector to every vector, including itself.
+     *
+     * Self-similarity is 1 for a non-zero vector and 0 for a zero vector. The matrix is
+     * symmetric, so each pair is computed once.
      */
-    private calculateCosineSimilarity(vectorA: Map<string, number>, vectorB: Map<string, number>): number {
-        let dotProduct = 0
-        let normA = 0
-        let normB = 0
+    private async calculateMeanCosineSimilarities(vectors: TfidfVector[]): Promise<number[]> {
+        const yieldIfNeeded = createEventLoopYielder()
+        const vectorCount = vectors.length
+        const similarityTotals = new Array<number>(vectorCount).fill(0)
 
-        // Get all unique terms from both vectors
-        const allTerms = new Set([...vectorA.keys(), ...vectorB.keys()])
+        for (let sourceIndex = 0; sourceIndex < vectorCount; sourceIndex++) {
+            if (vectors[sourceIndex].norm > 0) {
+                similarityTotals[sourceIndex] += 1
+            }
+            for (let comparisonIndex = sourceIndex + 1; comparisonIndex < vectorCount; comparisonIndex++) {
+                const similarity = this.calculateCosineSimilarity(vectors[sourceIndex], vectors[comparisonIndex])
+                similarityTotals[sourceIndex] += similarity
+                similarityTotals[comparisonIndex] += similarity
+            }
+            await yieldIfNeeded()
+        }
 
-        allTerms.forEach(term => {
-            const valueA = vectorA.get(term) || 0
-            const valueB = vectorB.get(term) || 0
+        return similarityTotals.map(total => (vectorCount > 0 ? total / vectorCount : 0))
+    }
 
-            dotProduct += valueA * valueB
-            normA += valueA * valueA
-            normB += valueB * valueB
-        })
-
-        // Avoid division by zero
-        if (normA === 0 || normB === 0) {
+    /**
+     * Cosine similarity of two sparse vectors, iterating the smaller one
+     */
+    private calculateCosineSimilarity(vectorA: TfidfVector, vectorB: TfidfVector): number {
+        if (vectorA.norm === 0 || vectorB.norm === 0) {
             return 0
         }
+        const [smaller, larger] =
+            vectorA.weights.size <= vectorB.weights.size
+                ? [vectorA.weights, vectorB.weights]
+                : [vectorB.weights, vectorA.weights]
 
-        return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB))
+        let dotProduct = 0
+        for (const [term, weight] of smaller) {
+            const other = larger.get(term)
+            if (other !== undefined) {
+                dotProduct += weight * other
+            }
+        }
+        return dotProduct / (vectorA.norm * vectorB.norm)
     }
 
     /**
@@ -447,9 +466,12 @@ export class MemoryBankController {
                 throw new Error('No source files found in workspace')
             }
 
-            // Filter out very large files to prevent conversation overflow
-            const MAX_FILE_SIZE_FOR_MEMORY_BANK = 20000 // 20KB limit
-            const reasonableSizedFiles = discoveredFiles.filter(file => file.size <= MAX_FILE_SIZE_FOR_MEMORY_BANK)
+            // Filter out very large files to prevent conversation overflow. `size` is a line count,
+            // so compare character length here; a single-line generated file can be megabytes.
+            const MAX_FILE_SIZE_FOR_MEMORY_BANK = 20000 // characters (~20KB)
+            const reasonableSizedFiles = discoveredFiles
+                .filter(file => file.characters <= MAX_FILE_SIZE_FOR_MEMORY_BANK)
+                .map(({ path, size }) => ({ path, size }))
 
             this.features.logging.debug(
                 `Memory Bank analysis: filtered ${discoveredFiles.length - reasonableSizedFiles.length} files over ${MAX_FILE_SIZE_FOR_MEMORY_BANK} characters`
