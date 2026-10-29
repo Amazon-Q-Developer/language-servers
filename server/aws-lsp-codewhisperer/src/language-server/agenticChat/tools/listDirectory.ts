@@ -2,7 +2,6 @@
 import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
 import { CancellationError, workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { sanitize } from '@aws/lsp-core/out/util/path'
 import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILES } from '../../chat/constants'
 import { CancellationToken } from '@aws/language-server-runtimes/protocol'
 
@@ -22,11 +21,15 @@ export class ListDirectory {
         this.lsp = features.lsp
     }
 
-    public async validate(params: ListDirectoryParams): Promise<void> {
+    /**
+     * `targetPath` is the canonical path the approval check evaluated for
+     * `params.path`; `params.path` is never resolved here.
+     */
+    public async validate(params: ListDirectoryParams, targetPath: string): Promise<void> {
         if (params.maxDepth !== undefined && params.maxDepth < 0) {
             throw new Error('MaxDepth cannot be negative.')
         }
-        await validatePath(params.path, this.workspace.fs.exists)
+        await validatePath(targetPath, this.workspace.fs.exists)
     }
 
     public async queueDescription(params: ListDirectoryParams, updates: WritableStream, requiresAcceptance: boolean) {
@@ -58,12 +61,19 @@ export class ListDirectory {
         return requiresPathAcceptance(params.path, 'listDirectory', this.workspace, this.logging, approvedPaths)
     }
 
-    public async invoke(params: ListDirectoryParams, token?: CancellationToken): Promise<InvokeOutput> {
-        const path = sanitize(params.path)
+    /**
+     * Lists `targetPath`, the canonical path the approval check evaluated. The
+     * requested `params.path` is not resolved again.
+     */
+    public async invoke(
+        params: ListDirectoryParams,
+        targetPath: string,
+        token?: CancellationToken
+    ): Promise<InvokeOutput> {
         try {
             const result = await workspaceUtils.readDirectoryWithTreeOutput(
                 { workspace: this.workspace, logging: this.logging },
-                path,
+                targetPath,
                 { maxDepth: params.maxDepth, excludeDirs: DEFAULT_EXCLUDE_DIRS, excludeFiles: DEFAULT_EXCLUDE_FILES },
                 token
             )
@@ -73,8 +83,8 @@ export class ListDirectory {
                 // bubble this up to the main agentic chat loop
                 throw error
             }
-            this.logging.error(`Failed to list directory "${path}": ${error.message || error}`)
-            throw new Error(`Failed to list directory "${path}": ${error.message || error}`)
+            this.logging.error(`Failed to list directory "${targetPath}": ${error.message || error}`)
+            throw new Error(`Failed to list directory "${targetPath}": ${error.message || error}`)
         }
     }
 
