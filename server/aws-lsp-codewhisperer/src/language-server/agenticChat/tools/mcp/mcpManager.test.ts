@@ -14,7 +14,7 @@ import { ProfileStatusMonitor } from './profileStatusMonitor'
 const fakeLogging = {
     log: () => {},
     info: () => {},
-    warn: () => {},
+    warn: (_message: string) => {},
     error: () => {},
     debug: () => {},
 }
@@ -220,6 +220,79 @@ describe('callTool()', () => {
         const res = await mgr.callTool('s1', 'tool1', { foo: 1 })
         expect(callToolStub.calledOnceWith({ name: 'tool1', arguments: { foo: 1 } })).to.be.true
         expect(res).to.equal('ok')
+    })
+
+    describe('request timeout passthrough', () => {
+        const initWithTimeout = async (timeout: number | undefined) => {
+            const cfg: MCPServerConfig = { ...enabledCfg, timeout } as MCPServerConfig
+            loadStub = sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+                servers: new Map([['s1', cfg]]),
+                serverNameMapping: new Map(),
+                errors: new Map(),
+                agentConfig: {
+                    name: 'test-agent',
+                    description: 'Test agent',
+                    mcpServers: { s1: cfg },
+                    tools: ['@s1'],
+                    allowedTools: [],
+                    toolsSettings: {},
+                    includedFiles: [],
+                    resources: [],
+                },
+            })
+            const mgr = await McpManager.init(['p.json'], features)
+            await mgr.discoverAllServers()
+            ;(mgr as any).clients.set('s1', new Client({ name: 'x', version: 'v' }))
+            return mgr
+        }
+
+        const optionsOfFirstCall = () => callToolStub.firstCall.args[2]
+
+        it('forwards the configured timeout to the SDK so it is not capped at 60s', async () => {
+            const mgr = await initWithTimeout(300_000)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: 300_000 })
+        })
+
+        it('forwards the default timeout when none is configured', async () => {
+            const mgr = await initWithTimeout(undefined)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+        })
+
+        it('maps timeout 0 to the maximum timer value instead of the SDK default', async () => {
+            const mgr = await initWithTimeout(0)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            const options = optionsOfFirstCall()
+            expect(options).to.deep.equal({ timeout: mcpUtils.MAX_TOOL_EXEC_TIMEOUT_MS })
+            // Must stay a finite value setTimeout can honour, otherwise the deadline fires at once.
+            expect(Number.isFinite(options.timeout)).to.be.true
+        })
+
+        it('falls back to the default and warns on an unusable timeout', async () => {
+            const spyWarn = sinon.spy(fakeLogging, 'warn')
+            const mgr = await initWithTimeout(-5)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+            expect(spyWarn.calledOnce).to.be.true
+            expect(spyWarn.firstCall.args[0]).to.contain('invalid timeout')
+        })
+
+        it('falls back to the default when the timeout exceeds the maximum timer value', async () => {
+            const mgr = await initWithTimeout(mcpUtils.MAX_TOOL_EXEC_TIMEOUT_MS + 1)
+
+            await mgr.callTool('s1', 'tool1', {})
+
+            expect(optionsOfFirstCall()).to.deep.equal({ timeout: mcpUtils.DEFAULT_TOOL_EXEC_TIMEOUT_MS })
+        })
     })
 
     it('times out and logs error', async () => {
@@ -1943,6 +2016,7 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
     const workspaceMcp = '/tmp/ws-a/.amazonq/mcp.json'
 
     let showMessageStub: sinon.SinonStub
+    let showDocumentStub: sinon.SinonStub
     let hasApprovalStub: sinon.SinonStub
     let recordApprovalStub: sinon.SinonStub
     let setStateSpy: sinon.SinonSpy
@@ -1953,13 +2027,14 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         recordApprovalStub = sinon.stub(consentStore, 'recordApproval').resolves()
 
         showMessageStub = sinon.stub()
+        showDocumentStub = sinon.stub().resolves({ success: true })
         const featuresWithPrompt = {
             ...features,
             workspace: {
                 ...fakeWorkspace,
                 fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome },
             },
-            lsp: { window: { showMessageRequest: showMessageStub } },
+            lsp: { window: { showMessageRequest: showMessageStub, showDocument: showDocumentStub } },
         }
         sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
             servers: new Map(),
@@ -2028,6 +2103,66 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         expect(showMessageStub.calledOnce).to.be.true
     })
 
+    it('marks truncated consent previews and visually separates their source', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const longCommand = 'c'.repeat(201)
+        const longEnvName = 'E'.repeat(201)
+        const longHeaderName = 'H'.repeat(201)
+        const cfg: MCPServerConfig = {
+            command: longCommand,
+            args: [],
+            env: { [longEnvName]: 'hidden-env-value' },
+            headers: { [longHeaderName]: 'hidden-header-value' },
+            __configPath__: workspaceMcp,
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include(`Command: ${longCommand.slice(0, 200)} { ... }\n`)
+        expect(message).to.include(`Environment variables: ${longEnvName.slice(0, 200)} { ... }\n`)
+        expect(message).to.include(`Headers: ${longHeaderName.slice(0, 200)} { ... }\n• Source: ${workspaceMcp}`)
+        expect(message).to.not.include('hidden-env-value')
+        expect(message).to.not.include('hidden-header-value')
+    })
+
+    it('does not mark complete consent previews as truncated', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            command: 'sh',
+            args: ['-c', 'x'],
+            env: { DEMO_ENV: 'hidden-env-value' },
+            headers: { 'X-Demo': 'hidden-header-value' },
+            __configPath__: workspaceMcp,
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Command: sh -c x\n')
+        expect(message).to.include('Environment variables: DEMO_ENV\n')
+        expect(message).to.include(`Headers: X-Demo\n• Source: ${workspaceMcp}`)
+        expect(message).to.not.include('{ ... }')
+    })
+
+    it('opens the workspace configuration and re-prompts before allowing', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.onFirstCall().resolves({ title: 'View full configuration' })
+        showMessageStub.onSecondCall().resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = { command: 'sh', args: ['-c', 'x'], __configPath__: workspaceMcp }
+
+        try {
+            await (mgr as any).initOneServerInternal('svc', cfg)
+        } catch {}
+
+        expect(showMessageStub.calledTwice).to.be.true
+        expect(showDocumentStub.calledOnce).to.be.true
+        expect(showDocumentStub.firstCall.args[0].uri).to.equal('file:///tmp/ws-a/.amazonq/mcp.json')
+        expect(showDocumentStub.firstCall.args[0].takeFocus).to.be.true
+        expect(recordApprovalStub.called).to.be.false
+    })
     it('denial sets DISABLED state and caches the decision', async () => {
         const mgr = await buildMgr()
         showMessageStub.resolves({ title: 'Deny' })
