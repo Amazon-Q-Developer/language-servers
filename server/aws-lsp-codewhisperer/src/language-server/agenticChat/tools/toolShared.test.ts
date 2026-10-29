@@ -1,11 +1,12 @@
 import * as assert from 'assert'
+import * as fs from 'fs'
 import * as path from 'path'
 import sinon from 'ts-sinon'
-import { isPathApproved, requiresPathAcceptance } from './toolShared'
+import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance, resolveSymlinkAwarePath } from './toolShared'
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
-import { TestFeatures } from '@aws/language-server-runtimes/testing'
+import { TestFeatures, createCheckedFileOperations } from '@aws/language-server-runtimes/testing'
 import { Context } from 'mocha'
 
 // Re-export isSensitivePath for testing via the module's internal function
@@ -135,6 +136,47 @@ describe('toolShared', () => {
             const filePath = '/test\\path\\file.js'
 
             assert.strictEqual(isPathApproved(filePath, 'testTool', approvedPaths), true)
+        })
+
+        it('should match a Windows path against the separators addApprovedPath stores', () => {
+            // addApprovedPath records 'C:\project\file.ts' as 'C:/project/file.ts',
+            // so the check has to normalize the same way or a Windows approval
+            // never matches and the user is asked about the file again.
+            const approvedPaths = new Map([['testTool', new Set(['C:/project/file.ts'])]])
+
+            assert.strictEqual(isPathApproved('C:\\project\\file.ts', 'testTool', approvedPaths), true)
+        })
+
+        it('should match an approved Windows directory for a file inside it', () => {
+            const approvedPaths = new Map([['testTool', new Set(['C:/project'])]])
+
+            assert.strictEqual(isPathApproved('C:\\project\\nested\\file.ts', 'testTool', approvedPaths), true)
+        })
+
+        it('should treat a trailing separator on the approved file as the same file', () => {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/file.js/'])]])
+
+            assert.strictEqual(isPathApproved('/test/path/file.js', 'testTool', approvedPaths), true)
+        })
+
+        it('should ignore case only where the filesystem does', function (this: Context) {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/File.js'])]])
+            const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin'
+
+            assert.strictEqual(
+                isPathApproved('/test/path/file.js', 'testTool', approvedPaths),
+                caseInsensitive,
+                caseInsensitive
+                    ? 'A differently cased path names the same file here'
+                    : 'A differently cased path is a different file here'
+            )
+        })
+
+        it('should not approve a sibling path that shares a prefix', () => {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/file.js'])]])
+
+            assert.strictEqual(isPathApproved('/test/path/file.js.bak', 'testTool', approvedPaths), false)
+            assert.strictEqual(isPathApproved('/test/path/other.js', 'testTool', approvedPaths), false)
         })
     })
 
@@ -885,6 +927,296 @@ describe('toolShared', () => {
                     'A symlink whose canonical target is outside the workspace should require acceptance'
                 )
             })
+        })
+
+        describe('hard link detection (real filesystem)', () => {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const fs = require('fs')
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const os = require('os')
+            let tmpRoot: string
+            let workspaceDir: string
+            let outsideTarget: string
+            let hardLinkInWorkspace: string
+            let ordinaryFileInWorkspace: string
+
+            beforeEach(function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+                mockWorkspace.fs.checkedFiles = createCheckedFileOperations()
+                tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'hardlink-'))
+                workspaceDir = path.join(tmpRoot, 'workspace')
+                fs.mkdirSync(workspaceDir)
+
+                // A file outside the workspace, given a second name inside it.
+                // lstat reports that second name as an ordinary file, so the
+                // symlink-aware resolver cannot follow it anywhere.
+                outsideTarget = path.join(tmpRoot, 'outside_target.txt')
+                fs.writeFileSync(outsideTarget, 'ORIGINAL')
+                hardLinkInWorkspace = path.join(workspaceDir, 'build-manifest.json')
+                fs.linkSync(outsideTarget, hardLinkInWorkspace)
+
+                ordinaryFileInWorkspace = path.join(workspaceDir, 'ordinary.txt')
+                fs.writeFileSync(ordinaryFileInWorkspace, 'CONTENT')
+
+                getWorkspaceFolderPathsStub.returns([workspaceDir])
+                isInWorkspaceStub.callsFake((folders: string[], p: string) =>
+                    folders.some(f => p === f || p.startsWith(f + path.sep))
+                )
+            })
+
+            afterEach(() => {
+                if (tmpRoot) {
+                    fs.rmSync(tmpRoot, { recursive: true, force: true })
+                }
+            })
+
+            it('reports a hard link as having additional names', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+                assert.strictEqual(await hasAdditionalHardLinks(hardLinkInWorkspace), true)
+            })
+
+            it('does not report an ordinary file as having additional names', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+                assert.strictEqual(await hasAdditionalHardLinks(ordinaryFileInWorkspace), false)
+            })
+
+            it('does not report a directory, whose link count is always above one', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+                assert.strictEqual(await hasAdditionalHardLinks(workspaceDir), false)
+            })
+
+            it('does not report a path that does not exist yet', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+                assert.strictEqual(await hasAdditionalHardLinks(path.join(workspaceDir, 'new.txt')), false)
+            })
+
+            it('requires acceptance for a hard link when flagging is on', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+
+                const result = await requiresPathAcceptance(
+                    hardLinkInWorkspace,
+                    'fsWrite',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging'],
+                    undefined,
+                    { flagMultiplyLinkedFiles: 'modify' }
+                )
+
+                assert.strictEqual(
+                    result.requiresAcceptance,
+                    true,
+                    'An in-workspace name for a file that is also named elsewhere should require acceptance'
+                )
+                assert.ok(result.warning, 'The prompt should explain that other names share this file')
+                assert.match(result.warning!, /changes the contents under every name/)
+                assert.strictEqual(
+                    result.acceptanceReason,
+                    'multiplyLinkedFile',
+                    'The prompt needs the reason to avoid describing an in-workspace path as outside the workspace'
+                )
+            })
+
+            it('requires acceptance for a hard link on the read side, with read wording', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+
+                const result = await requiresPathAcceptance(
+                    hardLinkInWorkspace,
+                    'fsRead',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging'],
+                    undefined,
+                    { flagMultiplyLinkedFiles: 'read' }
+                )
+
+                assert.strictEqual(
+                    result.requiresAcceptance,
+                    true,
+                    'Reading through an in-workspace name returns data that also lives under the other name'
+                )
+                assert.match(result.warning!, /contents are shared with that name/)
+                assert.strictEqual(result.acceptanceReason, 'multiplyLinkedFile')
+            })
+
+            it('does not require acceptance for a hard link when flagging is off', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+
+                const result = await requiresPathAcceptance(
+                    hardLinkInWorkspace,
+                    'listDirectory',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging']
+                )
+
+                assert.strictEqual(result.requiresAcceptance, false)
+            })
+
+            it('does not require acceptance for an ordinary in-workspace file', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+
+                const result = await requiresPathAcceptance(
+                    ordinaryFileInWorkspace,
+                    'fsWrite',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging'],
+                    undefined,
+                    { flagMultiplyLinkedFiles: 'modify' }
+                )
+
+                assert.strictEqual(result.requiresAcceptance, false)
+            })
+
+            it('still honors a path the user has explicitly approved', async function (this: Context) {
+                if (process.platform === 'win32') {
+                    this.skip()
+                    return
+                }
+
+                const approvedPaths = new Map([['fsWrite', new Set([fs.realpathSync(hardLinkInWorkspace)])]])
+                const result = await requiresPathAcceptance(
+                    hardLinkInWorkspace,
+                    'fsWrite',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging'],
+                    approvedPaths,
+                    { flagMultiplyLinkedFiles: 'modify' }
+                )
+
+                assert.strictEqual(
+                    result.requiresAcceptance,
+                    false,
+                    'Approval short-circuits before the hard link check, so an allowed path is not re-prompted. ' +
+                        'This is only sound because the session records approvals the user actually granted ' +
+                        '(see agenticChatController), not every path a tool has touched.'
+                )
+            })
+        })
+    })
+
+    describe('resolveSymlinkAwarePath error handling', () => {
+        // Resolution errors are propagated rather than recovered from. The
+        // filesystem is stubbed so each error code is exercised deterministically;
+        // canonicalizationFailure.test.ts covers the real-filesystem case.
+        const errno = (code: string) => Object.assign(new Error(code), { code })
+        const file = (): fs.Stats => ({ isSymbolicLink: () => false }) as unknown as fs.Stats
+        const link = (): fs.Stats => ({ isSymbolicLink: () => true }) as unknown as fs.Stats
+        const input = path.resolve(path.sep, 'ws', 'dir', 'file.txt')
+
+        afterEach(() => {
+            sinon.restore()
+        })
+
+        it('returns the realpath of an existing non-symlink path', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').resolves(path.resolve(path.sep, 'real', 'file.txt'))
+
+            assert.strictEqual(await resolveSymlinkAwarePath(input), path.resolve(path.sep, 'real', 'file.txt'))
+        })
+
+        it('rejects when realpath fails', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').rejects(errno('ENAMETOOLONG'))
+
+            await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ENAMETOOLONG')
+                return true
+            })
+        })
+
+        it('rejects when lstat fails for a reason other than ENOENT', async () => {
+            for (const code of ['EACCES', 'ENAMETOOLONG', 'ENOTDIR', 'ELOOP']) {
+                sinon.restore()
+                sinon.stub(fs.promises, 'lstat').rejects(errno(code))
+                const realpath = sinon.stub(fs.promises, 'realpath')
+
+                await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                    assert.strictEqual(error.code, code, `lstat ${code} must propagate`)
+                    return true
+                })
+                assert.strictEqual(realpath.called, false, `must not fall through to the parent on ${code}`)
+            }
+        })
+
+        it('still resolves a not-yet-created leaf under an existing parent', async () => {
+            const parent = path.dirname(input)
+            const realParent = path.resolve(path.sep, 'real', 'dir')
+            const lstat = sinon.stub(fs.promises, 'lstat')
+            lstat.withArgs(input).rejects(errno('ENOENT'))
+            lstat.withArgs(parent).resolves(file())
+            sinon.stub(fs.promises, 'realpath').withArgs(parent).resolves(realParent)
+
+            assert.strictEqual(await resolveSymlinkAwarePath(input), path.join(realParent, 'file.txt'))
+        })
+
+        it('rejects a not-yet-created leaf when its parent cannot be canonicalized', async () => {
+            const parent = path.dirname(input)
+            const lstat = sinon.stub(fs.promises, 'lstat')
+            lstat.withArgs(input).rejects(errno('ENOENT'))
+            lstat.withArgs(parent).resolves(file())
+            sinon.stub(fs.promises, 'realpath').withArgs(parent).rejects(errno('ENAMETOOLONG'))
+
+            await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ENAMETOOLONG')
+                return true
+            })
+        })
+
+        it('rejects a symlink cycle with ELOOP', async () => {
+            const a = path.resolve(path.sep, 'ws', 'a')
+            const b = path.resolve(path.sep, 'ws', 'b')
+            sinon.stub(fs.promises, 'lstat').resolves(link())
+            const readlink = sinon.stub(fs.promises, 'readlink')
+            readlink.withArgs(a).resolves('b')
+            readlink.withArgs(b).resolves('a')
+            const realpath = sinon.stub(fs.promises, 'realpath')
+
+            await assert.rejects(resolveSymlinkAwarePath(a), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ELOOP')
+                return true
+            })
+            assert.strictEqual(realpath.called, false)
+        })
+
+        it('is reported by requiresPathAcceptance as a validation error with no checked target', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').rejects(errno('ENAMETOOLONG'))
+            const workspace = {
+                getAllWorkspaceFolders: () => [{ uri: 'file:///ws', name: 'ws' }],
+            } as unknown as Features['workspace']
+            const logging = { error: sinon.stub(), debug: sinon.stub() } as unknown as Features['logging']
+
+            const result = await requiresPathAcceptance(input, 'fsRead', workspace, logging)
+
+            assert.strictEqual(result.requiresAcceptance, true)
+            assert.strictEqual((result.validationError as NodeJS.ErrnoException)?.code, 'ENAMETOOLONG')
+            assert.strictEqual(result.canonicalPaths, undefined)
+            assert.strictEqual(result.checkedTargets, undefined)
         })
     })
 })
