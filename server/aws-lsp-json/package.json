@@ -1,6 +1,6 @@
 {
     "name": "@aws/lsp-json",
-    "version": "0.1.26",
+    "version": "0.1.27",
     "description": "JSON Language Server",
     "main": "out/index.js",
     "repository": {
@@ -27,7 +27,7 @@
     },
     "dependencies": {
         "@aws/language-server-runtimes": "^0.3.14",
-        "@aws/lsp-core": "^0.0.21",
+        "@aws/lsp-core": "^0.0.22",
         "vscode-languageserver": "^9.0.1",
         "vscode-languageserver-textdocument": "^1.0.8"
     },
