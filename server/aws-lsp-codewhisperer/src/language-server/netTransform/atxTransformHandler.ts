@@ -108,10 +108,15 @@ interface DiffApplyContext {
     failedStepIds: string[]
 }
 
-// ITGen original code, shared with the IDE's OriginalCodeBackup: artifactWorkspace/before holds one
-// copy per solution, tagged with the id of the job that made it.
+// ITGen original code: artifactWorkspace/before holds one copy per solution. Its marker records the job
+// and the original-code artifact it came from; a copy is reused only when both match.
 const ORIGINAL_CODE_FOLDER = 'before'
 const ORIGINAL_CODE_JOB_MARKER = '.atx-itgen-job'
+
+interface OriginalCodeMarker {
+    jobId: string
+    codeArtifactId: string
+}
 // MSBuild walks up from a project until it finds these; an empty stub stops the walk.
 const ORIGINAL_CODE_WALK_UP_FILES = ['Directory.Build.props', 'Directory.Build.targets', 'Directory.Packages.props']
 const ORIGINAL_CODE_STUB =
@@ -217,6 +222,9 @@ export class ATXTransformHandler {
     // pre-job mode-selection -checkpoint (filter) from the post-build -checkpoint
     // (surface for auto-approve).
     private jobsPastLocalBuild: Set<string> = new Set()
+    // downloadOriginalCode calls queued per artifactWorkspace/before folder, so two calls for one solution
+    // never extract or swap at the same time.
+    private originalCodeQueue: Map<string, Promise<AtxDownloadOriginalCodeResponse>> = new Map()
 
     // Beam: parsed small-JSON artifacts keyed by artifactId. A `null` value is a positive result
     // meaning "these bytes are definitively not JSON" — the case that dominated the waste, and the
@@ -1252,10 +1260,15 @@ export class ATXTransformHandler {
      * extract it into `<SolutionRootPath>/artifactWorkspace/before`, the same folder the IDE copies a
      * local job's original to, so the original-side app launches and test runs find it in one place.
      *
-     * One copy per solution: this job's copy (job marker) is reused, another job's is replaced.
-     * Extraction goes to a sibling staging folder that is renamed into place only after it fully
-     * succeeds, so a crash or failed download never leaves a half-extracted copy that a later call
-     * would treat as complete. Keep the marker and stubs in step with the IDE's OriginalCodeBackup.
+     * One copy per solution. It's reused only when its marker names the same job AND the same
+     * original-code artifact (a web job has one original per repo, and an original can be re-saved);
+     * otherwise it's replaced. Calls for the same folder are queued, so they never extract or swap at
+     * the same time; a queued duplicate finds the finished copy and reuses it.
+     *
+     * Each call extracts into its own staging folder. The swap removes the old marker first, so a copy
+     * that is only partly replaced is never reused, then moves the old copy aside, renames the staging
+     * folder into place and deletes the old copy best-effort (a file the IDE still holds open only
+     * leaves a leftover that the next call cleans up).
      */
     async downloadOriginalCode(
         workspaceId: string,
@@ -1263,25 +1276,45 @@ export class ATXTransformHandler {
         codeArtifactId: string,
         solutionRootPath: string
     ): Promise<AtxDownloadOriginalCodeResponse> {
+        // A '..' segment could aim the copy elsewhere; a folder like 'Foo..Bar' is fine.
+        if (!solutionRootPath || !path.isAbsolute(solutionRootPath) || solutionRootPath.split(/[\\/]/).includes('..')) {
+            return { Success: false, Error: 'Invalid solution root path for original code' }
+        }
+        // jobId is written to the marker and used for the FES call: keep it a plain id.
+        if (!isSafePathSegment(jobId)) {
+            return { Success: false, Error: 'Invalid job id for original code' }
+        }
+        const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
+        const key = path.resolve(originalDir).toLowerCase()
+        const previous: Promise<unknown> = this.originalCodeQueue.get(key) ?? Promise.resolve()
+        const run = previous
+            .catch(() => undefined)
+            .then(() => this.downloadOriginalCodeNow(workspaceId, jobId, codeArtifactId, originalDir))
+        this.originalCodeQueue.set(key, run)
         try {
-            // A '..' segment could aim the copy elsewhere; a folder like 'Foo..Bar' is fine.
-            if (
-                !solutionRootPath ||
-                !path.isAbsolute(solutionRootPath) ||
-                solutionRootPath.split(/[\\/]/).includes('..')
-            ) {
-                return { Success: false, Error: 'Invalid solution root path for original code' }
+            return await run
+        } finally {
+            if (this.originalCodeQueue.get(key) === run) {
+                this.originalCodeQueue.delete(key)
             }
-            // jobId becomes a folder name: refuse anything that could leave artifactWorkspace.
-            if (!jobId || /[\\/]|\.\./.test(jobId)) {
-                return { Success: false, Error: 'Invalid job id for original code' }
-            }
-            const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
-            const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
-            if (fs.existsSync(marker) && fs.readFileSync(marker, 'utf8').trim() === jobId) {
-                this.logging.log(`ATX: downloadOriginalCode: reusing this job's original at ${originalDir}`)
+        }
+    }
+
+    private async downloadOriginalCodeNow(
+        workspaceId: string,
+        jobId: string,
+        codeArtifactId: string,
+        originalDir: string
+    ): Promise<AtxDownloadOriginalCodeResponse> {
+        const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
+        let stagingDir: string | undefined
+        try {
+            const current = this.readOriginalCodeMarker(marker)
+            if (current?.jobId === jobId && current.codeArtifactId === codeArtifactId) {
+                this.logging.log(`ATX: downloadOriginalCode: reusing ${codeArtifactId} at ${originalDir}`)
                 return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
             }
+            this.removeOriginalCodeLeftovers(originalDir)
 
             this.logging.log(`ATX: downloadOriginalCode ${codeArtifactId} -> ${originalDir}`)
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, codeArtifactId)
@@ -1289,8 +1322,7 @@ export class ATXTransformHandler {
                 return { Success: false, Error: 'No presigned URL for original code artifact' }
             }
 
-            const stagingDir = `${originalDir}.partial`
-            fs.rmSync(stagingDir, { recursive: true, force: true })
+            stagingDir = `${originalDir}.partial-${uuidv4()}`
             const archiveName = 'original-source.zip'
             await Utils.downloadAndExtractArchive(
                 dl.s3PresignedUrl,
@@ -1309,14 +1341,76 @@ export class ATXTransformHandler {
                     fs.writeFileSync(file, ORIGINAL_CODE_STUB)
                 }
             }
-            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), jobId)
-            fs.rmSync(originalDir, { recursive: true, force: true })
-            fs.renameSync(stagingDir, originalDir)
+            const newMarker: OriginalCodeMarker = { jobId, codeArtifactId }
+            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
+
+            // Swap. The old marker goes first: from here on the old copy is never reused.
+            fs.rmSync(marker, { force: true })
+            let aside: string | undefined
+            if (fs.existsSync(originalDir)) {
+                aside = `${originalDir}.old-${uuidv4()}`
+                fs.renameSync(originalDir, aside)
+            }
+            try {
+                fs.renameSync(stagingDir, originalDir)
+            } catch (error) {
+                if (aside) {
+                    try {
+                        fs.renameSync(aside, originalDir) // put the old copy back (without its marker)
+                    } catch {
+                        /* the next call cleans up */
+                    }
+                }
+                throw error
+            }
+            stagingDir = undefined
+            if (aside) {
+                try {
+                    fs.rmSync(aside, { recursive: true, force: true })
+                } catch (error) {
+                    this.logging.log(`ATX: downloadOriginalCode: couldn't remove ${aside} yet: ${String(error)}`)
+                }
+            }
             this.logging.log(`ATX: downloadOriginalCode extracted -> ${originalDir}`)
             return { Success: true, OriginalPath: originalDir, AlreadyPresent: false }
         } catch (error) {
             this.logging.error(`ATX: downloadOriginalCode error: ${String(error)}`)
             return { Success: false, Error: String(error) }
+        } finally {
+            if (stagingDir) {
+                try {
+                    fs.rmSync(stagingDir, { recursive: true, force: true })
+                } catch {
+                    /* the next call cleans up */
+                }
+            }
+        }
+    }
+
+    /** Null for a missing, unreadable or older plain-text marker, so those copies are replaced. */
+    private readOriginalCodeMarker(markerPath: string): OriginalCodeMarker | null {
+        try {
+            if (!fs.existsSync(markerPath)) return null
+            const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+            return typeof parsed?.jobId === 'string' && typeof parsed?.codeArtifactId === 'string' ? parsed : null
+        } catch {
+            return null
+        }
+    }
+
+    /** Staging and moved-aside folders that an interrupted call left next to artifactWorkspace/before. */
+    private removeOriginalCodeLeftovers(originalDir: string): void {
+        const parent = path.dirname(originalDir)
+        if (!fs.existsSync(parent)) return
+        const prefix = path.basename(originalDir) + '.'
+        for (const name of fs.readdirSync(parent)) {
+            if (name.startsWith(prefix + 'partial') || name.startsWith(prefix + 'old-')) {
+                try {
+                    fs.rmSync(path.join(parent, name), { recursive: true, force: true })
+                } catch {
+                    /* still locked; try again next time */
+                }
+            }
         }
     }
 
