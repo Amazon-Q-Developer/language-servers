@@ -7,6 +7,9 @@ import * as assert from 'assert'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { execFileSync } from 'child_process'
+import { URI } from 'vscode-uri'
+import { Workspace } from '@aws/language-server-runtimes/server-interface'
 import { FocalFileResolver } from './focalFileResolution'
 
 describe('focalFileResolver', function () {
@@ -276,6 +279,76 @@ export { alpha, beta };`
             assert.ok(basenames.includes('bar.ts'))
             assert.ok(basenames.includes('foo.test.ts'))
             assert.ok(basenames.includes('bar.test.ts'))
+        })
+    })
+
+    describe('walk should return only regular files inside the project', function () {
+        let outsideDir: string
+
+        beforeEach(() => {
+            outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'focalFileResolutionOutside-'))
+            fs.writeFileSync(path.join(outsideDir, 'secret.ts'), 'export const secret = 1')
+            fs.mkdirSync(path.join(tmpProjectRoot, 'src'))
+            fs.writeFileSync(path.join(tmpProjectRoot, 'src', 'foo.ts'), 'export class Foo {}')
+        })
+
+        afterEach(() => {
+            fs.rmSync(outsideDir, { recursive: true, force: true })
+        })
+
+        function linkOrSkip(ctx: Mocha.Context, target: string, linkPath: string, type: 'file' | 'junction'): void {
+            try {
+                fs.symlinkSync(target, linkPath, type)
+            } catch {
+                ctx.skip()
+            }
+        }
+
+        it('skips a file link that points outside the project', async function () {
+            linkOrSkip(this, path.join(outsideDir, 'secret.ts'), path.join(tmpProjectRoot, 'src', 'bar.ts'), 'file')
+
+            const files = await sut.walk(tmpProjectRoot, 'typescript')
+
+            assert.deepStrictEqual(files, [path.join(tmpProjectRoot, 'src', 'foo.ts')])
+        })
+
+        it('does not descend into a directory link that points outside the project', async function () {
+            linkOrSkip(this, outsideDir, path.join(tmpProjectRoot, 'src', 'linked'), 'junction')
+
+            const files = await sut.walk(tmpProjectRoot, 'typescript')
+
+            assert.deepStrictEqual(files, [path.join(tmpProjectRoot, 'src', 'foo.ts')])
+        })
+
+        it('skips a link to a named pipe so the read cannot block', async function () {
+            if (process.platform === 'win32') {
+                return this.skip()
+            }
+            const pipe = path.join(outsideDir, 'pipe')
+            try {
+                execFileSync('mkfifo', [pipe])
+            } catch {
+                return this.skip()
+            }
+            linkOrSkip(this, pipe, path.join(tmpProjectRoot, 'src', 'pipe.ts'), 'file')
+
+            const files = await sut.walk(tmpProjectRoot, 'typescript')
+
+            assert.deepStrictEqual(files, [path.join(tmpProjectRoot, 'src', 'foo.ts')])
+        })
+
+        it('does not infer a linked file as the focal file', async function () {
+            fs.rmSync(path.join(tmpProjectRoot, 'src', 'foo.ts'))
+            linkOrSkip(this, path.join(outsideDir, 'secret.ts'), path.join(tmpProjectRoot, 'src', 'foo.ts'), 'file')
+            const testFile = path.join(tmpProjectRoot, 'src', 'foo.test.ts')
+            fs.writeFileSync(testFile, "import { Foo } from './foo'")
+            const workspace = {
+                getAllWorkspaceFolders: () => [{ uri: URI.file(tmpProjectRoot).toString(), name: 'root' }],
+            } as unknown as Workspace
+
+            const focalFile = await sut.inferSourceFile(testFile, workspace, 'typescript')
+
+            assert.strictEqual(focalFile, undefined)
         })
     })
 })
