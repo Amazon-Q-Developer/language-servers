@@ -9,6 +9,7 @@ import {
     FilterOption,
     ListMcpServersParams,
     McpServerClickParams,
+    MessageType,
     Status,
 } from '@aws/language-server-runtimes/protocol'
 
@@ -32,6 +33,9 @@ import { ProfileStatusMonitor } from './profileStatusMonitor'
 import { McpRegistryService } from './mcpRegistryService'
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
 import { getReservedBuiltInToolNames } from '../../constants/toolConstants'
+import { getFolderApprovalsPath } from './mcpWorkspaceTrust'
+// eslint-disable-next-line import/no-nodejs-modules
+import * as path from 'path'
 
 interface PermissionOption {
     label: string
@@ -54,6 +58,8 @@ export class McpEventHandler {
     #pendingPermissionConfig: { serverName: string; permission: MCPServerPermission } | undefined
     #newlyAddedServers: Set<string> = new Set()
     #fileWatcher: ChokidarFileWatcher
+    #folderApprovalsWatcher: ChokidarFileWatcher
+    #disposed = false
     #isProgrammaticChange: boolean = false
     #debounceTimer: NodeJS.Timeout | null = null
     #lastProgrammaticState: boolean = false
@@ -74,7 +80,9 @@ export class McpEventHandler {
         this.#telemetryController = new ChatTelemetryController(features, telemetryService)
         this.#pendingPermissionConfig = undefined
         this.#fileWatcher = new ChokidarFileWatcher(features.logging)
+        this.#folderApprovalsWatcher = new ChokidarFileWatcher(features.logging)
         this.#setupFileWatchers()
+        this.#watchFolderApprovals()
     }
 
     /**
@@ -343,6 +351,18 @@ export class McpEventHandler {
                       text: 'Refresh MCP servers',
                       description: 'Refresh MCP servers',
                   },
+                  // Folder approvals are only used when the IDE reports no trust decision
+                  ...(McpManager.isInitialized() && McpManager.instance.getWorkspaceTrust() === 'prompt'
+                      ? [
+                            {
+                                id: 'forget-mcp-folder-approvals',
+                                icon: 'trash',
+                                status: 'clear',
+                                text: 'Forget allowed folders',
+                                description: 'Forget the folders you allowed local MCP servers to start in',
+                            },
+                        ]
+                      : []),
               ]
             : []
     }
@@ -366,8 +386,20 @@ export class McpEventHandler {
             'edit-mcp': () => this.#handleEditMcpServer(params),
             'mcp-permission-change': () => this.#handleMcpPermissionChange(params),
             'save-permission-change': () => this.#handleSavePermissionChange(params),
-            'refresh-mcp-list': () => this.#handleRefreshMCPList(params),
-            'mcp-enable-server': () => this.#handleEnableMcpServer(params),
+            'refresh-mcp-list': () => {
+                // An explicit refresh asks again for folders declined earlier in this session
+                if (McpManager.isInitialized()) {
+                    McpManager.instance.clearDeclinedFolders()
+                }
+                return this.#handleRefreshMCPList(params)
+            },
+            'mcp-enable-server': () => {
+                if (McpManager.isInitialized()) {
+                    McpManager.instance.clearDeclinedFolders()
+                }
+                return this.#handleEnableMcpServer(params)
+            },
+            'forget-mcp-folder-approvals': () => this.#handleForgetFolderApprovals(params),
             'mcp-disable-server': () => this.#handleDisableMcpServer(params),
             'mcp-delete-server': () => this.#handleDeleteMcpServer(params),
             'mcp-fix-server': () => this.#handleEditMcpServer(params),
@@ -1778,6 +1810,53 @@ export class McpEventHandler {
     }
 
     /**
+     * Forget every folder the user allowed local MCP servers to start in, after the user confirms
+     */
+    async #handleForgetFolderApprovals(params: McpServerClickParams) {
+        const forgetBtn = { title: 'Forget allowed folders' }
+        const cancelBtn = { title: 'Cancel' }
+        let choice: { title: string } | null | undefined
+        try {
+            choice = await this.#features.lsp.window.showMessageRequest({
+                type: MessageType.Warning,
+                message:
+                    'Forget the folders you allowed local MCP servers to start in?\n\n' +
+                    'Local MCP servers running in a workspace folder stop, and Amazon Q asks about the folder ' +
+                    'again before starting them.',
+                actions: [forgetBtn, cancelBtn],
+            })
+        } catch (error) {
+            this.#features.logging.error(`Failed to confirm forgetting MCP folder approvals: ${error}`)
+            return { id: params.id }
+        }
+        if (choice?.title !== forgetBtn.title) {
+            return { id: params.id }
+        }
+
+        let cleared = false
+        try {
+            cleared = await McpManager.instance.forgetFolderApprovals()
+        } catch (error) {
+            this.#features.logging.error(`Failed to forget MCP folder approvals: ${error}`)
+        }
+        if (!cleared) {
+            await this.#features.lsp.window
+                .showMessage({
+                    type: MessageType.Error,
+                    message:
+                        `Amazon Q could not clear the saved folder approvals in ` +
+                        `${getFolderApprovalsPath(this.#features.workspace) ?? 'the folder approval file'}. ` +
+                        `They are forgotten in this window until the IDE restarts. Check that the file can be ` +
+                        `written, then try again.`,
+                })
+                .catch(error => this.#features.logging.error(`Failed to show MCP folder approval error: ${error}`))
+        }
+        this.#emitMCPConfigEvent()
+        // The chat client lists the servers again when it gets this id, so held servers show their new status
+        return { id: 'update-mcp-list' }
+    }
+
+    /**
      * Handled refresh MCP list events
      * @param params The click parameters
      * @param isProgrammatic Whether this refresh was triggered by a programmatic change
@@ -1938,6 +2017,45 @@ export class McpEventHandler {
         }
 
         return undefined
+    }
+
+    /**
+     * Re-check MCP servers when the folder approval file changes, for example when another IDE window allows or
+     * forgets folders
+     */
+    #watchFolderApprovals(): void {
+        let file: string | undefined
+        try {
+            file = getFolderApprovalsPath(this.#features.workspace)
+        } catch (e) {
+            this.#features.logging.warn(`Failed to get the MCP folder approval file path: ${e}`)
+        }
+        if (!file) {
+            return
+        }
+        const approvalsFile = file
+        // The file watcher reports nothing for a file whose folder doesn't exist yet, so create the folder first
+        void Promise.resolve()
+            .then(() => this.#features.workspace.fs.mkdir(path.dirname(approvalsFile), { recursive: true }))
+            .catch(e => this.#features.logging.warn(`Failed to create ${path.dirname(approvalsFile)}: ${e}`))
+            .then(() => this.#startFolderApprovalsWatcher(approvalsFile))
+    }
+
+    #startFolderApprovalsWatcher(file: string): void {
+        if (this.#disposed) {
+            return
+        }
+        this.#folderApprovalsWatcher.watchPaths(
+            [file],
+            () => {
+                if (McpManager.isInitialized()) {
+                    McpManager.instance
+                        .onFolderApprovalsChanged()
+                        .catch(e => this.#features.logging.error(`MCP: failed to apply folder approval changes: ${e}`))
+                }
+            },
+            { includeUnlink: true }
+        )
     }
 
     /**
@@ -2150,10 +2268,12 @@ export class McpEventHandler {
      * Cleanup file watchers
      */
     dispose(): void {
+        this.#disposed = true
         if (this.#debounceTimer) {
             clearTimeout(this.#debounceTimer)
             this.#debounceTimer = null
         }
         this.#fileWatcher.close()
+        this.#folderApprovalsWatcher.close()
     }
 }

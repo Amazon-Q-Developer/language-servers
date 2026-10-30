@@ -12,6 +12,8 @@ import { ProfileStatusMonitor } from './profileStatusMonitor'
 import * as mcpUtils from './mcpUtils'
 import { getGlobalAgentConfigPath } from './mcpUtils'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
+import { ChokidarFileWatcher } from './chokidarFileWatcher'
+import { getFolderApprovalsPath } from './mcpWorkspaceTrust'
 
 describe('McpEventHandler error handling', () => {
     // Mock getGlobalAgentConfigPath to return a test path
@@ -42,6 +44,7 @@ describe('McpEventHandler error handling', () => {
                     exists: sinon.stub().resolves(false),
                     readFile: sinon.stub().resolves(Buffer.from('{}')),
                     writeFile: sinon.stub().resolves(undefined),
+                    mkdir: sinon.stub().resolves(undefined),
                     getUserHomeDir: sinon.stub().returns('/fake/home'),
                 },
                 getAllWorkspaceFolders: sinon.stub().returns([{ uri: '/fake/workspace' }]),
@@ -336,6 +339,163 @@ describe('McpEventHandler error handling', () => {
             const result = await eventHandler.onListMcpServers({})
 
             expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
+        })
+    })
+
+    describe('folders declined in the folder prompt', () => {
+        beforeEach(async () => {
+            sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+                servers: new Map(),
+                serverNameMapping: new Map(),
+                errors: new Map(),
+                agentConfig: {
+                    name: 'test-agent',
+                    description: 'Test agent',
+                    mcpServers: {},
+                    tools: [],
+                    allowedTools: [],
+                    toolsSettings: {},
+                    includedFiles: [],
+                    resources: [],
+                },
+            })
+            await McpManager.init([], features)
+        })
+
+        it('are asked again when the user refreshes the server list', async () => {
+            const clear = sinon.spy(McpManager.instance, 'clearDeclinedFolders')
+            sinon.stub(McpManager.instance, 'reinitializeMcpServers').resolves()
+
+            await eventHandler.onMcpServerClick({ id: 'refresh-mcp-list' })
+
+            expect(clear.calledOnce).to.be.true
+        })
+
+        it('are asked again when the user enables a server', async () => {
+            const clear = sinon.spy(McpManager.instance, 'clearDeclinedFolders')
+            sinon
+                .stub(McpManager.instance, 'getAllServerConfigs')
+                .returns(new Map([['svc', { command: 'node', __configPath__: '/fake/home/mcp.json' }]]))
+            sinon.stub(McpManager.instance, 'getMcpServerPermissions').returns({ enabled: false, toolPerms: {} })
+            const update = sinon.stub(McpManager.instance, 'updateServerPermission').resolves()
+
+            await eventHandler.onMcpServerClick({ id: 'mcp-enable-server', title: 'svc' })
+
+            expect(clear.calledOnce).to.be.true
+            expect(clear.calledBefore(update)).to.be.true
+        })
+
+        const forgetActionShown = async () => {
+            const result: any = await eventHandler.onListMcpServers({})
+            return (result.header?.actions ?? []).some((a: any) => a.id === 'forget-mcp-folder-approvals')
+        }
+
+        it('offers to forget allowed folders only while Amazon Q asks about folders itself', async () => {
+            const trust = sinon.stub(McpManager.instance, 'getWorkspaceTrust').returns('prompt')
+            expect(await forgetActionShown()).to.be.true
+
+            trust.returns('trusted')
+            expect(await forgetActionShown()).to.be.false
+            trust.returns('restricted')
+            expect(await forgetActionShown()).to.be.false
+        })
+
+        it('re-checks servers when the folder approval file changes', async () => {
+            const watch = sinon.stub(ChokidarFileWatcher.prototype, 'watchPaths')
+            const changed = sinon.stub(McpManager.instance, 'onFolderApprovalsChanged').resolves()
+            const mkdir = features.workspace.fs.mkdir as sinon.SinonStub
+            mkdir.resetHistory()
+            new McpEventHandler(features, telemetryService)
+            await new Promise(resolve => setImmediate(resolve))
+
+            // The folder is created first, because the watcher reports nothing for a file in a missing folder
+            const file = getFolderApprovalsPath(features.workspace) as string
+            expect(mkdir.calledWith(require('path').dirname(file), { recursive: true })).to.be.true
+            const call = watch.getCalls().find(c => c.args[0][0] === file)
+            expect(call && mkdir.firstCall.calledBefore(call)).to.be.true
+            expect(call?.args[2]).to.deep.equal({ includeUnlink: true })
+            call!.args[1]('changed')
+            expect(changed.calledOnce).to.be.true
+        })
+
+        it('still watches the folder approval file when its folder cannot be created', async () => {
+            const watch = sinon.stub(ChokidarFileWatcher.prototype, 'watchPaths')
+            ;(features.workspace.fs.mkdir as sinon.SinonStub).rejects(new Error('read-only file system'))
+            new McpEventHandler(features, telemetryService)
+            await new Promise(resolve => setImmediate(resolve))
+
+            const file = getFolderApprovalsPath(features.workspace)
+            expect(watch.getCalls().some(c => c.args[0][0] === file)).to.be.true
+        })
+
+        it('does not start watching the folder approval file after it was disposed', async () => {
+            const watch = sinon.stub(ChokidarFileWatcher.prototype, 'watchPaths')
+            new McpEventHandler(features, telemetryService).dispose()
+            await new Promise(resolve => setImmediate(resolve))
+
+            const file = getFolderApprovalsPath(features.workspace)
+            expect(watch.getCalls().some(c => c.args[0][0] === file)).to.be.false
+        })
+
+        describe('forgetting allowed folders', () => {
+            let showMessageRequest: sinon.SinonStub
+            let showMessage: sinon.SinonStub
+
+            beforeEach(() => {
+                showMessageRequest = sinon.stub()
+                showMessage = sinon.stub().resolves()
+                features.lsp.window = { showMessageRequest, showMessage }
+            })
+
+            afterEach(() => {
+                delete features.lsp.window
+            })
+
+            it('forgets after the user confirms and asks the chat client to list the servers again', async () => {
+                showMessageRequest.resolves({ title: 'Forget allowed folders' })
+                const forget = sinon.stub(McpManager.instance, 'forgetFolderApprovals').resolves(true)
+
+                const result = await eventHandler.onMcpServerClick({ id: 'forget-mcp-folder-approvals' })
+
+                expect(showMessageRequest.firstCall.args[0].message).to.include('stop')
+                expect(forget.calledOnce).to.be.true
+                expect(showMessage.called).to.be.false
+                expect(result).to.deep.equal({ id: 'update-mcp-list' })
+            })
+
+            it('forgets nothing when the user cancels or dismisses the confirmation', async () => {
+                const forget = sinon.stub(McpManager.instance, 'forgetFolderApprovals').resolves(true)
+                showMessageRequest.onFirstCall().resolves({ title: 'Cancel' })
+                showMessageRequest.onSecondCall().resolves(null)
+                showMessageRequest.onThirdCall().rejects(new Error('no dialog'))
+
+                for (let i = 0; i < 3; i++) {
+                    await eventHandler.onMcpServerClick({ id: 'forget-mcp-folder-approvals' })
+                }
+
+                expect(forget.called).to.be.false
+            })
+
+            it('tells the user when the saved approvals could not be cleared', async () => {
+                showMessageRequest.resolves({ title: 'Forget allowed folders' })
+                sinon.stub(McpManager.instance, 'forgetFolderApprovals').resolves(false)
+
+                await eventHandler.onMcpServerClick({ id: 'forget-mcp-folder-approvals' })
+
+                expect(showMessage.calledOnce).to.be.true
+                expect(showMessage.firstCall.args[0].message).to.include(
+                    getFolderApprovalsPath(features.workspace) as string
+                )
+            })
+
+            it('tells the user when forgetting fails', async () => {
+                showMessageRequest.resolves({ title: 'Forget allowed folders' })
+                sinon.stub(McpManager.instance, 'forgetFolderApprovals').rejects(new Error('boom'))
+
+                await eventHandler.onMcpServerClick({ id: 'forget-mcp-folder-approvals' })
+
+                expect(showMessage.calledOnce).to.be.true
+            })
         })
     })
 
