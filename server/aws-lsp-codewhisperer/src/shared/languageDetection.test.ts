@@ -33,6 +33,13 @@ describe('LanguageDetection', () => {
                 )
             }
         })
+
+        it(`maps the 'dockercompose' language id (used by some IDEs for docker-compose files) to yaml`, () => {
+            assert.strictEqual(
+                getLanguageId(TextDocument.create('test://docker-compose.yaml', 'dockercompose', 1, '')),
+                'yaml'
+            )
+        })
     })
 
     describe('getSupportedLanguageId', () => {
@@ -40,6 +47,11 @@ describe('LanguageDetection', () => {
         it('should return language id if it is in the list of supported languages', () => {
             assert.ok(getSupportedLanguageId(typescriptDocument, ['typescript', 'javascript']))
             assert.ok(!getSupportedLanguageId(typescriptDocument, ['javascript']))
+        })
+
+        it('should support docker-compose files reported with the dockercompose language id', () => {
+            const dockerComposeDocument = TextDocument.create('test://docker-compose.yaml', 'dockercompose', 1, '')
+            assert.strictEqual(getSupportedLanguageId(dockerComposeDocument), 'yaml')
         })
     })
 
