@@ -26,6 +26,7 @@ import {
     AtxGetJobReportRequest,
     AtxUploadCustomPlanRequest,
     AtxLoadOlderWorklogsRequest,
+    AtxDownloadOriginalCodeRequest,
 } from './atxModels'
 
 // ATX FES Commands - Consolidated APIs
@@ -53,6 +54,8 @@ const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
 // Beam to IDE
 const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
 const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
+// ITGen
+const AtxDownloadOriginalCodeCommand = 'aws/atxTransform/downloadOriginalCode'
 
 export const AtxNetTransformServerToken =
     (): Server =>
@@ -324,6 +327,25 @@ export const AtxNetTransformServerToken =
                             DestDir
                         )
                     }
+                    case AtxDownloadOriginalCodeCommand: {
+                        const request = params as AtxDownloadOriginalCodeRequest
+                        if (
+                            !request.WorkspaceId ||
+                            !request.TransformationJobId ||
+                            !request.CodeArtifactId ||
+                            !request.SolutionRootPath
+                        ) {
+                            throw new Error(
+                                'WorkspaceId, TransformationJobId, CodeArtifactId and SolutionRootPath are required for downloadOriginalCode'
+                            )
+                        }
+                        return await atxTransformHandler.downloadOriginalCode(
+                            request.WorkspaceId,
+                            request.TransformationJobId,
+                            request.CodeArtifactId,
+                            request.SolutionRootPath
+                        )
+                    }
                     default: {
                         throw new Error(`Unknown ATX FES command: ${params.command}`)
                     }
@@ -369,6 +391,7 @@ export const AtxNetTransformServerToken =
                             AtxLoadOlderWorklogsCommand,
                             AtxListBeamedReposCommand,
                             AtxDownloadBeamArtifactCommand,
+                            AtxDownloadOriginalCodeCommand,
                         ],
                     },
                 },

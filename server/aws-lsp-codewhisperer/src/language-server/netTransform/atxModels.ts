@@ -321,6 +321,23 @@ export interface AtxCompleteLocalBuildHitlResponse {
     Error?: string
 }
 
+// ITGen: download the original (pre-transformation) source by artifact id (contract C6)
+export interface AtxDownloadOriginalCodeRequest extends ExecuteCommandParams {
+    WorkspaceId: string
+    TransformationJobId: string
+    CodeArtifactId: string
+    SolutionRootPath: string
+}
+
+export interface AtxDownloadOriginalCodeResponse {
+    Success: boolean
+    // <SolutionRootPath>/artifactWorkspace/before
+    OriginalPath?: string
+    // true when this job's copy was already there (no download)
+    AlreadyPresent?: boolean
+    Error?: string
+}
+
 // ATX Get Job Dashboard request/response
 export interface AtxGetJobDashboardRequest extends ExecuteCommandParams {
     WorkspaceId: string
