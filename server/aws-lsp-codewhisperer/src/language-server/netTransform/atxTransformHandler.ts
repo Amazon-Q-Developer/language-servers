@@ -4751,8 +4751,42 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Path of a checkpoint metadata entry under rootPath, or undefined when the entry is not
+     * a path inside rootPath.
+     */
+    private checkpointEntryPath(rootPath: string, relativePath: unknown): string | undefined {
+        if (typeof relativePath !== 'string' || !relativePath) {
+            return undefined
+        }
+        const entryPath = path.join(rootPath, relativePath)
+        const relative = path.relative(path.resolve(rootPath), path.resolve(entryPath))
+        if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+            return undefined
+        }
+        return entryPath
+    }
+
+    /**
+     * Path of a checkpoint metadata entry in the solution folder, or undefined when the entry is
+     * not a path inside the solution folder or is in the folder that holds the job data
+     * (workspaceFolderName).
+     */
+    private solutionEntryPath(solutionRootPath: string, relativePath: unknown): string | undefined {
+        const entryPath = this.checkpointEntryPath(solutionRootPath, relativePath)
+        if (!entryPath) {
+            return undefined
+        }
+        const [firstSegment] = path.relative(path.resolve(solutionRootPath), path.resolve(entryPath)).split(path.sep)
+        // Windows trims trailing dots and spaces from a path segment, so compare without them
+        const normalizedFirstSegment = firstSegment.replace(/[. ]+$/, '')
+        return normalizedFirstSegment.toLowerCase() === workspaceFolderName.toLowerCase() ? undefined : entryPath
+    }
+
+    /**
      * Apply changes from a checkpoint folder to the solution root.
      * Reads metadata.json and applies file additions, removals, updates, and moves.
+     * Entries that are not paths inside the solution root, or that are in its job data folder,
+     * are skipped.
      */
     private async applyChanges(
         checkpointFolderPath: string,
@@ -4808,8 +4842,12 @@ export class ATXTransformHandler {
             // Handle filesAdded: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesAdded) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = this.checkpointEntryPath(path.join(checkpointFolderPath, 'after'), relativePath)
+                    const destPath = this.solutionEntryPath(solutionRootPath, relativePath)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped added file with a path that is not allowed: ${relativePath}`)
+                        continue
+                    }
 
                     // Preserve a customer edit rather than clobber it (see userModifiedFiles).
                     if (
@@ -4845,7 +4883,11 @@ export class ATXTransformHandler {
             // and record the conflict rather than silently deleting their work.
             for (const relativePath of filesRemoved) {
                 try {
-                    const filePath = path.join(solutionRootPath, relativePath)
+                    const filePath = this.solutionEntryPath(solutionRootPath, relativePath)
+                    if (!filePath) {
+                        this.logging.error(`ATX: Skipped removed file with a path that is not allowed: ${relativePath}`)
+                        continue
+                    }
                     if (fs.existsSync(filePath)) {
                         if (userModifiedFiles.size > 0 && userModifiedFiles.has(path.resolve(filePath))) {
                             try {
@@ -4871,8 +4913,12 @@ export class ATXTransformHandler {
             // Handle filesUpdated: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesUpdated) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = this.checkpointEntryPath(path.join(checkpointFolderPath, 'after'), relativePath)
+                    const destPath = this.solutionEntryPath(solutionRootPath, relativePath)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped updated file with a path that is not allowed: ${relativePath}`)
+                        continue
+                    }
 
                     // The DealerFx clobber: if the customer edited this already-applied file
                     // since the last sync, preserve their version instead of overwriting it.
@@ -4906,8 +4952,14 @@ export class ATXTransformHandler {
             // Handle filesMoved: Use movedFilesMap to copy content from before to after location, delete before file
             for (const mapping of movedFilesMap) {
                 try {
-                    const beforePath = path.join(solutionRootPath, mapping.before)
-                    const afterPath = path.join(solutionRootPath, mapping.after)
+                    const beforePath = this.solutionEntryPath(solutionRootPath, mapping.before)
+                    const afterPath = this.solutionEntryPath(solutionRootPath, mapping.after)
+                    if (!beforePath || !afterPath) {
+                        this.logging.error(
+                            `ATX: Skipped moved file with a path that is not allowed: ${mapping.before} -> ${mapping.after}`
+                        )
+                        continue
+                    }
 
                     // Ensure destination directory exists
                     const afterDir = path.dirname(afterPath)

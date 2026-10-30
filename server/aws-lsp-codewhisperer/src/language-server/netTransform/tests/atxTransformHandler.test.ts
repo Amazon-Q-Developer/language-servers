@@ -1525,6 +1525,156 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.error).to.be.a('string')
         })
 
+        it('should only apply entries inside the solution folder', async () => {
+            const otherFolder = path.join(tmpRoot, 'other')
+            fs.mkdirSync(otherFolder)
+            for (const name of ['removed.cs', 'updated.cs', 'moved.cs']) {
+                fs.writeFileSync(path.join(otherFolder, name), '// other')
+            }
+            // Sources that entries leaving after/ would read from
+            fs.mkdirSync(path.join(checkpointFolder, 'other'))
+            fs.writeFileSync(path.join(checkpointFolder, 'other', 'added.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(checkpointFolder, 'other', 'updated.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'Inside.cs'), '// inside')
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            writeMetadata({
+                filesAdded: ['../other/added.cs', 'Inside.cs'],
+                filesRemoved: ['../other/removed.cs'],
+                filesUpdated: ['../other/updated.cs'],
+                movedFilesMap: [
+                    { before: '../other/moved.cs', after: 'Moved.cs' },
+                    { before: 'Source.cs', after: 'src/../../other/Target.cs' },
+                ],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.addedFiles).to.deep.equal(['Inside.cs'])
+            expect(result.filesRemoved).to.equal(0)
+            expect(result.filesUpdated).to.equal(0)
+            expect(result.filesMoved).to.equal(0)
+            expect(fs.readdirSync(otherFolder).sort()).to.deep.equal(['moved.cs', 'removed.cs', 'updated.cs'])
+            expect(fs.readFileSync(path.join(otherFolder, 'updated.cs'), 'utf-8')).to.equal('// other')
+            expect(fs.readdirSync(tmpRoot).sort()).to.deep.equal(['checkpoint', 'other', 'sln'])
+            expect(fs.existsSync(path.join(solutionRoot, 'Source.cs'))).to.be.true
+            expect(fs.existsSync(path.join(solutionRoot, 'Moved.cs'))).to.be.false
+            const errors = (logging.error as sinon.SinonStub).args.map(args => String(args[0]))
+            for (const entry of [
+                '../other/added.cs',
+                '../other/removed.cs',
+                '../other/updated.cs',
+                '../other/moved.cs',
+                'src/../../other/Target.cs',
+            ]) {
+                expect(
+                    errors.some(message => message.includes(entry)),
+                    entry
+                ).to.be.true
+            }
+        })
+
+        it('should check the source and the destination of added and updated files separately', async () => {
+            // In after/, but the solution path is outside the solution folder
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'Up.cs'), '// checkpoint')
+            // Outside after/, but the solution path is inside the solution folder
+            fs.mkdirSync(path.join(checkpointFolder, 'sln'))
+            fs.writeFileSync(path.join(checkpointFolder, 'sln', 'New.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(checkpointFolder, 'sln', 'Down.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(solutionRoot, 'Down.cs'), '// solution')
+            writeMetadata({
+                filesAdded: ['../after/Up.cs', '../sln/New.cs'],
+                filesUpdated: ['../after/Up.cs', '../sln/Down.cs'],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.filesAdded).to.equal(0)
+            expect(result.filesUpdated).to.equal(0)
+            expect(fs.existsSync(path.join(tmpRoot, 'after'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'New.cs'))).to.be.false
+            expect(fs.readFileSync(path.join(solutionRoot, 'Down.cs'), 'utf-8')).to.equal('// solution')
+        })
+
+        it('should not apply entries in the job data folder', async () => {
+            const jobFolder = path.join(solutionRoot, workspaceFolderName, 'job-1')
+            const manifest = path.join(jobFolder, 'checkpoints', 'source-files.json')
+            const applied = path.join(jobFolder, 'checkpoints', 'checkpoints-applied.json')
+            fs.mkdirSync(path.dirname(manifest), { recursive: true })
+            fs.writeFileSync(manifest, '{}')
+            fs.writeFileSync(applied, '{}')
+            const afterJobFolder = path.join(checkpointFolder, 'after', workspaceFolderName, 'job-1')
+            fs.mkdirSync(path.join(afterJobFolder, 'checkpoints'), { recursive: true })
+            fs.writeFileSync(path.join(afterJobFolder, 'checkpoints', 'source-files.json'), '{"sourceFiles":[]}')
+            fs.writeFileSync(path.join(afterJobFolder, 'New.json'), '{}')
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            writeMetadata({
+                filesAdded: [`./${workspaceFolderName}/job-1/New.json`],
+                filesUpdated: [`${workspaceFolderName}/job-1/checkpoints/source-files.json`],
+                filesRemoved: [`src/../${workspaceFolderName}/job-1/checkpoints/checkpoints-applied.json`],
+                movedFilesMap: [
+                    { before: `${workspaceFolderName}/job-1/checkpoints/source-files.json`, after: 'Moved.json' },
+                    { before: 'Source.cs', after: `${workspaceFolderName}/job-1/Source.cs` },
+                ],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect([result.filesAdded, result.filesUpdated, result.filesRemoved, result.filesMoved]).to.deep.equal([
+                0, 0, 0, 0,
+            ])
+            expect(fs.readFileSync(manifest, 'utf-8')).to.equal('{}')
+            expect(fs.existsSync(applied)).to.be.true
+            expect(fs.existsSync(path.join(jobFolder, 'New.json'))).to.be.false
+            expect(fs.existsSync(path.join(jobFolder, 'Source.cs'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'Moved.json'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'Source.cs'))).to.be.true
+        })
+
+        it('should only resolve checkpoint entries that are paths inside the folder', () => {
+            const entryPath = (entry: unknown) => (handler as any).checkpointEntryPath(solutionRoot, entry)
+
+            expect(entryPath('src/File.cs')).to.equal(path.join(solutionRoot, 'src', 'File.cs'))
+            expect(entryPath('..File.cs')).to.equal(path.join(solutionRoot, '..File.cs'))
+            const outside: unknown[] = ['', '.', '..', '../File.cs', 'src/../../File.cs', undefined, 1, {}]
+            if (path.sep === '\\') {
+                outside.push('..\\File.cs', 'src\\..\\..\\File.cs')
+            }
+            for (const entry of outside) {
+                expect(entryPath(entry), String(entry)).to.be.undefined
+            }
+        })
+
+        it('should only resolve solution entries that are outside the job data folder', () => {
+            const entryPath = (entry: unknown) => (handler as any).solutionEntryPath(solutionRoot, entry)
+
+            expect(entryPath('src/File.cs')).to.equal(path.join(solutionRoot, 'src', 'File.cs'))
+            expect(entryPath(`src/${workspaceFolderName}/File.cs`)).to.equal(
+                path.join(solutionRoot, 'src', workspaceFolderName, 'File.cs')
+            )
+            expect(entryPath(`${workspaceFolderName}2/File.cs`)).to.equal(
+                path.join(solutionRoot, `${workspaceFolderName}2`, 'File.cs')
+            )
+            const outsideJobData: unknown[] = [
+                workspaceFolderName,
+                `${workspaceFolderName}/job/File.cs`,
+                `./${workspaceFolderName.toUpperCase()}/job/File.cs`,
+                `src/../${workspaceFolderName}/File.cs`,
+                '../File.cs',
+                // Windows trims a trailing dot or space from a path segment
+                `${workspaceFolderName}./job/File.cs`,
+                `${workspaceFolderName} /job/File.cs`,
+            ]
+            if (path.sep === '\\') {
+                outsideJobData.push(`${workspaceFolderName}\\job\\File.cs`, `${workspaceFolderName}.\\job\\File.cs`)
+            }
+            for (const entry of outsideJobData) {
+                expect(entryPath(entry), String(entry)).to.be.undefined
+            }
+        })
+
         // --- DealerFx P452432920: preserve customer edits instead of clobbering them ---
 
         const JOB_ID = 'job-dealerfx'
