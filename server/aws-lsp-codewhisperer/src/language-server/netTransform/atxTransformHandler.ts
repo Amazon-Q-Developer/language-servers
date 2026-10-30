@@ -100,6 +100,23 @@ function isSafePathSegment(value: unknown): value is string {
 }
 
 /**
+ * ITGen: true when a test-run request's tests.projectPath is a relative path that stays inside the
+ * tests artifact (not missing, not rooted, no '..').
+ */
+export function isSafeRelativeProjectPath(projectPath: unknown): projectPath is string {
+    if (typeof projectPath !== 'string' || projectPath.trim() === '') {
+        return false
+    }
+    const segments = projectPath.split(/[\\/]+/).filter(s => s !== '' && s !== '.')
+    return (
+        !path.isAbsolute(projectPath) &&
+        !/^[A-Za-z]:/.test(projectPath) &&
+        segments.length > 0 &&
+        !segments.includes('..')
+    )
+}
+
+/**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
  */
 interface DiffApplyContext {
@@ -186,6 +203,9 @@ export class ATXTransformHandler {
     // cached mode into the job's settings artifact, so an unscoped cache could write one job's mode
     // into another's. `source` is for the carry-forward log only.
     private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
+    // ITGen: in-flight test downloads by job and task, and the newest run started per job, side and project.
+    private readonly itGenTestDownloads = new Map<string, Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>>>()
+    private readonly itGenLatestRunByProject = new Map<string, string>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
     // The last ListHitls result of the getTransformInfo call in progress (undefined = not listed
@@ -2003,7 +2023,28 @@ export class ATXTransformHandler {
      * it's downloaded again for every test-run task and never reused by id; a marker file holding
      * the task id keeps one task's later polls from downloading it again.
      */
-    private async downloadItGenTests(
+    private downloadItGenTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        taskId: string,
+        request: any
+    ): Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>> {
+        // Overlapping polls for the same task share one download, so a late duplicate can't finish
+        // after a newer run and clean that run up.
+        const key = `${jobId}|${taskId}`
+        const inFlight = this.itGenTestDownloads.get(key)
+        if (inFlight) {
+            return inFlight
+        }
+        const download = this.downloadItGenTestsOnce(workspaceId, jobId, solutionRootPath, taskId, request).finally(
+            () => this.itGenTestDownloads.delete(key)
+        )
+        this.itGenTestDownloads.set(key, download)
+        return download
+    }
+
+    private async downloadItGenTestsOnce(
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
@@ -2016,17 +2057,39 @@ export class ATXTransformHandler {
         if (!isSafePathSegment(request.runId)) {
             return { RequestError: `Unsafe integ-test-run runId: ${request.runId}` }
         }
-        const runDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen', request.runId)
+        if (!isSafeRelativeProjectPath(request.tests?.projectPath)) {
+            return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
+        }
+        const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
+        const runDir = path.join(itgenDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
+        const projectMarkerPath = path.join(runDir, 'tests.project')
+        // Cleanup is keyed by side and project; without both, this run's tests are kept and never collected.
+        const projectKey =
+            typeof request.side === 'string' && request.side && typeof request.project === 'string' && request.project
+                ? `${request.side}|${request.project}`
+                : undefined
         if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8') === taskId && fs.existsSync(testsPath)) {
+            if (projectKey && !fs.existsSync(projectMarkerPath)) {
+                fs.writeFileSync(projectMarkerPath, projectKey)
+            }
             return { TestsPath: testsPath }
         }
 
+        // The newest run started for this side and project; only that run may collect earlier ones.
+        const latestKey = `${jobId}|${projectKey}`
+        if (projectKey) {
+            this.itGenLatestRunByProject.set(latestKey, request.runId)
+        }
         const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, request.artifactId)
         if (!downloadInfo) {
             return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
         }
+        // The artifact is unpacked whole, in its own layout: the generated test project plus any files
+        // next to it that its build reads (for example a root Directory.Build.props or nuget.config).
+        // Test projects are independent of the app's source (contract decision 16). Disk use is bounded by
+        // removing earlier runs' tests below.
         fs.rmSync(testsPath, { recursive: true, force: true })
         const zipName = 'tests-artifact.zip'
         await Utils.downloadAndExtractArchive(
@@ -2037,9 +2100,52 @@ export class ATXTransformHandler {
             this.logging
         )
         fs.rmSync(path.join(testsPath, zipName), { force: true })
+        if (!fs.existsSync(path.join(testsPath, request.tests.projectPath))) {
+            this.logging.warn(
+                `ATX: ${request.tests.projectPath} isn't in tests artifact ${request.artifactId} (run ${request.runId})`
+            )
+        }
         fs.writeFileSync(markerPath, taskId)
+        if (projectKey) {
+            fs.writeFileSync(projectMarkerPath, projectKey)
+            if (this.itGenLatestRunByProject.get(latestKey) === request.runId) {
+                this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
+            } else {
+                this.logging.log(
+                    `ATX: run ${request.runId} (${projectKey}) finished after a newer run started; not collecting earlier runs`
+                )
+            }
+        }
         this.logging.log(`ATX: tests artifact ${request.artifactId} for run ${request.runId} extracted to ${testsPath}`)
         return { TestsPath: testsPath }
+    }
+
+    /**
+     * ITGen: keeps only the latest run's tests per side and project, so a job holds at most one copy of
+     * the artifact per project instead of one per run. The agent opens a project's next run only after
+     * the IDE submitted the previous one, so an older run's tests are no longer needed. The run folder
+     * itself (with the IDE's result ZIP) stays.
+     */
+    private removeOlderItGenTests(itgenDir: string, currentRunId: string, projectKey: string): void {
+        for (const entry of fs.readdirSync(itgenDir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || entry.name === currentRunId) {
+                continue
+            }
+            const keyPath = path.join(itgenDir, entry.name, 'tests.project')
+            const oldTests = path.join(itgenDir, entry.name, 'tests')
+            try {
+                if (
+                    fs.existsSync(oldTests) &&
+                    fs.existsSync(keyPath) &&
+                    fs.readFileSync(keyPath, 'utf-8') === projectKey
+                ) {
+                    fs.rmSync(oldTests, { recursive: true, force: true })
+                    this.logging.log(`ATX: removed the tests of earlier run ${entry.name} (${projectKey})`)
+                }
+            } catch (error) {
+                this.logging.warn(`ATX: couldn't remove the tests of earlier run ${entry.name}: ${String(error)}`)
+            }
+        }
     }
 
     async getHitl(workspaceId: string, jobId: string, taskId: string): Promise<any | null> {
