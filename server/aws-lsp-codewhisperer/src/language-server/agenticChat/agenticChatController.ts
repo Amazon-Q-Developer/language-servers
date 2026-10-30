@@ -179,6 +179,8 @@ import {
     discardResolvedTargets,
     withResolvedTargets,
     getFileUpdate,
+    isSamePath,
+    isRegularFile,
     requiresPathAcceptance,
     resolveCanonicalPath,
     resolveSymlinkAwarePath,
@@ -282,6 +284,11 @@ type ChatHandlers = Omit<
     | 'sendSubscriptionDetails'
     | 'onSubscriptionUpgrade'
 >
+
+// `\\host\share`, `//host/x`, `\\?\` and `\\.\` paths reach a remote host or a device, not a local file.
+function isNetworkOrDevicePath(filePath: string | undefined): boolean {
+    return !!filePath && filePath.replace(/\\/g, '/').startsWith('//')
+}
 
 export class AgenticChatController implements ChatHandlers {
     #features: Features
@@ -4242,12 +4249,25 @@ export class AgenticChatController implements ChatHandlers {
                     fileContent: toolUse.fileChange?.after,
                 })
             } else if (toolUse?.name === FS_READ) {
-                await this.#openIfAllowed(params.filePath, FS_READ, session.data)
+                await this.#openIfAllowed(params.filePath, FS_READ, session.data, true)
             } else {
-                const absolutePath = params.fullPath ?? (await this.#resolveAbsolutePath(params.filePath))
-                if (absolutePath) {
-                    await this.#openIfAllowed(absolutePath, toolUse?.name ?? FS_READ, session.data)
+                if (isNetworkOrDevicePath(params.fullPath ?? params.filePath)) {
+                    this.#features.logging.info(`Not opening network or device path from a chat file click`)
+                    return
                 }
+                const absolutePath = params.fullPath ?? (await this.#resolveAbsolutePath(params.filePath))
+                if (!absolutePath) {
+                    // The path comes from model output, so only a bounded file name is echoed back.
+                    const name = path.basename(params.filePath).slice(0, 100)
+                    await this.#features.lsp.window.showMessage({
+                        type: MessageType.Warning,
+                        message: `Could not find ${name} in your workspace.`,
+                    })
+                    return
+                }
+                // Only an fsRead card can retain an Open choice; answer links and other cards prompt on every
+                // out-of-workspace click, though an approval the tool already holds still applies.
+                await this.#openIfAllowed(absolutePath, toolUse?.name ?? FS_READ, session.data)
             }
         } catch (e: any) {
             this.#features.logging.error(`Error opening file: ${e.message}`)
@@ -4255,17 +4275,24 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     /**
-     * Open a file from a chat file-list card only when the user could have
-     * read it through the tools: inside a workspace folder, or a path the user
-     * already approved for `toolName` in this session. Card paths come from
-     * model tool results and service findings, so an unchecked path plus one
-     * click would open any readable file and feed it to completion context.
+     * Open a file from a chat click only when the user could have read it through the tools: inside a workspace
+     * folder, or a path already approved for `toolName` in this session. Paths can come from model-generated
+     * answer links, tool results, and service findings, so an unchecked path plus one click would open any readable
+     * file and feed it to completion context.
      *
-     * The user prompts directory is allowed as well: `#resolveAbsolutePath`
-     * deliberately resolves `.prompt.md` files there, and they are user-authored
-     * context files rather than arbitrary disk contents.
+     * The user prompts directory is allowed as well: `#resolveAbsolutePath` deliberately resolves `.prompt.md`
+     * files there, and they are user-authored context files rather than arbitrary disk contents.
      */
-    async #openIfAllowed(filePath: string, toolName: string, session: ChatSessionService | undefined): Promise<void> {
+    async #openIfAllowed(
+        filePath: string,
+        toolName: string,
+        session: ChatSessionService | undefined,
+        recordToolApproval = false
+    ): Promise<void> {
+        if (isNetworkOrDevicePath(filePath)) {
+            this.#features.logging.info(`Not opening network or device path from a chat file click`)
+            return
+        }
         const canonicalPath = await resolveCanonicalPath(filePath)
         const promptsDirectory = await resolveCanonicalPath(getUserPromptsDirectory())
         const isPromptFile =
@@ -4280,25 +4307,60 @@ export class AgenticChatController implements ChatHandlers {
                 session?.approvedPaths
             )
             if (requiresAcceptance) {
-                // The path on a chat card comes from a tool result, not the
-                // user, so a path outside the workspace is opened only after an
-                // explicit confirmation. Approving records the path for this
-                // tool so a later click does not prompt again.
+                // Paths from model output open only after explicit confirmation. Opening a file the fsRead tool
+                // was asked to read may retain that choice for fsRead; any other click must not grant tool access.
+                const retainApproval = recordToolApproval && (await this.#isFsReadRequestedPath(canonicalPath, session))
                 const open: MessageActionItem = { title: 'Open' }
                 const cancel: MessageActionItem = { title: 'Cancel' }
                 const choice = await this.#features.lsp.window.showMessageRequest({
                     type: MessageType.Warning,
-                    message: `${warning ?? 'This file is outside your workspace.'}\n\n` + `Open ${canonicalPath}?`,
+                    message:
+                        `${warning ?? 'This file is outside your workspace.'}\n\n` +
+                        `Open ${canonicalPath} in the editor?` +
+                        (retainApproval
+                            ? ' Amazon Q will also be able to read this file for the rest of this chat.'
+                            : ''),
                     actions: [open, cancel],
                 })
                 if (choice?.title !== open.title) {
                     this.#features.logging.info(`User declined to open out-of-workspace file from a chat card`)
                     return
                 }
-                session?.addApprovedPath(canonicalPath, toolName)
+                if (retainApproval) {
+                    session?.addApprovedPath(canonicalPath, toolName)
+                }
             }
         }
         await this.#features.lsp.window.showDocument({ uri: URI.file(canonicalPath).toString() })
+    }
+
+    /**
+     * Whether any fsRead tool use in this session asked for `canonicalPath`. The card's messageId and filePath come
+     * from the client, and consecutive fsRead calls share one card, so the path is checked against every fsRead input
+     * rather than trusting the clicked card.
+     */
+    async #isFsReadRequestedPath(canonicalPath: string, session: ChatSessionService | undefined): Promise<boolean> {
+        // An approved directory covers everything under it, so only a regular file can keep an Open choice.
+        if (!(await isRegularFile(canonicalPath))) {
+            return false
+        }
+        for (const toolUse of session?.toolUseLookup.values() ?? []) {
+            if (toolUse.name !== FS_READ) {
+                continue
+            }
+            const paths = (toolUse.input as unknown as FsReadParams | undefined)?.paths
+            for (const requested of Array.isArray(paths) ? paths : []) {
+                if (
+                    typeof requested === 'string' &&
+                    (path.isAbsolute(requested) || /^~(?:[\\/]|$)/.test(requested)) &&
+                    !isNetworkOrDevicePath(requested) &&
+                    isSamePath(await resolveCanonicalPath(requested), canonicalPath)
+                ) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     async onFollowUpClicked(params: FollowUpClickParams) {

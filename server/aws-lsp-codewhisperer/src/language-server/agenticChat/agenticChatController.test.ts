@@ -72,6 +72,7 @@ import { ChatDatabase } from './tools/chatDb/chatDb'
 import { LocalProjectContextController } from '../../shared/localProjectContextController'
 import { CancellationError } from '@aws/lsp-core'
 import { CommandValidation, ToolApprovalException, requireResolvedTargets } from './tools/toolShared'
+import * as toolShared from './tools/toolShared'
 import { FsRead } from './tools/fsRead'
 import * as constants from './constants/constants'
 import { GENERIC_ERROR_MS } from './constants/constants'
@@ -4804,9 +4805,15 @@ ${' '.repeat(8)}}
         let outsideFile: string
         let showDocumentStub: sinon.SinonStub
         let showMessageRequestStub: sinon.SinonStub
+        let showMessageStub: sinon.SinonStub
 
         const OPEN = { title: 'Open' }
         const CANCEL = { title: 'Cancel' }
+        const existsOnDisk = (p: string) =>
+            fs.access(p).then(
+                () => true,
+                () => false
+            )
 
         beforeEach(async () => {
             workspaceDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ws-')))
@@ -4824,6 +4831,8 @@ ${' '.repeat(8)}}
             // each "refuses" case below means "refused when the user declines".
             showMessageRequestStub = sinon.stub().resolves(CANCEL)
             testFeatures.lsp.window.showMessageRequest = showMessageRequestStub
+            showMessageStub = sinon.stub().resolves()
+            testFeatures.lsp.window.showMessage = showMessageStub
             chatController.onTabAdd({ tabId: mockTabId })
         })
 
@@ -4841,16 +4850,94 @@ ${' '.repeat(8)}}
             assert.deepStrictEqual(openedUris(), [URI.file(insideFile).toString()])
         })
 
+        for (const networkPath of ['\\\\host\\share\\x', '//host/x']) {
+            it(`does not touch the filesystem or open a network path: ${networkPath}`, async () => {
+                const canonicalSpy = sinon.spy(toolShared, 'resolveCanonicalPath')
+                // The suite's fs is a plain object without `exists`, so stub it in rather than spying.
+                const existsSpy = sinon.stub().resolves(true)
+                testFeatures.workspace.fs.exists = existsSpy
+
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: networkPath, fullPath: networkPath })
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: networkPath })
+
+                sinon.assert.notCalled(canonicalSpy)
+                sinon.assert.notCalled(existsSpy)
+                sinon.assert.notCalled(showDocumentStub)
+                sinon.assert.notCalled(showMessageRequestStub)
+            })
+        }
+
         it('refuses a fullPath outside the workspace', async () => {
             await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
             sinon.assert.notCalled(showDocumentStub)
         })
 
-        it('refuses a relative filePath that escapes the workspace', async () => {
+        it('prompts for a relative filePath that escapes the workspace and does not record an approval', async () => {
             const escaping = path.relative(workspaceDir, outsideFile)
             assert.ok(escaping.startsWith('..'), 'test precondition: path must traverse upward')
+            testFeatures.workspace.fs.exists = existsOnDisk
+            showMessageRequestStub.resolves(OPEN)
+
             await chatController.onFileClicked({ tabId: mockTabId, filePath: escaping })
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: escaping })
+
+            // The traversal resolves outside the workspace, so every click asks and nothing is remembered.
+            sinon.assert.calledTwice(showMessageRequestStub)
+            assert.ok(showMessageRequestStub.firstCall.args[0].message.includes(outsideFile))
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString(), URI.file(outsideFile).toString()])
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            assert.strictEqual(session.approvedPaths.size, 0)
+        })
+
+        it('refuses a relative filePath that escapes the workspace when the user declines', async () => {
+            testFeatures.workspace.fs.exists = existsOnDisk
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: path.relative(workspaceDir, outsideFile) })
+            sinon.assert.calledOnce(showMessageRequestStub)
             sinon.assert.notCalled(showDocumentStub)
+        })
+
+        it('tells the user when a relative file link cannot be found', async () => {
+            testFeatures.workspace.fs.exists = existsOnDisk
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'src/missing.ts' })
+
+            sinon.assert.calledOnce(showMessageStub)
+            const notice = showMessageStub.firstCall.args[0]
+            assert.strictEqual(notice.type, MessageType.Warning)
+            assert.ok(notice.message.includes('missing.ts'), notice.message)
+            assert.ok(!notice.message.includes('src/'), 'only the bounded file name is echoed')
+            sinon.assert.notCalled(showDocumentStub)
+            sinon.assert.notCalled(showMessageRequestStub)
+        })
+
+        it('prompts on every click from a non-fsRead card and does not record an approval', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('grep-1', { toolUseId: 'grep-1', name: 'grepSearch', input: {} })
+
+            const click = { tabId: mockTabId, messageId: 'grep-1', filePath: 'secret.txt', fullPath: outsideFile }
+            await chatController.onFileClicked(click)
+            await chatController.onFileClicked(click)
+
+            sinon.assert.calledTwice(showMessageRequestStub)
+            assert.ok(!showMessageRequestStub.firstCall.args[0].message.includes('able to read'))
+            assert.strictEqual(openedUris().length, 2)
+            assert.strictEqual(session.approvedPaths.size, 0)
+        })
+
+        it('opens a non-fsRead card path without prompting when that tool already holds a parent approval', async () => {
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('grep-2', { toolUseId: 'grep-2', name: 'grepSearch', input: {} })
+            session.addApprovedPath(outsideDir, 'grepSearch')
+
+            await chatController.onFileClicked({
+                tabId: mockTabId,
+                messageId: 'grep-2',
+                filePath: 'secret.txt',
+                fullPath: outsideFile,
+            })
+
+            sinon.assert.notCalled(showMessageRequestStub)
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
         })
 
         it('refuses an fsRead card path outside the workspace when it was never approved', async () => {
@@ -4900,6 +4987,7 @@ ${' '.repeat(8)}}
             const request = showMessageRequestStub.firstCall.args[0]
             assert.strictEqual(request.type, MessageType.Warning)
             assert.ok(request.message.includes(outsideFile), 'dialog names the exact path being opened')
+            assert.ok(request.message.includes('in the editor'), 'dialog explains where the file will open')
             assert.deepStrictEqual(
                 request.actions.map((a: { title: string }) => a.title),
                 ['Open', 'Cancel']
@@ -4913,13 +5001,161 @@ ${' '.repeat(8)}}
             sinon.assert.notCalled(showDocumentStub)
         })
 
-        it('remembers an Open choice so the same path does not prompt again', async () => {
+        it('remembers an Open choice for an fsRead card so the same path does not prompt again', async () => {
             showMessageRequestStub.resolves(OPEN)
-            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
-            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-4', {
+                toolUseId: 'read-4',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-4', filePath: outsideFile })
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-4', filePath: outsideFile })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            assert.ok(
+                showMessageRequestStub.firstCall.args[0].message.includes('able to read this file'),
+                'dialog discloses that fsRead keeps access'
+            )
+            assert.strictEqual(openedUris().length, 2)
+        })
+
+        it('does not record an fsRead approval for a card path no fsRead call asked for', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            const otherFile = path.join(outsideDir, 'other.txt')
+            await fs.writeFile(otherFile, 'other')
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-5', {
+                toolUseId: 'read-5',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-5', filePath: otherFile })
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-5', filePath: otherFile })
+
+            sinon.assert.calledTwice(showMessageRequestStub)
+            assert.ok(!showMessageRequestStub.firstCall.args[0].message.includes('able to read'))
+            assert.strictEqual(openedUris().length, 2)
+            assert.strictEqual(session.approvedPaths.size, 0)
+        })
+
+        for (const [label, input] of [
+            ['an absolute directory', () => outsideDir],
+            ['the bare home directory', () => '~'],
+        ] as const) {
+            it(`does not record an fsRead approval when the fsRead input is ${label}`, async () => {
+                showMessageRequestStub.resolves(OPEN)
+                const session = chatSessionManagementService.getSession(mockTabId).data!
+                session.toolUseLookup.set('read-dir', {
+                    toolUseId: 'read-dir',
+                    name: 'fsRead',
+                    input: { paths: [input()] },
+                })
+                const homeStub = sinon.stub(os, 'homedir').returns(outsideDir)
+                try {
+                    // A client that clicks the directory itself must not gain fsRead access to everything below it.
+                    await chatController.onFileClicked({
+                        tabId: mockTabId,
+                        messageId: 'read-dir',
+                        filePath: outsideDir,
+                    })
+                } finally {
+                    homeStub.restore()
+                }
+
+                sinon.assert.calledOnce(showMessageRequestStub)
+                assert.ok(!showMessageRequestStub.firstCall.args[0].message.includes('able to read'))
+                assert.strictEqual(session.approvedPaths.size, 0)
+            })
+        }
+
+        // `~/x` must match on every platform, including Windows where the native separator is `\`.
+        for (const input of [...new Set(['~/secret.txt', `~${path.sep}secret.txt`])]) {
+            it(`records an fsRead approval for a home-relative fsRead input: ${input}`, async () => {
+                showMessageRequestStub.resolves(OPEN)
+                const session = chatSessionManagementService.getSession(mockTabId).data!
+                session.toolUseLookup.set('read-8', {
+                    toolUseId: 'read-8',
+                    name: 'fsRead',
+                    input: { paths: [input] },
+                })
+                const homeStub = sinon.stub(os, 'homedir').returns(outsideDir)
+                try {
+                    await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-8', filePath: outsideFile })
+                    await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-8', filePath: outsideFile })
+                } finally {
+                    homeStub.restore()
+                }
+
+                sinon.assert.calledOnce(showMessageRequestStub)
+                assert.strictEqual(openedUris().length, 2)
+            })
+        }
+
+        it('does not record an fsRead approval for a ~user fsRead input', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            // `sanitize` expands `~bob/secret.txt` to `<home>/bob/secret.txt`, so put a real file there. Only the
+            // `~user` exclusion can then stop the click from keeping the Open choice.
+            const misExpanded = path.join(outsideDir, 'bob', 'secret.txt')
+            await fs.mkdir(path.dirname(misExpanded), { recursive: true })
+            await fs.writeFile(misExpanded, 'bob')
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-9', {
+                toolUseId: 'read-9',
+                name: 'fsRead',
+                input: { paths: ['~bob/secret.txt'] },
+            })
+            const homeStub = sinon.stub(os, 'homedir').returns(outsideDir)
+            try {
+                await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-9', filePath: misExpanded })
+                await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-9', filePath: misExpanded })
+            } finally {
+                homeStub.restore()
+            }
+
+            sinon.assert.calledTwice(showMessageRequestStub)
+            assert.ok(!showMessageRequestStub.firstCall.args[0].message.includes('able to read'))
+            assert.strictEqual(openedUris().length, 2)
+            assert.strictEqual(session.approvedPaths.size, 0)
+        })
+
+        it('records an fsRead approval for a path read by a later fsRead call merged into the same card', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            const laterFile = path.join(outsideDir, 'later.txt')
+            await fs.writeFile(laterFile, 'later')
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-6', {
+                toolUseId: 'read-6',
+                name: 'fsRead',
+                input: { paths: [outsideFile] },
+            })
+            session.toolUseLookup.set('read-7', { toolUseId: 'read-7', name: 'fsRead', input: { paths: [laterFile] } })
+
+            // Consecutive fsRead calls share the first call's card, so the click carries that card's id.
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-6', filePath: laterFile })
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-6', filePath: laterFile })
 
             sinon.assert.calledOnce(showMessageRequestStub)
             assert.strictEqual(openedUris().length, 2)
+        })
+
+        it('does not grant fsRead approval when the user opens an answer link', async () => {
+            showMessageRequestStub.resolves(OPEN)
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'secret.txt', fullPath: outsideFile })
+
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
+            const nextRead = await toolShared.requiresPathAcceptance(
+                outsideFile,
+                'fsRead',
+                testFeatures.workspace,
+                testFeatures.logging,
+                session.approvedPaths
+            )
+            assert.strictEqual(nextRead.requiresAcceptance, true)
         })
 
         it('surfaces the sensitive-path reason in the dialog for a sensitive out-of-workspace file', async () => {

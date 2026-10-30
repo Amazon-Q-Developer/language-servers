@@ -9,6 +9,7 @@ import {
     toMynahFileList,
     toDetailsWithoutIcon,
     toMynahContextCommand,
+    classifyChatLink,
 } from './utils'
 
 describe('utils', () => {
@@ -247,5 +248,82 @@ describe('utils', () => {
             const result = toMynahContextCommand(feature)
             assert.deepEqual(result, {})
         })
+    })
+
+    describe('classifyChatLink', () => {
+        for (const href of ['https://example.com/a', 'http://example.com']) {
+            it(`opens ${href} as a link`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'link' })
+            })
+        }
+
+        const relative: [string, string][] = [
+            ['src/foo.ts', 'src/foo.ts'],
+            ['./a.ts', './a.ts'],
+            ['../b.ts', '../b.ts'],
+            ['file/////', 'file/////'],
+            ['src/foo.ts#L10', 'src/foo.ts'],
+            ['src/foo.ts?x=1', 'src/foo.ts'],
+            ['..%2F..%2Fx', '../../x'],
+            ['src/a%23b.ts', 'src/a#b.ts'],
+            ['src/a%3Fb.ts#L2', 'src/a?b.ts'],
+            ['foo.ts:10', 'foo.ts'],
+            ['src/foo.ts:10:5', 'src/foo.ts'],
+            ['./Makefile:3', './Makefile'],
+        ]
+        for (const [href, filePath] of relative) {
+            it(`routes ${href} as a file click with filePath`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'file', filePath })
+            })
+        }
+
+        const absolute: [string, string][] = [
+            ['/abs/x.ts', '/abs/x.ts'],
+            ['C:\\abs\\x.ts', 'C:\\abs\\x.ts'],
+            ['C:/abs/x.ts#L10', 'C:/abs/x.ts'],
+            ['C:\\abs\\x.ts:12', 'C:\\abs\\x.ts'],
+            ['/abs/x.ts:3:1', '/abs/x.ts'],
+        ]
+        for (const [href, filePath] of absolute) {
+            it(`routes ${href} as a file click with fullPath`, () => {
+                assert.deepEqual(classifyChatLink(href), {
+                    kind: 'file',
+                    filePath,
+                    fullPath: filePath,
+                })
+            })
+        }
+
+        const ignored = [
+            '//host/x',
+            '\\\\host\\share\\x',
+            '\\/host',
+            '/\\host',
+            '%2F%2Fhost%2Fx',
+            '\\\\?\\UNC\\h\\s',
+            '\\\\.\\pipe\\x',
+            'file:///etc/passwd',
+            'vscode://x',
+            'command:x',
+            'mailto:a@b',
+            'javascript:x',
+            'C:relative.txt',
+            '#only-fragment',
+            '?only-query',
+            '%2F%2Fhost#x',
+            'command:foo.bar:1',
+            'vscode://x:10',
+            'javascript:10',
+            'C:10',
+            // A bare name with a line suffix stays ambiguous with a URI scheme, so it is not opened.
+            'Makefile:3',
+            '',
+            '%E0%A4%A',
+        ]
+        for (const href of ignored) {
+            it(`sends nothing for ${JSON.stringify(href)}`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'none' })
+            })
+        }
     })
 })

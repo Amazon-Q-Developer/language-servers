@@ -1,8 +1,15 @@
 import * as assert from 'assert'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import sinon from 'ts-sinon'
-import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance, resolveSymlinkAwarePath } from './toolShared'
+import {
+    hasAdditionalHardLinks,
+    isPathApproved,
+    isRegularFile,
+    requiresPathAcceptance,
+    resolveSymlinkAwarePath,
+} from './toolShared'
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
@@ -414,6 +421,24 @@ describe('toolShared', () => {
             assert.strictEqual(result.requiresAcceptance, true)
             assert.ok(result.warning?.includes('sensitive system files'))
         })
+
+        for (const filePath of [
+            'C:\\Users\\developer\\.ssh\\id_rsa',
+            'C:\\Users\\developer\\.aws\\config',
+            'C:\\project\\.env',
+        ]) {
+            it(`should identify Windows-style sensitive path ${filePath}`, async () => {
+                const result = await requiresPathAcceptance(
+                    filePath,
+                    'testTool',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging']
+                )
+
+                assert.strictEqual(result.requiresAcceptance, true)
+                assert.ok(result.warning?.includes('sensitive system files'))
+            })
+        }
 
         it('should require acceptance for paths with traversal that resolve to sensitive locations', async () => {
             // Path that looks workspace-relative but resolves to /etc via traversal
@@ -1135,6 +1160,27 @@ describe('toolShared', () => {
                         '(see agenticChatController), not every path a tool has touched.'
                 )
             })
+        })
+    })
+
+    describe('isRegularFile', () => {
+        let dir: string
+
+        beforeEach(async () => {
+            dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'regular-file-'))
+        })
+
+        afterEach(async () => {
+            await fs.promises.rm(dir, { recursive: true, force: true })
+        })
+
+        it('is true for a file and false for a directory or a missing path', async () => {
+            const file = path.join(dir, 'a.txt')
+            await fs.promises.writeFile(file, 'a')
+
+            assert.strictEqual(await isRegularFile(file), true)
+            assert.strictEqual(await isRegularFile(dir), false)
+            assert.strictEqual(await isRegularFile(path.join(dir, 'missing.txt')), false)
         })
     })
 

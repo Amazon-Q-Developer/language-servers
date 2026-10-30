@@ -282,3 +282,55 @@ export function chatMessageToChatItem(message: ChatMessage, isPairProgrammingMod
         ...preparedItem,
     }
 }
+
+export type ChatLinkTarget = { kind: 'link' } | { kind: 'file'; filePath: string; fullPath?: string } | { kind: 'none' }
+
+/**
+ * Decides where a link clicked in a chat answer goes: http(s) URLs open as links, local paths
+ * go to the file-click handler, and everything else (other schemes, `//host` paths) is dropped.
+ */
+export function classifyChatLink(href: string | undefined): ChatLinkTarget {
+    if (!href) {
+        return { kind: 'none' }
+    }
+
+    try {
+        const url = new URL(href)
+        if ((url.protocol === 'http:' || url.protocol === 'https:') && url.hostname) {
+            return { kind: 'link' }
+        }
+    } catch {
+        // Not an absolute URL; check below whether it is a local path.
+    }
+
+    // Split off the query and fragment before decoding so an encoded `#` or `?` stays part of the file name.
+    let decoded: string
+    try {
+        decoded = decodeURIComponent(href.split(/[?#]/)[0])
+    } catch {
+        return { kind: 'none' }
+    }
+
+    // `\\host\share`, `\/host` and `%2F%2Fhost` all reach a remote host or device once normalized.
+    if (!decoded || decoded.replace(/\\/g, '/').startsWith('//')) {
+        return { kind: 'none' }
+    }
+
+    // `src/foo.ts:10` and `foo.ts:10:5` name a file and a line. Requiring a `.` or separator before the line keeps
+    // `scheme:123` links classified as schemes below.
+    const withoutLine = decoded.replace(/:\d+(?::\d+)?$/, '')
+    const filePath = withoutLine !== decoded && /[./\\]/.test(withoutLine) ? withoutLine : decoded
+
+    const normalizedFilePath = filePath.replace(/\\/g, '/')
+    // A Windows drive letter resembles a URI scheme but denotes an absolute local path.
+    if (/^[a-zA-Z]:\//.test(normalizedFilePath)) {
+        return { kind: 'file', filePath, fullPath: filePath }
+    }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalizedFilePath)) {
+        return { kind: 'none' }
+    }
+
+    return normalizedFilePath.startsWith('/')
+        ? { kind: 'file', filePath, fullPath: filePath }
+        : { kind: 'file', filePath }
+}

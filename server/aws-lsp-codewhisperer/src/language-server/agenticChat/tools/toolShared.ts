@@ -133,6 +133,15 @@ export async function resolveCanonicalPath(inputPath: string): Promise<string> {
     return resolveSymlinkAwarePath(sanitize(inputPath))
 }
 
+/** Whether `filePath` is a regular file (after following symlinks). Unreadable targets count as not a file. */
+export async function isRegularFile(filePath: string): Promise<boolean> {
+    try {
+        return (await fs.promises.stat(filePath)).isFile()
+    } catch {
+        return false
+    }
+}
+
 /**
  * Canonicalize workspace folder paths through the filesystem so boundary
  * comparisons stay accurate even when a workspace lives under a symlinked
@@ -277,7 +286,7 @@ function normalizePathSeparators(filePath: string): string {
  * which is the precedent `isParentFolder` already follows, and a trailing
  * separator does not change identity.
  */
-function isSamePath(left: string, right: string): boolean {
+export function isSamePath(left: string, right: string): boolean {
     const comparable = (value: string) => {
         const normalized = path.normalize(value).replace(/[\\/]+$/, '')
         return process.platform === 'win32' || process.platform === 'darwin' ? normalized.toLowerCase() : normalized
@@ -430,6 +439,7 @@ export async function requiresPathAcceptance(
 }
 
 function isSensitivePath(filePath: string): boolean {
+    const normalizedPath = filePath.replace(/\\/g, '/')
     const sensitivePatterns = [
         /\/\.ssh\//,
         /\/\.aws\//,
@@ -445,5 +455,5 @@ function isSensitivePath(filePath: string): boolean {
         /\/dev\//,
     ]
 
-    return sensitivePatterns.some(pattern => pattern.test(filePath))
+    return sensitivePatterns.some(pattern => pattern.test(normalizedPath))
 }
