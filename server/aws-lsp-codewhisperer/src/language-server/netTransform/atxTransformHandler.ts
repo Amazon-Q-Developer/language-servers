@@ -203,6 +203,9 @@ export class ATXTransformHandler {
     // cached mode into the job's settings artifact, so an unscoped cache could write one job's mode
     // into another's. `source` is for the carry-forward log only.
     private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
+    // ITGen: in-flight test downloads by job and task, and the newest run started per job, side and project.
+    private readonly itGenTestDownloads = new Map<string, Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>>>()
+    private readonly itGenLatestRunByProject = new Map<string, string>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
     // The last ListHitls result of the getTransformInfo call in progress (undefined = not listed
@@ -2020,7 +2023,28 @@ export class ATXTransformHandler {
      * it's downloaded again for every test-run task and never reused by id; a marker file holding
      * the task id keeps one task's later polls from downloading it again.
      */
-    private async downloadItGenTests(
+    private downloadItGenTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        taskId: string,
+        request: any
+    ): Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>> {
+        // Overlapping polls for the same task share one download, so a late duplicate can't finish
+        // after a newer run and clean that run up.
+        const key = `${jobId}|${taskId}`
+        const inFlight = this.itGenTestDownloads.get(key)
+        if (inFlight) {
+            return inFlight
+        }
+        const download = this.downloadItGenTestsOnce(workspaceId, jobId, solutionRootPath, taskId, request).finally(
+            () => this.itGenTestDownloads.delete(key)
+        )
+        this.itGenTestDownloads.set(key, download)
+        return download
+    }
+
+    private async downloadItGenTestsOnce(
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
@@ -2040,17 +2064,31 @@ export class ATXTransformHandler {
         const runDir = path.join(itgenDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
+        const projectMarkerPath = path.join(runDir, 'tests.project')
+        // Cleanup is keyed by side and project; without both, this run's tests are kept and never collected.
+        const projectKey =
+            typeof request.side === 'string' && request.side && typeof request.project === 'string' && request.project
+                ? `${request.side}|${request.project}`
+                : undefined
         if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8') === taskId && fs.existsSync(testsPath)) {
+            if (projectKey && !fs.existsSync(projectMarkerPath)) {
+                fs.writeFileSync(projectMarkerPath, projectKey)
+            }
             return { TestsPath: testsPath }
         }
 
+        // The newest run started for this side and project; only that run may collect earlier ones.
+        const latestKey = `${jobId}|${projectKey}`
+        if (projectKey) {
+            this.itGenLatestRunByProject.set(latestKey, request.runId)
+        }
         const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, request.artifactId)
         if (!downloadInfo) {
             return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
         }
-        // The whole artifact is kept, in its own layout: a test project can reference projects
-        // elsewhere in it (for example a common library) and rely on its root build files
-        // (Directory.Build.props, Directory.Packages.props, nuget.config). Disk use is bounded by
+        // The artifact is unpacked whole, in its own layout: the generated test project plus any files
+        // next to it that its build reads (for example a root Directory.Build.props or nuget.config).
+        // Test projects are independent of the app's source (contract decision 16). Disk use is bounded by
         // removing earlier runs' tests below.
         fs.rmSync(testsPath, { recursive: true, force: true })
         const zipName = 'tests-artifact.zip'
@@ -2068,9 +2106,16 @@ export class ATXTransformHandler {
             )
         }
         fs.writeFileSync(markerPath, taskId)
-        const projectKey = `${request.side}|${request.project}`
-        fs.writeFileSync(path.join(runDir, 'tests.project'), projectKey)
-        this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
+        if (projectKey) {
+            fs.writeFileSync(projectMarkerPath, projectKey)
+            if (this.itGenLatestRunByProject.get(latestKey) === request.runId) {
+                this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
+            } else {
+                this.logging.log(
+                    `ATX: run ${request.runId} (${projectKey}) finished after a newer run started; not collecting earlier runs`
+                )
+            }
+        }
         this.logging.log(`ATX: tests artifact ${request.artifactId} for run ${request.runId} extracted to ${testsPath}`)
         return { TestsPath: testsPath }
     }

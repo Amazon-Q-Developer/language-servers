@@ -30,6 +30,19 @@ const testRunRequest = (overrides: any = {}) => ({
     ...overrides,
 })
 
+// What Utils.downloadAndExtractArchive leaves for a tests artifact: the test project, a root build file next
+// to it, and the downloaded ZIP.
+const fakeExtract = (saveToDir: string, exportName: string) => {
+    fs.mkdirSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi'), { recursive: true })
+    fs.writeFileSync(
+        path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj'),
+        '<Project/>'
+    )
+    fs.writeFileSync(path.join(saveToDir, 'Directory.Build.props'), '<Project/>')
+    fs.writeFileSync(path.join(saveToDir, exportName), 'zip')
+    return saveToDir
+}
+
 const testRunHitl = { taskId: 'task-run', tag: ATX_HITL_TAG_INTEG_TEST_RUN, planStepId: 'step-run' }
 const appLaunchHitl = { taskId: 'task-launch', tag: ATX_HITL_TAG_INTEG_APP_LAUNCH, planStepId: 'step-launch' }
 
@@ -88,25 +101,16 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         downloadJsonStub = sinon
             .stub(handler as any, 'downloadJsonArtifact')
             .callsFake(async (...args: any[]) => requestsByArtifact[args[2]] ?? null)
-        // The tests artifact is the whole repo: app source, a root build file and the test project, plus the
-        // ZIP the real code leaves behind.
+        // The tests artifact: the independent generated test project and a root build file next to it, plus
+        // the ZIP the real code leaves behind (contract decision 16: no application source).
         downloadUrlStub = sinon
             .stub(handler, 'createArtifactDownloadUrl')
             .callsFake(async (...args: any[]) => ({ s3PresignedUrl: `url-${args[2]}`, requestHeaders: {} }))
         zipDownloadStub = sinon
             .stub(Utils, 'downloadAndExtractArchive')
-            .callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
-                fs.mkdirSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi'), { recursive: true })
-                fs.writeFileSync(
-                    path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj'),
-                    '<Project/>'
-                )
-                fs.mkdirSync(path.join(saveToDir, 'SampleWebApi'), { recursive: true })
-                fs.writeFileSync(path.join(saveToDir, 'SampleWebApi', 'Program.cs'), '// app')
-                fs.writeFileSync(path.join(saveToDir, 'Directory.Build.props'), '<Project/>')
-                fs.writeFileSync(path.join(saveToDir, exportName), 'zip')
-                return saveToDir
-            })
+            .callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) =>
+                fakeExtract(saveToDir, exportName)
+            )
     })
 
     afterEach(() => {
@@ -255,12 +259,10 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
                 )
             ).to.be.true
             expect(fs.existsSync(path.join(expectedTests, 'tests-artifact.zip'))).to.be.false
-            // The whole artifact is kept in its own layout, so the test project's references to other
-            // projects (a common library) and the root build files still resolve.
+            // The whole artifact is kept in its own layout, including files next to the test project.
             expect(fs.readdirSync(expectedTests).sort()).to.deep.equal([
                 'Directory.Build.props',
                 'GeneratedApiTests.SampleWebApi',
-                'SampleWebApi',
             ])
             expect((logging.warn as sinon.SinonStub).called).to.be.false
         })
@@ -306,6 +308,91 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(fs.existsSync(path.join(itgen, 'r1', 'results.zip'))).to.be.true
             expect(fs.existsSync(path.join(itgen, 'r5', 'tests'))).to.be.true
             expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
+        })
+
+        it('downloads once when overlapping polls ask for the same task', async () => {
+            let release!: () => void
+            const gate = new Promise<void>(resolve => (release = resolve))
+            zipDownloadStub.callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
+                await gate
+                return fakeExtract(saveToDir, exportName)
+            })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const first = poll()
+            const second = poll()
+            await new Promise(resolve => setTimeout(resolve, 20))
+            release()
+            const [a, b] = await Promise.all([first, second])
+
+            expect(zipDownloadStub.callCount).to.equal(1)
+            expect(a!.OpenHitls![0].TestsPath).to.equal(b!.OpenHitls![0].TestsPath)
+        })
+
+        it('does not let a run that finishes late collect a newer run', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            let releaseR1!: () => void
+            const r1Gate = new Promise<void>(resolve => (releaseR1 = resolve))
+            zipDownloadStub.callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
+                if (saveToDir.includes(`${path.sep}r1${path.sep}`)) {
+                    await r1Gate
+                }
+                return fakeExtract(saveToDir, exportName)
+            })
+            const download = (taskId: string, runId: string) =>
+                (handler as any).downloadItGenTests(WS_ID, JOB_ID, tmpRoot, taskId, testRunRequest({ runId }))
+
+            const r1 = download('task-r1', 'r1')
+            await new Promise(resolve => setTimeout(resolve, 10))
+            await download('task-r2', 'r2')
+            releaseR1()
+            await r1
+
+            expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
+        })
+
+        it('never collects runs whose request has no side or project', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            const download = (taskId: string, runId: string, overrides: any) =>
+                (handler as any).downloadItGenTests(
+                    WS_ID,
+                    JOB_ID,
+                    tmpRoot,
+                    taskId,
+                    testRunRequest({ runId, ...overrides })
+                )
+
+            await download('task-r1', 'r1', { side: undefined, project: undefined })
+            await download('task-r2', 'r2', { side: undefined, project: undefined })
+
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests.project'))).to.be.false
+        })
+
+        it('backfills the project marker when it reuses tests downloaded before markers existed', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            // The layout before tests.project: tests/ and tests.task only.
+            fs.mkdirSync(path.join(itgen, 'r1', 'tests'), { recursive: true })
+            fs.writeFileSync(path.join(itgen, 'r1', 'tests.task'), 'task-r1')
+
+            await (handler as any).downloadItGenTests(
+                WS_ID,
+                JOB_ID,
+                tmpRoot,
+                'task-r1',
+                testRunRequest({ runId: 'r1' })
+            )
+            await (handler as any).downloadItGenTests(
+                WS_ID,
+                JOB_ID,
+                tmpRoot,
+                'task-r2',
+                testRunRequest({ runId: 'r2' })
+            )
+
+            expect(zipDownloadStub.callCount).to.equal(1)
+            expect(fs.readFileSync(path.join(itgen, 'r1', 'tests.project'), 'utf-8')).to.equal('original|SampleWebApi')
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.false
         })
 
         it('downloads a task request and its tests once and reuses ListHitls (one call per poll)', async () => {
