@@ -366,8 +366,19 @@ export class McpEventHandler {
             'edit-mcp': () => this.#handleEditMcpServer(params),
             'mcp-permission-change': () => this.#handleMcpPermissionChange(params),
             'save-permission-change': () => this.#handleSavePermissionChange(params),
-            'refresh-mcp-list': () => this.#handleRefreshMCPList(params),
-            'mcp-enable-server': () => this.#handleEnableMcpServer(params),
+            'refresh-mcp-list': () => {
+                // An explicit refresh asks again for folders declined earlier in this session
+                if (McpManager.isInitialized()) {
+                    McpManager.instance.clearDeclinedFolders()
+                }
+                return this.#handleRefreshMCPList(params)
+            },
+            'mcp-enable-server': () => {
+                if (McpManager.isInitialized()) {
+                    McpManager.instance.clearDeclinedFolders()
+                }
+                return this.#handleEnableMcpServer(params)
+            },
             'mcp-disable-server': () => this.#handleDisableMcpServer(params),
             'mcp-delete-server': () => this.#handleDeleteMcpServer(params),
             'mcp-fix-server': () => this.#handleEditMcpServer(params),

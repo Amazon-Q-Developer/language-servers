@@ -339,6 +339,50 @@ describe('McpEventHandler error handling', () => {
         })
     })
 
+    describe('folders declined in the folder prompt', () => {
+        beforeEach(async () => {
+            sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+                servers: new Map(),
+                serverNameMapping: new Map(),
+                errors: new Map(),
+                agentConfig: {
+                    name: 'test-agent',
+                    description: 'Test agent',
+                    mcpServers: {},
+                    tools: [],
+                    allowedTools: [],
+                    toolsSettings: {},
+                    includedFiles: [],
+                    resources: [],
+                },
+            })
+            await McpManager.init([], features)
+        })
+
+        it('are asked again when the user refreshes the server list', async () => {
+            const clear = sinon.spy(McpManager.instance, 'clearDeclinedFolders')
+            sinon.stub(McpManager.instance, 'reinitializeMcpServers').resolves()
+
+            await eventHandler.onMcpServerClick({ id: 'refresh-mcp-list' })
+
+            expect(clear.calledOnce).to.be.true
+        })
+
+        it('are asked again when the user enables a server', async () => {
+            const clear = sinon.spy(McpManager.instance, 'clearDeclinedFolders')
+            sinon
+                .stub(McpManager.instance, 'getAllServerConfigs')
+                .returns(new Map([['svc', { command: 'node', __configPath__: '/fake/home/mcp.json' }]]))
+            sinon.stub(McpManager.instance, 'getMcpServerPermissions').returns({ enabled: false, toolPerms: {} })
+            const update = sinon.stub(McpManager.instance, 'updateServerPermission').resolves()
+
+            await eventHandler.onMcpServerClick({ id: 'mcp-enable-server', title: 'svc' })
+
+            expect(clear.calledOnce).to.be.true
+            expect(clear.calledBefore(update)).to.be.true
+        })
+    })
+
     it('handles server click events for fixing failed servers', async () => {
         // Make sure previous stubs are restored
         sinon.restore()

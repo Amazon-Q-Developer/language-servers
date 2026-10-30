@@ -43,6 +43,7 @@ import { AgenticChatError } from '../../errors'
 import { EventEmitter } from 'events'
 import { Mutex } from 'async-mutex'
 import path = require('path')
+import os = require('os')
 import { URI } from 'vscode-uri'
 import { MessageType } from '@aws/language-server-runtimes/protocol'
 import {
@@ -59,8 +60,13 @@ import { OAuthClient } from './mcpOauthClient'
 import { AgentPermissionManager } from './agentPermissionManager'
 import { McpRegistryService } from './mcpRegistryService'
 import { McpRegistryData } from './mcpTypes'
+import { WorkspaceTrustState, isFolderApproved, recordFolderApproval, fingerprintFolder } from './mcpWorkspaceTrust'
 
 export const MCP_SERVER_STATUS_CHANGED = 'mcpServerStatusChanged'
+/** Folder under ~/.aws/amazonq that stdio servers start in when no workspace folder is open. */
+export const DEFAULT_STDIO_CWD_NAME = 'mcp-cwd'
+/** How many servers start at the same time during discovery and after a trust change. */
+const MAX_CONCURRENT_SERVER_STARTS = 5
 export const AGENT_TOOLS_CHANGED = 'agentToolsChanged'
 export enum AuthIntent {
     Interactive = 'interactive',
@@ -102,6 +108,17 @@ export class McpManager {
     private registryUrlProvided: boolean = false
     private isPeriodicSync: boolean = false
     private sessionDeniedConsent = new Set<string>()
+    private workspaceTrust: WorkspaceTrustState = 'prompt'
+    // Folders the user declined in the folder prompt, kept for the language server session
+    private readonly sessionDeniedFolders = new Set<string>()
+    // Folders the user allowed in this session
+    private readonly sessionAllowedFolders = new Set<string>()
+    // One folder prompt at a time per folder, shared by servers starting concurrently
+    private readonly pendingFolderPrompts = new Map<string, Promise<boolean>>()
+    // Stdio servers held back until their launch folder is trusted
+    private readonly serversAwaitingTrust = new Set<string>()
+    // Workspace folder each running stdio server was started in
+    private readonly stdioLaunchFolders = new Map<string, string>()
 
     private constructor(
         private agentPaths: string[],
@@ -174,6 +191,78 @@ export class McpManager {
      */
     public static isInitialized(): boolean {
         return !!McpManager.#instance
+    }
+
+    /** Trust state the client reported for the open workspace. */
+    public getWorkspaceTrust(): WorkspaceTrustState {
+        return this.workspaceTrust
+    }
+
+    /**
+     * Apply a trust state reported by the client. Servers held back for trust start once the state allows
+     * it, and stdio servers running in a workspace folder stop when the workspace becomes restricted.
+     */
+    public async setWorkspaceTrust(state: WorkspaceTrustState): Promise<void> {
+        if (state === this.workspaceTrust) {
+            return
+        }
+        this.features.logging.info(`MCP: workspace trust changed from '${this.workspaceTrust}' to '${state}'`)
+        this.workspaceTrust = state
+        if (state === 'restricted') {
+            await Promise.all(
+                [...this.stdioLaunchFolders.keys()].map(name =>
+                    // The state can change again while this waits for the server's lock
+                    this.runExclusiveForServer(name, async () => {
+                        if (this.workspaceTrust === 'restricted') {
+                            await this.holdServerUntilTrusted(name, 'waiting')
+                        }
+                    })
+                )
+            )
+            return
+        }
+        await this.startServersAwaitingTrust()
+    }
+
+    /**
+     * Ask again for folders the user declined earlier in this session. Called when the user explicitly
+     * refreshes or enables MCP servers.
+     */
+    public clearDeclinedFolders(): void {
+        this.sessionDeniedFolders.clear()
+    }
+
+    private async startServersAwaitingTrust(): Promise<void> {
+        const names = [...this.serversAwaitingTrust]
+        for (let i = 0; i < names.length; i += MAX_CONCURRENT_SERVER_STARTS) {
+            await Promise.all(
+                names.slice(i, i + MAX_CONCURRENT_SERVER_STARTS).map(name => this.startServerAwaitingTrust(name))
+            )
+        }
+    }
+
+    private async startServerAwaitingTrust(name: string): Promise<void> {
+        const cfg = this.mcpServers.get(name)
+        if (!cfg || this.isServerDisabled(name)) {
+            this.serversAwaitingTrust.delete(name)
+            return
+        }
+        try {
+            await this.runExclusiveForServer(name, async () => {
+                // Another trust change or folder answer may have started it while this waited for the lock
+                if (this.serversAwaitingTrust.has(name)) {
+                    await this.initOneServerInternal(name, cfg, AuthIntent.Silent)
+                }
+            })
+        } catch (e) {
+            this.features.logging.warn(`MCP: [${name}] failed to start after a trust change: ${e}`)
+        }
+    }
+
+    /** Forget a server's launch folder and trust hold, after it is removed or disabled. */
+    private forgetServerLaunch(serverName: string): void {
+        this.stdioLaunchFolders.delete(serverName)
+        this.serversAwaitingTrust.delete(serverName)
     }
 
     /**
@@ -315,7 +404,7 @@ export class McpManager {
         }
 
         // Process servers in batches of 5 at a time
-        const MAX_CONCURRENT_SERVERS = 5
+        const MAX_CONCURRENT_SERVERS = MAX_CONCURRENT_SERVER_STARTS
         const totalServers = serversToInit.length
 
         if (totalServers > 0) {
@@ -432,6 +521,19 @@ export class McpManager {
     ): Promise<void> {
         const DEFAULT_SERVER_INIT_TIMEOUT_MS = 120_000
 
+        // A stdio server starts in the first workspace folder, so its launcher can load programs and
+        // settings from that folder. Start it only once that folder is trusted.
+        const isStdio = !!cfg.command
+        const launchFolder = isStdio ? this.getStdioLaunchFolder(serverName) : undefined
+        if (launchFolder) {
+            const decision = await this.checkLaunchFolder(launchFolder)
+            if (decision !== 'allowed') {
+                await this.holdServerUntilTrusted(serverName, decision)
+                return
+            }
+        }
+        this.serversAwaitingTrust.delete(serverName)
+
         // Consent gate for workspace-scoped MCP configs (P417451767).
         // Workspace-scoped configs live in a folder the user opened and may be attacker-controlled.
         // Global configs (~/.aws/amazonq/...) are user-authored and trusted implicitly.
@@ -532,8 +634,29 @@ export class McpManager {
             }
         }
 
+        // With no workspace folder open, start in an empty Amazon Q directory rather than inheriting the
+        // language server's working directory, which depends on how the IDE was launched
+        let defaultCwd: string | undefined
+        if (isStdio && !launchFolder) {
+            try {
+                defaultCwd = await this.prepareDefaultStdioCwd()
+            } catch (e: any) {
+                this.features.logging.warn(`MCP: [${serverName}] could not prepare a working directory: ${e?.message}`)
+                this.setState(serverName, McpServerStatus.FAILED, 0, 'Could not prepare a working directory')
+                this.emitToolsChanged(serverName)
+                return
+            }
+        }
+
         // Lightweight cleanup - only kill our tracked processes
         await this.cleanupExistingServer(serverName)
+
+        // Trust can change while a consent prompt is open. Nothing below awaits before the process starts,
+        // so this is the last point where the decision can change.
+        if (launchFolder && this.workspaceTrust === 'restricted') {
+            await this.holdServerUntilTrusted(serverName, 'waiting')
+            return
+        }
 
         this.setState(serverName, McpServerStatus.INITIALIZING, 0)
 
@@ -546,7 +669,6 @@ export class McpManager {
             })
 
             let transport: any
-            const isStdio = !!cfg.command
             const doConnect = async () => {
                 if (isStdio) {
                     // stdio transport - merge additional env with base env
@@ -558,14 +680,12 @@ export class McpManager {
                             ? Object.fromEntries(Object.entries(finalEnv).filter(([k, v]) => k.trim() && v.trim()))
                             : {}),
                     }
-                    let cwd: string | undefined
-                    try {
-                        const folders = this.features.workspace.getAllWorkspaceFolders()
-                        if (folders.length > 0) cwd = URI.parse(folders[0].uri).fsPath
-                    } catch {
-                        this.features.logging.debug(
-                            `MCP: no workspace folder for [${serverName}], continuing without cwd`
-                        )
+                    // Use the folder checked above, so the folder that was trusted is the folder the server starts in
+                    const cwd = launchFolder ?? defaultCwd
+                    if (launchFolder) {
+                        this.stdioLaunchFolders.set(serverName, launchFolder)
+                    } else {
+                        this.stdioLaunchFolders.delete(serverName)
                     }
                     const argsStr = (cfg.args ?? []).length > 0 ? ` ${(cfg.args ?? []).join(' ')}` : ''
                     const envKeys = Object.keys(finalEnv || {})
@@ -1202,6 +1322,7 @@ export class McpManager {
             await client.close()
             this.clients.delete(serverName)
         }
+        this.forgetServerLaunch(serverName)
         this.mcpTools = this.mcpTools.filter(t => t.serverName !== serverName)
         this.mcpServerStates.delete(serverName)
 
@@ -1364,6 +1485,7 @@ export class McpManager {
             this.serverNameMapping.set(serverName, unsanitizedServerName)
 
             if (this.isServerDisabled(serverName)) {
+                this.forgetServerLaunch(serverName)
                 this.setState(serverName, McpServerStatus.DISABLED, 0)
                 this.emitToolsChanged(serverName)
             } else {
@@ -1424,6 +1546,8 @@ export class McpManager {
         this.mcpServers.clear()
         this.mcpServerStates.clear()
         this.sessionDeniedConsent.clear()
+        this.serversAwaitingTrust.clear()
+        this.stdioLaunchFolders.clear()
         this.agentConfig = {
             name: 'q_ide_default',
             description: 'Agent configuration',
@@ -1594,6 +1718,7 @@ export class McpManager {
                     await client.close()
                     this.clients.delete(serverName)
                 }
+                this.forgetServerLaunch(serverName)
                 this.setState(serverName, McpServerStatus.DISABLED, 0)
             } else {
                 if (!this.clients.has(serverName) && serverName !== 'Built-in') {
@@ -1842,6 +1967,129 @@ export class McpManager {
         const st: McpServerRuntimeState = { status, toolsCount, lastError }
         this.mcpServerStates.set(server, st)
         this.events.emit(MCP_SERVER_STATUS_CHANGED, server, { ...st })
+    }
+
+    private async runExclusiveForServer(serverName: string, fn: () => Promise<void>): Promise<void> {
+        if (!this.serverInitMutexes.has(serverName)) {
+            this.serverInitMutexes.set(serverName, new Mutex())
+        }
+        await this.serverInitMutexes.get(serverName)!.runExclusive(fn)
+    }
+
+    /** Working directory for stdio servers when no workspace folder is open: an Amazon Q folder that holds no files. */
+    private async prepareDefaultStdioCwd(): Promise<string> {
+        const home = this.features.workspace.fs.getUserHomeDir() || os.homedir()
+        if (!home || !path.isAbsolute(home)) {
+            throw new Error('the home directory is unknown')
+        }
+        const dir = path.join(home, '.aws', 'amazonq', DEFAULT_STDIO_CWD_NAME)
+        await this.features.workspace.fs.mkdir(dir, { recursive: true })
+        return dir
+    }
+
+    /** First workspace folder, which stdio servers use as their working directory. */
+    private getStdioLaunchFolder(serverName: string): string | undefined {
+        try {
+            const folders = this.features.workspace.getAllWorkspaceFolders()
+            if (folders && folders.length > 0) {
+                return URI.parse(folders[0].uri).fsPath
+            }
+        } catch {
+            this.features.logging.debug(`MCP: no workspace folder for [${serverName}], continuing without cwd`)
+        }
+        return undefined
+    }
+
+    private async checkLaunchFolder(folder: string): Promise<'allowed' | 'waiting' | 'declined'> {
+        if (this.workspaceTrust === 'trusted') {
+            return 'allowed'
+        }
+        if (this.workspaceTrust === 'restricted') {
+            return 'waiting'
+        }
+        const key = fingerprintFolder(folder)
+        if (this.sessionDeniedFolders.has(key)) {
+            return 'declined'
+        }
+        if (
+            this.sessionAllowedFolders.has(key) ||
+            (await isFolderApproved(this.features.workspace, this.features.logging, folder))
+        ) {
+            return 'allowed'
+        }
+        this.requestFolderApproval(folder, key)
+        return 'waiting'
+    }
+
+    /**
+     * Ask the user about a folder without holding up discovery. Servers held for the folder are re-checked
+     * once the user answers, which starts them if the folder was allowed.
+     */
+    private requestFolderApproval(folder: string, key: string): void {
+        if (this.pendingFolderPrompts.has(key)) {
+            return
+        }
+        const pending = this.promptForLaunchFolder(folder, key)
+            .then(async allowed => {
+                await this.startServersAwaitingTrust()
+                return allowed
+            })
+            .catch(e => {
+                this.features.logging.warn(`MCP: failed to apply the folder decision for '${folder}': ${e}`)
+                return false
+            })
+            .finally(() => this.pendingFolderPrompts.delete(key))
+        this.pendingFolderPrompts.set(key, pending)
+    }
+
+    private async promptForLaunchFolder(folder: string, key: string): Promise<boolean> {
+        const allowBtn = { title: 'Allow' }
+        const denyBtn = { title: "Don't allow" }
+        let choice: { title: string } | null | undefined
+        try {
+            choice = await this.features.lsp.window.showMessageRequest({
+                type: MessageType.Warning,
+                message:
+                    `Amazon Q — Start MCP servers in this folder?\n\n` +
+                    `Your local MCP servers start with this folder as their working directory:\n${folder}\n\n` +
+                    `Commands such as npx and python -m can run programs and read settings from the working ` +
+                    `directory. Only allow this if you trust the contents of this folder.\n\n` +
+                    `If you allow, Amazon Q won't ask again for this folder.`,
+                actions: [allowBtn, denyBtn],
+            })
+        } catch (e: any) {
+            this.features.logging.warn(`MCP: folder prompt failed for '${folder}': ${e?.message}`)
+            this.sessionDeniedFolders.add(key)
+            return false
+        }
+        if (choice?.title === allowBtn.title) {
+            // Also remembered in memory, so a failed write to the store doesn't ask again in this session
+            this.sessionAllowedFolders.add(key)
+            this.sessionDeniedFolders.delete(key)
+            await recordFolderApproval(this.features.workspace, this.features.logging, folder)
+            this.features.logging.info(`MCP: local MCP servers allowed in '${folder}'`)
+            return true
+        }
+        this.features.logging.info(
+            `MCP: local MCP servers not allowed in '${folder}' (response: ${choice?.title ?? 'dismissed'})`
+        )
+        this.sessionDeniedFolders.add(key)
+        return false
+    }
+
+    private async holdServerUntilTrusted(serverName: string, reason: 'waiting' | 'declined'): Promise<void> {
+        this.features.logging.info(`MCP: [${serverName}] not started in the workspace folder (${reason})`)
+        this.serversAwaitingTrust.add(serverName)
+        await this.cleanupExistingServer(serverName)
+        this.stdioLaunchFolders.delete(serverName)
+        this.mcpTools = this.mcpTools.filter(t => t.serverName !== serverName)
+        this.setState(
+            serverName,
+            McpServerStatus.DISABLED,
+            0,
+            reason === 'declined' ? 'Not allowed in this folder' : 'Waiting for workspace trust'
+        )
+        this.emitToolsChanged(serverName)
     }
 
     /**
