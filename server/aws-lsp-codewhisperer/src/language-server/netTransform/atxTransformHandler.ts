@@ -3147,7 +3147,10 @@ export class ATXTransformHandler {
             } as AtxGetTransformInfoResponse
         }
 
-        if (hasPlan) {
+        // No HITL open (the agent is waiting on a chat answer, e.g. at the end of the job) with a plan that has steps:
+        // still the execution phase, even when the first step has no sub-steps (e.g. "Assess Solution"). Return the
+        // plan so the IDE keeps seeing step statuses (ITGen stops its apps once Local Verification has finished).
+        if (hasPlan || (!hitlResponse?.HitlTag && plan.Root.Children.length > 0)) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
         } else {

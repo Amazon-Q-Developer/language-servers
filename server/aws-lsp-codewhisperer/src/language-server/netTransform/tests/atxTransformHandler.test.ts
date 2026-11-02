@@ -4072,6 +4072,91 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
             expect(result?.StepInformation).to.be.undefined
         })
+
+        // A plan whose first top-level step has no sub-steps, while later steps do.
+        const planWithLeafFirstStep = () =>
+            ({
+                Root: {
+                    StepId: 'root',
+                    Children: [
+                        { StepId: 'assess', Status: 'SUCCEEDED', Children: [] },
+                        {
+                            StepId: 'transform',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'transform-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                        {
+                            StepId: 'verify',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'verify-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                    ],
+                },
+            }) as any
+
+        it('should return the plan when no HITL is open and only a later step has sub-steps', async () => {
+            // The agent is waiting on a chat answer (e.g. at the end of the job), not on a HITL. The
+            // first step having no sub-steps must not send this down the planning path, which
+            // returns no plan, so the IDE would stop seeing step statuses.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+        })
+
+        it('should keep the planning path for a tagged planning HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                PlanPath: '/p',
+                ReportPath: '/r',
+                HitlTag: 'plan-review',
+                TaskId: 'task-1',
+            } as any)
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.PlanPath).to.equal('/p')
+            expect(result?.ReportPath).to.equal('/r')
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it('should keep the planning path when no HITL is open and the plan is empty', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            sinon.stub(handler, 'getTransformationPlan').resolves({
+                Root: { StepId: 'root', Children: [] },
+            } as any)
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+        })
     })
 
     describe('findPendingHumanInputStep', () => {
