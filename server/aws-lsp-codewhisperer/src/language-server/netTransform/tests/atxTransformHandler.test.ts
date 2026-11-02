@@ -8,7 +8,10 @@ import got from 'got'
 import {
     ATXTransformHandler,
     ATX_OBJECTIVE_BROWSER_KEY,
+    ATX_OBJECTIVE_GENERATE_API_TESTS_KEY,
     ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
+    ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY,
+    ATX_ITGEN_ENABLED_ENV_VAR,
 } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -2665,83 +2668,221 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             expect(objective).to.not.have.property('generate_unit_tests')
         })
 
-        it('should include generate_integration_tests:true in objective when opted in', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
-
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
-        })
-
-        it('should include generate_integration_tests:false in objective on explicit decline', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: false })
-
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(false)
-        })
-
-        it('should omit generate_integration_tests and browser from objective when no choice is sent', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({ workspaceId: 'ws-1' })
-
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-            expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
-        })
-
-        it('should omit generate_integration_tests when the value is not a real boolean', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: 'true' as any })
-
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-        })
-
-        it('should include browser type and version in objective', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({
-                workspaceId: 'ws-1',
-                generateIntegrationTests: true,
-                browser: { Type: 'edge', Version: '130.0.2849.68' },
+        describe('with ITGen off', () => {
+            beforeEach(() => {
+                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
             })
 
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'edge', version: '130.0.2849.68' })
-        })
-
-        it('should send a null browser version when no browser was found', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-            await handler.createJob({
-                workspaceId: 'ws-1',
-                generateIntegrationTests: true,
-                browser: { Type: 'none', Version: null },
+            afterEach(() => {
+                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
             })
 
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'none', version: null })
+            it('should omit the ITGen keys and browser even when the request sets them', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUiTests: true,
+                    generateApiTests: true,
+                    generateIntegrationTests: true,
+                    browser: { Type: 'edge', Version: '130.0.2849.68' },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should omit explicit false ITGen choices too', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUiTests: false,
+                    generateApiTests: false,
+                    generateIntegrationTests: false,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+            })
+
+            it('should still forward generate_unit_tests, which is not an ITGen key', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUnitTests: true,
+                    generateUiTests: true,
+                    generateIntegrationTests: true,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective.generate_unit_tests).to.equal(true)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+            })
+
+            it('should treat a flag value other than exactly "true" as off', async () => {
+                process.env[ATX_ITGEN_ENABLED_ENV_VAR] = '1'
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateUiTests: true, generateIntegrationTests: true })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+            })
         })
 
-        it('should omit browser when it is malformed', async () => {
-            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+        describe('with ITGen on', () => {
+            beforeEach(() => {
+                process.env[ATX_ITGEN_ENABLED_ENV_VAR] = 'true'
+            })
 
-            await handler.createJob({ workspaceId: 'ws-1', browser: { Version: '1.0' } as any })
+            afterEach(() => {
+                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
+            })
 
-            const command = sendStub.firstCall.args[0]
-            const objective = JSON.parse(command.input.objective)
-            expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            it('should include generate_integration_tests:true in objective when opted in', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
+            })
+
+            it('should include generate_integration_tests:false in objective on explicit decline', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: false })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(false)
+            })
+
+            it('should omit generate_integration_tests and browser from objective when no choice is sent', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1' })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should omit generate_integration_tests when the value is not a real boolean', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: 'true' as any })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+            })
+
+            it('should include generate_ui_tests and generate_api_tests in objective', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUnitTests: false,
+                    generateUiTests: true,
+                    generateApiTests: false,
+                    generateIntegrationTests: true,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective.generate_unit_tests).to.equal(false)
+                expect(objective[ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY]).to.equal(true)
+                expect(objective[ATX_OBJECTIVE_GENERATE_API_TESTS_KEY]).to.equal(false)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
+            })
+
+            it('should use the contract key names for UI and API tests', () => {
+                expect(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY).to.equal('generate_ui_tests')
+                expect(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY).to.equal('generate_api_tests')
+                expect(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY).to.equal('generate_integration_tests')
+            })
+
+            it('should omit generate_ui_tests and generate_api_tests when no choice is sent', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                // Older clients only send GenerateIntegrationTests
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
+            })
+
+            it('should omit generate_ui_tests and generate_api_tests when the values are not real booleans', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUiTests: 'true' as any,
+                    generateApiTests: 1 as any,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
+            })
+
+            it('should include browser type and version in objective', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Type: 'edge', Version: '130.0.2849.68' },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'edge', version: '130.0.2849.68' })
+            })
+
+            it('should send a null browser version when no browser was found', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Type: 'none', Version: null },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'none', version: null })
+            })
+
+            it('should omit browser when it is malformed', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', browser: { Version: '1.0' } as any })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
         })
     })
 
@@ -2860,6 +3001,27 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             const args = createJobStub.firstCall.args[0]
             expect(args.generateIntegrationTests).to.equal(true)
             expect(args.browser).to.deep.equal({ Type: 'chrome', Version: '131.0.6778.86' })
+        })
+
+        it('should forward GenerateUITests and GenerateApiTests from the start request to createJob', async () => {
+            const createJobStub = sinon.stub(handler, 'createJob').resolves(null)
+
+            await handler.startTransform({
+                workspaceId: 'ws-1',
+                startTransformRequest: {
+                    TargetFramework: 'net8.0',
+                    GenerateUnitTests: true,
+                    GenerateUITests: false,
+                    GenerateApiTests: true,
+                    GenerateIntegrationTests: true,
+                },
+            })
+
+            const args = createJobStub.firstCall.args[0]
+            expect(args.generateUnitTests).to.equal(true)
+            expect(args.generateUiTests).to.equal(false)
+            expect(args.generateApiTests).to.equal(true)
+            expect(args.generateIntegrationTests).to.equal(true)
         })
 
         it('should return null when createJob returns null', async () => {
