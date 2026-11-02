@@ -26,7 +26,7 @@ export interface StartTransformRequest extends ExecuteCommandParams {
     // Customer's up-front unit-test choice, forwarded to the ATX job objective as
     // `generate_unit_tests`. Optional: absent means "no choice sent" (legacy behavior).
     GenerateUnitTests?: boolean
-    // Customer's up-front "Generate UI tests" and "Generate API tests" choices (under Verification in the start
+    // Customer's up-front "Generate UI tests" and "Generate API tests" choices (under Validation in the start
     // dialog), forwarded to the ATX job objective as `generate_ui_tests` and `generate_api_tests`.
     // Optional: absent means "no choice sent" (older clients).
     GenerateUITests?: boolean

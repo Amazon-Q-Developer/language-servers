@@ -72,7 +72,7 @@ import { request } from 'http'
 import { Utils, workspaceFolderName } from './utils'
 import { BrowserInfo } from './models'
 
-// ATX job objective keys for the test options under "Verification" in the IDE start dialog (contract v0 §1).
+// ATX job objective keys for the test options under "Validation" in the IDE start dialog (contract v0 §1).
 // generate_integration_tests is true when UI or API tests are on; it's the key the Transform agent reads to plan
 // the app launches and test runs. The browser is only sent for UI tests.
 export const ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY = 'generate_ui_tests'
