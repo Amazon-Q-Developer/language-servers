@@ -5179,11 +5179,25 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive').callsFake(fakeExtract(files))
 
         beforeEach(() => {
+            process.env.ATX_ITGEN_ENABLED = 'true'
             root = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-original-'))
         })
 
         afterEach(() => {
+            delete process.env.ATX_ITGEN_ENABLED
             fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('refuses without ATX_ITGEN_ENABLED and touches nothing', async () => {
+            delete process.env.ATX_ITGEN_ENABLED
+            const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/requires ATX_ITGEN_ENABLED/)
+            expect(urlStub.called).to.be.false
+            expect(fs.existsSync(workspaceDir())).to.be.false
         })
 
         it('rejects a relative or traversing solution root', async () => {
@@ -5251,6 +5265,19 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(urlStub.called).to.be.false
         })
 
+        it('cleans up leftovers from an interrupted call even when the copy is reused, and nothing else', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            writeMarker('job-1', 'orig-1')
+            for (const name of ['before.partial-1234', 'before.old-5678', 'before.partialbackup', 'before.notes']) {
+                fs.mkdirSync(path.join(workspaceDir(), name))
+            }
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.AlreadyPresent).to.be.true
+            expect(leftovers().sort()).to.deep.equal(['before.notes', 'before.partialbackup'])
+        })
+
         it('downloads again for the same job when the original-code artifact differs (another repo, or re-saved)', async () => {
             fs.mkdirSync(originalDir(), { recursive: true })
             fs.writeFileSync(path.join(originalDir(), 'OtherRepo.sln'), '')
@@ -5297,8 +5324,8 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const urlStub = presigned()
             stubExtract()
             // Moving the old copy aside fails, as it does on Windows when the IDE holds a file in it open.
-            const realRename = fs.renameSync
-            const rename = sinon.stub(fs, 'renameSync').callsFake((from: fs.PathLike, to: fs.PathLike) => {
+            const realRename = fs.promises.rename
+            const rename = sinon.stub(fs.promises, 'rename').callsFake((from: fs.PathLike, to: fs.PathLike) => {
                 if (String(to).includes('before.old-')) {
                     throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
                 }
@@ -5326,8 +5353,8 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             writeMarker('job-0', 'orig-0')
             presigned()
             stubExtract()
-            const realRename = fs.renameSync
-            sinon.stub(fs, 'renameSync').callsFake((from: fs.PathLike, to: fs.PathLike) => {
+            const realRename = fs.promises.rename
+            sinon.stub(fs.promises, 'rename').callsFake((from: fs.PathLike, to: fs.PathLike) => {
                 if (String(from).includes('before.partial-')) {
                     throw Object.assign(new Error('EBUSY: resource busy, rename'), { code: 'EBUSY' })
                 }

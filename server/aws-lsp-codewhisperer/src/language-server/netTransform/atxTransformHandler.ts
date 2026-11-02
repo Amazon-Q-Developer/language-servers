@@ -100,6 +100,11 @@ function isSafePathSegment(value: unknown): value is string {
     return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..')
 }
 
+// IDE-supplied folders we extract into: absolute, with no '..' segment (a folder like 'Foo..Bar' is fine).
+function isSafeAbsolutePath(value: unknown): value is string {
+    return typeof value === 'string' && path.isAbsolute(value) && !value.split(/[\\/]/).includes('..')
+}
+
 /**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
  */
@@ -1232,7 +1237,7 @@ export class ATXTransformHandler {
             // Reject relative/traversal input so extraction can't be aimed at an unexpected
             // location; the zip-slip guard in extractAllEntriesTo then confines each entry
             // within this dir.
-            if (!destDir || !path.isAbsolute(destDir) || destDir.includes('..')) {
+            if (!isSafeAbsolutePath(destDir)) {
                 return { Success: false, Error: 'Invalid destination directory for beam artifact' }
             }
             const dl = await this.createArtifactDownloadUrl(workspaceId, parentJobId, beamArtifactId)
@@ -1276,8 +1281,10 @@ export class ATXTransformHandler {
         codeArtifactId: string,
         solutionRootPath: string
     ): Promise<AtxDownloadOriginalCodeResponse> {
-        // A '..' segment could aim the copy elsewhere; a folder like 'Foo..Bar' is fine.
-        if (!solutionRootPath || !path.isAbsolute(solutionRootPath) || solutionRootPath.split(/[\\/]/).includes('..')) {
+        if (!isItGenEnabled()) {
+            return { Success: false, Error: `downloadOriginalCode requires ${ATX_ITGEN_ENABLED_ENV_VAR}` }
+        }
+        if (!isSafeAbsolutePath(solutionRootPath)) {
             return { Success: false, Error: 'Invalid solution root path for original code' }
         }
         // jobId is written to the marker and used for the FES call: keep it a plain id.
@@ -1309,12 +1316,13 @@ export class ATXTransformHandler {
         const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
         let stagingDir: string | undefined
         try {
+            // Before the reuse check, so leftovers from an earlier interrupted call go even when the copy is reused.
+            await this.removeOriginalCodeLeftovers(originalDir)
             const current = this.readOriginalCodeMarker(marker)
             if (current?.jobId === jobId && current.codeArtifactId === codeArtifactId) {
                 this.logging.log(`ATX: downloadOriginalCode: reusing ${codeArtifactId} at ${originalDir}`)
                 return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
             }
-            this.removeOriginalCodeLeftovers(originalDir)
 
             this.logging.log(`ATX: downloadOriginalCode ${codeArtifactId} -> ${originalDir}`)
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, codeArtifactId)
@@ -1349,14 +1357,14 @@ export class ATXTransformHandler {
             let aside: string | undefined
             if (fs.existsSync(originalDir)) {
                 aside = `${originalDir}.old-${uuidv4()}`
-                fs.renameSync(originalDir, aside)
+                await fs.promises.rename(originalDir, aside)
             }
             try {
-                fs.renameSync(stagingDir, originalDir)
+                await fs.promises.rename(stagingDir, originalDir)
             } catch (error) {
                 if (aside) {
                     try {
-                        fs.renameSync(aside, originalDir) // put the old copy back (without its marker)
+                        await fs.promises.rename(aside, originalDir) // put the old copy back (without its marker)
                     } catch {
                         /* the next call cleans up */
                     }
@@ -1366,7 +1374,7 @@ export class ATXTransformHandler {
             stagingDir = undefined
             if (aside) {
                 try {
-                    fs.rmSync(aside, { recursive: true, force: true })
+                    await fs.promises.rm(aside, { recursive: true, force: true })
                 } catch (error) {
                     this.logging.log(`ATX: downloadOriginalCode: couldn't remove ${aside} yet: ${String(error)}`)
                 }
@@ -1379,7 +1387,7 @@ export class ATXTransformHandler {
         } finally {
             if (stagingDir) {
                 try {
-                    fs.rmSync(stagingDir, { recursive: true, force: true })
+                    await fs.promises.rm(stagingDir, { recursive: true, force: true })
                 } catch {
                     /* the next call cleans up */
                 }
@@ -1399,14 +1407,14 @@ export class ATXTransformHandler {
     }
 
     /** Staging and moved-aside folders that an interrupted call left next to artifactWorkspace/before. */
-    private removeOriginalCodeLeftovers(originalDir: string): void {
+    private async removeOriginalCodeLeftovers(originalDir: string): Promise<void> {
         const parent = path.dirname(originalDir)
         if (!fs.existsSync(parent)) return
-        const prefix = path.basename(originalDir) + '.'
+        const base = path.basename(originalDir)
         for (const name of fs.readdirSync(parent)) {
-            if (name.startsWith(prefix + 'partial') || name.startsWith(prefix + 'old-')) {
+            if (name.startsWith(`${base}.partial-`) || name.startsWith(`${base}.old-`)) {
                 try {
-                    fs.rmSync(path.join(parent, name), { recursive: true, force: true })
+                    await fs.promises.rm(path.join(parent, name), { recursive: true, force: true })
                 } catch {
                     /* still locked; try again next time */
                 }

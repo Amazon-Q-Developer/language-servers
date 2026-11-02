@@ -54,7 +54,7 @@ const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
 // Beam to IDE
 const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
 const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
-// ITGen
+// ITGen; the handler refuses it unless ATX_ITGEN_ENABLED is on
 const AtxDownloadOriginalCodeCommand = 'aws/atxTransform/downloadOriginalCode'
 
 export const AtxNetTransformServerToken =
