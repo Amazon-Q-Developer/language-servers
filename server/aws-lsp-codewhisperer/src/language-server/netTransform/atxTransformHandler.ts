@@ -74,7 +74,8 @@ import { BrowserInfo } from './models'
 
 // ATX job objective keys for the test options under "Validation" in the IDE start dialog (contract v0 §1).
 // generate_integration_tests is true when UI or API tests are on; it's the key the Transform agent reads to plan
-// the app launches and test runs. The browser is only sent for UI tests.
+// the app launches and test runs. The browser is only sent for UI tests. createJob only writes these keys
+// while isItGenEnabled().
 export const ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY = 'generate_ui_tests'
 export const ATX_OBJECTIVE_GENERATE_API_TESTS_KEY = 'generate_api_tests'
 export const ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY = 'generate_integration_tests'
@@ -659,26 +660,32 @@ export class ATXTransformHandler {
                 objective.generate_unit_tests = request.generateUnitTests
             }
 
-            // The customer's up-front UI and API test choices, and generate_integration_tests (true when either is on).
-            // Same rule as unit tests: only a real boolean counts, and an explicit false is a decline.
-            if (typeof request.generateUiTests === 'boolean') {
-                objective[ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY] = request.generateUiTests
-            }
+            // The ITGen keys are only written while ITGen is on, like the other ITGen paths in this
+            // handler, so a client that sends them can't change the job objective where ITGen is off.
+            // generate_unit_tests above is the separate unit-test feature and stays ungated.
+            if (isItGenEnabled()) {
+                // The customer's up-front UI and API test choices, and generate_integration_tests (true when
+                // either is on). Same rule as unit tests: only a real boolean counts, and an explicit false
+                // is a decline.
+                if (typeof request.generateUiTests === 'boolean') {
+                    objective[ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY] = request.generateUiTests
+                }
 
-            if (typeof request.generateApiTests === 'boolean') {
-                objective[ATX_OBJECTIVE_GENERATE_API_TESTS_KEY] = request.generateApiTests
-            }
+                if (typeof request.generateApiTests === 'boolean') {
+                    objective[ATX_OBJECTIVE_GENERATE_API_TESTS_KEY] = request.generateApiTests
+                }
 
-            if (typeof request.generateIntegrationTests === 'boolean') {
-                objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY] = request.generateIntegrationTests
-            }
+                if (typeof request.generateIntegrationTests === 'boolean') {
+                    objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY] = request.generateIntegrationTests
+                }
 
-            // Browser used to run the generated UI tests against localhost. The client only sends it
-            // when UI tests are requested; drop anything that isn't a well-formed object.
-            if (request.browser && typeof request.browser.Type === 'string') {
-                objective[ATX_OBJECTIVE_BROWSER_KEY] = {
-                    type: request.browser.Type,
-                    version: typeof request.browser.Version === 'string' ? request.browser.Version : null,
+                // Browser used to run the generated UI tests against localhost. The client only sends it
+                // when UI tests are requested; drop anything that isn't a well-formed object.
+                if (request.browser && typeof request.browser.Type === 'string') {
+                    objective[ATX_OBJECTIVE_BROWSER_KEY] = {
+                        type: request.browser.Type,
+                        version: typeof request.browser.Version === 'string' ? request.browser.Version : null,
+                    }
                 }
             }
 
