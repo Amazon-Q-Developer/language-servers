@@ -8,9 +8,7 @@ import got from 'got'
 import {
     ATXTransformHandler,
     ATX_OBJECTIVE_BROWSER_KEY,
-    ATX_OBJECTIVE_GENERATE_API_TESTS_KEY,
     ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
-    ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY,
     ATX_ITGEN_ENABLED_ENV_VAR,
 } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
@@ -2682,34 +2680,23 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
 
                 await handler.createJob({
                     workspaceId: 'ws-1',
-                    generateUiTests: true,
-                    generateApiTests: true,
                     generateIntegrationTests: true,
                     browser: { Type: 'edge', Version: '130.0.2849.68' },
                 })
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
             })
 
-            it('should omit explicit false ITGen choices too', async () => {
+            it('should omit an explicit false ITGen choice too', async () => {
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUiTests: false,
-                    generateApiTests: false,
-                    generateIntegrationTests: false,
-                })
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: false })
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
             })
 
@@ -2719,14 +2706,12 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 await handler.createJob({
                     workspaceId: 'ws-1',
                     generateUnitTests: true,
-                    generateUiTests: true,
                     generateIntegrationTests: true,
                 })
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
                 expect(objective.generate_unit_tests).to.equal(true)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
             })
 
@@ -2734,11 +2719,10 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 process.env[ATX_ITGEN_ENABLED_ENV_VAR] = '1'
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
-                await handler.createJob({ workspaceId: 'ws-1', generateUiTests: true, generateIntegrationTests: true })
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
             })
         })
@@ -2793,57 +2777,26 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
             })
 
-            it('should include generate_ui_tests and generate_api_tests in objective', async () => {
+            it('should never write generate_ui_tests or generate_api_tests', async () => {
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
+                // generate_integration_tests is the only ITGen key; anything else a client sends is dropped.
                 await handler.createJob({
                     workspaceId: 'ws-1',
-                    generateUnitTests: false,
-                    generateUiTests: true,
-                    generateApiTests: false,
                     generateIntegrationTests: true,
-                })
+                    generateUiTests: true,
+                    generateApiTests: true,
+                } as any)
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
-                expect(objective.generate_unit_tests).to.equal(false)
-                expect(objective[ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY]).to.equal(true)
-                expect(objective[ATX_OBJECTIVE_GENERATE_API_TESTS_KEY]).to.equal(false)
+                expect(objective).to.not.have.property('generate_ui_tests')
+                expect(objective).to.not.have.property('generate_api_tests')
                 expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
             })
 
-            it('should use the contract key names for UI and API tests', () => {
-                expect(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY).to.equal('generate_ui_tests')
-                expect(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY).to.equal('generate_api_tests')
+            it('should use the contract key name for integration tests', () => {
                 expect(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY).to.equal('generate_integration_tests')
-            })
-
-            it('should omit generate_ui_tests and generate_api_tests when no choice is sent', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                // Older clients only send GenerateIntegrationTests
-                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
-                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
-            })
-
-            it('should omit generate_ui_tests and generate_api_tests when the values are not real booleans', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUiTests: 'true' as any,
-                    generateApiTests: 1 as any,
-                })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
             })
 
             it('should include browser type and version in objective', async () => {
@@ -3003,7 +2956,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             expect(args.browser).to.deep.equal({ Type: 'chrome', Version: '131.0.6778.86' })
         })
 
-        it('should forward GenerateUITests and GenerateApiTests from the start request to createJob', async () => {
+        it('should not forward GenerateUITests or GenerateApiTests from the start request', async () => {
             const createJobStub = sinon.stub(handler, 'createJob').resolves(null)
 
             await handler.startTransform({
@@ -3019,8 +2972,8 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
 
             const args = createJobStub.firstCall.args[0]
             expect(args.generateUnitTests).to.equal(true)
-            expect(args.generateUiTests).to.equal(false)
-            expect(args.generateApiTests).to.equal(true)
+            expect(args).to.not.have.property('generateUiTests')
+            expect(args).to.not.have.property('generateApiTests')
             expect(args.generateIntegrationTests).to.equal(true)
         })
 
