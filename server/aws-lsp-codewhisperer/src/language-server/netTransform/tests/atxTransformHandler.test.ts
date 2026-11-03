@@ -1156,7 +1156,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         const appliedOrder = () => applyStub.getCalls().map(c => path.basename(c.args[0]))
 
         beforeEach(() => {
-            ;(handler as any)._itGenJobs.set(JOB_ID, true)
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
             tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-apply-'))
             checkpointsDir = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
             sendStub = (handler as any).atxClient.send
@@ -1283,7 +1283,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
 
         it('keeps the depth-2-only behavior for a job without generate_integration_tests', async () => {
-            ;(handler as any)._itGenJobs.set(JOB_ID, false)
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, false)
             sendStub.resolves(listedArtifacts())
 
             await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
@@ -5319,8 +5319,8 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive').callsFake(fakeExtract(files))
 
         beforeEach(() => {
-            ;(handler as any)._itGenJobs.set('job-0', true)
-            ;(handler as any)._itGenJobs.set('job-1', true)
+            ;(handler as any).itGenJobs.rememberFlag('job-0', true)
+            ;(handler as any).itGenJobs.rememberFlag('job-1', true)
             root = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-original-'))
         })
 
@@ -5329,7 +5329,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         })
 
         it('refuses for a job without generate_integration_tests and touches nothing', async () => {
-            ;(handler as any)._itGenJobs.set('job-1', false)
+            ;(handler as any).itGenJobs.rememberFlag('job-1', false)
             const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
 
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)

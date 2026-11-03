@@ -68,7 +68,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
     let itGenJob: boolean
     const setItGen = (on: boolean) => {
         itGenJob = on
-        ;(handler as any)._itGenJobs.delete(JOB_ID)
+        ;(handler as any).itGenJobs.forget(JOB_ID)
     }
 
     beforeEach(() => {
