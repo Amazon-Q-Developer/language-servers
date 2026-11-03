@@ -8,10 +8,8 @@ import got from 'got'
 import {
     ATXTransformHandler,
     ATX_OBJECTIVE_BROWSER_KEY,
-    ATX_OBJECTIVE_GENERATE_API_TESTS_KEY,
     ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
-    ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY,
-    ATX_ITGEN_ENABLED_ENV_VAR,
+    objectiveHasIntegrationTests,
 } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -1158,7 +1156,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         const appliedOrder = () => applyStub.getCalls().map(c => path.basename(c.args[0]))
 
         beforeEach(() => {
-            process.env.ATX_ITGEN_ENABLED = 'true'
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
             tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-apply-'))
             checkpointsDir = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
             sendStub = (handler as any).atxClient.send
@@ -1174,7 +1172,6 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
 
         afterEach(() => {
-            delete process.env.ATX_ITGEN_ENABLED
             fs.rmSync(tmpRoot, { recursive: true, force: true })
         })
 
@@ -1285,8 +1282,8 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal(['round-1'])
         })
 
-        it('keeps the depth-2-only behavior when the flag is off', async () => {
-            delete process.env.ATX_ITGEN_ENABLED
+        it('keeps the depth-2-only behavior for a job without generate_integration_tests', async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, false)
             sendStub.resolves(listedArtifacts())
 
             await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
@@ -2668,90 +2665,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             expect(objective).to.not.have.property('generate_unit_tests')
         })
 
-        describe('with ITGen off', () => {
-            beforeEach(() => {
-                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
-            })
-
-            afterEach(() => {
-                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
-            })
-
-            it('should omit the ITGen keys and browser even when the request sets them', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUiTests: true,
-                    generateApiTests: true,
-                    generateIntegrationTests: true,
-                    browser: { Type: 'edge', Version: '130.0.2849.68' },
-                })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
-            })
-
-            it('should omit explicit false ITGen choices too', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUiTests: false,
-                    generateApiTests: false,
-                    generateIntegrationTests: false,
-                })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-            })
-
-            it('should still forward generate_unit_tests, which is not an ITGen key', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUnitTests: true,
-                    generateUiTests: true,
-                    generateIntegrationTests: true,
-                })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective.generate_unit_tests).to.equal(true)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-            })
-
-            it('should treat a flag value other than exactly "true" as off', async () => {
-                process.env[ATX_ITGEN_ENABLED_ENV_VAR] = '1'
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({ workspaceId: 'ws-1', generateUiTests: true, generateIntegrationTests: true })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
-            })
-        })
-
-        describe('with ITGen on', () => {
-            beforeEach(() => {
-                process.env[ATX_ITGEN_ENABLED_ENV_VAR] = 'true'
-            })
-
-            afterEach(() => {
-                delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
-            })
-
+        describe('integration tests', () => {
             it('should include generate_integration_tests:true in objective when opted in', async () => {
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
@@ -2793,57 +2707,26 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
             })
 
-            it('should include generate_ui_tests and generate_api_tests in objective', async () => {
+            it('should never write generate_ui_tests or generate_api_tests', async () => {
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
+                // generate_integration_tests is the only ITGen key; anything else a client sends is dropped.
                 await handler.createJob({
                     workspaceId: 'ws-1',
-                    generateUnitTests: false,
-                    generateUiTests: true,
-                    generateApiTests: false,
                     generateIntegrationTests: true,
-                })
+                    generateUiTests: true,
+                    generateApiTests: true,
+                } as any)
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
-                expect(objective.generate_unit_tests).to.equal(false)
-                expect(objective[ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY]).to.equal(true)
-                expect(objective[ATX_OBJECTIVE_GENERATE_API_TESTS_KEY]).to.equal(false)
+                expect(objective).to.not.have.property('generate_ui_tests')
+                expect(objective).to.not.have.property('generate_api_tests')
                 expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
             })
 
-            it('should use the contract key names for UI and API tests', () => {
-                expect(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY).to.equal('generate_ui_tests')
-                expect(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY).to.equal('generate_api_tests')
+            it('should use the contract key name for integration tests', () => {
                 expect(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY).to.equal('generate_integration_tests')
-            })
-
-            it('should omit generate_ui_tests and generate_api_tests when no choice is sent', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                // Older clients only send GenerateIntegrationTests
-                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
-                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
-            })
-
-            it('should omit generate_ui_tests and generate_api_tests when the values are not real booleans', async () => {
-                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
-
-                await handler.createJob({
-                    workspaceId: 'ws-1',
-                    generateUiTests: 'true' as any,
-                    generateApiTests: 1 as any,
-                })
-
-                const command = sendStub.firstCall.args[0]
-                const objective = JSON.parse(command.input.objective)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_UI_TESTS_KEY)
-                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_API_TESTS_KEY)
             })
 
             it('should include browser type and version in objective', async () => {
@@ -2877,12 +2760,107 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             it('should omit browser when it is malformed', async () => {
                 sendStub.resolves({ jobId: 'j', status: 'CREATED' })
 
-                await handler.createJob({ workspaceId: 'ws-1', browser: { Version: '1.0' } as any })
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Version: '1.0' } as any,
+                })
 
                 const command = sendStub.firstCall.args[0]
                 const objective = JSON.parse(command.input.objective)
                 expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
             })
+
+            it('should omit browser without integration tests', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: false,
+                    browser: { Type: 'msedge', Version: '130.0.2849.68' },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should keep generate_unit_tests independent of integration tests', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUnitTests: true,
+                    generateIntegrationTests: false,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective.generate_unit_tests).to.equal(true)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(false)
+            })
+
+            it('should remember the job as an ITGen job without asking GetJob', async () => {
+                sendStub.resolves({ jobId: 'job-it', status: 'CREATED' })
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
+                sendStub.resetHistory()
+
+                expect(await handler.isItGenJob('ws-1', 'job-it')).to.be.true
+                expect(sendStub.called).to.be.false
+            })
+
+            it('should remember a job created without integration tests as not ITGen', async () => {
+                sendStub.resolves({ jobId: 'job-plain', status: 'CREATED' })
+                await handler.createJob({ workspaceId: 'ws-1' })
+                sendStub.resetHistory()
+
+                expect(await handler.isItGenJob('ws-1', 'job-plain')).to.be.false
+                expect(sendStub.called).to.be.false
+            })
+        })
+    })
+
+    describe('isItGenJob', () => {
+        it('reads the objective from GetJob once and caches it', async () => {
+            sendStub.resolves({ job: { objective: JSON.stringify({ generate_integration_tests: true }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-old')).to.be.true
+            expect(await handler.isItGenJob('ws-1', 'job-old')).to.be.true
+
+            expect(sendStub.callCount).to.equal(1)
+            expect(sendStub.firstCall.args[0].input.includeObjective).to.be.true
+        })
+
+        it('treats a job whose objective has no generate_integration_tests as not ITGen', async () => {
+            sendStub.resolves({ job: { objective: JSON.stringify({ target_framework: 'net10.0' }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-plain')).to.be.false
+        })
+
+        it('asks again on the next call when GetJob fails', async () => {
+            sendStub.onFirstCall().rejects(new Error('throttled'))
+            sendStub
+                .onSecondCall()
+                .resolves({ job: { objective: JSON.stringify({ generate_integration_tests: true }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-x')).to.be.false
+            expect(await handler.isItGenJob('ws-1', 'job-x')).to.be.true
+            expect(sendStub.callCount).to.equal(2)
+        })
+    })
+
+    describe('objectiveHasIntegrationTests', () => {
+        it('is true only for a real true', () => {
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: true }))).to.be.true
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: false }))).to.be.false
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: 'true' }))).to.be.false
+            expect(objectiveHasIntegrationTests(JSON.stringify({}))).to.be.false
+        })
+
+        it('is false for a missing or unparseable objective', () => {
+            expect(objectiveHasIntegrationTests(undefined)).to.be.false
+            expect(objectiveHasIntegrationTests('')).to.be.false
+            expect(objectiveHasIntegrationTests('{not json')).to.be.false
         })
     })
 
@@ -3003,7 +2981,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             expect(args.browser).to.deep.equal({ Type: 'chrome', Version: '131.0.6778.86' })
         })
 
-        it('should forward GenerateUITests and GenerateApiTests from the start request to createJob', async () => {
+        it('should not forward GenerateUITests or GenerateApiTests from the start request', async () => {
             const createJobStub = sinon.stub(handler, 'createJob').resolves(null)
 
             await handler.startTransform({
@@ -3019,8 +2997,8 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
 
             const args = createJobStub.firstCall.args[0]
             expect(args.generateUnitTests).to.equal(true)
-            expect(args.generateUiTests).to.equal(false)
-            expect(args.generateApiTests).to.equal(true)
+            expect(args).to.not.have.property('generateUiTests')
+            expect(args).to.not.have.property('generateApiTests')
             expect(args.generateIntegrationTests).to.equal(true)
         })
 
@@ -5341,23 +5319,23 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive').callsFake(fakeExtract(files))
 
         beforeEach(() => {
-            process.env.ATX_ITGEN_ENABLED = 'true'
+            ;(handler as any).itGenJobs.rememberFlag('job-0', true)
+            ;(handler as any).itGenJobs.rememberFlag('job-1', true)
             root = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-original-'))
         })
 
         afterEach(() => {
-            delete process.env.ATX_ITGEN_ENABLED
             fs.rmSync(root, { recursive: true, force: true })
         })
 
-        it('refuses without ATX_ITGEN_ENABLED and touches nothing', async () => {
-            delete process.env.ATX_ITGEN_ENABLED
+        it('refuses for a job without generate_integration_tests and touches nothing', async () => {
+            ;(handler as any).itGenJobs.rememberFlag('job-1', false)
             const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
 
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.match(/requires ATX_ITGEN_ENABLED/)
+            expect(result.Error).to.match(/requires a job with generate_integration_tests/)
             expect(urlStub.called).to.be.false
             expect(fs.existsSync(workspaceDir())).to.be.false
         })

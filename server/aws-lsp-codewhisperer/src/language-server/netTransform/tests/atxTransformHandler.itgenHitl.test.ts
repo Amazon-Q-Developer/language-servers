@@ -9,7 +9,6 @@ import {
     ATXTransformHandler,
     ATX_HITL_TAG_INTEG_APP_LAUNCH,
     ATX_HITL_TAG_INTEG_TEST_RUN,
-    ATX_ITGEN_ENABLED_ENV_VAR,
     isSafeRelativeProjectPath,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
@@ -64,8 +63,16 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             SolutionRootPath: tmpRoot,
         } as any)
 
+    // ITGen runs only for a job whose objective has generate_integration_tests: true. The GetJob stub
+    // returns that objective; setItGen also updates the LS's per-job cache so a mid-test change is seen.
+    let itGenJob: boolean
+    const setItGen = (on: boolean) => {
+        itGenJob = on
+        ;(handler as any).itGenJobs.forget(JOB_ID)
+    }
+
     beforeEach(() => {
-        process.env[ATX_ITGEN_ENABLED_ENV_VAR] = 'true'
+        itGenJob = true
         tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-hitl-'))
         logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
         handler = new ATXTransformHandler(
@@ -90,7 +97,13 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
                 throw new Error(`unexpected ${command.constructor.name}`)
             }),
         }
-        sinon.stub(handler, 'getJob').callsFake(async () => ({ statusDetails: { status: jobStatus } }) as any)
+        sinon.stub(handler, 'getJob').callsFake(
+            async () =>
+                ({
+                    statusDetails: { status: jobStatus },
+                    objective: JSON.stringify({ generate_integration_tests: itGenJob }),
+                }) as any
+        )
         sinon.stub(handler, 'getTransformationPlan').resolves({ Root: { Children: [] } } as any)
         sinon.stub(handler as any, 'listWorklogs').resolves(undefined)
 
@@ -115,7 +128,6 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
     afterEach(() => {
         sinon.restore()
-        delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
         fs.rmSync(tmpRoot, { recursive: true, force: true })
     })
 
@@ -139,13 +151,13 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect((await poll())?.HitlTag).to.equal('missing-packages')
         })
 
-        it('puts integ-test-run ahead of a post-LBV checkpoint only when the flag is on', async () => {
+        it('puts integ-test-run ahead of a post-LBV checkpoint only for a job with generate_integration_tests', async () => {
             ;(handler as any).jobsPastLocalBuild.add(JOB_ID)
             hitls = [{ taskId: 'task-cp', tag: `${JOB_ID}-checkpoint` }, testRunHitl]
 
             expect((await poll())?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
 
-            delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
+            setItGen(false)
             expect((await poll())?.HitlTag).to.equal(`${JOB_ID}-checkpoint`)
         })
 
@@ -176,11 +188,11 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
     })
 
-    // With the flag off an integ-* tag is just an unknown tag: every path must behave exactly as it
+    // For a job without generate_integration_tests an integ-* tag is just an unknown tag: every path must behave exactly as it
     // did before ITGen, and nothing ITGen-specific (request.json, tests download) may happen.
-    describe('flag off: existing behavior unchanged', () => {
+    describe('job without generate_integration_tests: existing behavior unchanged', () => {
         beforeEach(() => {
-            delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
+            setItGen(false)
         })
 
         const noItGenFiles = () => {
@@ -477,8 +489,8 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(open.RequestError).to.contain('no agent artifact')
         })
 
-        it('is absent when the flag is off', async () => {
-            delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
+        it('is absent for a job without generate_integration_tests', async () => {
+            setItGen(false)
             hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
 
             const result = await poll()
@@ -540,14 +552,14 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(submitStub.firstCall.args).to.deep.equal([WS_ID, JOB_ID, 'task-run', 'upload-1'])
         })
 
-        it('refuses when the flag is off', async () => {
-            delete process.env[ATX_ITGEN_ENABLED_ENV_VAR]
+        it('refuses for a job without generate_integration_tests', async () => {
+            setItGen(false)
             const full = writeZip('results.zip', { 'summary.json': summary() })
 
             const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.contain(ATX_ITGEN_ENABLED_ENV_VAR)
+            expect(result.Error).to.contain('requires a job with generate_integration_tests')
             expect(uploadUrlStub.called).to.be.false
         })
 
