@@ -151,7 +151,7 @@ export interface AtxGetTransformInfoResponse {
     // Surfaced so the IDE can restore the correct mode instead of relying on its local
     // settings store, which may be missing/stale (e.g. cold restart on another machine).
     InteractiveMode?: InteractiveMode
-    // ITGen (ATX_ITGEN_ENABLED only): every HITL open this poll, so a test-run HITL can't be
+    // ITGen (jobs with generate_integration_tests only): every HITL open this poll, so a test-run HITL can't be
     // hidden behind the one HitlTag/HitlTaskId picks. Absent when the poll didn't list HITLs.
     OpenHitls?: AtxOpenHitl[]
 }

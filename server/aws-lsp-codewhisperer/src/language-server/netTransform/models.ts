@@ -26,8 +26,9 @@ export interface StartTransformRequest extends ExecuteCommandParams {
     // Customer's up-front unit-test choice, forwarded to the ATX job objective as
     // `generate_unit_tests`. Optional: absent means "no choice sent" (legacy behavior).
     GenerateUnitTests?: boolean
-    // Customer's up-front "Generate and run integration tests on this machine" choice, forwarded to the ATX
-    // job objective. Optional: absent means "no choice sent" (legacy behavior).
+    // The customer's "Generate and run integration tests" choice, forwarded to the ATX job objective as
+    // `generate_integration_tests`, the only ITGen key.
+    // Optional: absent means "no choice sent" (legacy behavior).
     GenerateIntegrationTests?: boolean
     // Browser found on the customer's machine for running the generated tests against localhost.
     // Only sent by the client when GenerateIntegrationTests is true.

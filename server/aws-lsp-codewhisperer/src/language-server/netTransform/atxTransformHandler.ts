@@ -72,20 +72,15 @@ import { request } from 'http'
 
 import { Utils, workspaceFolderName } from './utils'
 import { BrowserInfo } from './models'
+import { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, ItGenJobGate } from './itgenJobGate'
 
-// ATX job objective keys for the "Generate and run integration tests on this machine" option.
-// TODO: key name pending confirmation from the Transform agent (C1) - change it here only.
-export const ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY = 'generate_integration_tests'
+// ATX job objective keys for the integration-test option in the IDE start dialog (contract v0 §1).
+// generate_integration_tests is the only ITGen key: the Transform agent reads it to plan the app launches and
+// test runs. The browser is only sent with it. It also gates the LS's ITGen code: ITGen HITLs, OpenHitls,
+// test-result submits, diffs at any depth and the original-code download run only for jobs whose objective has
+// generate_integration_tests: true (ItGenJobGate); every other job behaves exactly as before ITGen.
+export { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, objectiveHasIntegrationTests } from './itgenJobGate'
 export const ATX_OBJECTIVE_BROWSER_KEY = 'browser'
-
-// LS-side feature flag for the ITGen (integration test generation) plumbing. Off unless the env
-// var is exactly 'true'; while off, the LS behaves exactly as before ITGen.
-// TODO: row 18 replaces this with the real feature flag - change it here only.
-export const ATX_ITGEN_ENABLED_ENV_VAR = 'ATX_ITGEN_ENABLED'
-
-export function isItGenEnabled(): boolean {
-    return process.env[ATX_ITGEN_ENABLED_ENV_VAR] === 'true'
-}
 
 // ITGen HITL tags (contract v0 §3). The IDE answers both; one task per launch attempt / test run.
 export const ATX_HITL_TAG_INTEG_APP_LAUNCH = 'integ-app-launch'
@@ -237,6 +232,11 @@ export class ATXTransformHandler {
     // yet), reused to build OpenHitls without a second ListHitls call. Same lifetime as
     // _currentDiffContext.
     private _currentPollHitls: any[] | undefined = undefined
+    // ITGen: whether each job's objective has generate_integration_tests: true (see ItGenJobGate).
+    private readonly itGenJobs = new ItGenJobGate(
+        (workspaceId, jobId) => this.getJob(workspaceId, jobId, true),
+        message => this.logging.log(message)
+    )
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -431,6 +431,7 @@ export class ATXTransformHandler {
             this.interactiveModeByJob.delete(jobId)
             this._worklogNextTokenByJob.delete(jobId)
             Utils.clearWorklogCacheForJob(jobId)
+            this.itGenJobs.forget(jobId)
         }
         this.logging.log('ATX: Cleared job cache')
     }
@@ -682,15 +683,19 @@ export class ATXTransformHandler {
                 objective.generate_unit_tests = request.generateUnitTests
             }
 
-            // The customer's up-front "Generate and run integration tests on this machine" choice. Same rule as unit tests:
-            // only a real boolean counts, and an explicit false is a decline.
+            // The customer's integration-test choice, the only ITGen key. Same rule as unit tests: only a
+            // real boolean counts, and an explicit false is a decline.
             if (typeof request.generateIntegrationTests === 'boolean') {
                 objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY] = request.generateIntegrationTests
             }
 
-            // Browser used to run the generated tests against localhost. The client only sends it
-            // when integration tests are requested; drop anything that isn't a well-formed object.
-            if (request.browser && typeof request.browser.Type === 'string') {
+            // Browser used to run the generated tests against localhost. Only sent with integration tests;
+            // drop anything that isn't a well-formed object.
+            if (
+                request.generateIntegrationTests === true &&
+                request.browser &&
+                typeof request.browser.Type === 'string'
+            ) {
                 objective[ATX_OBJECTIVE_BROWSER_KEY] = {
                     type: request.browser.Type,
                     version: typeof request.browser.Version === 'string' ? request.browser.Version : null,
@@ -721,6 +726,7 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: CreateJob RequestId: ${response.$metadata?.requestId}`)
 
             if (response.jobId && response.status) {
+                this.itGenJobs.rememberFlag(response.jobId, request.generateIntegrationTests === true)
                 return { jobId: response.jobId, status: response.status }
             }
 
@@ -1301,15 +1307,15 @@ export class ATXTransformHandler {
         codeArtifactId: string,
         solutionRootPath: string
     ): Promise<AtxDownloadOriginalCodeResponse> {
-        if (!isItGenEnabled()) {
-            return { Success: false, Error: `downloadOriginalCode requires ${ATX_ITGEN_ENABLED_ENV_VAR}` }
-        }
         if (!isSafeAbsolutePath(solutionRootPath)) {
             return { Success: false, Error: 'Invalid solution root path for original code' }
         }
         // jobId is written to the marker and used for the FES call: keep it a plain id.
         if (!isSafePathSegment(jobId)) {
             return { Success: false, Error: 'Invalid job id for original code' }
+        }
+        if (!(await this.isItGenJob(workspaceId, jobId))) {
+            return { Success: false, Error: 'downloadOriginalCode requires a job with generate_integration_tests' }
         }
         const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
         const key = path.resolve(originalDir).toLowerCase()
@@ -1689,6 +1695,15 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * ITGen: whether the job's objective has generate_integration_tests: true. The LS runs its ITGen
+     * code (ITGen HITLs, OpenHitls, test-result submits, diffs at any depth, the original-code
+     * download) only for these jobs. A failed GetJob isn't cached, so the next call asks again.
+     */
+    async isItGenJob(workspaceId: string, jobId: string): Promise<boolean> {
+        return this.itGenJobs.isItGenJob(workspaceId, jobId)
+    }
+
     async getJob(workspaceId: string, jobId: string, includeObjective: boolean = false): Promise<JobInfo | null> {
         try {
             this.logging.log(`ATX: Getting job: ${jobId} in workspace: ${workspaceId}`)
@@ -1834,7 +1849,7 @@ export class ATXTransformHandler {
 
             this.logging.log(`ATX: ListHitls completed - Found ${result.hitlTasks?.length || 0} tasks`)
             const hitls = result.hitlTasks || []
-            if (this._currentDiffContext && isItGenEnabled()) {
+            if (this._currentDiffContext && this.itGenJobs.isKnownItGenJob(jobId)) {
                 this._currentPollHitls = hitls
             }
             return hitls
@@ -1994,8 +2009,11 @@ export class ATXTransformHandler {
         solutionRootPath: string
     ): Promise<{ Success: boolean; Error?: string }> {
         try {
-            if (!isItGenEnabled()) {
-                return { Success: false, Error: `completeHitlWithTestResults requires ${ATX_ITGEN_ENABLED_ENV_VAR}` }
+            if (!(await this.isItGenJob(workspaceId, jobId))) {
+                return {
+                    Success: false,
+                    Error: 'completeHitlWithTestResults requires a job with generate_integration_tests',
+                }
             }
             if (!taskId) {
                 return { Success: false, Error: 'TaskId is required' }
@@ -2121,10 +2139,10 @@ export class ATXTransformHandler {
 
     /**
      * ITGen: the first open integ-app-launch, else integ-test-run HITL in the pool. Undefined when
-     * ATX_ITGEN_ENABLED is off, so every selection site keeps today's order.
+     * the job has no generate_integration_tests, so every selection site keeps today's order.
      */
-    private findItGenHitl(pool: any[]): any | undefined {
-        if (!isItGenEnabled()) {
+    private findItGenHitl(pool: any[], jobId: string): any | undefined {
+        if (!this.itGenJobs.isKnownItGenJob(jobId)) {
             return undefined
         }
         return (
@@ -2470,7 +2488,7 @@ export class ATXTransformHandler {
                 scopedLbv ||
                 fallbackPool.find(h => h.tag === 'local-build-verification') ||
                 fallbackPool.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
-                this.findItGenHitl(fallbackPool) ||
+                this.findItGenHitl(fallbackPool, jobId) ||
                 fallbackPool[0]
             if (!hitl) {
                 this.logging.log(
@@ -2504,7 +2522,7 @@ export class ATXTransformHandler {
 
             // ITGen: the IDE answers these too. The agent artifact is request.json, not a plan ZIP;
             // it's downloaded per task for OpenHitls (buildOpenHitls), not here.
-            if (isItGenEnabled() && isItGenHitlTag(hitlTag)) {
+            if (this.itGenJobs.isKnownItGenJob(jobId) && isItGenHitlTag(hitlTag)) {
                 const itGenStepId = this.getStepId(hitl)
                 this.logging.log(
                     `ATX: ${hitlTag} HITL — returning tag for IDE to handle | stepId=${itGenStepId ?? '<none>'}`
@@ -2613,7 +2631,11 @@ export class ATXTransformHandler {
             }
             // ITGen: every open HITL, from the ListHitls this poll already made (terminal job
             // statuses don't list HITLs, so they get no OpenHitls).
-            if (result && isItGenEnabled() && this._currentPollHitls !== undefined) {
+            if (
+                result &&
+                this.itGenJobs.isKnownItGenJob(request.TransformationJobId) &&
+                this._currentPollHitls !== undefined
+            ) {
                 result.OpenHitls = await this.buildOpenHitls(
                     request.WorkspaceId,
                     request.TransformationJobId,
@@ -2635,8 +2657,11 @@ export class ATXTransformHandler {
         try {
             this.logging.log(`ATX: Getting transform info for job: ${request.TransformationJobId}`)
 
-            // Check if we need to determine interactive mode from the job objective
-            const needObjective = this.getCachedInteractiveMode(request.TransformationJobId) === null
+            // Check if we need to determine interactive mode, or whether this is an ITGen job, from the
+            // job objective
+            const needObjective =
+                this.getCachedInteractiveMode(request.TransformationJobId) === null ||
+                !this.itGenJobs.isKnown(request.TransformationJobId)
             const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective)
 
             if (!job) {
@@ -2645,6 +2670,10 @@ export class ATXTransformHandler {
                     TransformationJob: null,
                     ErrorString: 'JOB_NOT_FOUND',
                 } as unknown as AtxGetTransformInfoResponse
+            }
+
+            if (needObjective && !this.itGenJobs.isKnown(request.TransformationJobId)) {
+                this.itGenJobs.rememberObjective(request.TransformationJobId, job.objective)
             }
 
             // A mid-job mode change is written to the checkpoint-settings artifact and never back
@@ -2826,7 +2855,7 @@ export class ATXTransformHandler {
                         execFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
-                        this.findItGenHitl(execFallbackPool) ||
+                        this.findItGenHitl(execFallbackPool, request.TransformationJobId) ||
                         execFallbackPool.find(h => String(h.tag).endsWith('-checkpoint')) ||
                         execFallbackPool[0]
                     if (!execHitl) {
@@ -2931,7 +2960,7 @@ export class ATXTransformHandler {
                         planFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
-                        this.findItGenHitl(planFallbackPool) ||
+                        this.findItGenHitl(planFallbackPool, request.TransformationJobId) ||
                         planFallbackPool[0]
                     this.logging.log(`ATX: Found HITL task - tag: ${hitl.tag}, hasArtifact: ${!!hitl.agentArtifact}`)
                     // For missing packages HITL, try to download artifact if available
@@ -2979,7 +3008,7 @@ export class ATXTransformHandler {
                             TransformationPlan: plan,
                         } as AtxGetTransformInfoResponse
                     }
-                    if (isItGenEnabled() && isItGenHitlTag(hitl.tag)) {
+                    if (this.itGenJobs.isKnownItGenJob(request.TransformationJobId) && isItGenHitlTag(hitl.tag)) {
                         const itGenStepId = this.getStepId(hitl)
                         this.logging.log(
                             `ATX: ${jobStatus} job has pending ${hitl.tag} HITL — taskId=${hitl.taskId} stepId=${itGenStepId ?? '<none>'}; surfacing AWAITING_HUMAN_INPUT to IDE`
@@ -3096,7 +3125,7 @@ export class ATXTransformHandler {
         }
 
         // ITGen app-launch / test-run HITLs: the IDE handles them, like LBV (the request is in OpenHitls).
-        if (isItGenEnabled() && isItGenHitlTag(hitlResponse?.HitlTag)) {
+        if (this.itGenJobs.isKnownItGenJob(request.TransformationJobId) && isItGenHitlTag(hitlResponse?.HitlTag)) {
             const plan = await this.getTransformationPlan(
                 request.WorkspaceId,
                 request.TransformationJobId,
@@ -4326,7 +4355,7 @@ export class ATXTransformHandler {
 
         try {
             let completedSteps: (AtxPlanStep & { score?: number })[]
-            if (isItGenEnabled()) {
+            if (await this.isItGenJob(workspaceId, jobId)) {
                 // Already in application order (tree post-order).
                 completedSteps = await this.findCompletedStepsAnyDepth(workspaceId, jobId, solutionRootPath, plan.Root)
             } else {

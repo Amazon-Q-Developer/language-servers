@@ -45,7 +45,7 @@ const AtxBatchGetMessagesCommand = 'aws/atxTransform/batchGetMessages'
 const AtxListArtifactsCommand = 'aws/atxTransform/listArtifacts'
 const AtxDownloadArtifactCommand = 'aws/atxTransform/downloadArtifact'
 const AtxCompleteLocalBuildHitlCommand = 'aws/atxTransform/completeLocalBuildHitl'
-// ITGen; the handler refuses it unless ATX_ITGEN_ENABLED is on
+// ITGen; the handler refuses it unless the job has generate_integration_tests
 const AtxCompleteHitlWithTestResultsCommand = 'aws/atxTransform/completeHitlWithTestResults'
 const AtxGetJobDashboardCommand = 'aws/atxTransform/getJobDashboard'
 const AtxGetJobReportCommand = 'aws/atxTransform/getJobReport'
@@ -54,7 +54,7 @@ const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
 // Beam to IDE
 const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
 const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
-// ITGen; the handler refuses it unless ATX_ITGEN_ENABLED is on
+// ITGen; the handler refuses it unless the job has generate_integration_tests
 const AtxDownloadOriginalCodeCommand = 'aws/atxTransform/downloadOriginalCode'
 
 export const AtxNetTransformServerToken =
