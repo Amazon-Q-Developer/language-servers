@@ -768,7 +768,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
     // The objective is the job-creation payload and never changes, so restoring the mode from it
     // discards any mid-job switch. The checkpoint-settings artifact is the store every client
-    // writes when the mode changes, so it wins (V2381727290).
+    // writes when the mode changes, so it wins.
     it('should prefer the checkpoint-settings artifact over the job objective', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
@@ -1679,9 +1679,9 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.error).to.be.a('string')
         })
 
-        // --- DealerFx P452432920: preserve customer edits instead of clobbering them ---
+        // --- A customer-reported edit clobber: preserve customer edits instead of overwriting them ---
 
-        const JOB_ID = 'job-dealerfx'
+        const JOB_ID = 'job-edit-clobber'
 
         // Seed the source-files manifest so getModifiedFilesSinceCheckpoint can flag the
         // listed dest paths as customer-edited since the last apply.
@@ -1904,7 +1904,7 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
 
         it('downloadCompletedStepArtifacts applies a step and stamps the apply watermark (interactive path)', async () => {
             // The interactive download path must also stamp lastAppliedTimestamp after a
-            // successful apply (the DealerFx co-fix — the diff-artifact path already did).
+            // successful apply (part of the edit-clobber fix — the diff-artifact path already did).
             // Drive it end-to-end: stub the per-step download to materialize a checkpoint,
             // let the real applyChanges run, and assert the step is marked applied AND the
             // watermark advances. (Kept in this block, which the coverage suite reliably
@@ -2285,7 +2285,7 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
 
         // The settings artifact is full state and the agent reads a missing interactive_mode as
         // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
-        // must not drop a mode the user already chose (V2381727290).
+        // must not drop a mode the user already chose.
         const stubUploadChain = () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({
@@ -2457,6 +2457,49 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot)
 
             expect(result).to.be.null
+        })
+
+        it('should report a failed lookup when listHitls fails', async () => {
+            sinon.stub(handler, 'listHitls').resolves(null)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should report a failed lookup when the client cannot initialize', async () => {
+            ;(handler as any).atxClient = undefined
+            ;((handler as any).initializeAtxClient as sinon.SinonStub).resolves(false)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should not report a failed lookup when no HITL is open', async () => {
+            sinon.stub(handler, 'listHitls').resolves([])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
+        })
+
+        it("should return null without reporting a failed lookup when beam scope leaves out a sibling repo's LBV HITL", async () => {
+            sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, 'loaded-repo', lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
         })
 
         it('should return tag and taskId early for local-build-verification HITL (no download)', async () => {
@@ -4211,6 +4254,190 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
 
             expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
             expect(result?.StepInformation).to.be.undefined
+        })
+
+        // A plan whose first top-level step has no sub-steps, while later steps do.
+        const planWithLeafFirstStep = () =>
+            ({
+                Root: {
+                    StepId: 'root',
+                    Children: [
+                        { StepId: 'assess', Status: 'SUCCEEDED', Children: [] },
+                        {
+                            StepId: 'transform',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'transform-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                        {
+                            StepId: 'verify',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'verify-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                    ],
+                },
+            }) as any
+
+        it('should return the plan when no HITL is open and only a later step has sub-steps', async () => {
+            // The agent is waiting on a chat answer (e.g. at the end of the job), not on a HITL. The
+            // first step having no sub-steps must not send this down the planning path, which
+            // returns no plan, so the IDE would stop seeing step statuses.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+        })
+
+        it('should keep the planning path for a tagged planning HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                PlanPath: '/p',
+                ReportPath: '/r',
+                HitlTag: 'plan-review',
+                TaskId: 'task-1',
+            } as any)
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.PlanPath).to.equal('/p')
+            expect(result?.ReportPath).to.equal('/r')
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it('should keep the planning path when no HITL is open and the plan is empty', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            sinon.stub(handler, 'getTransformationPlan').resolves({
+                Root: { StepId: 'root', Children: [] },
+            } as any)
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should take the execution path for a step review HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                HitlTag: 'transform-1-review',
+                TaskId: 'step-task',
+            } as any)
+            const plan = planWithLeafFirstStep()
+            plan.Root.Children[1].Status = 'IN_PROGRESS'
+            plan.Root.Children[1].Children[0].Status = 'PENDING_HUMAN_INPUT'
+            plan.Root.Children[2].Status = 'NOT_STARTED'
+            plan.Root.Children[2].Children[0].Status = 'NOT_STARTED'
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const findStepHitlStub = sinon.stub(handler as any, 'findStepLevelHitl').resolves({
+                taskId: 'step-task',
+                agentArtifact: { artifactId: 'art-1' },
+            })
+            sinon
+                .stub(handler as any, 'downloadAndParseStepHitlArtifact')
+                .resolves({ StepId: 'transform-1', DiffArtifactPath: '/d' })
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(findStepHitlStub.calledOnceWith('ws-1', 'job-1', 'transform-1')).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation?.StepId).to.equal('transform-1')
+        })
+
+        it('should return the plan when ListHitls finds no HITL open and the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'listHitls').resolves([])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should keep the planning path when ListHitls fails and the first step has no sub-steps', async () => {
+            // A failed ListHitls isn't "no HITL open": during plan review the planning path looks the HITL up
+            // again, so a transient failure still returns the plan review's tag and task in the same poll.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon.stub(handler, 'listHitls')
+            listHitlsStub.onFirstCall().resolves(null)
+            listHitlsStub.onSecondCall().resolves([{ tag: 'plan-review', taskId: 'task-1' }])
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(listHitlsStub.calledTwice).to.be.true
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it("should return the plan, not a sibling repo's LBV HITL, on a beam-scoped request when the first step has no sub-steps", async () => {
+            // Multi-repo beam job: the only open HITL is a sibling repo's local-build-verification. The beam-scoped
+            // lookup leaves it out and answers with no HITL (not a failed lookup), so this takes the execution path
+            // and returns the plan alone. The planning path would list the HITLs again without the scope and
+            // return the sibling's tag, with neither its step id nor the plan.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo({
+                ...baseRequest,
+                beamScopeStepIds: 'transform,transform-1',
+            } as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(listHitlsStub.calledOnce).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
         })
     })
 

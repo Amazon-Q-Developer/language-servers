@@ -2446,11 +2446,18 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * The open HITL to surface, with its agent artifact downloaded. Null when there's none to surface: no HITL is
+     * open, or `beamScopeStepIds` is set and the only open HITLs are local-build-verification HITLs outside that
+     * scope (a sibling repo's, on a multi-repo beam job). Also null when the lookup fails; a caller that needs to
+     * tell that apart passes `lookup`, whose `failed` is set only when the job's HITLs couldn't be listed.
+     */
     async getHitlAgentArtifact(
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        beamScopeStepIds?: string
+        beamScopeStepIds?: string,
+        lookup: { failed: boolean } = { failed: false }
     ): Promise<{
         PlanPath?: string
         ReportPath?: string
@@ -2465,12 +2472,19 @@ export class ATXTransformHandler {
 
             if (!this.atxClient && !(await this.initializeAtxClient())) {
                 this.logging.error('ATX: Failed to initialize client for GetHitlAgentArtifact')
+                lookup.failed = true
                 return null
             }
 
             const hitls = await this.listHitls(workspaceId, jobId)
 
-            if (!hitls || hitls.length === 0) {
+            if (!hitls) {
+                this.logging.log(`ATX: Could not list hitls`)
+                lookup.failed = true
+                return null
+            }
+
+            if (hitls.length === 0) {
                 this.logging.log(`ATX: No hitls available`)
                 return null
             }
@@ -2497,7 +2511,8 @@ export class ATXTransformHandler {
                 // Scope is set and the pending HITL(s) are LBV, but NONE is in the loaded repo's
                 // subtree → they all belong to sibling repos. Return null so the IDE isn't handed a
                 // sibling's HITL it would only skip every poll. Non-LBV HITLs (e.g.
-                // missing-packages) still fall through below and are handled normally.
+                // missing-packages) still fall through below and are handled normally. The lookup
+                // answered, so `lookup.failed` stays unset (here and in the fallback below).
                 if (allOutOfScopeLbv) {
                     this.logging.log(
                         'ATX: getHitlAgentArtifact — all pending HITLs are sibling-repo LBV (none in loaded scope); returning none'
@@ -2637,6 +2652,7 @@ export class ATXTransformHandler {
             if (hitl) {
                 return { HitlTag: hitl.tag || null, TaskId: hitl.taskId }
             }
+            lookup.failed = true
             return null
         }
     }
@@ -3123,11 +3139,13 @@ export class ATXTransformHandler {
         // Check for local-build-verification HITL first — it can happen with or without a plan.
         // Beam-to-IDE: pass the loaded repo's scope so we surface THIS repo's LBV HITL, not
         // the first in the list (which may be a sibling's on a multi-repo beam job).
+        const hitlLookup = { failed: false }
         const hitlResponse = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.beamScopeStepIds
+            request.beamScopeStepIds,
+            hitlLookup
         )
         if (hitlResponse?.HitlTag === 'local-build-verification') {
             this.logging.log(
@@ -3207,7 +3225,19 @@ export class ATXTransformHandler {
             } as AtxGetTransformInfoResponse
         }
 
-        if (hasPlan) {
+        // hasPlan guesses the phase from the plan's shape, and a first step with no sub-steps (e.g. "Assess
+        // Solution") looks like planning. Two signals mean the execution phase whatever the shape:
+        // - the open HITL is the step review ({stepId}-review) of a step in the plan;
+        // - ListHitls answered and there's no HITL to surface. Either none is open (the agent is waiting on a chat
+        //   answer, e.g. at the end of the job), or the request is beam-scoped and the only open HITLs are sibling
+        //   repos' local-build-verification HITLs, which getHitlAgentArtifact leaves out (the planning path would
+        //   look them up again without the scope and return a sibling's tag; the EXECUTING and PLANNING branches
+        //   return the plan alone for them too). Return the plan so the IDE keeps seeing step statuses (ITGen
+        //   stops its apps once Local Verification has finished). A failed lookup is neither case: it keeps the
+        //   shape-based choice, and the planning path looks the HITL up again.
+        const isStepReviewHitl = !!hitlResponse?.HitlTag && this.isStepReviewTag(plan.Root, hitlResponse.HitlTag)
+        const noHitlToSurface = !hitlResponse && !hitlLookup.failed && plan.Root.Children.length > 0
+        if (hasPlan || isStepReviewHitl || noHitlToSurface) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
         } else {
@@ -3342,6 +3372,13 @@ export class ATXTransformHandler {
         }
 
         return null
+    }
+
+    /**
+     * Whether the tag is the step-review tag ({stepId}-review, see findStepLevelHitl) of a step in the plan tree.
+     */
+    private isStepReviewTag(step: AtxPlanStep, tag: string): boolean {
+        return `${step.StepId}-review` === tag || step.Children.some(child => this.isStepReviewTag(child, tag))
     }
 
     /**
@@ -4435,9 +4472,10 @@ export class ATXTransformHandler {
                             // path at the downloadDiffArtifact call site already does). Without
                             // it, ``lastAppliedTimestamp`` stays absent here, so the user-edit
                             // protection in applyChanges sees an empty modified-set and is a
-                            // no-op on the exact interactive path where customer edits were lost. The
-                            // per-step re-stamp can't shrink later steps' protection because
-                            // the byte-equal short-circuit ignores the agent's own re-writes.
+                            // no-op on the exact interactive path where a customer reported
+                            // losing edits. The per-step re-stamp can't shrink later steps'
+                            // protection because the byte-equal short-circuit ignores the
+                            // agent's own re-writes.
                             this.saveLastAppliedTimestamp(solutionRootPath, jobId, step.StepId)
                         } else {
                             this.logging.error(`ATX: Failed to apply changes for step ${step.StepId}: ${result.error}`)
@@ -5513,13 +5551,14 @@ export class ATXTransformHandler {
 
             // Files the customer edited locally since the last checkpoint apply. Applying
             // the transform's version on top of these silently destroys the customer's
-            // work (edits to an already-transformed project clobbered
-            // by a later sync). Compute the protected set ONCE up front (a per-step stamp
-            // would shrink it for later steps in this run) and resolve to absolute paths so
-            // it can be membership-tested against each resolved destination. ``getModified…``
-            // returns absolute paths; an absent watermark (no prior apply) yields [], i.e.
-            // first-apply is unprotected by necessity — no ``before/`` baseline ships, so a
-            // 3-way merge is infeasible and the first write onto a virgin tree cannot conflict.
+            // work (a customer-reported edit clobber: edits to an already-transformed
+            // project were overwritten by a later sync). Compute the protected set ONCE up
+            // front (a per-step stamp would shrink it for later steps in this run) and
+            // resolve to absolute paths so it can be membership-tested against each resolved
+            // destination. ``getModified…`` returns absolute paths; an absent watermark (no
+            // prior apply) yields [], i.e. first-apply is unprotected by necessity — no
+            // ``before/`` baseline ships, so a 3-way merge is infeasible and the first write
+            // onto a virgin tree cannot conflict.
             const userModifiedFiles = new Set(
                 (jobId ? this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId) : []).map(p => path.resolve(p))
             )
@@ -5594,8 +5633,9 @@ export class ATXTransformHandler {
                     const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
                     const destPath = path.join(solutionRootPath, relativePath)
 
-                    // The clobber: if the customer edited this already-applied file
-                    // since the last sync, preserve their version instead of overwriting it.
+                    // The customer-reported edit clobber: if the customer edited this
+                    // already-applied file since the last sync, preserve their version instead
+                    // of overwriting it.
                     if (
                         this.shouldPreserveUserFile(
                             destPath,
