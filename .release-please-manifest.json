@@ -5,5 +5,5 @@
     "server/aws-lsp-codewhisperer": "0.0.133",
     "server/aws-lsp-json": "0.1.27",
     "server/aws-lsp-partiql": "0.0.24",
-    "server/aws-lsp-yaml": "0.1.27"
+    "server/aws-lsp-yaml": "0.1.28"
 }
