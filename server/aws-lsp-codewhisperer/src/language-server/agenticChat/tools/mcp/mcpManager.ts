@@ -21,6 +21,7 @@ import {
     McpPermissionType,
     MCPServerPermission,
     AgentConfig,
+    AgentResourceSource,
     isMCPServerConfig,
     isRegistryServerConfig,
 } from './mcpTypes'
@@ -96,6 +97,8 @@ export class McpManager {
     private toolNameMapping: Map<string, { serverName: string; toolName: string }>
     private serverNameMapping: Map<string, string>
     private agentConfig!: AgentConfig
+    // The agent configs that list each resource in agentConfig.resources
+    private resourceSources = new Map<string, AgentResourceSource>()
     private permissionManager!: AgentPermissionManager
     private registryService?: McpRegistryService
     private currentRegistry: McpRegistryData | null = null
@@ -257,6 +260,7 @@ export class McpManager {
 
         // Extract agent config and other data
         this.agentConfig = result.agentConfig
+        this.resourceSources = result.resourceSources ?? new Map()
         this.permissionManager = new AgentPermissionManager(
             this.agentConfig,
             (serverName: string) => this.getAvailableToolsForServer(serverName),
@@ -1424,6 +1428,7 @@ export class McpManager {
         this.mcpServers.clear()
         this.mcpServerStates.clear()
         this.sessionDeniedConsent.clear()
+        this.resourceSources = new Map()
         this.agentConfig = {
             name: 'q_ide_default',
             description: 'Agent configuration',
@@ -1996,6 +2001,11 @@ export class McpManager {
      */
     public getResources(): string[] {
         return this.agentConfig?.resources ?? []
+    }
+
+    /** The agent configs that list each resource that getResources returns */
+    public getResourceSources(): ReadonlyMap<string, AgentResourceSource> {
+        return this.resourceSources
     }
 
     public getRegistryService(): McpRegistryService | undefined {

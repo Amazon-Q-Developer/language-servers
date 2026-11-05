@@ -12,6 +12,7 @@ import {
     MCPServerPermission,
     McpPermissionType,
     AgentConfig,
+    AgentResourceSource,
     McpRegistryData,
     isRegistryServerConfig,
 } from './mcpTypes'
@@ -232,6 +233,15 @@ const DEFAULT_PERSONA_RAW = `{
   }
 }`
 
+/** True for a file:// resource with an absolute path, such as file:///abs/path or file://C:/path */
+function isAbsoluteFileResource(resource: string): boolean {
+    if (!resource.startsWith('file://')) {
+        return false
+    }
+    const resourcePath = resource.slice('file://'.length)
+    return path.isAbsolute(resourcePath) || resourcePath.startsWith('/') || /^[a-zA-Z]:/.test(resourcePath)
+}
+
 /**
  * Load, validate, and parse agent configurations from JSON files.
  * - If both global and workspace files are missing, create a default global.
@@ -252,11 +262,14 @@ export async function loadAgentConfig(
     serverNameMapping: Map<string, string>
     errors: Map<string, string>
     agentConfig: AgentConfig
+    /** The agent configs that list each resource in agentConfig.resources */
+    resourceSources?: Map<string, AgentResourceSource>
 }> {
     // Initialize return values similar to loadMcpServerConfigs
     const servers = new Map<string, MCPServerConfig>()
     const serverNameMapping = new Map<string, string>()
     const configErrors = new Map<string, string>()
+    const resourceSources = new Map<string, AgentResourceSource>()
 
     // Create base agent config
     const agentConfig: AgentConfig = {
@@ -408,10 +421,27 @@ export async function loadAgentConfig(
             }
         }
 
-        // 5b) Process resources
+        // 5b) Process resources. Files outside the workspace can only come from the global config.
         if (Array.isArray(json.resources)) {
             for (const resource of json.resources) {
-                if (typeof resource === 'string' && !agentConfig.resources!.includes(resource)) {
+                if (typeof resource !== 'string') {
+                    continue
+                }
+                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                    logging.warn(
+                        `Ignoring absolute resource path ${JSON.stringify(resource)} in agent config at ${fsPath}. Add it to the global agent config instead.`
+                    )
+                    continue
+                }
+                // A resource from a workspace folder's agent config applies to that folder only
+                const source = resourceSources.get(resource) ?? { global: false, configPaths: [] }
+                if (fsPath === globalConfigPath) {
+                    source.global = true
+                } else if (!source.configPaths.includes(fsPath)) {
+                    source.configPaths.push(fsPath)
+                }
+                resourceSources.set(resource, source)
+                if (!agentConfig.resources!.includes(resource)) {
                     agentConfig.resources!.push(resource)
                 }
             }
@@ -664,6 +694,7 @@ export async function loadAgentConfig(
         serverNameMapping,
         errors: configErrors,
         agentConfig,
+        resourceSources,
     }
 }
 

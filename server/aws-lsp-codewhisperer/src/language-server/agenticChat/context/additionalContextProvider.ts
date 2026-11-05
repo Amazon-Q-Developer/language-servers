@@ -35,6 +35,8 @@ import { ChatMessage, ImageBlock, ImageFormat } from '@amzn/codewhisperer-stream
 import { getRelativePathWithUri, getRelativePathWithWorkspaceFolder } from '../../workspaceContext/util'
 import { isSupportedImageExtension, MAX_IMAGE_CONTEXT_COUNT } from '../../../shared/imageVerification'
 import { MemoryBankController } from './memorybank/memoryBankController'
+import { canonicalizeWorkspaceFolders, hasAdditionalHardLinks, resolveSymlinkAwarePath } from '../tools/toolShared'
+import type { AgentResourceSource } from '../tools/mcp/mcpTypes'
 
 export const ACTIVE_EDITOR_CONTEXT_ID = 'active-editor'
 
@@ -46,6 +48,23 @@ export const activeFileCmd = {
 }
 
 type ContextCommandInfo = ContextCommand & { pinned: boolean }
+
+/** True when `filePath` is `folder` or inside it, comparing case-insensitively where the file system usually is */
+function isInsideFolder(folder: string, filePath: string): boolean {
+    const comparable = (value: string) =>
+        process.platform === 'win32' || process.platform === 'darwin' ? value.toLowerCase() : value
+    const relativePath = path.relative(comparable(folder), comparable(filePath))
+    return relativePath !== '..' && !relativePath.startsWith('..' + path.sep) && !path.isAbsolute(relativePath)
+}
+
+/**
+ * True when `configPath` is an agent config of `workspaceFolder` itself (<folder>/.amazonq/agents/<name>.json),
+ * not of a folder inside it
+ */
+function isAgentConfigOf(workspaceFolder: string, configPath: string): boolean {
+    const configFolder = path.resolve(configPath, '..', '..', '..')
+    return isInsideFolder(workspaceFolder, configFolder) && isInsideFolder(configFolder, workspaceFolder)
+}
 
 /**
  * AdditionalContextProvider manages context information for Amazon Q chat sessions.
@@ -63,12 +82,17 @@ export class AdditionalContextProvider {
      */
     private readonly getResources: () => string[]
 
+    /** Callback to retrieve the agent configs that list each resource, injected for the same reason */
+    private readonly getResourceSources: () => ReadonlyMap<string, AgentResourceSource>
+
     constructor(
         private readonly features: Features,
         private readonly chatDb: ChatDatabase,
-        getResources?: () => string[]
+        getResources?: () => string[],
+        getResourceSources?: () => ReadonlyMap<string, AgentResourceSource>
     ) {
         this.getResources = getResources ?? (() => [])
+        this.getResourceSources = getResourceSources ?? (() => new Map())
     }
 
     /**
@@ -94,6 +118,12 @@ export class AdditionalContextProvider {
             } else if (entry.isFile() && entry.name.endsWith(promptFileExtension)) {
                 // Skip duplicate rules (same file resolved from multiple workspace folders)
                 if (seenIds?.has(fullPath)) {
+                    continue
+                }
+                if (await hasAdditionalHardLinks(fullPath)) {
+                    this.features.logging.warn(
+                        `Skipping rule file ${fullPath}, which shares its data with another name on disk`
+                    )
                     continue
                 }
                 seenIds?.add(fullPath)
@@ -181,6 +211,15 @@ export class AdditionalContextProvider {
     }
 
     /**
+     * True when `filePath` is inside `workspaceFolder` after following symlinks. A name that starts
+     * with two dots, such as ..notes.md, is inside.
+     */
+    private async isInWorkspaceFolder(filePath: string, workspaceFolder: string): Promise<boolean> {
+        const [canonicalFolder] = await canonicalizeWorkspaceFolders([workspaceFolder])
+        return isInsideFolder(canonicalFolder, await resolveSymlinkAwarePath(filePath))
+    }
+
+    /**
      * Internal method to collect workspace rules without tab filtering.
      * Resolves paths from agentConfig.resources when available, falling back to hardcoded defaults.
      */
@@ -196,32 +235,53 @@ export class AdditionalContextProvider {
         }
 
         // Get resources from agentConfig via injected callback
-        let resources: string[]
+        let configuredResources: string[]
+        let sources: ReadonlyMap<string, AgentResourceSource>
         try {
-            resources = this.getResources()
+            configuredResources = this.getResources()
+            sources = this.getResourceSources()
         } catch {
-            resources = []
+            configuredResources = []
+            sources = new Map()
         }
-
-        // Fall back to default resources if none configured
-        if (resources.length === 0) {
-            resources = ['file://AmazonQ.md', 'file://README.md', 'file://.amazonq/rules/**/*.md']
-        }
+        const defaultResources = ['file://AmazonQ.md', 'file://README.md', 'file://.amazonq/rules/**/*.md']
+        const warnedResources = new Set<string>()
 
         for (const workspaceFolder of workspaceFolders) {
+            // A resource from a workspace folder's agent config applies to that folder only, and one from
+            // the global agent config to every folder. A folder that no resource applies to gets the defaults.
+            const folderResources = configuredResources.filter(resource => {
+                const source = sources.get(resource)
+                return (
+                    !source ||
+                    source.global ||
+                    source.configPaths.some(configPath => isAgentConfigOf(workspaceFolder, configPath))
+                )
+            })
+            const usesDefaults = folderResources.length === 0
+            const resources = usesDefaults ? defaultResources : folderResources
+
             for (const resource of resources) {
                 const resolved = this.resolveResourcePath(resource, workspaceFolder)
                 if (!resolved) {
                     continue
                 }
+                const source = usesDefaults ? undefined : sources.get(resource)
 
                 // Handle glob pattern for rules directory
                 if (resolved.endsWith(path.join('.amazonq', 'rules', '**', '*.md'))) {
                     const rulesPath = path.join(workspaceFolder, '.amazonq', 'rules')
                     const folderExists = await this.features.workspace.fs.exists(rulesPath)
-                    if (folderExists) {
-                        await this.collectMarkdownFilesRecursively(workspaceFolder, rulesPath, rulesFiles, seenIds)
+                    if (!folderExists) {
+                        continue
                     }
+                    if (!(await this.isInWorkspaceFolder(rulesPath, workspaceFolder))) {
+                        this.features.logging.warn(
+                            `Skipping rules folder ${rulesPath}, which resolves outside the workspace folder ${workspaceFolder}`
+                        )
+                        continue
+                    }
+                    await this.collectMarkdownFilesRecursively(workspaceFolder, rulesPath, rulesFiles, seenIds)
                     continue
                 }
 
@@ -231,6 +291,16 @@ export class AdditionalContextProvider {
                 )
                 if (isAbsolute) {
                     if (seenIds.has(resolved)) {
+                        continue
+                    }
+                    // Only the global agent config can add a file outside the workspace
+                    if (!source?.global) {
+                        if (!warnedResources.has(resource)) {
+                            warnedResources.add(resource)
+                            this.features.logging.warn(
+                                `Skipping absolute resource ${JSON.stringify(resource)}, which only the global agent config can add`
+                            )
+                        }
                         continue
                     }
                     const exists = await this.features.workspace.fs.exists(resolved)
@@ -251,15 +321,28 @@ export class AdditionalContextProvider {
                     continue
                 }
                 const exists = await this.features.workspace.fs.exists(resolved)
-                if (exists) {
-                    seenIds.add(resolved)
-                    rulesFiles.push({
-                        workspaceFolder,
-                        type: 'file',
-                        relativePath: path.relative(workspaceFolder, resolved),
-                        id: resolved,
-                    })
+                if (!exists) {
+                    continue
                 }
+                if (!(await this.isInWorkspaceFolder(resolved, workspaceFolder))) {
+                    this.features.logging.warn(
+                        `Skipping resource ${JSON.stringify(resource)}, which resolves outside the workspace folder ${workspaceFolder}`
+                    )
+                    continue
+                }
+                if (await hasAdditionalHardLinks(await resolveSymlinkAwarePath(resolved))) {
+                    this.features.logging.warn(
+                        `Skipping resource ${JSON.stringify(resource)}, which shares its data with another name on disk`
+                    )
+                    continue
+                }
+                seenIds.add(resolved)
+                rulesFiles.push({
+                    workspaceFolder,
+                    type: 'file',
+                    relativePath: path.relative(workspaceFolder, resolved),
+                    id: resolved,
+                })
             }
         }
 
