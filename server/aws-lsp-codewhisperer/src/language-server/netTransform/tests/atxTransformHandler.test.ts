@@ -768,7 +768,7 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
     // The objective is the job-creation payload and never changes, so restoring the mode from it
     // discards any mid-job switch. The checkpoint-settings artifact is the store every client
-    // writes when the mode changes, so it wins (V2381727290).
+    // writes when the mode changes, so it wins.
     it('should prefer the checkpoint-settings artifact over the job objective', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
@@ -1679,9 +1679,9 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.error).to.be.a('string')
         })
 
-        // --- DealerFx P452432920: preserve customer edits instead of clobbering them ---
+        // --- A customer-reported edit clobber: preserve customer edits instead of overwriting them ---
 
-        const JOB_ID = 'job-dealerfx'
+        const JOB_ID = 'job-edit-clobber'
 
         // Seed the source-files manifest so getModifiedFilesSinceCheckpoint can flag the
         // listed dest paths as customer-edited since the last apply.
@@ -1904,7 +1904,7 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
 
         it('downloadCompletedStepArtifacts applies a step and stamps the apply watermark (interactive path)', async () => {
             // The interactive download path must also stamp lastAppliedTimestamp after a
-            // successful apply (the DealerFx co-fix — the diff-artifact path already did).
+            // successful apply (part of the edit-clobber fix — the diff-artifact path already did).
             // Drive it end-to-end: stub the per-step download to materialize a checkpoint,
             // let the real applyChanges run, and assert the step is marked applied AND the
             // watermark advances. (Kept in this block, which the coverage suite reliably
@@ -2285,7 +2285,7 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
 
         // The settings artifact is full state and the agent reads a missing interactive_mode as
         // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
-        // must not drop a mode the user already chose (V2381727290).
+        // must not drop a mode the user already chose.
         const stubUploadChain = () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({

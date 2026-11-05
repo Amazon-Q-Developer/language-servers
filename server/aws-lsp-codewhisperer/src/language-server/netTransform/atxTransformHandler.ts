@@ -2695,7 +2695,7 @@ export class ATXTransformHandler {
             // A mid-job mode change is written to the checkpoint-settings artifact and never back
             // into the objective, which is the job-creation payload and immutable. Reading the
             // objective alone therefore restores the mode the job STARTED in and silently discards
-            // any later switch, so reopening the IDE reverted the mode (V2381727290). Prefer the
+            // any later switch, so reopening the IDE reverted the mode. Prefer the
             // artifact - it is the store every client writes, so it also reflects a switch made
             // from the web UI or another IDE - and keep the objective as the fallback for a job
             // whose mode was never changed and so has no artifact yet.
@@ -3173,7 +3173,7 @@ export class ATXTransformHandler {
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
 
-        // missing-packages can be raised once a plan already exists (P516058803). Only the planning
+        // missing-packages can be raised once a plan already exists. Only the planning
         // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
         // ({stepId}-review) HITLs and would drop them, so the IDE never shows the package-upload
         // dialog. Return it directly, mirroring the local-build-verification early-exit above.
@@ -4441,9 +4441,10 @@ export class ATXTransformHandler {
                             // path at the downloadDiffArtifact call site already does). Without
                             // it, ``lastAppliedTimestamp`` stays absent here, so the user-edit
                             // protection in applyChanges sees an empty modified-set and is a
-                            // no-op on the exact interactive path DealerFx lost edits on. The
-                            // per-step re-stamp can't shrink later steps' protection because
-                            // the byte-equal short-circuit ignores the agent's own re-writes.
+                            // no-op on the exact interactive path where a customer reported
+                            // losing edits. The per-step re-stamp can't shrink later steps'
+                            // protection because the byte-equal short-circuit ignores the
+                            // agent's own re-writes.
                             this.saveLastAppliedTimestamp(solutionRootPath, jobId, step.StepId)
                         } else {
                             this.logging.error(`ATX: Failed to apply changes for step ${step.StepId}: ${result.error}`)
@@ -5137,7 +5138,7 @@ export class ATXTransformHandler {
             } else {
                 // This artifact is full state and the agent reads a missing interactive_mode as "use
                 // the default", not "leave it alone", so a checkpoints-only sync has to carry the
-                // current mode forward or it silently reverts the user's choice (V2381727290).
+                // current mode forward or it silently reverts the user's choice.
                 // Known limitation: the cache is resolved once per job, so a switch made elsewhere
                 // after that read is overwritten by the next sync.
                 const cachedMode = this.getCachedInteractiveMode(jobId)
@@ -5519,13 +5520,14 @@ export class ATXTransformHandler {
 
             // Files the customer edited locally since the last checkpoint apply. Applying
             // the transform's version on top of these silently destroys the customer's
-            // work (DealerFx P452432920 — edits to an already-transformed project clobbered
-            // by a later sync). Compute the protected set ONCE up front (a per-step stamp
-            // would shrink it for later steps in this run) and resolve to absolute paths so
-            // it can be membership-tested against each resolved destination. ``getModified…``
-            // returns absolute paths; an absent watermark (no prior apply) yields [], i.e.
-            // first-apply is unprotected by necessity — no ``before/`` baseline ships, so a
-            // 3-way merge is infeasible and the first write onto a virgin tree cannot conflict.
+            // work (a customer-reported edit clobber: edits to an already-transformed
+            // project were overwritten by a later sync). Compute the protected set ONCE up
+            // front (a per-step stamp would shrink it for later steps in this run) and
+            // resolve to absolute paths so it can be membership-tested against each resolved
+            // destination. ``getModified…`` returns absolute paths; an absent watermark (no
+            // prior apply) yields [], i.e. first-apply is unprotected by necessity — no
+            // ``before/`` baseline ships, so a 3-way merge is infeasible and the first write
+            // onto a virgin tree cannot conflict.
             const userModifiedFiles = new Set(
                 (jobId ? this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId) : []).map(p => path.resolve(p))
             )
@@ -5600,8 +5602,9 @@ export class ATXTransformHandler {
                     const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
                     const destPath = path.join(solutionRootPath, relativePath)
 
-                    // The DealerFx clobber: if the customer edited this already-applied file
-                    // since the last sync, preserve their version instead of overwriting it.
+                    // The customer-reported edit clobber: if the customer edited this
+                    // already-applied file since the last sync, preserve their version instead
+                    // of overwriting it.
                     if (
                         this.shouldPreserveUserFile(
                             destPath,
