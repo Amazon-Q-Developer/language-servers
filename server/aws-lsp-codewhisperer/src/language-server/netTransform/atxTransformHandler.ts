@@ -2415,11 +2415,17 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * The open HITL to surface, with its agent artifact downloaded. Null both when no HITL is open and when the
+     * lookup fails; a caller that needs to tell them apart passes `lookup`, whose `failed` is set when the job's
+     * HITLs couldn't be listed.
+     */
     async getHitlAgentArtifact(
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        beamScopeStepIds?: string
+        beamScopeStepIds?: string,
+        lookup: { failed: boolean } = { failed: false }
     ): Promise<{
         PlanPath?: string
         ReportPath?: string
@@ -2434,12 +2440,19 @@ export class ATXTransformHandler {
 
             if (!this.atxClient && !(await this.initializeAtxClient())) {
                 this.logging.error('ATX: Failed to initialize client for GetHitlAgentArtifact')
+                lookup.failed = true
                 return null
             }
 
             const hitls = await this.listHitls(workspaceId, jobId)
 
-            if (!hitls || hitls.length === 0) {
+            if (!hitls) {
+                this.logging.log(`ATX: Could not list hitls`)
+                lookup.failed = true
+                return null
+            }
+
+            if (hitls.length === 0) {
                 this.logging.log(`ATX: No hitls available`)
                 return null
             }
@@ -2606,6 +2619,7 @@ export class ATXTransformHandler {
             if (hitl) {
                 return { HitlTag: hitl.tag || null, TaskId: hitl.taskId }
             }
+            lookup.failed = true
             return null
         }
     }
@@ -3092,11 +3106,13 @@ export class ATXTransformHandler {
         // Check for local-build-verification HITL first — it can happen with or without a plan.
         // Beam-to-IDE: pass the loaded repo's scope so we surface THIS repo's LBV HITL, not
         // the first in the list (which may be a sibling's on a multi-repo beam job).
+        const hitlLookup = { failed: false }
         const hitlResponse = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.beamScopeStepIds
+            request.beamScopeStepIds,
+            hitlLookup
         )
         if (hitlResponse?.HitlTag === 'local-build-verification') {
             this.logging.log(
@@ -3176,10 +3192,16 @@ export class ATXTransformHandler {
             } as AtxGetTransformInfoResponse
         }
 
-        // No HITL open (the agent is waiting on a chat answer, e.g. at the end of the job) with a plan that has steps:
-        // still the execution phase, even when the first step has no sub-steps (e.g. "Assess Solution"). Return the
-        // plan so the IDE keeps seeing step statuses (ITGen stops its apps once Local Verification has finished).
-        if (hasPlan || (!hitlResponse?.HitlTag && plan.Root.Children.length > 0)) {
+        // hasPlan guesses the phase from the plan's shape, and a first step with no sub-steps (e.g. "Assess
+        // Solution") looks like planning. Two signals mean the execution phase whatever the shape:
+        // - the open HITL is the step review ({stepId}-review) of a step in the plan;
+        // - ListHitls answered and no HITL is open: the agent is waiting on a chat answer, e.g. at the end of the
+        //   job. Return the plan so the IDE keeps seeing step statuses (ITGen stops its apps once Local
+        //   Verification has finished). A failed lookup isn't "no HITL open": it keeps the shape-based choice,
+        //   and the planning path looks the HITL up again.
+        const isStepReviewHitl = !!hitlResponse?.HitlTag && this.isStepReviewTag(plan.Root, hitlResponse.HitlTag)
+        const noHitlOpen = !hitlResponse && !hitlLookup.failed && plan.Root.Children.length > 0
+        if (hasPlan || isStepReviewHitl || noHitlOpen) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
         } else {
@@ -3314,6 +3336,13 @@ export class ATXTransformHandler {
         }
 
         return null
+    }
+
+    /**
+     * Whether the tag is the step-review tag ({stepId}-review, see findStepLevelHitl) of a step in the plan tree.
+     */
+    private isStepReviewTag(step: AtxPlanStep, tag: string): boolean {
+        return `${step.StepId}-review` === tag || step.Children.some(child => this.isStepReviewTag(child, tag))
     }
 
     /**

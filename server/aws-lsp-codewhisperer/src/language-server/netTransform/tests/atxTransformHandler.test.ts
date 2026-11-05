@@ -2459,6 +2459,37 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(result).to.be.null
         })
 
+        it('should report a failed lookup when listHitls fails', async () => {
+            sinon.stub(handler, 'listHitls').resolves(null)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should report a failed lookup when the client cannot initialize', async () => {
+            ;(handler as any).atxClient = undefined
+            ;((handler as any).initializeAtxClient as sinon.SinonStub).resolves(false)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should not report a failed lookup when no HITL is open', async () => {
+            sinon.stub(handler, 'listHitls').resolves([])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
+        })
+
         it('should return tag and taskId early for local-build-verification HITL (no download)', async () => {
             sinon.stub(handler, 'listHitls').resolves([{ tag: 'local-build-verification', taskId: 'task-lbv' }])
             const downloadStub = sinon.stub(handler, 'createArtifactDownloadUrl')
@@ -4296,6 +4327,75 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             expect(result?.TransformationPlan).to.be.undefined
             expect(result?.PlanPath).to.be.undefined
             expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should take the execution path for a step review HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                HitlTag: 'transform-1-review',
+                TaskId: 'step-task',
+            } as any)
+            const plan = planWithLeafFirstStep()
+            plan.Root.Children[1].Status = 'IN_PROGRESS'
+            plan.Root.Children[1].Children[0].Status = 'PENDING_HUMAN_INPUT'
+            plan.Root.Children[2].Status = 'NOT_STARTED'
+            plan.Root.Children[2].Children[0].Status = 'NOT_STARTED'
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const findStepHitlStub = sinon.stub(handler as any, 'findStepLevelHitl').resolves({
+                taskId: 'step-task',
+                agentArtifact: { artifactId: 'art-1' },
+            })
+            sinon
+                .stub(handler as any, 'downloadAndParseStepHitlArtifact')
+                .resolves({ StepId: 'transform-1', DiffArtifactPath: '/d' })
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(findStepHitlStub.calledOnceWith('ws-1', 'job-1', 'transform-1')).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation?.StepId).to.equal('transform-1')
+        })
+
+        it('should return the plan when ListHitls finds no HITL open and the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'listHitls').resolves([])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should keep the planning path when ListHitls fails and the first step has no sub-steps', async () => {
+            // A failed ListHitls isn't "no HITL open": during plan review the planning path looks the HITL up
+            // again, so a transient failure still returns the plan review's tag and task in the same poll.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon.stub(handler, 'listHitls')
+            listHitlsStub.onFirstCall().resolves(null)
+            listHitlsStub.onSecondCall().resolves([{ tag: 'plan-review', taskId: 'task-1' }])
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(listHitlsStub.calledTwice).to.be.true
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
         })
     })
 
