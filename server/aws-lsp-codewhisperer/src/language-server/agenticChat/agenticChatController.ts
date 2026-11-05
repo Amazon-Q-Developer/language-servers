@@ -171,7 +171,7 @@ import { CheckedTarget, logFileAccess, readCheckedFile, updateCheckedFile } from
 import { FsRead, FsReadParams } from './tools/fsRead'
 import { ListDirectory, ListDirectoryParams } from './tools/listDirectory'
 import { FsWrite, FsWriteParams } from './tools/fsWrite'
-import { ExecuteBash, ExecuteBashParams } from './tools/executeBash'
+import { ExecuteBash, ExecuteBashOutput, ExecuteBashParams } from './tools/executeBash'
 import {
     CommandValidation,
     ExplanatoryParams,
@@ -2097,6 +2097,8 @@ export class AgenticChatController implements ChatHandlers {
             // Retain acceptance-check targets for execution and approval caching.
             let checkedCanonicalPaths: string[] | undefined
             let checkedTargets: readonly CheckedTarget[] | undefined
+            // What an approval of an executeBash prompt allows for later commands
+            let approvalPaths: readonly string[] | undefined
             let executionInput: object | undefined
             if (!toolUse.name || !toolUse.toolUseId) continue
             session.toolUseLookup.set(toolUse.toolUseId, toolUse)
@@ -2178,7 +2180,13 @@ export class AgenticChatController implements ChatHandlers {
                             canonicalPaths,
                             checkedTargets: acceptedTargets,
                             validationError,
-                        } = await tool.requiresAcceptance(toolUse.input as any, approvedPaths)
+                            approvalPaths: pathsForApproval,
+                        } = await tool.requiresAcceptance(
+                            toolUse.input as any,
+                            approvedPaths,
+                            session.approvedLinkedFiles
+                        )
+                        approvalPaths = pathsForApproval
 
                         // Filesystem execution requires the canonical targets returned by acceptance.
                         const isFsTool = [FS_READ, FS_WRITE, FS_REPLACE, FILE_SEARCH, LIST_DIRECTORY].includes(
@@ -2377,33 +2385,6 @@ export class AgenticChatController implements ChatHandlers {
                     }
                 }
 
-                // Record the path only when the user was actually asked and
-                // allowed it. Recording every path a tool touches turns this map
-                // into "paths the tool has seen", which then short-circuits the
-                // acceptance check on later calls — so a path that was harmless
-                // on first use (an ordinary file inside the workspace) would
-                // skip the check after it becomes something the user should be
-                // asked about, such as a name that a hard link now shares with a
-                // file outside the workspace.
-                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
-                if (toolApprovalGranted && checkedCanonicalPaths) {
-                    for (const checkedPath of checkedCanonicalPaths) {
-                        session.addApprovedPath(checkedPath, toolUse.name)
-                    }
-                } else if (inputPath && toolApprovalGranted) {
-                    session.addApprovedPath(inputPath, toolUse.name)
-                    // The acceptance check compares the canonical path, so also
-                    // record that form; otherwise an approval never matches when
-                    // the input reaches the file through a symlinked ancestor
-                    // (a symlinked home directory, or macOS /tmp) and the user is
-                    // asked again on every call. Resolved the same way as
-                    // requiresPathAcceptance.
-                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
-                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
-                        session.addApprovedPath(canonicalInputPath, toolUse.name)
-                    }
-                }
-
                 const ws = this.#getWritableStream(chatResultStream, toolUse)
                 if (checkedTargets) {
                     if (token?.isCancellationRequested) {
@@ -2428,6 +2409,48 @@ export class AgenticChatController implements ChatHandlers {
                         toolName: toolUse.name,
                         canonicalPaths: checkedCanonicalPaths,
                     })
+                }
+
+                // Record the path only when the user was actually asked and
+                // allowed it, and the tool then succeeded. Recording every path
+                // a tool touches turns this map into "paths the tool has seen",
+                // which then short-circuits the acceptance check on later calls,
+                // so a path that was harmless on first use (an ordinary file
+                // inside the workspace) would skip the check after it becomes
+                // something the user should be asked about, such as a name that
+                // a hard link now shares with a file outside the workspace.
+                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
+                // A command that exits with an error returns a result rather than throwing
+                const exitStatus =
+                    toolUse.name === EXECUTE_BASH
+                        ? ((result as InvokeOutput | undefined)?.output?.content as ExecuteBashOutput | undefined)
+                              ?.exitStatus
+                        : undefined
+                const toolSucceeded = exitStatus === undefined || exitStatus === '0'
+                if (toolApprovalGranted && toolSucceeded && checkedTargets) {
+                    // With the target, a file with more than one hard link stays approved only as it was
+                    for (const target of checkedTargets) {
+                        session.addApprovedPath(target.path, toolUse.name, target)
+                    }
+                } else if (toolUse.name === EXECUTE_BASH) {
+                    // Only an out-of-workspace prompt allows the cwd for later commands
+                    if (toolApprovalGranted && toolSucceeded) {
+                        for (const approvalPath of approvalPaths ?? []) {
+                            session.addApprovedPath(approvalPath, toolUse.name)
+                        }
+                    }
+                } else if (inputPath && toolApprovalGranted && toolSucceeded) {
+                    session.addApprovedPath(inputPath, toolUse.name)
+                    // The acceptance check compares the canonical path, so also
+                    // record that form; otherwise an approval never matches when
+                    // the input reaches the file through a symlinked ancestor
+                    // (a symlinked home directory, or macOS /tmp) and the user is
+                    // asked again on every call. Resolved the same way as
+                    // requiresPathAcceptance.
+                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
+                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
+                        session.addApprovedPath(canonicalInputPath, toolUse.name)
+                    }
                 }
 
                 let toolResultContent: ToolResultContentBlock

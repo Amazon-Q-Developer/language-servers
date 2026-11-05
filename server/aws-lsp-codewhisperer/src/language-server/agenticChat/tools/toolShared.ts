@@ -7,7 +7,7 @@ import * as path from 'path'
 import { CommandCategory } from './executeBash'
 import { EmptyPathError } from '../errors'
 import { captureCheckedTarget, CheckedTarget } from './checkedFileIo'
-import { FileUpdateOutcome } from '@aws/language-server-runtimes/server-interface'
+import { ExistingFileTarget, FileUpdateOutcome } from '@aws/language-server-runtimes/server-interface'
 
 const resolvedTargets = new WeakMap<object, { toolName: string; targets: readonly CheckedTarget[] }>()
 const fileUpdates = new WeakMap<object, FileUpdateOutcome>()
@@ -191,6 +191,12 @@ export const multiplyLinkedFileWarning = (access: FileAccessKind): string =>
         : 'This file is also reachable under another name on disk, which may be outside the ' +
           'workspace. Writing to it changes the contents under every name.'
 
+/**
+ * Files with more than one hard link that the user approved, per tool name, as they were when
+ * approved: the identity and link count captured by the check the user was asked about.
+ */
+export type ApprovedLinkedFiles = ReadonlyMap<string, readonly ExistingFileTarget[]>
+
 export interface PathAcceptanceOptions {
     /**
      * Require approval for an in-workspace path that resolves to a file with
@@ -199,6 +205,29 @@ export interface PathAcceptanceOptions {
      * 'read' by tools that return its contents.
      */
     flagMultiplyLinkedFiles?: FileAccessKind
+    /**
+     * With flagMultiplyLinkedFiles, a file with more than one hard link needs no approval only when
+     * it is listed here for the tool: the same file, with no more names than when it was approved.
+     */
+    approvedLinkedFiles?: ApprovedLinkedFiles
+}
+
+/**
+ * True when the target is a file the user approved for the tool while it had more than one
+ * hard link, and it is still the same file with no more names. A target without a captured
+ * identity, as on Windows, is never covered.
+ */
+function isApprovedLinkedFile(target: CheckedTarget, toolName: string, approved?: ApprovedLinkedFiles): boolean {
+    if (target.state !== 'existing') {
+        return false
+    }
+    return (approved?.get(toolName) ?? []).some(
+        file =>
+            isSamePath(normalizePathSeparators(file.path), normalizePathSeparators(target.path)) &&
+            file.dev === target.dev &&
+            file.ino === target.ino &&
+            BigInt(target.linkCount) <= BigInt(file.linkCount)
+    )
 }
 
 interface Output<Kind, Content> {
@@ -233,6 +262,12 @@ export interface CommandValidation {
     canonicalPaths?: string[]
     checkedTargets?: readonly CheckedTarget[]
     validationError?: Error
+    /**
+     * Paths to record as approved when the user allows the prompt and the tool succeeds. Set by
+     * executeBash to the cwd, only for an out-of-workspace prompt while the cwd is outside the
+     * workspace, so a prompt for another reason does not allow the cwd for later commands.
+     */
+    approvalPaths?: readonly string[]
 }
 
 export async function validatePath(path: string, exists: (p: string) => Promise<boolean>) {
@@ -293,6 +328,23 @@ export function isSamePath(left: string, right: string): boolean {
     }
 
     return comparable(left) === comparable(right)
+}
+
+/**
+ * Checks if this exact path, rather than one of its parent directories, has been approved for a specific tool
+ */
+export function isPathExactlyApproved(
+    filePath: string,
+    toolName: string,
+    approvedPaths?: Map<string, Set<string>>
+): boolean {
+    const toolPaths = approvedPaths?.get(toolName)
+    if (!toolPaths || toolPaths.size === 0) {
+        return false
+    }
+
+    const normalizedFilePath = normalizePathSeparators(filePath)
+    return [...toolPaths].some(approvedPath => isSamePath(normalizePathSeparators(approvedPath), normalizedFilePath))
 }
 
 /**
@@ -358,7 +410,10 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
 /**
  * Shared implementation to check if a file path requires user acceptance.
  * Returns true when the file is not resolvable within our workspace (i.e., is outside of our workspace).
- * If the path has already been approved (in approvedPaths), returns false.
+ * If the path or one of its parent directories has already been approved (in approvedPaths), returns false.
+ * A credential or system path (see needsExactApproval) returns false only when that exact path has been approved.
+ * With flagMultiplyLinkedFiles, a file with more than one hard link returns true unless it is listed in
+ * approvedLinkedFiles; an approval of the path or a folder above it does not cover it.
  *
  * @param path The file path to check
  * @param toolName The name of the tool requesting access
@@ -390,9 +445,41 @@ export async function requiresPathAcceptance(
             ? await captureCheckedTarget(workspace, canonicalPath)
             : Object.freeze({ path: canonicalPath, state: 'unverified' })
         const checked = { canonicalPaths: [canonicalPath], checkedTargets: Object.freeze([target]) }
+        const isSensitive = isSensitivePath(inputPath) || isSensitivePath(canonicalPath)
+        // The warning when the path is a file with more than one hard link that needs approval. Only
+        // an approval of that file as it was when approved covers it (see approvedLinkedFiles).
+        const linkedFileWarning = async (): Promise<string | undefined> => {
+            const access = options?.flagMultiplyLinkedFiles
+            if (!access || isApprovedLinkedFile(target, toolName, options?.approvedLinkedFiles)) {
+                return undefined
+            }
+            const multiplyLinked =
+                target.state === 'existing'
+                    ? BigInt(target.linkCount) > 1n
+                    : target.state === 'unverified' && (await hasAdditionalHardLinks(canonicalPath))
+            return multiplyLinked ? multiplyLinkedFileWarning(access) : undefined
+        }
 
-        if (isPathApproved(canonicalPath, toolName, approvedPaths)) {
-            return { requiresAcceptance: false, ...checked }
+        // Credential and system paths need an approval of the exact path
+        const isApproved =
+            needsExactApproval(inputPath) || needsExactApproval(canonicalPath)
+                ? isPathExactlyApproved(canonicalPath, toolName, approvedPaths)
+                : isPathApproved(canonicalPath, toolName, approvedPaths)
+        if (isApproved) {
+            const warning = await linkedFileWarning()
+            if (!warning) {
+                return { requiresAcceptance: false, ...checked }
+            }
+            const isInWorkspace = workspaceUtils.isInWorkspace(
+                await canonicalizeWorkspaceFolders(getWorkspaceFolderPaths(workspace)),
+                canonicalPath
+            )
+            return {
+                requiresAcceptance: true,
+                warning,
+                ...(isInWorkspace ? { acceptanceReason: 'multiplyLinkedFile' as const } : {}),
+                ...checked,
+            }
         }
 
         const workspaceFolders = getWorkspaceFolderPaths(workspace)
@@ -403,24 +490,14 @@ export async function requiresPathAcceptance(
 
         const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(workspaceFolders)
         if (workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)) {
-            const multiplyLinked =
-                target.state === 'existing'
-                    ? BigInt(target.linkCount) > 1n
-                    : target.state === 'unverified' && options?.flagMultiplyLinkedFiles
-                      ? await hasAdditionalHardLinks(canonicalPath)
-                      : false
-            if (options?.flagMultiplyLinkedFiles && multiplyLinked) {
-                return {
-                    requiresAcceptance: true,
-                    warning: multiplyLinkedFileWarning(options.flagMultiplyLinkedFiles),
-                    acceptanceReason: 'multiplyLinkedFile',
-                    ...checked,
-                }
+            const warning = await linkedFileWarning()
+            if (warning) {
+                return { requiresAcceptance: true, warning, acceptanceReason: 'multiplyLinkedFile', ...checked }
             }
             return { requiresAcceptance: false, ...checked }
         }
 
-        if (isSensitivePath(inputPath) || isSensitivePath(canonicalPath)) {
+        if (isSensitive) {
             return {
                 requiresAcceptance: true,
                 warning: 'Access to sensitive system files requires explicit approval',
@@ -438,13 +515,48 @@ export async function requiresPathAcceptance(
     }
 }
 
+// Folders and files that hold credentials, and system folders. Case is ignored because the file
+// systems of Windows and macOS ignore it.
+const exactApprovalPatterns = [
+    /[\\/]\.(?:ssh|aws|azure|kube|gnupg|docker)(?:[\\/]|$)/i,
+    /[\\/](?:\.config|AppData[\\/]Roaming)[\\/]gcloud(?:[\\/]|$)/i,
+    /[\\/]Library[\\/]Keychains(?:[\\/]|$)/i,
+    /[\\/](?:\.netrc|_netrc|\.git-credentials)$/i,
+    /[\\/]\.env(?:\.|$)/i,
+    /^(?:[\\/]private)?[\\/](?:etc|proc|sys|dev)(?:[\\/]|$)/i,
+    /[\\/]Windows[\\/]System32[\\/]config(?:[\\/]|$)/i,
+]
+
+/**
+ * True on Windows for a path with a segment that Windows can open under another name: one that
+ * ends with a dot or a space, or that contains a colon (other than the drive).
+ */
+function hasAmbiguousWindowsSegment(filePath: string): boolean {
+    return (
+        process.platform === 'win32' &&
+        filePath
+            .split(/[\\/]/)
+            .some(
+                (segment, index) =>
+                    (/[. ]$/.test(segment) && segment !== '.' && segment !== '..') ||
+                    (segment.includes(':') && !(index === 0 && /^[a-z]:$/i.test(segment)))
+            )
+    )
+}
+
+/**
+ * True for a path in a folder or file that holds credentials (such as .ssh, .aws, .kube or .env
+ * files), in a system folder, or, on Windows, with a segment that Windows can open under another
+ * name. Approving a parent folder does not approve such a path; only an approval of the path
+ * itself does.
+ */
+export function needsExactApproval(filePath: string): boolean {
+    return exactApprovalPatterns.some(pattern => pattern.test(filePath)) || hasAmbiguousWindowsSegment(filePath)
+}
+
 function isSensitivePath(filePath: string): boolean {
     const normalizedPath = filePath.replace(/\\/g, '/')
     const sensitivePatterns = [
-        /\/\.ssh\//,
-        /\/\.aws\//,
-        /\/\.env$/,
-        /\/\.env\./,
         /password/i,
         /secret/i,
         /credential/i,
@@ -455,5 +567,5 @@ function isSensitivePath(filePath: string): boolean {
         /\/dev\//,
     ]
 
-    return sensitivePatterns.some(pattern => pattern.test(normalizedPath))
+    return needsExactApproval(filePath) || sensitivePatterns.some(pattern => pattern.test(normalizedPath))
 }

@@ -1,5 +1,11 @@
 import { CheckedTarget, updateCheckedFile } from './checkedFileIo'
-import { CommandValidation, ExplanatoryParams, InvokeOutput, requiresPathAcceptance } from './toolShared'
+import {
+    ApprovedLinkedFiles,
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    requiresPathAcceptance,
+} from './toolShared'
 import { EmptyPathError, EmptyDiffsError, FileNotExistsError, TextNotFoundError, MultipleMatchesError } from '../errors'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as os from 'os'
@@ -68,10 +74,12 @@ export class FsReplace {
 
     public async requiresAcceptance(
         params: FsReplaceParams,
-        approvedPaths?: Map<string, Set<string>>
+        approvedPaths?: Map<string, Set<string>>,
+        approvedLinkedFiles?: ApprovedLinkedFiles
     ): Promise<CommandValidation> {
         return requiresPathAcceptance(params.path, 'fsReplace', this.workspace, this.logging, approvedPaths, {
             flagMultiplyLinkedFiles: 'modify',
+            approvedLinkedFiles,
         })
     }
 
