@@ -4189,6 +4189,36 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             expect(result?.StepInformation?.StepId).to.equal('g1')
         })
 
+        it('should treat a plan whose first top-level step has no sub-steps as a plan', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            const plan = {
+                Root: {
+                    StepId: 'root',
+                    Children: [
+                        { StepId: 'assess', StepName: 'Assess Solution', Status: 'SUCCEEDED', Children: [] },
+                        {
+                            StepId: 'transform',
+                            StepName: 'Transform Projects',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'p1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                        { StepId: 'lv', StepName: 'Local Verification', Status: 'IN_PROGRESS', Children: [] },
+                    ],
+                },
+            }
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan as any)
+            const planningStub = sinon.stub(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningStub.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+        })
+
         it('should return plan only when no pending step found in execution phase', async () => {
             sinon.stub(handler, 'getJob').resolves({
                 statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
