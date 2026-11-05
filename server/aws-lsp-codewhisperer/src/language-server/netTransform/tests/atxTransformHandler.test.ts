@@ -956,6 +956,324 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
     })
 
+    describe('getTransformationPlan on a beam: merged unit tests', () => {
+        const node = (StepId: string, StepName: string, Status: string, Children: any[] = []) =>
+            ({ StepId, StepName, Status, Children }) as any
+
+        // root > RepoA's web transform card (with its OWN unit test run, already in the beamed zip)
+        // and "(Beamed) Batch" > a card per beamed repo. The orchestrator's two extra levels are
+        // why the depth-2 rule the IDE flow uses cannot find these steps.
+        const beamPlan = () => ({
+            Root: node('root', 'root', 'IN_PROGRESS', [
+                node('repoA', 'RepoA', 'SUCCEEDED', [
+                    node('a-web-ut', 'Generate Unit Tests', 'SUCCEEDED', [
+                        node('a-web-merge', 'Merge Tests', 'SUCCEEDED'),
+                    ]),
+                ]),
+                node('batch', '(Beamed) Batch', 'IN_PROGRESS', [
+                    node('cardA', 'RepoA (beamed)', 'IN_PROGRESS', [
+                        node('a-lbv', 'Local Build Verification', 'SUCCEEDED'),
+                        node('a-ut', 'Generate Unit Tests', 'IN_PROGRESS', [
+                            node('a-merge', 'Merge Tests', 'SUCCEEDED'),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        })
+        // A second beamed repo, so the loaded one has to be identified.
+        const withSecondCard = (plan: any) => {
+            plan.Root.Children[1].Children.push(
+                node('cardB', 'RepoB (beamed)', 'IN_PROGRESS', [
+                    node('b-ut', 'Generate Unit Tests', 'IN_PROGRESS', [node('b-merge', 'Merge Tests', 'SUCCEEDED')]),
+                ])
+            )
+            return plan
+        }
+
+        let applied: string[]
+        let downloadStub: sinon.SinonStub
+
+        beforeEach(() => {
+            applied = []
+            sinon.stub(handler as any, 'fetchWorklogs').resolves(undefined)
+            sinon.stub(handler as any, 'downloadCompletedStepArtifacts').resolves(false)
+            sinon.stub(handler as any, 'loadAppliedCheckpoints').callsFake(() => [...applied])
+            // Stands in for the shared downloader, which applies and records the step itself.
+            downloadStub = sinon
+                .stub(handler as any, 'downloadCompletedStepArtifact')
+                .callsFake(async (_w: any, _j: any, stepId: any) => {
+                    applied.push(stepId)
+                })
+        })
+
+        it("applies the beamed card's finished Merge Tests step", async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.callCount).to.equal(1)
+            expect(downloadStub.firstCall.args[2]).to.equal('a-merge')
+            // Backups are on for this path, since nothing else protects the customer's files.
+            expect(downloadStub.firstCall.args[4]).to.be.true
+        })
+
+        it("never applies the web transform's own Merge Tests", async () => {
+            // a-web-merge sits under the transform card, not a beam card: already in the zip.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
+        it('applies nothing without a solution path', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', '', true)
+
+            expect(downloadStub.called).to.be.false
+        })
+
+        it('skips a step that is already applied', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            applied = ['a-merge']
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+        })
+
+        it('matches card and step names normalized (case and surrounding whitespace)', async () => {
+            const plan = beamPlan()
+            const card = plan.Root.Children[1].Children[0]
+            card.StepName = ' RepoA (Beamed) '
+            card.Children[1].Children[0].StepName = ' merge tests '
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
+        it('needs no scope at all when the plan has one beam card', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, undefined)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
+        it('uses the scope to pick the loaded repo when the batch has several', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA')
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
+        it('accepts a scope naming a step under the card, not only the card', async () => {
+            // The toolkit may send only the step IDs that existed when the repo loaded.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'a-lbv')
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
+        it('applies nothing when several cards and no scope, rather than guess', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+            const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(errors.some(l => l.includes('no scope from the IDE'))).to.be.true
+        })
+
+        it('applies nothing when the scope matches no card or more than one', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'nope')
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'cardA,cardB')
+
+            expect(downloadStub.called).to.be.false
+            const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(errors.filter(l => l.includes('beam cards')).length).to.equal(2)
+        })
+
+        it('applies each run on the card once, in plan order', async () => {
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge', 'a-merge2'])
+        })
+
+        it('stops at a step that did not apply, so a later one cannot land first', async () => {
+            // applyChanges copies whole after/ files, so an earlier diff landing after a later one
+            // would overwrite the later one's .sln and drop its test project.
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+            downloadStub.callsFake(async () => {
+                /* artifact not up yet: nothing gets recorded as applied */
+            })
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+            const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(logged.some(l => l.includes('not applied yet, will retry'))).to.be.true
+        })
+
+        it('retries a step that did not apply, then gives up once after the poll bound', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => {})
+            ;(handler as any)._beamGiveUpPolls = 3
+
+            for (let i = 0; i < 5; i++) {
+                await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            }
+
+            // Three polls tried, then it is left alone for the session.
+            expect(downloadStub.callCount).to.equal(3)
+            const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(errors.filter(l => l.includes('not trying again this session')).length).to.equal(1)
+        })
+
+        it('logs when a finished unit test run on the card has no Merge Tests step', async () => {
+            const plan = beamPlan()
+            const run = plan.Root.Children[1].Children[0].Children[1]
+            run.Status = 'SUCCEEDED'
+            run.Children[0].StepName = 'Merge Generated Tests'
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+            const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(logged.some(l => l.includes('likely renamed'))).to.be.true
+        })
+
+        it('does nothing when the plan has no beam card', async () => {
+            const plan = beamPlan()
+            plan.Root.Children.splice(1, 1)
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+        })
+    })
+
+    describe('beam apply: backing up what it overwrites', () => {
+        const withSolution = async (fn: (root: string, checkpoints: string) => Promise<void>) => {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'beam-backup-'))
+            try {
+                await fn(root, path.join(root, workspaceFolderName, 'job-1', 'checkpoints'))
+            } finally {
+                fs.rmSync(root, { recursive: true, force: true })
+            }
+        }
+        const writeDiff = (folder: string, files: Record<string, string>, metadata: object) => {
+            for (const [rel, text] of Object.entries(files)) {
+                fs.mkdirSync(path.dirname(path.join(folder, 'after', rel)), { recursive: true })
+                fs.writeFileSync(path.join(folder, 'after', rel), text)
+            }
+            fs.mkdirSync(folder, { recursive: true })
+            fs.writeFileSync(path.join(folder, 'metadata.json'), JSON.stringify(metadata))
+        }
+
+        it("keeps a copy of the customer's file before overwriting it", async () => {
+            await withSolution(async (root, checkpoints) => {
+                const sln = path.join(root, 'App.sln')
+                fs.writeFileSync(sln, 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.success).to.be.true
+                // The overwrite is deliberate: the tests must reach the solution.
+                expect(fs.readFileSync(sln, 'utf-8')).to.equal('the agent version')
+                expect(fs.readFileSync(path.join(checkpoints, 'conflict-backups', 'App.sln'), 'utf-8')).to.equal(
+                    'the customer version'
+                )
+                const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
+                expect(logged.some(l => l.includes('merge your own changes back'))).to.be.true
+            })
+        })
+
+        it('does not back up when the bytes already match', async () => {
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'same')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'same' }, { filesUpdated: ['App.sln'] })
+
+                await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(fs.existsSync(path.join(checkpoints, 'conflict-backups', 'App.sln'))).to.be.false
+            })
+        })
+
+        it('keeps the first backup when a later run overwrites the same file', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const props = path.join(root, 'Directory.Packages.props')
+                fs.writeFileSync(props, 'the customer original')
+                const one = path.join(checkpoints, 'a-merge')
+                const two = path.join(checkpoints, 'a-merge2')
+                writeDiff(one, { 'Directory.Packages.props': 'run 1' }, { filesUpdated: ['Directory.Packages.props'] })
+                writeDiff(two, { 'Directory.Packages.props': 'run 2' }, { filesUpdated: ['Directory.Packages.props'] })
+
+                await (handler as any).applyChanges(one, root, 'job-1', true)
+                await (handler as any).applyChanges(two, root, 'job-1', true)
+
+                const backups = path.join(checkpoints, 'conflict-backups')
+                expect(fs.readFileSync(path.join(backups, 'Directory.Packages.props'), 'utf-8')).to.equal(
+                    'the customer original'
+                )
+                expect(fs.readFileSync(path.join(backups, 'Directory.Packages.props.2'), 'utf-8')).to.equal('run 1')
+            })
+        })
+
+        it('keeps the file instead of overwriting it when the backup fails', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const sln = path.join(root, 'App.sln')
+                fs.writeFileSync(sln, 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+                sinon.stub(handler as any, 'backupConflictedFile').throws(new Error('EACCES'))
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                // With no copy anywhere, overwriting could destroy work with no way back.
+                expect(fs.readFileSync(sln, 'utf-8')).to.equal('the customer version')
+                expect(result.conflictedFiles).to.deep.equal([path.resolve(sln)])
+            })
+        })
+
+        it('leaves the non-beam apply untouched: no backups, same behaviour', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const sln = path.join(root, 'App.sln')
+                fs.writeFileSync(sln, 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+
+                await (handler as any).applyChanges(step, root, 'job-1')
+
+                expect(fs.readFileSync(sln, 'utf-8')).to.equal('the agent version')
+                expect(fs.existsSync(path.join(checkpoints, 'conflict-backups'))).to.be.false
+            })
+        })
+    })
+
     describe('buildTreeFromFlatList', () => {
         it('should build a parent-child tree from flat list', () => {
             const flat = [

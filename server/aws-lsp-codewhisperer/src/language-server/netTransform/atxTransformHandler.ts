@@ -106,6 +106,18 @@ interface BeamMapRepo {
     scenario?: string
 }
 
+// A beam card is the per-repo plan step the web orchestrator mints under "(Beamed) Batch", named
+// "<repo> (beamed)". Unit test runs hang off the card where the run was STARTED: a web transform's
+// own run sits under the repo's transform card and its tests are already in the beamed zip, so only
+// runs under a beam card are applied locally.
+const BEAM_CARD_NAME_SUFFIX = '(beamed)'
+const MERGE_TESTS_STEP_NAME = 'merge tests'
+// A merged-tests step that has not applied after this many polls is left alone for the rest of the
+// session. Counted in polls, not elapsed time, so a laptop sleep cannot spend the budget. Without a
+// bound, a step that can never apply re-lists artifacts and retries its download on every poll for
+// the life of the session, against a service that already throttles us.
+const BEAM_MERGE_TESTS_GIVE_UP_POLLS = 5
+
 /** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
 interface BeamedRepoInfo {
     RepositoryName: string
@@ -164,6 +176,12 @@ export class ATXTransformHandler {
     private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
+    // Polls that have seen a beam merged-tests step ("<jobId>:<stepId>") still unapplied, and the
+    // steps given up on once that ran out. Held for the LSP session; clearJobCache resets a job's.
+    private beamMergeTestsPolls = new Map<string, number>()
+    private beamMergeTestsGaveUp = new Set<string>()
+    // A field so a test can reach the give-up bound without running five polls.
+    private _beamGiveUpPolls = BEAM_MERGE_TESTS_GIVE_UP_POLLS
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -441,6 +459,17 @@ export class ATXTransformHandler {
             this.interactiveModeByJob.delete(jobId)
             this._worklogNextTokenByJob.delete(jobId)
             Utils.clearWorklogCacheForJob(jobId)
+            const beamPrefix = `${jobId}:`
+            for (const key of [...this.beamMergeTestsPolls.keys()]) {
+                if (key.startsWith(beamPrefix)) {
+                    this.beamMergeTestsPolls.delete(key)
+                }
+            }
+            for (const key of [...this.beamMergeTestsGaveUp]) {
+                if (key.startsWith(beamPrefix)) {
+                    this.beamMergeTestsGaveUp.delete(key)
+                }
+            }
         }
         this.logging.log('ATX: Cleared job cache')
     }
@@ -2179,7 +2208,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 return {
@@ -2222,7 +2252,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 // If GetCheckpoints is requested, populate HasCheckpoint field on steps
@@ -2366,7 +2397,8 @@ export class ATXTransformHandler {
                         request.WorkspaceId,
                         request.TransformationJobId,
                         request.SolutionRootPath,
-                        request.IsBeam === true
+                        request.IsBeam === true,
+                        request.beamScopeStepIds
                     )
                 } catch (e) {
                     // Plan not available yet
@@ -2539,7 +2571,8 @@ export class ATXTransformHandler {
                 request.WorkspaceId,
                 request.TransformationJobId,
                 request.SolutionRootPath,
-                request.IsBeam === true
+                request.IsBeam === true,
+                request.beamScopeStepIds
             )
             return {
                 TransformationJob: {
@@ -2562,7 +2595,8 @@ export class ATXTransformHandler {
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.IsBeam === true
+            request.IsBeam === true,
+            request.beamScopeStepIds
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
@@ -3009,7 +3043,8 @@ export class ATXTransformHandler {
         jobId: string,
         diffArtifactId: string,
         solutionRootPath: string,
-        stepId: string
+        stepId: string,
+        backupBeforeOverwrite: boolean = false
     ): Promise<string> {
         const maxRetries = 3
 
@@ -3035,7 +3070,7 @@ export class ATXTransformHandler {
                 this.logging.log(`ATX: Diff artifact extracted to: ${pathToDownload}`)
 
                 // Immediately apply changes after extraction
-                const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId)
+                const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId, backupBeforeOverwrite)
                 if (result.success) {
                     this.logging.log(`ATX: Changes applied immediately for step: ${stepId}`)
 
@@ -3704,7 +3739,8 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        isBeam: boolean = false
+        isBeam: boolean = false,
+        beamScopeStepIds?: string
     ): Promise<AtxTransformationPlan> {
         try {
             const plan = await this.fetchPlanTree(workspaceId, jobId)
@@ -3723,10 +3759,17 @@ export class ATXTransformHandler {
             // step" and sets DiffApplyFailed on every poll, stalling the LBV loop. New
             // LBV-round diffs are surfaced via the separate diff-artifact path, which is
             // not gated here.
+            //
+            // Unit tests generated AFTER the beam are the one exception: their Merge Tests diff is
+            // new work on top of the beamed source, so it is applied, scoped to the loaded repo's
+            // beam card. See applyBeamMergedTests.
             if (isBeam) {
                 this.logging.log(
                     `ATX: [BEAM] skipping completed-step artifact apply for beamed job ${jobId} — source is already transformed`
                 )
+                if (solutionRootPath) {
+                    await this.applyBeamMergedTests(workspaceId, jobId, solutionRootPath, plan, beamScopeStepIds)
+                }
                 this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
                 return plan
             }
@@ -3742,6 +3785,182 @@ export class ATXTransformHandler {
             this.logging.error(`ATX: getTransformationPlan error: ${String(error)}`)
             return { Root: createEmptyRootNode() }
         }
+    }
+
+    /**
+     * Beam to IDE: applies the Merge Tests diffs for unit test runs started AFTER the beam.
+     *
+     * The transform agent already does everything the normal IDE flow needs — it uploads a
+     * CUSTOMER_OUTPUT diff tagged with the step id and marks the step SUCCEEDED. The IDE flow then
+     * picks that up in downloadCompletedStepArtifacts, which selects SUCCEEDED steps at plan DEPTH
+     * 2. A beam job is two levels deeper, because the orchestrator inserts "(Beamed) Batch" and a
+     * card per repo, so the depth rule never matches and the whole pass is skipped besides. Those
+     * two facts are the entire reason this exists.
+     *
+     * Scoping. Unit tests must land in the solution that is actually open. With one beam card there
+     * is no ambiguity. With several — a multi-repo batch — the loaded repo is identified by the
+     * IDE's scope (beamScopeStepIds), accepting either the card's own StepId or any step under it.
+     * Picking the wrong card would write another repo's files into this solution.
+     *
+     * Overwrites. The customer's local edits are NOT preserved: a beam job never passed through
+     * startTransform, so it has no source-files.json and applyChanges has nothing to protect
+     * against. Instead every file this apply would overwrite is copied into conflict-backups first
+     * and named in a log line, so nothing is lost silently and the customer can merge by hand. The
+     * `.sln` is the file this matters for, and it also means a project the customer removed locally
+     * comes back, since the agent's `.sln` is the server's whole solution. Accepted deliberately:
+     * the alternative is a structural merge, which is a much larger change for a rarer case.
+     */
+    private async applyBeamMergedTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        plan: AtxTransformationPlan,
+        beamScopeStepIds?: string
+    ): Promise<void> {
+        const card = this.findLoadedBeamCard(plan.Root, beamScopeStepIds)
+        if (!card) {
+            return
+        }
+        const steps = this.findMergeTestsSteps(card)
+        if (steps.length === 0) {
+            // A finished unit test run with no Merge Tests step under it means a step name drifted
+            // out from under the match. Surface it, or the customer silently gets no tests again.
+            if (this.hasUnmatchedUnitTestRun(card)) {
+                this.logging.log(
+                    `ATX: [BEAM] job ${jobId}: beam card ${card.StepId} has a SUCCEEDED "Generate Unit Tests" ` +
+                        `run but no "${MERGE_TESTS_STEP_NAME}" step under it — a step was likely renamed`
+                )
+            }
+            return
+        }
+        if (this._applyingCheckpoints) {
+            this.logging.log('ATX: [BEAM] merged-tests apply already in progress, skipping')
+            return
+        }
+        this._applyingCheckpoints = true
+        try {
+            for (const step of steps) {
+                const key = `${jobId}:${step.StepId}`
+                if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
+                    continue
+                }
+                if (this.beamMergeTestsGaveUp.has(key)) {
+                    continue
+                }
+                this.logging.log(`ATX: [BEAM] applying merged unit tests from step ${step.StepId}`)
+                // Downloads, extracts, applies and records the step as applied, with its own
+                // retries. Failures are logged inside and leave the step unapplied.
+                await this.downloadCompletedStepArtifact(workspaceId, jobId, step.StepId, solutionRootPath, true)
+
+                if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
+                    continue
+                }
+                // Still not applied. The artifact may not be uploaded yet, so retry on later polls
+                // — but stop here rather than applying anything after it: applyChanges copies whole
+                // after/ files, so a later step landing first and this one landing afterwards would
+                // overwrite the later step's .sln and drop its test project from the solution.
+                const polls = (this.beamMergeTestsPolls.get(key) ?? 0) + 1
+                this.beamMergeTestsPolls.set(key, polls)
+                if (polls >= this._beamGiveUpPolls) {
+                    this.beamMergeTestsGaveUp.add(key)
+                    this.logging.error(
+                        `ATX: [BEAM] merged unit tests from step ${step.StepId} did not apply after ${polls} ` +
+                            `polls; not trying again this session`
+                    )
+                    continue
+                }
+                this.logging.log(
+                    `ATX: [BEAM] merged unit tests from step ${step.StepId} not applied yet, will retry on a later poll`
+                )
+                break
+            }
+        } catch (error) {
+            this.logging.error(`ATX: [BEAM] applyBeamMergedTests error: ${String(error)}`)
+        } finally {
+            this._applyingCheckpoints = false
+        }
+    }
+
+    /**
+     * The beam card for the solution that is open, or null when none can be identified.
+     *
+     * One card in the plan is unambiguous, so no scope is needed. With several, the scope must say
+     * which repo is loaded — either by the card's own StepId or by any step beneath it, since
+     * either one identifies exactly one card.
+     */
+    private findLoadedBeamCard(root: AtxPlanStep, beamScopeStepIds?: string): AtxPlanStep | null {
+        const cards: AtxPlanStep[] = []
+        const collect = (step: AtxPlanStep) => {
+            if (this.isBeamCardName(step.StepName)) {
+                cards.push(step)
+            }
+            step.Children.forEach(collect)
+        }
+        collect(root)
+
+        if (cards.length === 0) {
+            return null
+        }
+        if (cards.length === 1) {
+            return cards[0]
+        }
+        const scope = new Set(
+            (beamScopeStepIds || '')
+                .split(',')
+                .map(s => s.trim())
+                .filter(s => s.length > 0)
+        )
+        if (scope.size === 0) {
+            this.logging.error(
+                `ATX: [BEAM] ${cards.length} beam cards in the plan and no scope from the IDE; not applying ` +
+                    `merged unit tests, because the wrong repo's tests would land in this solution`
+            )
+            return null
+        }
+        const inScope = (step: AtxPlanStep): boolean =>
+            scope.has(step.StepId) || step.Children.some(child => inScope(child))
+        const matched = cards.filter(inScope)
+        if (matched.length !== 1) {
+            this.logging.error(
+                `ATX: [BEAM] the IDE's scope [${[...scope].join(', ')}] matched ${matched.length} of ` +
+                    `${cards.length} beam cards; not applying merged unit tests`
+            )
+            return null
+        }
+        return matched[0]
+    }
+
+    /** SUCCEEDED "Merge Tests" steps under this card, in DFS (plan) order. */
+    private findMergeTestsSteps(step: AtxPlanStep): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if (step.Status === 'SUCCEEDED' && this.isMergeTestsStep(step.StepName)) {
+            found.push(step)
+        }
+        for (const child of step.Children) {
+            found.push(...this.findMergeTestsSteps(child))
+        }
+        return found
+    }
+
+    /** True when a finished unit test run under this card has no Merge Tests step beneath it. */
+    private hasUnmatchedUnitTestRun(step: AtxPlanStep): boolean {
+        if (
+            step.Status === 'SUCCEEDED' &&
+            this.isUnitTestGenerationStep(step.StepName) &&
+            this.findMergeTestsSteps(step).length === 0
+        ) {
+            return true
+        }
+        return step.Children.some(child => this.hasUnmatchedUnitTestRun(child))
+    }
+
+    /** Normalized, because the service sends no machine-readable step label. */
+    private isBeamCardName(stepName: string | undefined): boolean {
+        return typeof stepName === 'string' && stepName.trim().toLowerCase().endsWith(BEAM_CARD_NAME_SUFFIX)
+    }
+
+    private isMergeTestsStep(stepName: string | undefined): boolean {
+        return typeof stepName === 'string' && stepName.trim().toLowerCase() === MERGE_TESTS_STEP_NAME
     }
 
     /**
@@ -3930,7 +4149,8 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         stepId: string,
-        solutionRootPath: string
+        solutionRootPath: string,
+        backupBeforeOverwrite: boolean = false
     ): Promise<void> {
         try {
             this.logging.log(`ATX: Downloading artifact for completed step: ${stepId}`)
@@ -3948,7 +4168,14 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: Found artifact ${artifact.artifactId} for step: ${stepId}`)
 
             // Download and extract the artifact
-            await this.downloadDiffArtifact(workspaceId, jobId, artifact.artifactId, solutionRootPath, stepId)
+            await this.downloadDiffArtifact(
+                workspaceId,
+                jobId,
+                artifact.artifactId,
+                solutionRootPath,
+                stepId,
+                backupBeforeOverwrite
+            )
         } catch (error) {
             this.logging.error(`ATX: downloadCompletedStepArtifact error for step ${stepId}: ${String(error)}`)
         }
@@ -4757,7 +4984,11 @@ export class ATXTransformHandler {
     private async applyChanges(
         checkpointFolderPath: string,
         solutionRootPath: string,
-        jobId: string = ''
+        jobId: string = '',
+        // Beam apply only: copy any existing destination into conflict-backups before overwriting
+        // it. A beam job has no source-files.json, so ``userModifiedFiles`` below is always empty
+        // and the customer's edits are not preserved — this is what keeps them recoverable.
+        backupBeforeOverwrite: boolean = false
     ): Promise<{
         success: boolean
         error?: string
@@ -4824,6 +5055,18 @@ export class ATXTransformHandler {
                     ) {
                         continue
                     }
+                    if (
+                        this.backupBeforeBeamOverwrite(
+                            destPath,
+                            sourcePath,
+                            jobId,
+                            solutionRootPath,
+                            conflictedFiles,
+                            backupBeforeOverwrite
+                        )
+                    ) {
+                        continue
+                    }
 
                     // Ensure destination directory exists
                     const destDir = path.dirname(destPath)
@@ -4859,6 +5102,18 @@ export class ATXTransformHandler {
                             conflictedFiles.push(path.resolve(filePath))
                             continue
                         }
+                        if (
+                            this.backupBeforeBeamOverwrite(
+                                filePath,
+                                '',
+                                jobId,
+                                solutionRootPath,
+                                conflictedFiles,
+                                backupBeforeOverwrite
+                            )
+                        ) {
+                            continue
+                        }
                         fs.unlinkSync(filePath)
                         removedCount++
                         this.logging.log(`ATX: Removed file: ${relativePath}`)
@@ -4884,6 +5139,18 @@ export class ATXTransformHandler {
                             conflictedFiles,
                             solutionRootPath,
                             jobId
+                        )
+                    ) {
+                        continue
+                    }
+                    if (
+                        this.backupBeforeBeamOverwrite(
+                            destPath,
+                            sourcePath,
+                            jobId,
+                            solutionRootPath,
+                            conflictedFiles,
+                            backupBeforeOverwrite
                         )
                     ) {
                         continue
@@ -4943,6 +5210,18 @@ export class ATXTransformHandler {
                                 this.logging.error(`ATX: Failed to back up conflicted file ${beforePath}: ${String(e)}`)
                             }
                             conflictedFiles.push(path.resolve(beforePath))
+                            continue
+                        }
+                        if (
+                            this.backupBeforeBeamOverwrite(
+                                afterPath,
+                                beforePath,
+                                jobId,
+                                solutionRootPath,
+                                conflictedFiles,
+                                backupBeforeOverwrite
+                            )
+                        ) {
                             continue
                         }
                         fs.copyFileSync(beforePath, afterPath)
@@ -5041,13 +5320,54 @@ export class ATXTransformHandler {
      * never anything under that dir, so a backup here cannot be re-detected as a customer
      * edit and round-tripped back up on the next sync. Returns the backup path.
      */
+    /**
+     * Beam apply only: keep a copy of an existing destination before the agent's version overwrites
+     * it, so the customer can merge their own changes back by hand. Returns true when the caller
+     * must SKIP its write: a backup that could not be taken means overwriting might destroy work
+     * with no copy anywhere, so the file is kept and reported as a conflict instead.
+     */
+    private backupBeforeBeamOverwrite(
+        destPath: string,
+        sourcePath: string,
+        jobId: string,
+        solutionRootPath: string,
+        conflictedFiles: string[],
+        backupBeforeOverwrite: boolean
+    ): boolean {
+        if (!backupBeforeOverwrite || !fs.existsSync(destPath)) {
+            return false
+        }
+        if (sourcePath && this.filesEqual(sourcePath, destPath)) {
+            return false
+        }
+        try {
+            const backupPath = this.backupConflictedFile(destPath, jobId, solutionRootPath)
+            this.logging.log(
+                `ATX: [BEAM] backed up ${destPath} to ${backupPath} before overwriting it; merge your own ` +
+                    `changes back from there if you had any`
+            )
+            return false
+        } catch (e) {
+            this.logging.error(`ATX: [BEAM] keeping ${destPath}: could not back it up before overwriting: ${String(e)}`)
+            conflictedFiles.push(path.resolve(destPath))
+            return true
+        }
+    }
+
     private backupConflictedFile(destPath: string, jobId: string, solutionRootPath: string): string {
         const backupRoot = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'conflict-backups')
         const relForBackup = path.relative(solutionRootPath, destPath)
         const backupPath = path.join(backupRoot, relForBackup)
         fs.mkdirSync(path.dirname(backupPath), { recursive: true })
-        fs.copyFileSync(destPath, backupPath)
-        return backupPath
+        // Never replace an existing backup. The FIRST copy of a file is the customer's own version;
+        // a later run that touches the same path would otherwise overwrite it with agent content,
+        // losing the very thing the backup exists to keep. Later copies get a numbered suffix.
+        let unique = backupPath
+        for (let n = 2; fs.existsSync(unique); n++) {
+            unique = `${backupPath}.${n}`
+        }
+        fs.copyFileSync(destPath, unique)
+        return unique
     }
 
     /**
