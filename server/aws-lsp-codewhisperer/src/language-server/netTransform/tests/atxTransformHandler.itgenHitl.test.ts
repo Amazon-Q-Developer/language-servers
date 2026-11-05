@@ -10,6 +10,7 @@ import {
     ATX_HITL_TAG_INTEG_APP_LAUNCH,
     ATX_HITL_TAG_INTEG_TEST_RUN,
     isSafeRelativeProjectPath,
+    itGenProjectFolderName,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -346,14 +347,40 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(fs.existsSync(path.join(itgen, 'SampleWebApi.Admin', 'r1', 'tests'))).to.be.true
         })
 
-        it("refuses a project that isn't a single folder name", async () => {
-            requestsByArtifact['art-run'] = testRunRequest({ project: '../SampleWebApi' })
+        it('gives a project whose name is not a plain folder name a safe folder of its own', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            for (const [artifact, project] of [
+                ['art-space', 'Contoso Web'],
+                ['art-climb', '../SampleWebApi'],
+            ]) {
+                requestsByArtifact[artifact] = testRunRequest({ project })
+                hitls = [{ ...testRunHitl, taskId: `task-${artifact}`, agentArtifact: { artifactId: artifact } }]
+
+                const open = (await poll())!.OpenHitls![0]
+
+                expect(open.RequestError).to.be.undefined
+                const folder = path.relative(itgen, open.TestsPath!).split(path.sep)[0]
+                expect(folder).to.equal(itGenProjectFolderName(project))
+                expect(folder).to.match(/^[A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{8}$/)
+            }
+        })
+
+        it('treats an empty project as no project', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ project: '' })
             hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
 
             const open = (await poll())!.OpenHitls![0]
 
-            expect(open.RequestError).to.contain('Unsafe integ-test-run project')
-            expect(zipDownloadStub.called).to.be.false
+            expect(open.TestsPath).to.equal(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'r2', 'tests'))
+        })
+
+        it('keeps plain project names, and tells apart names that look alike once made safe', () => {
+            expect(itGenProjectFolderName('SampleWebApi.Admin')).to.equal('SampleWebApi.Admin')
+            expect(itGenProjectFolderName(undefined)).to.be.undefined
+            expect(itGenProjectFolderName('  ')).to.be.undefined
+            expect(itGenProjectFolderName('Contoso Web')).to.not.equal(itGenProjectFolderName('Contoso_Web '))
+            expect(itGenProjectFolderName('Shared.')).to.match(/^Shared-[0-9a-f]{8}$/)
+            expect(itGenProjectFolderName('CON')).to.match(/^CON-[0-9a-f]{8}$/)
         })
 
         it('downloads once when overlapping polls ask for the same task', async () => {

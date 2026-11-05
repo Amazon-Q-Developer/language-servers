@@ -95,6 +95,32 @@ function isSafePathSegment(value: unknown): value is string {
     return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..')
 }
 
+/**
+ * ITGen: the folder under itgen/ for a test-run request's project, or undefined for no project (absent or empty).
+ * Project names come from the customer's .csproj file names, so they can hold spaces, parentheses or other
+ * characters: a name that isn't a plain folder name is made one, with a hash of the name so two names that look
+ * alike after that still get their own folders.
+ */
+export function itGenProjectFolderName(project: unknown): string | undefined {
+    if (typeof project !== 'string' || project.trim() === '') {
+        return undefined
+    }
+    // Windows can't have a folder named after a device (CON, NUL, COM1...), nor one ending in a dot or a space
+    const windowsDevice = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i
+    if (isSafePathSegment(project) && !/[. ]$/.test(project) && !windowsDevice.test(project)) {
+        return project
+    }
+    const readable =
+        project
+            .replace(/[^A-Za-z0-9._-]/g, '_')
+            .replace(/\.{2,}/g, '_')
+            .replace(/^[^A-Za-z0-9]+/, '')
+            .replace(/[.]+$/, '')
+            .slice(0, 40) || 'project'
+    const hash = crypto.createHash('sha256').update(project).digest('hex').slice(0, 8)
+    return `${readable}-${hash}`
+}
+
 // IDE-supplied folders we extract into: absolute, with no '..' segment (a folder like 'Foo..Bar' is fine).
 function isSafeAbsolutePath(value: unknown): value is string {
     return typeof value === 'string' && path.isAbsolute(value) && !value.split(/[\\/]/).includes('..')
@@ -2274,12 +2300,10 @@ export class ATXTransformHandler {
         if (!isSafeRelativeProjectPath(request.tests?.projectPath)) {
             return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
         }
-        if (request.project !== undefined && request.project !== null && !isSafePathSegment(request.project)) {
-            return { RequestError: `Unsafe integ-test-run project: ${request.project}` }
-        }
         const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
         // The project's runs share a folder; another project's run with the same id has its own
-        const runsDir = request.project ? path.join(itgenDir, request.project) : itgenDir
+        const projectFolder = itGenProjectFolderName(request.project)
+        const runsDir = projectFolder ? path.join(itgenDir, projectFolder) : itgenDir
         const runDir = path.join(runsDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
@@ -2686,7 +2710,7 @@ export class ATXTransformHandler {
             // A mid-job mode change is written to the checkpoint-settings artifact and never back
             // into the objective, which is the job-creation payload and immutable. Reading the
             // objective alone therefore restores the mode the job STARTED in and silently discards
-            // any later switch, so reopening the IDE reverted the mode (V2381727290). Prefer the
+            // any later switch, so reopening the IDE reverted the mode. Prefer the
             // artifact - it is the store every client writes, so it also reflects a switch made
             // from the web UI or another IDE - and keep the objective as the fallback for a job
             // whose mode was never changed and so has no artifact yet.
@@ -3162,7 +3186,7 @@ export class ATXTransformHandler {
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
 
-        // missing-packages can be raised once a plan already exists (P516058803). Only the planning
+        // missing-packages can be raised once a plan already exists. Only the planning
         // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
         // ({stepId}-review) HITLs and would drop them, so the IDE never shows the package-upload
         // dialog. Return it directly, mirroring the local-build-verification early-exit above.
@@ -4411,7 +4435,7 @@ export class ATXTransformHandler {
                             // path at the downloadDiffArtifact call site already does). Without
                             // it, ``lastAppliedTimestamp`` stays absent here, so the user-edit
                             // protection in applyChanges sees an empty modified-set and is a
-                            // no-op on the exact interactive path DealerFx lost edits on. The
+                            // no-op on the exact interactive path where customer edits were lost. The
                             // per-step re-stamp can't shrink later steps' protection because
                             // the byte-equal short-circuit ignores the agent's own re-writes.
                             this.saveLastAppliedTimestamp(solutionRootPath, jobId, step.StepId)
@@ -5107,7 +5131,7 @@ export class ATXTransformHandler {
             } else {
                 // This artifact is full state and the agent reads a missing interactive_mode as "use
                 // the default", not "leave it alone", so a checkpoints-only sync has to carry the
-                // current mode forward or it silently reverts the user's choice (V2381727290).
+                // current mode forward or it silently reverts the user's choice.
                 // Known limitation: the cache is resolved once per job, so a switch made elsewhere
                 // after that read is overwritten by the next sync.
                 const cachedMode = this.getCachedInteractiveMode(jobId)
@@ -5489,7 +5513,7 @@ export class ATXTransformHandler {
 
             // Files the customer edited locally since the last checkpoint apply. Applying
             // the transform's version on top of these silently destroys the customer's
-            // work (DealerFx P452432920 — edits to an already-transformed project clobbered
+            // work (edits to an already-transformed project clobbered
             // by a later sync). Compute the protected set ONCE up front (a per-step stamp
             // would shrink it for later steps in this run) and resolve to absolute paths so
             // it can be membership-tested against each resolved destination. ``getModified…``
@@ -5570,7 +5594,7 @@ export class ATXTransformHandler {
                     const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
                     const destPath = path.join(solutionRootPath, relativePath)
 
-                    // The DealerFx clobber: if the customer edited this already-applied file
+                    // The clobber: if the customer edited this already-applied file
                     // since the last sync, preserve their version instead of overwriting it.
                     if (
                         this.shouldPreserveUserFile(
