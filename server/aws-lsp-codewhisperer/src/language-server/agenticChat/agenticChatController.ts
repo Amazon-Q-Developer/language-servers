@@ -176,9 +176,11 @@ import {
     CommandValidation,
     ExplanatoryParams,
     InvokeOutput,
+    canonicalizeWorkspaceFolders,
     discardResolvedTargets,
     withResolvedTargets,
     getFileUpdate,
+    hasAdditionalHardLinks,
     isSamePath,
     isRegularFile,
     requiresPathAcceptance,
@@ -987,10 +989,12 @@ export class AgenticChatController implements ChatHandlers {
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 
-        // Memory Bank Creation Flow - Delegate to MemoryBankController
-        if (this.#memoryBankController.isMemoryBankCreationRequest(params.prompt.prompt)) {
+        // Memory Bank Creation Flow - Delegate to MemoryBankController.
+        // The flag belongs to this request and is passed down its agent loop, so a turn that is still
+        // running in the same tab never sees it.
+        let isMemoryBankGeneration = this.#memoryBankController.isMemoryBankCreationRequest(params.prompt.prompt)
+        if (isMemoryBankGeneration) {
             this.#features.logging.info(`Memory Bank creation request detected for tabId: ${params.tabId}`)
-            session.isMemoryBankGeneration = true
 
             // Store original prompt to prevent data loss on failure
             const originalPrompt = params.prompt.prompt
@@ -1073,7 +1077,7 @@ export class AgenticChatController implements ChatHandlers {
                 // Restore original prompt to ensure no data loss
                 params.prompt.prompt = originalPrompt
                 // Reset memory bank flag since preparation failed
-                session.isMemoryBankGeneration = false
+                isMemoryBankGeneration = false
             }
         }
 
@@ -1243,7 +1247,8 @@ export class AgenticChatController implements ChatHandlers {
                     session.conversationId,
                     token,
                     triggerContext.documentReference,
-                    additionalContext
+                    additionalContext,
+                    isMemoryBankGeneration
                 )
             }
 
@@ -1524,7 +1529,8 @@ export class AgenticChatController implements ChatHandlers {
         conversationIdentifier?: string,
         token?: CancellationToken,
         documentReference?: FileList,
-        additionalContext?: AdditionalContentEntryAddition[]
+        additionalContext?: AdditionalContentEntryAddition[],
+        isMemoryBankGeneration: boolean = false
     ): Promise<Result<AgenticChatResultWithMetadata, string>> {
         let currentRequestInput = { ...initialRequestInput }
         let finalResult: Result<AgenticChatResultWithMetadata, string> | null = null
@@ -1761,7 +1767,8 @@ export class AgenticChatController implements ChatHandlers {
                     session,
                     tabId,
                     token,
-                    additionalContext
+                    additionalContext,
+                    isMemoryBankGeneration
                 )
                 if (toolResults.some(toolResult => this.#shouldSendBackErrorContent(toolResult))) {
                     content = 'There was an error processing one or more tool uses. Try again, do not apologize.'
@@ -2077,7 +2084,38 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     /**
-     * Processes tool uses by running the tools and collecting results
+     * Approved paths for a memory bank generation request, which also include the memory
+     * bank files. The user asked for these files, so writing them does not ask again.
+     * A memory bank file that is a link, or is in a linked folder, or that has another name
+     * on disk, is left out so the usual checks still ask about it.
+     */
+    async #withMemoryBankFiles(approvedPaths: Map<string, Set<string>>): Promise<Map<string, Set<string>>> {
+        const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+        if (!workspaceFolders.length) {
+            return approvedPaths
+        }
+
+        const [canonicalWorkspaceFolder] = await canonicalizeWorkspaceFolders([workspaceFolders[0]])
+        const memoryBankFilePaths: string[] = []
+        for (const filePath of this.#memoryBankController.getMemoryBankFilePaths(workspaceFolders[0])) {
+            const resolvedPath = await resolveSymlinkAwarePath(sanitize(filePath))
+            const expectedPath = path.join(canonicalWorkspaceFolder, path.relative(workspaceFolders[0], filePath))
+            if (isSamePath(resolvedPath, expectedPath) && !(await hasAdditionalHardLinks(resolvedPath))) {
+                memoryBankFilePaths.push(resolvedPath)
+            }
+        }
+
+        const result = new Map(approvedPaths)
+        for (const toolName of [FS_WRITE, FS_REPLACE]) {
+            result.set(toolName, new Set([...(approvedPaths.get(toolName) ?? []), ...memoryBankFilePaths]))
+        }
+        return result
+    }
+
+    /**
+     * Processes tool uses by running the tools and collecting results.
+     * @param isMemoryBankGeneration True only when the request that runs these tool uses asked for a
+     * memory bank; it lets that request write the memory bank files.
      */
     async processToolUses(
         toolUses: Array<ToolUse & { stop: boolean }>,
@@ -2085,7 +2123,8 @@ export class AgenticChatController implements ChatHandlers {
         session: ChatSessionService,
         tabId: string,
         token?: CancellationToken,
-        additionalContext?: AdditionalContentEntryAddition[]
+        additionalContext?: AdditionalContentEntryAddition[],
+        isMemoryBankGeneration: boolean = false
     ): Promise<ToolResult[]> {
         const results: ToolResult[] = []
 
@@ -2155,7 +2194,7 @@ export class AgenticChatController implements ChatHandlers {
 
                         const { Tool } = toolMap[toolUse.name as keyof typeof toolMap]
                         const tool =
-                            toolUse.name === FS_READ && session.isMemoryBankGeneration
+                            toolUse.name === FS_READ && isMemoryBankGeneration
                                 ? new Tool(
                                       this.#features,
                                       FSREAD_MEMORY_BANK_MAX_PER_FILE,
@@ -2169,7 +2208,9 @@ export class AgenticChatController implements ChatHandlers {
                         // const builtInPermission = permission !== 'alwaysAllow'
 
                         // Get the approved paths from the session
-                        const approvedPaths = session.approvedPaths
+                        const approvedPaths = isMemoryBankGeneration
+                            ? await this.#withMemoryBankFiles(session.approvedPaths)
+                            : session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
                         const {
@@ -2229,7 +2270,8 @@ export class AgenticChatController implements ChatHandlers {
                                 commandCategory,
                                 undefined,
                                 undefined,
-                                acceptanceReason
+                                acceptanceReason,
+                                (toolUse.input as { path?: unknown } | undefined)?.path
                             )
                             cachedButtonBlockId = await chatResultStream.writeResultBlock(confirmationResult)
                             const isExecuteBash = toolUse.name === EXECUTE_BASH
@@ -3331,7 +3373,8 @@ export class AgenticChatController implements ChatHandlers {
         commandCategory?: CommandCategory,
         toolType?: string,
         builtInPermission?: boolean,
-        acceptanceReason?: CommandValidation['acceptanceReason']
+        acceptanceReason?: CommandValidation['acceptanceReason'],
+        requestedPath?: unknown
     ): ChatResult {
         // The name used for dispatch and classification is the registered tool
         // name, which is namespaced for MCP tools. `toolType` carries the
@@ -3339,10 +3382,19 @@ export class AgenticChatController implements ChatHandlers {
         // able to select built-in rendering by matching a built-in name.
         const dispatchName = toolUse.name
         const toolName = toolType || toolUse.name
-        // A multiply linked path is inside the workspace, so the filesystem
-        // prompts below describe the shared file rather than a location outside
-        // the workspace.
-        const isMultiplyLinkedFile = acceptanceReason === 'multiplyLinkedFile'
+        // A multiply linked path or a configuration file is inside the workspace,
+        // so the filesystem prompts below do not describe a location outside the
+        // workspace.
+        const isInWorkspacePath = acceptanceReason !== undefined
+        // A configuration file prompt also names the requested path when it reaches the file
+        // through a link, because the requested name may be what makes it configuration
+        const requestedPathNote = (shownPath: string) =>
+            acceptanceReason === 'configFile' &&
+            typeof requestedPath === 'string' &&
+            !isSamePath(path.resolve(sanitize(requestedPath)), shownPath)
+                ? // Without segments that `..` cancels, so it names only folders on the way to the file
+                  `\nRequested as \`${path.resolve(sanitize(requestedPath))}\``
+                : ''
         let buttons: Button[] = []
         let header: {
             body: string
@@ -3432,15 +3484,16 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    (builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
-                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``) +
+                    requestedPathNote(writeFilePath)
                 break
             }
 
@@ -3456,15 +3509,16 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    (builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
-                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``) +
+                    requestedPathNote(writeFilePath)
                 break
             }
 
@@ -3475,7 +3529,7 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'tools',
                     iconForegroundStatus: 'tools',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow read-only tools'
                             : '#### Allow read-only tools outside your workspace',
                     buttons,
@@ -3491,7 +3545,7 @@ export class AgenticChatController implements ChatHandlers {
                     const formattedPaths: string[] = []
                     paths.forEach(element => formattedPaths.push(`\`${element}\``))
                     body =
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? `I need permission to read files.\n${formattedPaths.join('\n')}`
                             : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
                 } else {
@@ -3923,9 +3977,6 @@ export class AgenticChatController implements ChatHandlers {
             },
         })
 
-        // Reset memory bank flag after completion
-        session.isMemoryBankGeneration = false
-
         return chatResultStream.getResult()
     }
 
@@ -3961,12 +4012,8 @@ export class AgenticChatController implements ChatHandlers {
             requestModelId
         )
 
-        // Reset memory bank flag on request error
         const sessionResult = this.#chatSessionManagementService.getSession(tabId)
         const modelId = requestModelId ?? (sessionResult.success ? sessionResult.data.modelId : undefined)
-        if (sessionResult.success) {
-            sessionResult.data.isMemoryBankGeneration = false
-        }
 
         if (isUsageLimitError(err)) {
             if (this.#paidTierMode !== 'paidtier') {
