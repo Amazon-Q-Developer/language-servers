@@ -3160,9 +3160,7 @@ export class ATXTransformHandler {
             request.IsBeam === true
         )
 
-        // A plan exists once any top-level step has sub-steps. The first one can be a leaf (for example "Assess
-        // Solution"), and checking only it sent an executing job down the planning path, which returns no plan.
-        const hasPlan = plan.Root.Children.some((step: AtxPlanStep) => (step.Children?.length ?? 0) > 0)
+        const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
 
         // missing-packages can be raised once a plan already exists (P516058803). Only the planning
         // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
