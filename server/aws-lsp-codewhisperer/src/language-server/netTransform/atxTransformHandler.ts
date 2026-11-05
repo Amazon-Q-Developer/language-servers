@@ -95,6 +95,32 @@ function isSafePathSegment(value: unknown): value is string {
     return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..')
 }
 
+/**
+ * ITGen: the folder under itgen/ for a test-run request's project, or undefined for no project (absent or empty).
+ * Project names come from the customer's .csproj file names, so they can hold spaces, parentheses or other
+ * characters: a name that isn't a plain folder name is made one, with a hash of the name so two names that look
+ * alike after that still get their own folders.
+ */
+export function itGenProjectFolderName(project: unknown): string | undefined {
+    if (typeof project !== 'string' || project.trim() === '') {
+        return undefined
+    }
+    // Windows can't have a folder named after a device (CON, NUL, COM1...), nor one ending in a dot or a space
+    const windowsDevice = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i
+    if (isSafePathSegment(project) && !/[. ]$/.test(project) && !windowsDevice.test(project)) {
+        return project
+    }
+    const readable =
+        project
+            .replace(/[^A-Za-z0-9._-]/g, '_')
+            .replace(/\.{2,}/g, '_')
+            .replace(/^[^A-Za-z0-9]+/, '')
+            .replace(/[.]+$/, '')
+            .slice(0, 40) || 'project'
+    const hash = crypto.createHash('sha256').update(project).digest('hex').slice(0, 8)
+    return `${readable}-${hash}`
+}
+
 // IDE-supplied folders we extract into: absolute, with no '..' segment (a folder like 'Foo..Bar' is fine).
 function isSafeAbsolutePath(value: unknown): value is string {
     return typeof value === 'string' && path.isAbsolute(value) && !value.split(/[\\/]/).includes('..')
@@ -2230,10 +2256,12 @@ export class ATXTransformHandler {
 
     /**
      * ITGen: downloads the repo artifact holding the generated test projects (request.artifactId)
-     * into artifactWorkspace/<job>/itgen/<runId>/tests, for tests.projectPath to resolve against
-     * (contract v0 §4). The agent rewrites that artifact under the same id on every test fix, so
-     * it's downloaded again for every test-run task and never reused by id; a marker file holding
-     * the task id keeps one task's later polls from downloading it again.
+     * into artifactWorkspace/<job>/itgen/<project>/<runId>/tests (itgen/<runId>/tests for a request
+     * without a project), for tests.projectPath to resolve against (contract v0 §4). The agent can use
+     * the same run ids for every project, so each project has its own folder. The agent rewrites that
+     * artifact under the same id on every test fix, so it's downloaded again for every test-run task
+     * and never reused by id; a marker file holding the task id keeps one task's later polls from
+     * downloading it again.
      */
     private downloadItGenTests(
         workspaceId: string,
@@ -2273,7 +2301,10 @@ export class ATXTransformHandler {
             return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
         }
         const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
-        const runDir = path.join(itgenDir, request.runId)
+        // The project's runs share a folder; another project's run with the same id has its own
+        const projectFolder = itGenProjectFolderName(request.project)
+        const runsDir = projectFolder ? path.join(itgenDir, projectFolder) : itgenDir
+        const runDir = path.join(runsDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
         const projectMarkerPath = path.join(runDir, 'tests.project')
@@ -2321,7 +2352,7 @@ export class ATXTransformHandler {
         if (projectKey) {
             fs.writeFileSync(projectMarkerPath, projectKey)
             if (this.itGenLatestRunByProject.get(latestKey) === request.runId) {
-                this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
+                this.removeOlderItGenTests(runsDir, request.runId, projectKey)
             } else {
                 this.logging.log(
                     `ATX: run ${request.runId} (${projectKey}) finished after a newer run started; not collecting earlier runs`
@@ -2336,15 +2367,15 @@ export class ATXTransformHandler {
      * ITGen: keeps only the latest run's tests per side and project, so a job holds at most one copy of
      * the artifact per project instead of one per run. The agent opens a project's next run only after
      * the IDE submitted the previous one, so an older run's tests are no longer needed. The run folder
-     * itself (with the IDE's result ZIP) stays.
+     * itself (with the IDE's result ZIP) stays. runsDir is the folder holding the project's runs.
      */
-    private removeOlderItGenTests(itgenDir: string, currentRunId: string, projectKey: string): void {
-        for (const entry of fs.readdirSync(itgenDir, { withFileTypes: true })) {
+    private removeOlderItGenTests(runsDir: string, currentRunId: string, projectKey: string): void {
+        for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
             if (!entry.isDirectory() || entry.name === currentRunId) {
                 continue
             }
-            const keyPath = path.join(itgenDir, entry.name, 'tests.project')
-            const oldTests = path.join(itgenDir, entry.name, 'tests')
+            const keyPath = path.join(runsDir, entry.name, 'tests.project')
+            const oldTests = path.join(runsDir, entry.name, 'tests')
             try {
                 if (
                     fs.existsSync(oldTests) &&

@@ -10,6 +10,7 @@ import {
     ATX_HITL_TAG_INTEG_APP_LAUNCH,
     ATX_HITL_TAG_INTEG_TEST_RUN,
     isSafeRelativeProjectPath,
+    itGenProjectFolderName,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
@@ -250,7 +251,15 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             const result = await poll()
 
             const expectedPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl', 'task-run', 'request.json')
-            const expectedTests = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'r2', 'tests')
+            const expectedTests = path.join(
+                tmpRoot,
+                workspaceFolderName,
+                JOB_ID,
+                'itgen',
+                'SampleWebApi',
+                'r2',
+                'tests'
+            )
             expect(result?.OpenHitls).to.deep.equal([
                 {
                     TaskId: 'task-run',
@@ -302,7 +311,8 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
 
         it('removes the tests of earlier runs of the same project, and only those', async () => {
-            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
+            const adminItgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi.Admin')
             requestsByArtifact['art-run'] = testRunRequest({ runId: 'r1' })
             requestsByArtifact['art-admin'] = testRunRequest({ runId: 'r5', project: 'SampleWebApi.Admin' })
             hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
@@ -318,8 +328,59 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.false
             expect(fs.existsSync(path.join(itgen, 'r1', 'results.zip'))).to.be.true
-            expect(fs.existsSync(path.join(itgen, 'r5', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(adminItgen, 'r5', 'tests'))).to.be.true
             expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
+        })
+
+        it('keeps the tests of two projects whose runs have the same id apart', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            requestsByArtifact['art-run'] = testRunRequest({ runId: 'r1' })
+            requestsByArtifact['art-admin'] = testRunRequest({ runId: 'r1', project: 'SampleWebApi.Admin' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+            const first = await poll()
+            hitls = [{ ...testRunHitl, taskId: 'task-admin', agentArtifact: { artifactId: 'art-admin' } }]
+            const second = await poll()
+
+            expect(first!.OpenHitls![0].TestsPath).to.equal(path.join(itgen, 'SampleWebApi', 'r1', 'tests'))
+            expect(second!.OpenHitls![0].TestsPath).to.equal(path.join(itgen, 'SampleWebApi.Admin', 'r1', 'tests'))
+            expect(fs.existsSync(path.join(itgen, 'SampleWebApi', 'r1', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'SampleWebApi.Admin', 'r1', 'tests'))).to.be.true
+        })
+
+        it('gives a project whose name is not a plain folder name a safe folder of its own', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            for (const [artifact, project] of [
+                ['art-space', 'Contoso Web'],
+                ['art-climb', '../SampleWebApi'],
+            ]) {
+                requestsByArtifact[artifact] = testRunRequest({ project })
+                hitls = [{ ...testRunHitl, taskId: `task-${artifact}`, agentArtifact: { artifactId: artifact } }]
+
+                const open = (await poll())!.OpenHitls![0]
+
+                expect(open.RequestError).to.be.undefined
+                const folder = path.relative(itgen, open.TestsPath!).split(path.sep)[0]
+                expect(folder).to.equal(itGenProjectFolderName(project))
+                expect(folder).to.match(/^[A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{8}$/)
+            }
+        })
+
+        it('treats an empty project as no project', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ project: '' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const open = (await poll())!.OpenHitls![0]
+
+            expect(open.TestsPath).to.equal(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'r2', 'tests'))
+        })
+
+        it('keeps plain project names, and tells apart names that look alike once made safe', () => {
+            expect(itGenProjectFolderName('SampleWebApi.Admin')).to.equal('SampleWebApi.Admin')
+            expect(itGenProjectFolderName(undefined)).to.be.undefined
+            expect(itGenProjectFolderName('  ')).to.be.undefined
+            expect(itGenProjectFolderName('Contoso Web')).to.not.equal(itGenProjectFolderName('Contoso_Web '))
+            expect(itGenProjectFolderName('Shared.')).to.match(/^Shared-[0-9a-f]{8}$/)
+            expect(itGenProjectFolderName('CON')).to.match(/^CON-[0-9a-f]{8}$/)
         })
 
         it('downloads once when overlapping polls ask for the same task', async () => {
@@ -342,7 +403,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
 
         it('does not let a run that finishes late collect a newer run', async () => {
-            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
             let releaseR1!: () => void
             const r1Gate = new Promise<void>(resolve => (releaseR1 = resolve))
             zipDownloadStub.callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
@@ -382,7 +443,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
 
         it('backfills the project marker when it reuses tests downloaded before markers existed', async () => {
-            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
             // The layout before tests.project: tests/ and tests.task only.
             fs.mkdirSync(path.join(itgen, 'r1', 'tests'), { recursive: true })
             fs.writeFileSync(path.join(itgen, 'r1', 'tests.task'), 'task-r1')
@@ -430,7 +491,9 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             expect(zipDownloadStub.callCount).to.equal(2)
             expect(downloadUrlStub.secondCall.args[2]).to.equal('repo-artifact')
-            expect(open.TestsPath).to.equal(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'r3', 'tests'))
+            expect(open.TestsPath).to.equal(
+                path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi', 'r3', 'tests')
+            )
         })
 
         it('does not download tests for an app launch', async () => {
