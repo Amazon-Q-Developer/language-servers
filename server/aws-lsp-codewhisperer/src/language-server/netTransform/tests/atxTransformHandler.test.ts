@@ -6,7 +6,7 @@ import * as os from 'os'
 import { Readable } from 'stream'
 import got from 'got'
 import { ATXTransformHandler } from '../atxTransformHandler'
-import { workspaceFolderName } from '../utils'
+import { Utils, workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 
@@ -992,12 +992,25 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
         let applied: string[]
         let downloadStub: sinon.SinonStub
+        let beamState: { polls: Record<string, number>; skipped: string[] }
+        let worklogs: string[]
 
         beforeEach(() => {
             applied = []
+            beamState = { polls: {}, skipped: [] }
+            worklogs = []
             sinon.stub(handler as any, 'fetchWorklogs').resolves(undefined)
             sinon.stub(handler as any, 'downloadCompletedStepArtifacts').resolves(false)
             sinon.stub(handler as any, 'loadAppliedCheckpoints').callsFake(() => [...applied])
+            // The real apply state lives on disk beside checkpoints-applied.json; these tests use a
+            // fake solution path, so keep it in memory instead of writing to it.
+            sinon.stub(handler as any, 'readBeamApplyState').callsFake(() => beamState)
+            sinon.stub(handler as any, 'writeBeamApplyState').callsFake((_r: any, _j: any, s: any) => {
+                beamState = s
+            })
+            sinon.stub(handler as any, 'tellCustomer').callsFake(async (_j: any, _s: any, _r: any, message: any) => {
+                worklogs.push(String(message))
+            })
             // Stands in for the shared downloader, which applies and records the step itself.
             downloadStub = sinon
                 .stub(handler as any, 'downloadCompletedStepArtifact')
@@ -1145,7 +1158,76 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             // Three polls tried, then it is left alone for the session.
             expect(downloadStub.callCount).to.equal(3)
             const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
-            expect(errors.filter(l => l.includes('not trying again this session')).length).to.equal(1)
+            expect(errors.filter(l => l.includes('not trying it again')).length).to.equal(1)
+        })
+
+        it('tells the customer in the worklog when the tests are added', async () => {
+            // The LSP output log is not somewhere a Visual Studio customer looks.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs.some(m => m.includes('Added the generated unit tests'))).to.be.true
+        })
+
+        it('tells the customer when it gives up, not just the log', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => {})
+            ;(handler as any)._beamGiveUpPolls = 2
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs.some(m => m.includes('Could not add the generated unit tests'))).to.be.true
+        })
+
+        it('tells the customer when it cannot tell which beamed repo this is', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs.some(m => m.includes('not clear which beamed repository'))).to.be.true
+        })
+
+        it('remembers a give-up across sessions, so it can never apply out of order later', async () => {
+            // The count and the give-up list are on disk: clearJobCache runs on every poll of a
+            // COMPLETED job, and a given-up step that applied in a LATER session would overwrite
+            // the .sln of a step that came after it in the plan.
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+            downloadStub.callsFake(async (_w: any, _j: any, stepId: any) => {
+                // a-merge never applies; a-merge2 would if it were reached.
+                if (stepId !== 'a-merge') {
+                    applied.push(stepId)
+                }
+            })
+            ;(handler as any)._beamGiveUpPolls = 1
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            expect(beamState.skipped).to.deep.equal(['a-merge'])
+
+            // A brand-new handler, as a Visual Studio restart would give, reading the same state.
+            const fresh = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
+            sinon.stub(fresh as any, 'initializeAtxClient').resolves(true)
+            sinon.stub(fresh as any, 'fetchWorklogs').resolves(undefined)
+            sinon.stub(fresh as any, 'fetchPlanTree').resolves(plan)
+            sinon.stub(fresh as any, 'downloadCompletedStepArtifacts').resolves(false)
+            sinon.stub(fresh as any, 'loadAppliedCheckpoints').callsFake(() => [...applied])
+            sinon.stub(fresh as any, 'readBeamApplyState').callsFake(() => beamState)
+            sinon.stub(fresh as any, 'writeBeamApplyState').callsFake(() => {})
+            sinon.stub(fresh as any, 'tellCustomer').resolves(undefined)
+            const freshDownload = sinon.stub(fresh as any, 'downloadCompletedStepArtifact').resolves(undefined)
+
+            await fresh.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            // a-merge2 already applied in the first session. a-merge must NEVER be retried now:
+            // applying it here would copy its older .sln over a-merge2's and drop a-merge2's test
+            // project from the solution.
+            expect(freshDownload.args.map(a => a[2])).to.not.include('a-merge')
+            expect(applied).to.deep.equal(['a-merge2'])
         })
 
         it('logs when a finished unit test run on the card has no Merge Tests step', async () => {
@@ -1223,6 +1305,38 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             })
         })
 
+        it('keeps the beam apply state on disk, beside the applied-checkpoints file', async () => {
+            // Stubbed out in the plan tests, so prove the real thing round-trips here. It must be a
+            // file: clearJobCache runs on every poll of a COMPLETED job, and the give-up has to
+            // outlive a Visual Studio restart.
+            await withSolution(async (root, checkpoints) => {
+                expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({ polls: {}, skipped: [] })
+                ;(handler as any).writeBeamApplyState(root, 'job-1', { polls: { 'a-merge': 2 }, skipped: ['a-old'] })
+
+                expect(fs.existsSync(path.join(checkpoints, 'beam-apply-state.json'))).to.be.true
+                expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({
+                    polls: { 'a-merge': 2 },
+                    skipped: ['a-old'],
+                })
+            })
+        })
+
+        it('replaces the backup in place for a non-beam conflict, as it always has', async () => {
+            // The numbered-suffix rule is beam-only: other callers keep one backup per path.
+            await withSolution(async (root, checkpoints) => {
+                const file = path.join(root, 'App.sln')
+                fs.writeFileSync(file, 'first')
+                const first = (handler as any).backupConflictedFile(file, 'job-1', root)
+                fs.writeFileSync(file, 'second')
+                const second = (handler as any).backupConflictedFile(file, 'job-1', root)
+
+                expect(second).to.equal(first)
+                expect(fs.readFileSync(first, 'utf-8')).to.equal('second')
+                expect(fs.existsSync(`${first}.2`)).to.be.false
+                expect(checkpoints).to.be.a('string')
+            })
+        })
+
         it('keeps the first backup when a later run overwrites the same file', async () => {
             await withSolution(async (root, checkpoints) => {
                 const props = path.join(root, 'Directory.Packages.props')
@@ -1256,6 +1370,85 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 // With no copy anywhere, overwriting could destroy work with no way back.
                 expect(fs.readFileSync(sln, 'utf-8')).to.equal('the customer version')
                 expect(result.conflictedFiles).to.deep.equal([path.resolve(sln)])
+            })
+        })
+
+        it('backs up a file before deleting it', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const doomed = path.join(root, 'Old.cs')
+                fs.writeFileSync(doomed, 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, {}, { filesRemoved: ['Old.cs'] })
+
+                await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(fs.existsSync(doomed)).to.be.false
+                expect(fs.readFileSync(path.join(checkpoints, 'conflict-backups', 'Old.cs'), 'utf-8')).to.equal(
+                    'the customer version'
+                )
+            })
+        })
+
+        it('keeps a file instead of deleting it when its backup fails', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const doomed = path.join(root, 'Old.cs')
+                fs.writeFileSync(doomed, 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, {}, { filesRemoved: ['Old.cs'] })
+                sinon.stub(handler as any, 'backupConflictedFile').throws(new Error('EACCES'))
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(fs.readFileSync(doomed, 'utf-8')).to.equal('the customer version')
+                expect(result.backupFailed).to.be.true
+            })
+        })
+
+        it('backs up the destination of a move before overwriting it', async () => {
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'From.cs'), 'moved content')
+                const dest = path.join(root, 'To.cs')
+                fs.writeFileSync(dest, 'the customer version at the destination')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, {}, { movedFilesMap: [{ before: 'From.cs', after: 'To.cs' }] })
+
+                await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(fs.readFileSync(dest, 'utf-8')).to.equal('moved content')
+                expect(fs.readFileSync(path.join(checkpoints, 'conflict-backups', 'To.cs'), 'utf-8')).to.equal(
+                    'the customer version at the destination'
+                )
+            })
+        })
+
+        it('reports backupFailed so the step is not recorded as applied', async () => {
+            // Otherwise the diff half-lands, the step retires, and the solution never gets the
+            // test project with nothing retrying it.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+                sinon.stub(handler as any, 'backupConflictedFile').throws(new Error('EACCES'))
+                const saveApplied = sinon.stub(handler as any, 'saveAppliedCheckpoint')
+                sinon.stub(handler as any, 'createArtifactDownloadUrl').resolves({ s3PresignedUrl: 'u' })
+                sinon.stub(Utils, 'downloadAndExtractArchive').resolves(step)
+                sinon.stub(handler as any, 'tellCustomer').resolves(undefined)
+
+                await (handler as any).downloadDiffArtifact('ws-1', 'job-1', 'art-1', root, 'a-merge', true)
+
+                expect(saveApplied.called).to.be.false
+            })
+        })
+
+        it('names the backed-up files so the caller can tell the customer', async () => {
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.backedUpFiles).to.deep.equal(['App.sln'])
             })
         })
 
