@@ -30,7 +30,7 @@
         "@aws/lsp-core": "^0.0.22",
         "vscode-languageserver": "^9.0.1",
         "vscode-languageserver-textdocument": "^1.0.8",
-        "yaml-language-server": "1.13.0"
+        "yaml-language-server": "1.25.0"
     },
     "prettier": {
         "printWidth": 120,
