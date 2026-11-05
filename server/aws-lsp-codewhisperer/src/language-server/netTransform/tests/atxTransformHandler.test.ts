@@ -2490,6 +2490,18 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(lookup.failed).to.be.false
         })
 
+        it("should return null without reporting a failed lookup when beam scope leaves out a sibling repo's LBV HITL", async () => {
+            sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, 'loaded-repo', lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
+        })
+
         it('should return tag and taskId early for local-build-verification HITL (no download)', async () => {
             sinon.stub(handler, 'listHitls').resolves([{ tag: 'local-build-verification', taskId: 'task-lbv' }])
             const downloadStub = sinon.stub(handler, 'createArtifactDownloadUrl')
@@ -4396,6 +4408,36 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             expect(result?.HitlTag).to.equal('plan-review')
             expect(result?.HitlTaskId).to.equal('task-1')
             expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it("should return the plan, not a sibling repo's LBV HITL, on a beam-scoped request when the first step has no sub-steps", async () => {
+            // Multi-repo beam job: the only open HITL is a sibling repo's local-build-verification. The beam-scoped
+            // lookup leaves it out and answers with no HITL (not a failed lookup), so this takes the execution path
+            // and returns the plan alone. The planning path would list the HITLs again without the scope and
+            // return the sibling's tag, with neither its step id nor the plan.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo({
+                ...baseRequest,
+                beamScopeStepIds: 'transform,transform-1',
+            } as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(listHitlsStub.calledOnce).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
         })
     })
 

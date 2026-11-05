@@ -2416,9 +2416,10 @@ export class ATXTransformHandler {
     }
 
     /**
-     * The open HITL to surface, with its agent artifact downloaded. Null both when no HITL is open and when the
-     * lookup fails; a caller that needs to tell them apart passes `lookup`, whose `failed` is set when the job's
-     * HITLs couldn't be listed.
+     * The open HITL to surface, with its agent artifact downloaded. Null when there's none to surface: no HITL is
+     * open, or `beamScopeStepIds` is set and the only open HITLs are local-build-verification HITLs outside that
+     * scope (a sibling repo's, on a multi-repo beam job). Also null when the lookup fails; a caller that needs to
+     * tell that apart passes `lookup`, whose `failed` is set only when the job's HITLs couldn't be listed.
      */
     async getHitlAgentArtifact(
         workspaceId: string,
@@ -2479,7 +2480,8 @@ export class ATXTransformHandler {
                 // Scope is set and the pending HITL(s) are LBV, but NONE is in the loaded repo's
                 // subtree → they all belong to sibling repos. Return null so the IDE isn't handed a
                 // sibling's HITL it would only skip every poll. Non-LBV HITLs (e.g.
-                // missing-packages) still fall through below and are handled normally.
+                // missing-packages) still fall through below and are handled normally. The lookup
+                // answered, so `lookup.failed` stays unset (here and in the fallback below).
                 if (allOutOfScopeLbv) {
                     this.logging.log(
                         'ATX: getHitlAgentArtifact — all pending HITLs are sibling-repo LBV (none in loaded scope); returning none'
@@ -3195,13 +3197,16 @@ export class ATXTransformHandler {
         // hasPlan guesses the phase from the plan's shape, and a first step with no sub-steps (e.g. "Assess
         // Solution") looks like planning. Two signals mean the execution phase whatever the shape:
         // - the open HITL is the step review ({stepId}-review) of a step in the plan;
-        // - ListHitls answered and no HITL is open: the agent is waiting on a chat answer, e.g. at the end of the
-        //   job. Return the plan so the IDE keeps seeing step statuses (ITGen stops its apps once Local
-        //   Verification has finished). A failed lookup isn't "no HITL open": it keeps the shape-based choice,
-        //   and the planning path looks the HITL up again.
+        // - ListHitls answered and there's no HITL to surface. Either none is open (the agent is waiting on a chat
+        //   answer, e.g. at the end of the job), or the request is beam-scoped and the only open HITLs are sibling
+        //   repos' local-build-verification HITLs, which getHitlAgentArtifact leaves out (the planning path would
+        //   look them up again without the scope and return a sibling's tag; the EXECUTING and PLANNING branches
+        //   return the plan alone for them too). Return the plan so the IDE keeps seeing step statuses (ITGen
+        //   stops its apps once Local Verification has finished). A failed lookup is neither case: it keeps the
+        //   shape-based choice, and the planning path looks the HITL up again.
         const isStepReviewHitl = !!hitlResponse?.HitlTag && this.isStepReviewTag(plan.Root, hitlResponse.HitlTag)
-        const noHitlOpen = !hitlResponse && !hitlLookup.failed && plan.Root.Children.length > 0
-        if (hasPlan || isStepReviewHitl || noHitlOpen) {
+        const noHitlToSurface = !hitlResponse && !hitlLookup.failed && plan.Root.Children.length > 0
+        if (hasPlan || isStepReviewHitl || noHitlToSurface) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
         } else {
