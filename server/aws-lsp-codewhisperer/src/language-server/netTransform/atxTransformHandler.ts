@@ -2230,10 +2230,12 @@ export class ATXTransformHandler {
 
     /**
      * ITGen: downloads the repo artifact holding the generated test projects (request.artifactId)
-     * into artifactWorkspace/<job>/itgen/<runId>/tests, for tests.projectPath to resolve against
-     * (contract v0 §4). The agent rewrites that artifact under the same id on every test fix, so
-     * it's downloaded again for every test-run task and never reused by id; a marker file holding
-     * the task id keeps one task's later polls from downloading it again.
+     * into artifactWorkspace/<job>/itgen/<project>/<runId>/tests (itgen/<runId>/tests for a request
+     * without a project), for tests.projectPath to resolve against (contract v0 §4). The agent can use
+     * the same run ids for every project, so each project has its own folder. The agent rewrites that
+     * artifact under the same id on every test fix, so it's downloaded again for every test-run task
+     * and never reused by id; a marker file holding the task id keeps one task's later polls from
+     * downloading it again.
      */
     private downloadItGenTests(
         workspaceId: string,
@@ -2272,8 +2274,13 @@ export class ATXTransformHandler {
         if (!isSafeRelativeProjectPath(request.tests?.projectPath)) {
             return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
         }
+        if (request.project !== undefined && request.project !== null && !isSafePathSegment(request.project)) {
+            return { RequestError: `Unsafe integ-test-run project: ${request.project}` }
+        }
         const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
-        const runDir = path.join(itgenDir, request.runId)
+        // The project's runs share a folder; another project's run with the same id has its own
+        const runsDir = request.project ? path.join(itgenDir, request.project) : itgenDir
+        const runDir = path.join(runsDir, request.runId)
         const testsPath = path.join(runDir, 'tests')
         const markerPath = path.join(runDir, 'tests.task')
         const projectMarkerPath = path.join(runDir, 'tests.project')
@@ -2321,7 +2328,7 @@ export class ATXTransformHandler {
         if (projectKey) {
             fs.writeFileSync(projectMarkerPath, projectKey)
             if (this.itGenLatestRunByProject.get(latestKey) === request.runId) {
-                this.removeOlderItGenTests(itgenDir, request.runId, projectKey)
+                this.removeOlderItGenTests(runsDir, request.runId, projectKey)
             } else {
                 this.logging.log(
                     `ATX: run ${request.runId} (${projectKey}) finished after a newer run started; not collecting earlier runs`
@@ -2336,15 +2343,15 @@ export class ATXTransformHandler {
      * ITGen: keeps only the latest run's tests per side and project, so a job holds at most one copy of
      * the artifact per project instead of one per run. The agent opens a project's next run only after
      * the IDE submitted the previous one, so an older run's tests are no longer needed. The run folder
-     * itself (with the IDE's result ZIP) stays.
+     * itself (with the IDE's result ZIP) stays. runsDir is the folder holding the project's runs.
      */
-    private removeOlderItGenTests(itgenDir: string, currentRunId: string, projectKey: string): void {
-        for (const entry of fs.readdirSync(itgenDir, { withFileTypes: true })) {
+    private removeOlderItGenTests(runsDir: string, currentRunId: string, projectKey: string): void {
+        for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
             if (!entry.isDirectory() || entry.name === currentRunId) {
                 continue
             }
-            const keyPath = path.join(itgenDir, entry.name, 'tests.project')
-            const oldTests = path.join(itgenDir, entry.name, 'tests')
+            const keyPath = path.join(runsDir, entry.name, 'tests.project')
+            const oldTests = path.join(runsDir, entry.name, 'tests')
             try {
                 if (
                     fs.existsSync(oldTests) &&

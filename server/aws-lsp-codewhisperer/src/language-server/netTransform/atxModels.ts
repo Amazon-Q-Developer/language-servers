@@ -171,7 +171,7 @@ export interface AtxOpenHitl {
     RequestPath?: string
     RequestError?: string
     // integ-test-run only: absolute path of the extracted repo artifact holding the generated test
-    // projects (artifactWorkspace/<job>/itgen/<runId>/tests); the request's tests.projectPath is
+    // projects (artifactWorkspace/<job>/itgen/<project>/<runId>/tests); the request's tests.projectPath is
     // relative to it. Downloaded again for every test-run task.
     TestsPath?: string
 }
