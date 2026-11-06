@@ -6,6 +6,8 @@ import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { TextDocument, Workspace } from '@aws/language-server-runtimes/server-interface'
 import { testFolder } from '@aws/lsp-core'
 import { StubbedInstance } from 'ts-sinon'
+import { ChatSessionService } from '../../chat/chatSessionService'
+import { withCheckedFileOperations, checkedTarget } from './checkedFileFixtures.test'
 
 describe('FsRead Tool', () => {
     let features: TestFeatures
@@ -26,21 +28,22 @@ describe('FsRead Tool', () => {
                         .catch(() => false),
             } as Workspace['fs'],
         } as StubbedInstance<Workspace>
+        features.workspace.fs = withCheckedFileOperations(features.workspace.fs) as typeof features.workspace.fs
         tempFolder = await testFolder.TestFolder.create()
     })
 
     after(async () => {
-        tempFolder.delete()
+        await tempFolder.delete()
     })
 
     afterEach(async () => {
-        tempFolder.clear()
+        await tempFolder.clear()
     })
 
     it('invalidates empty path', async () => {
         const fsRead = new FsRead(features)
         await assert.rejects(
-            fsRead.validate({ paths: [''] }),
+            fsRead.validate({ paths: [''] }, [{ path: '', state: 'unverified' }]),
             /Path cannot be empty/i,
             'Expected an error about empty path'
         )
@@ -51,8 +54,8 @@ describe('FsRead Tool', () => {
         const fsRead = new FsRead(features)
 
         await assert.rejects(
-            fsRead.validate({ paths: [filePath] }),
-            /does not exist or cannot be accessed/i,
+            fsRead.validate({ paths: [filePath] }, [await checkedTarget(filePath)]),
+            /does not exist/i,
             'Expected an error indicating the path does not exist'
         )
     })
@@ -61,8 +64,8 @@ describe('FsRead Tool', () => {
         const fileContent = 'A'.repeat(FsRead.maxResponseSize + 10)
         const filePath = await tempFolder.write('largeFile.txt', fileContent)
         const fsRead = new FsRead(features)
-        await fsRead.validate({ paths: [filePath] })
-        const result = await fsRead.invoke({ paths: [filePath] })
+        await fsRead.validate({ paths: [filePath] }, [await checkedTarget(filePath)])
+        const result = await fsRead.invoke({ paths: [filePath] }, [await checkedTarget(filePath)])
 
         verifyResult(result, [
             { path: filePath, content: 'A'.repeat(FsRead.maxResponseSize - 3) + '...', truncated: true },
@@ -74,7 +77,7 @@ describe('FsRead Tool', () => {
         const filePath = await tempFolder.write('fullFile.txt', fileContent)
 
         const fsRead = new FsRead(features)
-        const result = await fsRead.invoke({ paths: [filePath] })
+        const result = await fsRead.invoke({ paths: [filePath] }, [await checkedTarget(filePath)])
         verifyResult(result, [{ path: filePath, content: fileContent, truncated: false }])
     })
 
@@ -85,7 +88,10 @@ describe('FsRead Tool', () => {
         const filePath1 = await tempFolder.write('fullFile1.txt', fileContent1)
 
         const fsRead = new FsRead(features)
-        const result = await fsRead.invoke({ paths: [filePath, filePath1] })
+        const result = await fsRead.invoke({ paths: [filePath, filePath1] }, [
+            await checkedTarget(filePath),
+            await checkedTarget(filePath1),
+        ])
         verifyResult(result, [
             { path: filePath, content: fileContent, truncated: false },
             { path: filePath1, content: fileContent1, truncated: false },
@@ -125,6 +131,99 @@ describe('FsRead Tool', () => {
             result.requiresAcceptance,
             false,
             'Expected requiresAcceptance to be false for a path inside the workspace'
+        )
+    })
+
+    it('should require acceptance for an in-workspace name that a hard link shares with a file outside it', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+            return
+        }
+
+        // A file outside the workspace, given a second name inside it. lstat
+        // reports that name as an ordinary file, so nothing is there for a
+        // symlink-aware resolver to follow, yet reading it returns the outside
+        // file's contents.
+        const workspaceDir = path.join(tempFolder.path, 'workspace')
+        await fs.mkdir(workspaceDir)
+        const outsideTarget = path.join(tempFolder.path, 'outside-secret.txt')
+        await fs.writeFile(outsideTarget, 'SENSITIVE')
+        const hardLinkInWorkspace = path.join(workspaceDir, 'looks-normal.txt')
+        await fs.link(outsideTarget, hardLinkInWorkspace)
+
+        const fsRead = new FsRead({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getTextDocument: async s => ({}) as TextDocument,
+                getAllWorkspaceFolders: () => [{ uri: `file://${workspaceDir}`, name: 'workspace' }],
+            },
+        })
+
+        const result = await fsRead.requiresAcceptance({ paths: [hardLinkInWorkspace] })
+        assert.equal(
+            result.requiresAcceptance,
+            true,
+            'Reading a file that is also named outside the workspace should be confirmed by the user'
+        )
+        assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
+    })
+
+    it('does not ask again for paths the user already approved in a multi-path read', async () => {
+        // Regression: fsRead takes a `paths` array, and an approval recorded
+        // from a singular `path` never matched a later read of the same file.
+        const outsideDir = path.join(tempFolder.path, 'outside')
+        await fs.mkdir(outsideDir, { recursive: true })
+        const firstPath = path.join(outsideDir, 'first.txt')
+        const secondPath = path.join(outsideDir, 'second.txt')
+        const unapprovedPath = path.join(outsideDir, 'third.txt')
+        await fs.writeFile(firstPath, 'first')
+        await fs.writeFile(secondPath, 'second')
+        await fs.writeFile(unapprovedPath, 'third')
+
+        const fsRead = new FsRead({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getTextDocument: async s => ({}) as TextDocument,
+                getAllWorkspaceFolders: () => [
+                    { uri: `file://${path.join(tempFolder.path, 'workspace')}`, name: 'ws' },
+                ],
+            },
+        })
+
+        const toolUseInput = { paths: [firstPath, secondPath] }
+
+        // Both paths are outside the workspace, so the user is asked.
+        const first = await fsRead.requiresAcceptance(toolUseInput)
+        assert.equal(first.requiresAcceptance, true)
+        assert.equal(first.canonicalPaths?.length, 2, 'Every requested path is checked')
+
+        // Mirrors how the controller records a granted approval: every
+        // canonical path the acceptance check evaluated.
+        const session = new ChatSessionService()
+        for (const checkedPath of first.canonicalPaths ?? []) {
+            session.addApprovedPath(checkedPath, 'fsRead')
+        }
+
+        assert.equal(
+            (await fsRead.requiresAcceptance(toolUseInput, session.approvedPaths)).requiresAcceptance,
+            false,
+            'The same read should not be asked about twice'
+        )
+        for (const approvedPath of [firstPath, secondPath]) {
+            assert.equal(
+                (await fsRead.requiresAcceptance({ paths: [approvedPath] }, session.approvedPaths)).requiresAcceptance,
+                false,
+                `Reading ${approvedPath} on its own should not be asked about again`
+            )
+        }
+
+        // An approval does not spread to a file the user was not shown.
+        assert.equal(
+            (await fsRead.requiresAcceptance({ paths: [unapprovedPath] }, session.approvedPaths)).requiresAcceptance,
+            true,
+            'A path outside the approved set still requires acceptance'
         )
     })
 })
