@@ -134,8 +134,10 @@ const BEAM_APPLY_STATE_FILE = 'beam-apply-state.json'
  * a dropped download, a bad archive — which says nothing about whether it can apply and clears up
  * on its own, so a caller that bounds its retries must not spend that bound on it. `apply-failed`
  * means the diff was on disk and writing it into the solution did not fully work. `rejected` means
- * the apply refused it outright and wrote nothing: that verdict comes from the diff's own contents,
- * so it is settled — retrying is pure waste, and the customer can be told the truth at once.
+ * the apply refused it outright and wrote nothing, on a verdict that comes from the diff's own
+ * contents and nothing else — so it is settled, retrying is pure waste, and the customer can be
+ * told the truth at once. A refusal that depends on the state of the customer's tree is NOT
+ * settled and must not use it: that tree changes.
  */
 type DiffApplyOutcome = 'applied' | 'apply-failed' | 'transfer-failed' | 'rejected'
 
@@ -3931,6 +3933,18 @@ export class ATXTransformHandler {
                 if (state.skipped.includes(step.StepId)) {
                     break
                 }
+                // The service is already telling us to back off. Every poll here is a ListArtifacts
+                // plus up to three presigned-URL attempts for the same pending step, which feeds
+                // the throttle this cooldown exists to relieve — and each one would spend the
+                // arrival bound below, so a long enough window would permanently retire a step
+                // whose artifact is perfectly fine. Come back after the cooldown, state untouched.
+                if (this.isBeamThrottleCooldownActive()) {
+                    this.logging.log(
+                        `ATX: [BEAM] holding off on merged unit tests from step ${step.StepId} while the ` +
+                            `throttle cooldown is active`
+                    )
+                    break
+                }
                 this.logging.log(`ATX: [BEAM] applying merged unit tests from step ${step.StepId}`)
                 // Downloads, extracts, applies and records the step as applied, with its own
                 // retries. Failures are logged inside and leave the step unapplied. The return value
@@ -5354,9 +5368,13 @@ export class ATXTransformHandler {
                     mustAlreadyExist.length > 0 &&
                     !mustAlreadyExist.some(relativePath => fs.existsSync(path.join(solutionRootPath, relativePath)))
                 ) {
+                    // Deliberately NOT `rejected`. This reads the customer's working tree, and a
+                    // Merge Tests diff usually updates the .sln alone — so a .sln they have
+                    // momentarily renamed, moved or deleted looks exactly like a wrong root. Let it
+                    // through the bounded retry instead, or one such moment would permanently
+                    // retire the step and every later test run on the repo.
                     return {
                         success: false,
-                        rejected: true,
                         error:
                             `none of the ${mustAlreadyExist.length} file(s) this diff updates or removes exist ` +
                             `under ${solutionRootPath}, so it was computed against a different root — nothing ` +
@@ -5510,8 +5528,21 @@ export class ATXTransformHandler {
                 }
             }
 
+            // A test project file that did not land must not be announced by the .sln. On a beam
+            // the diff is one test project plus the .sln, so overwriting the .sln here would leave
+            // Visual Studio with a solution naming a .csproj that is not on disk, and `dotnet
+            // build` failing outright. The step is already going to be retried; leave the
+            // customer's solution buildable until that retry lands the whole diff.
+            const stopBeforeUpdates = beamApply && writeFailed
+            if (stopBeforeUpdates) {
+                this.logging.error(
+                    'ATX: [BEAM] not updating the solution file: a file this diff adds could not be written, ' +
+                        'so the solution would name a project that is not on disk'
+                )
+            }
+
             // Handle filesUpdated: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
-            for (const relativePath of filesUpdated) {
+            for (const relativePath of stopBeforeUpdates ? [] : filesUpdated) {
                 try {
                     const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
                     const destPath = path.join(solutionRootPath, relativePath)
@@ -5562,7 +5593,7 @@ export class ATXTransformHandler {
             }
 
             // Handle filesMoved: Use movedFilesMap to copy content from before to after location, delete before file
-            for (const mapping of movedFilesMap) {
+            for (const mapping of stopBeforeUpdates ? [] : movedFilesMap) {
                 try {
                     const beforePath = path.join(solutionRootPath, mapping.before)
                     const afterPath = path.join(solutionRootPath, mapping.after)

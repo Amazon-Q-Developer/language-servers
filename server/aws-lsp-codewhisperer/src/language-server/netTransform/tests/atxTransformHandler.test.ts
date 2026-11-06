@@ -1232,6 +1232,33 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(logged.some(l => l.includes('did not arrive (transfer-failed)'))).to.be.true
         })
 
+        it('holds off entirely while the throttle cooldown is active', async () => {
+            // The service is already saying back off. Polling here feeds the throttle the cooldown
+            // exists to relieve, and each poll would spend the arrival bound on a healthy step.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            sinon.stub(handler as any, 'isBeamThrottleCooldownActive').returns(true)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+            expect(beamState.waits).to.deep.equal({})
+            expect(beamState.polls).to.deep.equal({})
+            expect(beamState.skipped).to.be.empty
+            const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(logged.some(l => l.includes('throttle cooldown is active'))).to.be.true
+        })
+
+        it('applies as usual once the cooldown has passed', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            const cooling = sinon.stub(handler as any, 'isBeamThrottleCooldownActive').returns(true)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            cooling.returns(false)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
         it('gives up at once on a diff the apply refused, without spending a bound', async () => {
             // A wrong root or an escaping path is settled by the diff itself. Polling it five times
             // costs fifteen presigned URLs and downloads for the same answer, and the customer has
@@ -1517,8 +1544,10 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 const result = await (handler as any).applyChanges(step, root, 'job-1', true)
 
                 expect(result.success).to.be.false
-                // rejected, not merely failed: the caller must not retry a settled verdict.
-                expect(result.rejected).to.be.true
+                // NOT rejected: this reads the customer's tree, and a .sln they momentarily
+                // renamed or moved looks the same as a wrong root. It must stay retryable, or one
+                // such moment would permanently retire the step and every later run on the repo.
+                expect(result.rejected).to.be.undefined
                 expect(String(result.error)).to.include('computed against a different root')
                 // Not even the added files, which would otherwise have landed somewhere wrong.
                 expect(fs.existsSync(path.join(root, 'src', 'Tests', 'T.cs'))).to.be.false
@@ -1576,7 +1605,56 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 const result = await (handler as any).applyChanges(step, root, 'job-1', true)
 
                 expect(result.writeFailed).to.be.true
-                // The .sln still landed, which is exactly why the step must be retried.
+                // And the .sln is NOT updated. It would name the test project that failed to land,
+                // so Visual Studio would reload a solution pointing at a missing .csproj. The
+                // retry lands the whole diff; until then the customer's solution still builds.
+                expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the customer version')
+                const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+                expect(errors.some(l => l.includes('not updating the solution file'))).to.be.true
+            })
+        })
+
+        it('still skips the moves when a file the diff adds could not be written', async () => {
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'Old.cs'), 'move me')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(
+                    step,
+                    { 'Tests/sub/T.cs': 'new' },
+                    {
+                        filesAdded: ['Tests/sub/T.cs'],
+                        movedFilesMap: [{ before: 'Old.cs', after: 'New.cs' }],
+                    }
+                )
+                fs.mkdirSync(path.join(root, 'Tests'), { recursive: true })
+                fs.writeFileSync(path.join(root, 'Tests', 'sub'), 'in the way')
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.writeFailed).to.be.true
+                expect(fs.existsSync(path.join(root, 'Old.cs'))).to.be.true
+                expect(fs.existsSync(path.join(root, 'New.cs'))).to.be.false
+            })
+        })
+
+        it('lets the non-beam apply finish the diff after a failed add, as it always has', async () => {
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(
+                    step,
+                    { 'App.sln': 'the agent version', 'Tests/sub/T.cs': 'new' },
+                    {
+                        filesUpdated: ['App.sln'],
+                        filesAdded: ['Tests/sub/T.cs'],
+                    }
+                )
+                fs.mkdirSync(path.join(root, 'Tests'), { recursive: true })
+                fs.writeFileSync(path.join(root, 'Tests', 'sub'), 'in the way')
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1')
+
+                expect(result.success).to.be.true
                 expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the agent version')
             })
         })
