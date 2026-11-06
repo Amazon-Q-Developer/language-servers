@@ -4,6 +4,7 @@ import { ATXTransformHandler } from '../atxTransformHandler'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 import { Utils } from '../utils'
+import got from 'got'
 
 describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
     let handler: ATXTransformHandler
@@ -54,7 +55,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(createArtifactDownloadUrlStub.calledOnce).to.be.true
         expect(applyChangesStub.calledOnce).to.be.true
         expect(saveAppliedCheckpointStub.calledOnce).to.be.true
@@ -77,12 +79,13 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(createArtifactDownloadUrlStub.calledTwice).to.be.true
         expect(applyChangesStub.calledOnce).to.be.true
     })
 
-    it('should return empty string after all retries exhausted', async () => {
+    it('should report a transfer failure, not an apply failure, when the download URL never comes', async () => {
         createArtifactDownloadUrlStub.resolves(null)
 
         const result = await (handler as any).downloadDiffArtifact(
@@ -93,7 +96,9 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        // The diff never arrived, so a caller that bounds its retries must not count this.
+        expect(result.outcome).to.equal('transfer-failed')
         expect(createArtifactDownloadUrlStub.calledThrice).to.be.true
         expect(applyChangesStub.called).to.be.false
         expect(saveAppliedCheckpointStub.called).to.be.false
@@ -116,12 +121,75 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(applyChangesStub.calledTwice).to.be.true
         expect(saveAppliedCheckpointStub.calledOnce).to.be.true
     })
 
-    it('should return empty string when applyChanges fails on all retries', async () => {
+    it('does not retry a diff the apply refused, and says nothing was written', async () => {
+        // The verdict comes from the diff's own contents, so each retry is another presigned URL
+        // and another download against a throttling service, for the same answer.
+        createArtifactDownloadUrlStub.resolves({
+            s3PresignedUrl: 'https://s3.example.com/artifact.zip',
+            requestHeaders: {},
+        })
+        downloadAndExtractStub.resolves()
+        applyChangesStub.resolves({
+            success: false,
+            rejected: true,
+            wroteNothing: true,
+            error: 'it reaches outside the solution',
+        })
+        const told = sinon.stub(handler as any, 'tellCustomer').resolves(undefined)
+
+        const result = await (handler as any).downloadDiffArtifact(
+            'ws-123',
+            'job-456',
+            'artifact-789',
+            '/solution/root',
+            'step-001',
+            true
+        )
+
+        expect(result.outcome).to.equal('rejected')
+        expect(applyChangesStub.calledOnce).to.be.true
+        expect(createArtifactDownloadUrlStub.calledOnce).to.be.true
+        expect(saveAppliedCheckpointStub.called).to.be.false
+        // The real reason, and no claim that files may have changed.
+        const message = String(told.firstCall.args[3])
+        expect(message).to.include('nothing in it was changed')
+        expect(message).to.include('reaches outside the solution')
+    })
+
+    it('retries a refusal that depends on the tree, and reports it wrote nothing', async () => {
+        // A wrong root is read off the customer's tree, so it can clear up: a .sln they moved for a
+        // moment looks the same. It must stay retryable, but still say nothing was written.
+        createArtifactDownloadUrlStub.resolves({
+            s3PresignedUrl: 'https://s3.example.com/artifact.zip',
+            requestHeaders: {},
+        })
+        downloadAndExtractStub.resolves()
+        applyChangesStub.resolves({
+            success: false,
+            wroteNothing: true,
+            error: 'it was computed against a different root',
+        })
+
+        const result = await (handler as any).downloadDiffArtifact(
+            'ws-123',
+            'job-456',
+            'artifact-789',
+            '/solution/root',
+            'step-001',
+            true
+        )
+
+        expect(result.outcome).to.equal('apply-refused')
+        expect(saveAppliedCheckpointStub.called).to.be.false
+    })
+
+    it('should report an apply failure when applyChanges fails on all retries', async () => {
         createArtifactDownloadUrlStub.resolves({
             s3PresignedUrl: 'https://s3.example.com/artifact.zip',
             requestHeaders: {},
@@ -137,7 +205,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        expect(result.outcome).to.equal('apply-failed')
         expect(applyChangesStub.calledThrice).to.be.true
         expect(saveAppliedCheckpointStub.called).to.be.false
     })
@@ -157,8 +226,62 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        expect(result.outcome).to.equal('transfer-failed')
         expect(saveAppliedCheckpointStub.called).to.be.false
+    })
+})
+
+describe('ATXTransformHandler - the HITL caller reads the outcome, not the path', () => {
+    let handler: ATXTransformHandler
+    let logging: Logging
+
+    beforeEach(() => {
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            logging,
+            {} as Runtime
+        )
+        sinon.stub(handler as any, 'createArtifactDownloadUrl').resolves({
+            s3PresignedUrl: 'https://s3.example.com/hitl.json',
+            requestHeaders: {},
+        })
+        sinon.stub(got, 'get').resolves({ body: JSON.stringify({ diffArtifactId: 'diff-1' }) } as any)
+    })
+
+    afterEach(() => sinon.restore())
+
+    const callHitl = async () =>
+        (handler as any).downloadAndParseStepHitlArtifact(
+            'ws-1',
+            'job-1',
+            { taskId: 't-1', agentArtifact: { artifactId: 'agent-1' } },
+            'step-001',
+            '/solution/root'
+        )
+
+    it('calls a half-applied diff a failure even though it returns a path', async () => {
+        // A diff that was extracted and then only partly applied returns the folder it was
+        // extracted to, so an empty path no longer means failure.
+        sinon
+            .stub(handler as any, 'downloadDiffArtifact')
+            .resolves({ path: '/solution/root/.atx/job-1/checkpoints/step-001', outcome: 'apply-failed' })
+
+        const result = await callHitl()
+
+        expect(result.DiffApplyFailed).to.be.true
+    })
+
+    it('calls an applied diff applied', async () => {
+        sinon
+            .stub(handler as any, 'downloadDiffArtifact')
+            .resolves({ path: '/solution/root/.atx/job-1/checkpoints/step-001', outcome: 'applied' })
+
+        const result = await callHitl()
+
+        expect(result.DiffApplyFailed).to.be.false
     })
 })
 
