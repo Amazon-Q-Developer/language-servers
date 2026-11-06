@@ -18,6 +18,7 @@ import {
     AmazonQServiceServerToken,
 } from './amazonQServer'
 import { BaseAmazonQServiceManager } from './amazonQServiceManager/BaseAmazonQServiceManager'
+import { AtxTokenServiceManager } from './amazonQServiceManager/AtxTokenServiceManager'
 
 const TEST_SERVER_NAME = 'Test Amazon Q Server'
 
@@ -142,6 +143,21 @@ describe('AmazonQServiceServer', () => {
         // triggers the handler registered by Amazon Q Server during features.initialize
         features.credentialsProvider.onCredentialsDeleted.args[0]?.[0]('some-creds-type' as CredentialsType)
         sinon.assert.calledOnce(handleOnCredentialsDeletedSpy)
+    })
+
+    it('forwards only IAM credential deletions to the AWS Transform service manager', async () => {
+        await features.initialize(server)
+        const atxHandleOnCredentialsDeletedSpy = sinon.spy(
+            AtxTokenServiceManager.prototype,
+            'handleOnCredentialsDeleted'
+        )
+        const onCredentialsDeleted = features.credentialsProvider.onCredentialsDeleted.args[0]?.[0]
+
+        onCredentialsDeleted('bearer' as CredentialsType)
+        sinon.assert.notCalled(atxHandleOnCredentialsDeletedSpy)
+
+        onCredentialsDeleted('iam' as CredentialsType)
+        sinon.assert.calledOnceWithExactly(atxHandleOnCredentialsDeletedSpy, 'iam')
     })
 
     it('should handle ATX configuration updates', async () => {

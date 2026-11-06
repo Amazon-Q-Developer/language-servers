@@ -137,6 +137,47 @@ describe('toolShared', () => {
 
             assert.strictEqual(isPathApproved(filePath, 'testTool', approvedPaths), true)
         })
+
+        it('should match a Windows path against the separators addApprovedPath stores', () => {
+            // addApprovedPath records 'C:\project\file.ts' as 'C:/project/file.ts',
+            // so the check has to normalize the same way or a Windows approval
+            // never matches and the user is asked about the file again.
+            const approvedPaths = new Map([['testTool', new Set(['C:/project/file.ts'])]])
+
+            assert.strictEqual(isPathApproved('C:\\project\\file.ts', 'testTool', approvedPaths), true)
+        })
+
+        it('should match an approved Windows directory for a file inside it', () => {
+            const approvedPaths = new Map([['testTool', new Set(['C:/project'])]])
+
+            assert.strictEqual(isPathApproved('C:\\project\\nested\\file.ts', 'testTool', approvedPaths), true)
+        })
+
+        it('should treat a trailing separator on the approved file as the same file', () => {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/file.js/'])]])
+
+            assert.strictEqual(isPathApproved('/test/path/file.js', 'testTool', approvedPaths), true)
+        })
+
+        it('should ignore case only where the filesystem does', function (this: Context) {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/File.js'])]])
+            const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin'
+
+            assert.strictEqual(
+                isPathApproved('/test/path/file.js', 'testTool', approvedPaths),
+                caseInsensitive,
+                caseInsensitive
+                    ? 'A differently cased path names the same file here'
+                    : 'A differently cased path is a different file here'
+            )
+        })
+
+        it('should not approve a sibling path that shares a prefix', () => {
+            const approvedPaths = new Map([['testTool', new Set(['/test/path/file.js'])]])
+
+            assert.strictEqual(isPathApproved('/test/path/file.js.bak', 'testTool', approvedPaths), false)
+            assert.strictEqual(isPathApproved('/test/path/other.js', 'testTool', approvedPaths), false)
+        })
     })
 
     describe('requiresPathAcceptance', () => {
