@@ -5,7 +5,7 @@
     "main": "./out/index.js",
     "repository": {
         "type": "git",
-        "url": "https://github.com/aws/language-servers"
+        "url": "https://github.com/Amazon-Q-Developer/language-servers"
     },
     "author": "Amazon Web Services",
     "license": "Apache-2.0",
