@@ -149,6 +149,8 @@ interface BeamApplyState {
     polls: Record<string, number>
     /** Per step: polls where the diff never arrived at all. Bounded far more loosely. */
     waits: Record<string, number>
+    /** Per step: polls the apply refused on the state of the tree. Same loose bound. */
+    refusals: Record<string, number>
     /** Steps given up on. Stops every later test run on the same card too. */
     skipped: string[]
     /** Unit test runs the customer has already been told have no Merge Tests step. */
@@ -1712,12 +1714,11 @@ export class ATXTransformHandler {
                 lastErr = error
                 // Distinguish throttling from other errors so the log tells us WHY a Load failed
                 // (was misattributed to "No presigned URL"). Retry only throttling.
-                const name = (error as any)?.name ?? ''
                 const msg = String(error)
-                const isThrottle =
-                    name === 'ThrottlingException' ||
-                    name === 'TooManyRequestsException' ||
-                    /throttl|too many requests|rate exceeded/i.test(msg)
+                // One source of truth for what a throttle is: a second copy here and in
+                // listArtifactsForStep would drift, and then the cooldown both feed would engage
+                // for one call path and not the other.
+                const isThrottle = this.isThrottleError(error)
                 if (isThrottle) {
                     // Record it regardless of whether we retry: the signal is "the service is
                     // pushing back", which is true on the last attempt as much as the first.
@@ -3140,30 +3141,6 @@ export class ATXTransformHandler {
                                 `merge your own changes back.`
                         )
                     }
-                    // A file kept because its backup failed, or a write that threw, means the diff
-                    // did NOT fully land. Recording the step applied would retire it for good: the
-                    // solution would never get the test project and nothing would retry. Leave it
-                    // unapplied for the caller's retry and give-up.
-                    if (result.backupFailed || result.writeFailed) {
-                        this.logging.error(
-                            `ATX: [BEAM] step ${stepId} left unapplied: ` +
-                                (result.backupFailed
-                                    ? 'a file was kept because it could not be backed up first'
-                                    : 'a file could not be written')
-                        )
-                        await this.tellCustomer(
-                            jobId,
-                            stepId,
-                            solutionRootPath,
-                            result.backupFailed
-                                ? `Could not update ${(result.conflictedFiles || []).join(', ')} because a backup ` +
-                                      `copy could not be written. Your file was left as it is, and this will be retried.`
-                                : 'Could not write every file of the generated unit tests — one may be locked by ' +
-                                      'Visual Studio or another program. This will be retried.'
-                        )
-                        return { path: pathToDownload, outcome: 'apply-failed' }
-                    }
-
                     // Mark this step as applied
                     this.saveAppliedCheckpoint(solutionRootPath, jobId, stepId)
 
@@ -3171,6 +3148,27 @@ export class ATXTransformHandler {
                     this.saveLastAppliedTimestamp(solutionRootPath, jobId, stepId)
 
                     return { path: pathToDownload, outcome: 'applied' }
+                } else if (result.backupFailed || result.writeFailed) {
+                    // The diff did NOT fully land. Recording the step applied would retire it for
+                    // good: the solution would never get the test project and nothing would retry.
+                    // Leave it unapplied for the caller's retry and give-up.
+                    this.logging.error(
+                        `ATX: [BEAM] step ${stepId} left unapplied: ` +
+                            (result.backupFailed
+                                ? 'a file was kept because it could not be backed up first'
+                                : 'a file could not be written')
+                    )
+                    await this.tellCustomer(
+                        jobId,
+                        stepId,
+                        solutionRootPath,
+                        result.backupFailed
+                            ? `Could not update ${(result.conflictedFiles || []).join(', ')} because a backup copy ` +
+                                  `could not be written. Your file was left as it is, and this will be retried.`
+                            : 'Could not write every file of the generated unit tests — one may be locked by ' +
+                                  'Visual Studio or another program. This will be retried.'
+                    )
+                    return { path: pathToDownload, outcome: 'apply-failed' }
                 } else if (result.wroteNothing && !result.rejected) {
                     // Refused before writing anything, on a verdict that may change — a .sln the
                     // customer has momentarily moved looks the same as a wrong root. Retry within
@@ -4002,7 +4000,43 @@ export class ATXTransformHandler {
                     )
                     break
                 }
-                if (outcome !== 'apply-failed' && outcome !== 'apply-refused') {
+                if (outcome === 'apply-refused') {
+                    // Refused before writing anything, on a verdict read off the customer's tree:
+                    // a .sln they renamed, moved or deleted for a moment looks exactly like a diff
+                    // computed against another root. So it gets the GENEROUS bound, not the
+                    // 5-attempt apply bound — five polls is about two minutes, and a branch switch
+                    // can easily outlast that, which would retire the step for the whole job.
+                    //
+                    // The card-wide stop stays. Nothing was written, but the NEXT run's .sln names
+                    // this run's test project, which never landed, so applying it would leave
+                    // Visual Studio with a solution pointing at a .csproj that is not on disk.
+                    const refusals = (state.refusals[step.StepId] ?? 0) + 1
+                    state.refusals[step.StepId] = refusals
+                    if (refusals >= this._beamWaitGiveUpPolls) {
+                        state.skipped.push(step.StepId)
+                        this.writeBeamApplyState(solutionRootPath, jobId, state)
+                        this.logging.error(
+                            `ATX: [BEAM] the diff for step ${step.StepId} was still refused after ${refusals} ` +
+                                `polls; not trying it again, and not applying any later test run on this repo`
+                        )
+                        await this.tellCustomer(
+                            jobId,
+                            step.StepId,
+                            solutionRootPath,
+                            'Unit tests were generated but could not be added to your solution, and nothing in ' +
+                                'it was changed. Unit tests generated later in this job will not be added ' +
+                                'either, because they build on this run. Please report this.'
+                        )
+                        break
+                    }
+                    this.writeBeamApplyState(solutionRootPath, jobId, state)
+                    this.logging.log(
+                        `ATX: [BEAM] the diff for step ${step.StepId} was refused for now, will try again on a ` +
+                            `later poll (${refusals}/${this._beamWaitGiveUpPolls})`
+                    )
+                    break
+                }
+                if (outcome !== 'apply-failed') {
                     const waits = (state.waits[step.StepId] ?? 0) + 1
                     state.waits[step.StepId] = waits
                     if (waits >= this._beamWaitGiveUpPolls) {
@@ -4041,23 +4075,18 @@ export class ATXTransformHandler {
                         `ATX: [BEAM] merged unit tests from step ${step.StepId} did not apply after ${polls} ` +
                             `attempts; not trying it again, and not applying any later test run on this repo`
                     )
-                    // Two different truths. applyChanges writes file by file, so a diff that failed
-                    // part way through has already put some of its files on disk — but a refusal
-                    // wrote nothing at all, and telling that customer their solution may be half
-                    // updated sends them looking for damage that does not exist.
+                    // Only apply-failed reaches here, where applyChanges wrote file by file and a
+                    // diff that failed part way through has already put some of its files on disk.
+                    // A refusal wrote nothing and has its own message above.
                     await this.tellCustomer(
                         jobId,
                         step.StepId,
                         solutionRootPath,
-                        outcome === 'apply-refused'
-                            ? 'Could not add the generated unit tests to your solution after several attempts, ' +
-                                  'and nothing in it was changed. Unit tests generated later in this job will ' +
-                                  'not be added either, because they build on this run. Please report this.'
-                            : 'Could not finish adding the generated unit tests to your solution after several ' +
-                                  'attempts. Some files may already have been updated, and any file that was ' +
-                                  `overwritten has a copy in ${workspaceFolderName}/${jobId}/checkpoints/` +
-                                  'conflict-backups. Unit tests generated later in this job will not be added ' +
-                                  'either, because they build on this run. Please report this.'
+                        'Could not finish adding the generated unit tests to your solution after several ' +
+                            'attempts. Some files may already have been updated, and any file that was ' +
+                            `overwritten has a copy in ${workspaceFolderName}/${jobId}/checkpoints/` +
+                            'conflict-backups. Unit tests generated later in this job will not be added ' +
+                            'either, because they build on this run. Please report this.'
                     )
                     break
                 }
@@ -4180,7 +4209,8 @@ export class ATXTransformHandler {
     /**
      * Per-job beam apply state, next to checkpoints-applied.json so it survives both clearJobCache
      * and a Visual Studio restart. `polls` counts the polls that got the step's diff onto disk and
-     * still failed to apply it, `waits` the polls where it never arrived; `skipped` is the steps
+     * still failed to apply it, `waits` the polls where it never arrived, `refusals` the polls the
+     * apply refused on the state of the tree; `skipped` is the steps
      * given up on, which also stops every later test run on the same card; `reported` keeps the
      * rename warning to once per run.
      *
@@ -4199,6 +4229,7 @@ export class ATXTransformHandler {
                 return {
                     polls: data.polls || {},
                     waits: data.waits || {},
+                    refusals: data.refusals || {},
                     skipped: data.skipped || [],
                     reported: data.reported || [],
                 }
@@ -4206,7 +4237,7 @@ export class ATXTransformHandler {
         } catch (error) {
             this.logging.error(`ATX: [BEAM] could not read the apply state: ${String(error)}`)
         }
-        return { polls: {}, waits: {}, skipped: [], reported: [] }
+        return { polls: {}, waits: {}, refusals: {}, skipped: [], reported: [] }
     }
 
     private writeBeamApplyState(solutionRootPath: string, jobId: string, state: BeamApplyState): void {
@@ -5370,10 +5401,10 @@ export class ATXTransformHandler {
         filesMoved?: number
         addedFiles?: string[]
         conflictedFiles?: string[]
-        // Beam apply only. `backedUpFiles` are solution-relative paths this apply overwrote after
-        // keeping a copy, for the caller to tell the customer about. `backupFailed` means at least
-        // one file was KEPT because its backup could not be taken, and `writeFailed` that a write
-        // itself threw — a file locked by Visual Studio or a virus scanner, a permission error. In
+        // Beam apply only, and all three make `success` false. `backedUpFiles` are
+        // solution-relative paths this apply overwrote after keeping a copy, for the caller to tell
+        // the customer about. `backupFailed` means at least one file was KEPT because its backup
+        // could not be taken, and `writeFailed` that a write itself threw — a file locked by Visual Studio or a virus scanner, a permission error. In
         // either case the diff did not fully land, so the step must not be recorded as applied.
         backedUpFiles?: string[]
         backupFailed?: boolean
@@ -5589,8 +5620,8 @@ export class ATXTransformHandler {
             const stopBeforeUpdates = beamApply && writeFailed
             if (stopBeforeUpdates) {
                 this.logging.error(
-                    'ATX: [BEAM] not updating the solution file: a file this diff adds could not be written, ' +
-                        'so the solution would name a project that is not on disk'
+                    'ATX: [BEAM] not updating the solution file or moving anything: a file this diff adds or ' +
+                        'removes could not be written, so the solution would name a project that is not on disk'
                 )
             }
 
@@ -5718,7 +5749,12 @@ export class ATXTransformHandler {
                 `ATX: applyChanges completed - Added: ${addedCount}, Removed: ${removedCount}, Updated: ${updatedCount}, Moved: ${movedCount}, Preserved (conflicts): ${conflictedFiles.length}`
             )
             return {
-                success: true,
+                // `success` means the diff LANDED. A file kept because its backup failed, or a
+                // write that threw, means it did not — and a caller that checked `success` alone
+                // would otherwise record a half-landed diff as applied and retire the step. Gated
+                // on beamApply: the IDE flow has always logged a per-file error and carried on, and
+                // tests pin that.
+                success: !(beamApply && (backupFailed || writeFailed)),
                 filesAdded: addedCount,
                 filesRemoved: removedCount,
                 filesUpdated: updatedCount,

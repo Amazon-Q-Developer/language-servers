@@ -995,6 +995,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         let beamState: {
             polls: Record<string, number>
             waits: Record<string, number>
+            refusals: Record<string, number>
             skipped: string[]
             reported: string[]
         }
@@ -1002,7 +1003,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
         beforeEach(() => {
             applied = []
-            beamState = { polls: {}, waits: {}, skipped: [], reported: [] }
+            beamState = { polls: {}, waits: {}, refusals: {}, skipped: [], reported: [] }
             worklogs = []
             sinon.stub(handler as any, 'fetchWorklogs').resolves(undefined)
             sinon.stub(handler as any, 'downloadCompletedStepArtifacts').resolves(false)
@@ -1232,20 +1233,63 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(logged.some(l => l.includes('did not arrive (transfer-failed)'))).to.be.true
         })
 
-        it('counts a refusal against the apply bound, then says nothing was changed', async () => {
-            // A wrong root is retryable, so it spends the apply bound like any failure. But nothing
-            // was written, so the give-up must not send the customer hunting for damage.
+        it('gives a refusal the generous bound, not the 5-attempt apply bound', async () => {
+            // A wrong root is read off the customer's tree: a .sln renamed or moved during a branch
+            // switch looks the same. Five polls is about two minutes, which a branch switch easily
+            // outlasts — and the give-up is permanent and card-wide.
             sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
             downloadStub.callsFake(async () => 'apply-refused')
             ;(handler as any)._beamGiveUpPolls = 2
+            ;(handler as any)._beamWaitGiveUpPolls = 6
+
+            for (let i = 0; i < 4; i++) {
+                await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            }
+
+            // Past the apply bound of 2, and still being retried.
+            expect(beamState.refusals).to.deep.equal({ 'a-merge': 4 })
+            expect(beamState.polls).to.deep.equal({})
+            expect(beamState.skipped).to.be.empty
+            expect(worklogs).to.be.empty
+        })
+
+        it('applies a refusal that clears up before the bound', async () => {
+            // The .sln comes back, and the tests land. Nothing was retired on the way.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => 'apply-refused')
+            ;(handler as any)._beamWaitGiveUpPolls = 6
 
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            downloadStub.callsFake(async (_w: any, _j: any, stepId: any) => {
+                applied.push(stepId)
+                return 'applied'
+            })
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
 
-            expect(beamState.polls).to.deep.equal({ 'a-merge': 2 })
-            expect(beamState.waits).to.deep.equal({})
+            expect(applied).to.deep.equal(['a-merge'])
+            expect(beamState.skipped).to.be.empty
+            expect(worklogs.some(m => m.includes('Added the generated unit tests'))).to.be.true
+        })
+
+        it('still gives up, card-wide, on a refusal that never clears', async () => {
+            // Nothing was written, but the NEXT run's .sln names this run's test project, which
+            // never landed — so applying it would leave VS pointing at a missing .csproj.
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+            downloadStub.callsFake(async () => 'apply-refused')
+            ;(handler as any)._beamWaitGiveUpPolls = 2
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
             expect(beamState.skipped).to.deep.equal(['a-merge'])
-            const giveUp = worklogs.find(m => m.includes('Could not add the generated unit tests'))!
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge', 'a-merge'])
+            const giveUp = worklogs.find(m => m.includes('could not be added'))!
             expect(giveUp).to.include('nothing in it was changed')
             expect(giveUp).to.not.include('conflict-backups')
         })
@@ -1349,7 +1393,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
             )
             sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
-            beamState = { polls: {}, waits: {}, skipped: ['a-merge'], reported: [] }
+            beamState = { polls: {}, waits: {}, refusals: {}, skipped: ['a-merge'], reported: [] }
 
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
 
@@ -1653,6 +1697,59 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             })
         })
 
+        it('holds the .sln back when a REMOVAL fails too, and says so', async () => {
+            // Documented behaviour, not just the add case: writeFailed is set in the removal catch
+            // as well, and an on-call engineer reading the log must not go hunting for an added
+            // file that does not exist.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const locked = path.join(root, 'Locked')
+                fs.mkdirSync(locked, { recursive: true })
+                fs.writeFileSync(path.join(locked, 'keep.cs'), 'cannot be deleted')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(
+                    step,
+                    { 'App.sln': 'the agent version' },
+                    { filesUpdated: ['App.sln'], filesRemoved: ['Locked/keep.cs'] }
+                )
+                // The file reads fine, so the backup succeeds, but the folder denies the unlink.
+                fs.chmodSync(locked, 0o555)
+                try {
+                    const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                    expect(result.writeFailed).to.be.true
+                    expect(result.success).to.be.false
+                    expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the customer version')
+                    const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+                    expect(errors.some(l => l.includes('adds or removes could not be written'))).to.be.true
+                } finally {
+                    fs.chmodSync(locked, 0o755)
+                }
+            })
+        })
+
+        it('reports success only when the diff actually landed', async () => {
+            // A caller that checks `success` alone must never record a half-landed diff as applied.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'App.sln': 'the agent version' }, { filesUpdated: ['App.sln'] })
+
+                const landed = await (handler as any).applyChanges(step, root, 'job-1', true)
+                expect(landed.success).to.be.true
+
+                // Now make the backup impossible: a FILE where the backup folder must go.
+                fs.rmSync(path.join(checkpoints, 'conflict-backups'), { recursive: true, force: true })
+                fs.writeFileSync(path.join(checkpoints, 'conflict-backups'), 'in the way')
+                fs.writeFileSync(path.join(root, 'App.sln'), 'edited again')
+
+                const kept = await (handler as any).applyChanges(step, root, 'job-1', true)
+                expect(kept.backupFailed).to.be.true
+                expect(kept.success).to.be.false
+                expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('edited again')
+            })
+        })
+
         it('still skips the moves when a file the diff adds could not be written', async () => {
             await withSolution(async (root, checkpoints) => {
                 fs.writeFileSync(path.join(root, 'Old.cs'), 'move me')
@@ -1787,12 +1884,14 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({
                     polls: {},
                     waits: {},
+                    refusals: {},
                     skipped: [],
                     reported: [],
                 })
                 ;(handler as any).writeBeamApplyState(root, 'job-1', {
                     polls: { 'a-merge': 2 },
                     waits: { 'a-merge2': 7 },
+                    refusals: { 'a-merge3': 4 },
                     skipped: ['a-old'],
                     reported: ['a-ut'],
                 })
@@ -1801,6 +1900,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({
                     polls: { 'a-merge': 2 },
                     waits: { 'a-merge2': 7 },
+                    refusals: { 'a-merge3': 4 },
                     skipped: ['a-old'],
                     reported: ['a-ut'],
                 })
