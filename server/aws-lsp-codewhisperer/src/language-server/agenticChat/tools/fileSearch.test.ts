@@ -1,5 +1,11 @@
 import * as assert from 'assert'
-import { FileSearch } from './fileSearch'
+import { FileSearch, FileSearchParams } from './fileSearch'
+import { resolveCanonicalPath } from './toolShared'
+
+async function invokeSearch(tool: FileSearch, params: FileSearchParams) {
+    const target = await resolveCanonicalPath(params.path)
+    return tool.invoke(params, target)
+}
 import { testFolder } from '@aws/lsp-core'
 import * as path from 'path'
 import * as fs from 'fs/promises'
@@ -37,7 +43,7 @@ describe('FileSearch Tool', () => {
     it('invalidates empty path', async () => {
         const fileSearch = new FileSearch(testFeatures)
         await assert.rejects(
-            fileSearch.validate({ path: '', queryName: 'test' }),
+            fileSearch.validate({ path: '', queryName: 'test' }, ''),
             /Path cannot be empty/i,
             'Expected an error about empty path'
         )
@@ -46,7 +52,7 @@ describe('FileSearch Tool', () => {
     it('invalidates invalid threshold pattern', async () => {
         const fileSearch = new FileSearch(testFeatures)
         await assert.rejects(
-            fileSearch.validate({ path: tempFolder.path, queryName: 'test', threshold: -1 }),
+            fileSearch.validate({ path: tempFolder.path, queryName: 'test', threshold: -1 }, tempFolder.path),
             /Invalid threshold/i,
             'Expected an error about invalid threshold'
         )
@@ -55,7 +61,7 @@ describe('FileSearch Tool', () => {
     it('invalidates empty maxDepth', async () => {
         const fileSearch = new FileSearch(testFeatures)
         await assert.rejects(
-            fileSearch.validate({ path: tempFolder.path, queryName: 'test', maxDepth: -1 }),
+            fileSearch.validate({ path: tempFolder.path, queryName: 'test', maxDepth: -1 }, tempFolder.path),
             /MaxDepth cannot be negative/i,
             'Expected an error about negative maxDepth'
         )
@@ -64,7 +70,7 @@ describe('FileSearch Tool', () => {
     it('invalidates empty queryName', async () => {
         const fileSearch = new FileSearch(testFeatures)
         await assert.rejects(
-            fileSearch.validate({ path: tempFolder.path, queryName: '' }),
+            fileSearch.validate({ path: tempFolder.path, queryName: '' }, tempFolder.path),
             /queryName cannot be empty/i,
             'Expected an error about empty queryName'
         )
@@ -76,7 +82,7 @@ describe('FileSearch Tool', () => {
         await tempFolder.write('fileC.js', 'console.log("fileC");')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'txt',
             maxDepth: 0,
@@ -98,7 +104,7 @@ describe('FileSearch Tool', () => {
         await tempFolder.write('fileC.md', '# fileC content')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'txt',
         })
@@ -125,7 +131,7 @@ describe('FileSearch Tool', () => {
         await subfolder2.write('level2.txt', 'level2 content')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'txt',
             maxDepth: 1,
@@ -147,7 +153,7 @@ describe('FileSearch Tool', () => {
         await tempFolder.write('fileLower.txt', 'lower case filename')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'file',
             maxDepth: 0,
@@ -167,7 +173,7 @@ describe('FileSearch Tool', () => {
         await tempFolder.write('fileLower.txt', 'lower case filename')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'file',
             maxDepth: 0,
@@ -189,7 +195,7 @@ describe('FileSearch Tool', () => {
         await nodeModules.write('excluded.txt', 'excluded content')
 
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: tempFolder.path,
             queryName: 'txt',
         })
@@ -208,7 +214,7 @@ describe('FileSearch Tool', () => {
         const fileSearch = new FileSearch(testFeatures)
 
         await assert.rejects(
-            fileSearch.invoke({ path: missingPath, queryName: '.*' }),
+            invokeSearch(fileSearch, { path: missingPath, queryName: '.*' }),
             /Failed to search directory/i,
             'Expected an error about non-existent path'
         )
@@ -216,7 +222,7 @@ describe('FileSearch Tool', () => {
 
     it('expands ~ path', async () => {
         const fileSearch = new FileSearch(testFeatures)
-        const result = await fileSearch.invoke({
+        const result = await invokeSearch(fileSearch, {
             path: '~',
             queryName: '.*',
             maxDepth: 0,
