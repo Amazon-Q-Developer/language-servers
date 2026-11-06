@@ -138,7 +138,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
         applyChangesStub.resolves({
             success: false,
             rejected: true,
-            error: 'it was computed against a different root',
+            wroteNothing: true,
+            error: 'it reaches outside the solution',
         })
         const told = sinon.stub(handler as any, 'tellCustomer').resolves(undefined)
 
@@ -158,7 +159,34 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
         // The real reason, and no claim that files may have changed.
         const message = String(told.firstCall.args[3])
         expect(message).to.include('nothing in it was changed')
-        expect(message).to.include('computed against a different root')
+        expect(message).to.include('reaches outside the solution')
+    })
+
+    it('retries a refusal that depends on the tree, and reports it wrote nothing', async () => {
+        // A wrong root is read off the customer's tree, so it can clear up: a .sln they moved for a
+        // moment looks the same. It must stay retryable, but still say nothing was written.
+        createArtifactDownloadUrlStub.resolves({
+            s3PresignedUrl: 'https://s3.example.com/artifact.zip',
+            requestHeaders: {},
+        })
+        downloadAndExtractStub.resolves()
+        applyChangesStub.resolves({
+            success: false,
+            wroteNothing: true,
+            error: 'it was computed against a different root',
+        })
+
+        const result = await (handler as any).downloadDiffArtifact(
+            'ws-123',
+            'job-456',
+            'artifact-789',
+            '/solution/root',
+            'step-001',
+            true
+        )
+
+        expect(result.outcome).to.equal('apply-refused')
+        expect(saveAppliedCheckpointStub.called).to.be.false
     })
 
     it('should report an apply failure when applyChanges fails on all retries', async () => {

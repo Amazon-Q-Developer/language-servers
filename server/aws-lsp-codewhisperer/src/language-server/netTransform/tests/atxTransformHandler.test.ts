@@ -1232,6 +1232,45 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(logged.some(l => l.includes('did not arrive (transfer-failed)'))).to.be.true
         })
 
+        it('counts a refusal against the apply bound, then says nothing was changed', async () => {
+            // A wrong root is retryable, so it spends the apply bound like any failure. But nothing
+            // was written, so the give-up must not send the customer hunting for damage.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => 'apply-refused')
+            ;(handler as any)._beamGiveUpPolls = 2
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(beamState.polls).to.deep.equal({ 'a-merge': 2 })
+            expect(beamState.waits).to.deep.equal({})
+            expect(beamState.skipped).to.deep.equal(['a-merge'])
+            const giveUp = worklogs.find(m => m.includes('Could not add the generated unit tests'))!
+            expect(giveUp).to.include('nothing in it was changed')
+            expect(giveUp).to.not.include('conflict-backups')
+        })
+
+        it('refuses to guess when the only card disagrees with the scope', async () => {
+            // One card and no scope is unambiguous. One card and a scope naming none of its steps
+            // is the IDE saying this solution is some other repo — writing this card's test project
+            // into it would put the wrong repo's project in the customer's solution.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'someone-elses-step')
+
+            expect(downloadStub.called).to.be.false
+            const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(errors.some(l => l.includes('names nothing under the only beam card'))).to.be.true
+        })
+
+        it('still applies when the only card agrees with the scope', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true, 'a-lbv')
+
+            expect(downloadStub.args.map(a => a[2])).to.deep.equal(['a-merge'])
+        })
+
         it('holds off entirely while the throttle cooldown is active', async () => {
             // The service is already saying back off. Polling here feeds the throttle the cooldown
             // exists to relieve, and each poll would spend the arrival bound on a healthy step.
@@ -1260,9 +1299,9 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
         })
 
         it('gives up at once on a diff the apply refused, without spending a bound', async () => {
-            // A wrong root or an escaping path is settled by the diff itself. Polling it five times
-            // costs fifteen presigned URLs and downloads for the same answer, and the customer has
-            // already been told the real reason.
+            // An escaping path is settled by the diff itself. Polling it five times costs fifteen
+            // presigned URLs and downloads for the same answer, and the customer has already been
+            // told the real reason. (A wrong root is NOT settled — see the apply-refused tests.)
             sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
             downloadStub.callsFake(async () => 'rejected')
 
@@ -5107,6 +5146,22 @@ describe('ATXTransformHandler - final coverage push', () => {
             sendStub.rejects(new Error('boom'))
             const result = await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
             expect(result).to.be.null
+            // A plain error is not the service pushing back, so it must not start a cooldown.
+            expect((handler as any).isBeamThrottleCooldownActive()).to.be.false
+        })
+
+        it('starts the throttle cooldown when the listing is throttled', async () => {
+            // Otherwise a throttled listing looks exactly like "the artifact is not up yet": the
+            // beam apply counts it against the permanent arrival bound and keeps listing, feeding
+            // the throttle and retiring a healthy step.
+            const throttled = new Error('Rate exceeded')
+            throttled.name = 'ThrottlingException'
+            sendStub.rejects(throttled)
+
+            const result = await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
+
+            expect(result).to.be.null
+            expect((handler as any).isBeamThrottleCooldownActive()).to.be.true
         })
     })
 

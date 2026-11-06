@@ -137,9 +137,11 @@ const BEAM_APPLY_STATE_FILE = 'beam-apply-state.json'
  * the apply refused it outright and wrote nothing, on a verdict that comes from the diff's own
  * contents and nothing else — so it is settled, retrying is pure waste, and the customer can be
  * told the truth at once. A refusal that depends on the state of the customer's tree is NOT
- * settled and must not use it: that tree changes.
+ * settled and must not use it: that tree changes. Such a refusal is `apply-refused` — it counts
+ * against the apply bound like `apply-failed`, but nothing was written, so the customer must not be
+ * told their solution may be half updated.
  */
-type DiffApplyOutcome = 'applied' | 'apply-failed' | 'transfer-failed' | 'rejected'
+type DiffApplyOutcome = 'applied' | 'apply-failed' | 'apply-refused' | 'transfer-failed' | 'rejected'
 
 /** See readBeamApplyState. */
 interface BeamApplyState {
@@ -1196,6 +1198,16 @@ export class ATXTransformHandler {
 
     private isBeamThrottleCooldownActive(): boolean {
         return Date.now() < this.beamThrottleCooldownUntilMs
+    }
+
+    /** FES pushing back, by either the SDK's error name or the message it carries. */
+    private isThrottleError(error: unknown): boolean {
+        const name = (error as any)?.name ?? ''
+        return (
+            name === 'ThrottlingException' ||
+            name === 'TooManyRequestsException' ||
+            /throttl|too many requests|rate exceeded/i.test(String(error))
+        )
     }
 
     private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
@@ -3159,6 +3171,12 @@ export class ATXTransformHandler {
                     this.saveLastAppliedTimestamp(solutionRootPath, jobId, stepId)
 
                     return { path: pathToDownload, outcome: 'applied' }
+                } else if (result.wroteNothing && !result.rejected) {
+                    // Refused before writing anything, on a verdict that may change — a .sln the
+                    // customer has momentarily moved looks the same as a wrong root. Retry within
+                    // the bound, but remember that nothing landed.
+                    this.logging.error(`ATX: [BEAM] refused the diff for step ${stepId} for now: ${result.error}`)
+                    return { path: pathToDownload, outcome: 'apply-refused' }
                 } else if (result.rejected) {
                     // Settled by the diff's own contents, so the retry loop cannot change it and
                     // every attempt costs another presigned URL and another download against a
@@ -3984,7 +4002,7 @@ export class ATXTransformHandler {
                     )
                     break
                 }
-                if (outcome !== 'apply-failed') {
+                if (outcome !== 'apply-failed' && outcome !== 'apply-refused') {
                     const waits = (state.waits[step.StepId] ?? 0) + 1
                     state.waits[step.StepId] = waits
                     if (waits >= this._beamWaitGiveUpPolls) {
@@ -4023,17 +4041,23 @@ export class ATXTransformHandler {
                         `ATX: [BEAM] merged unit tests from step ${step.StepId} did not apply after ${polls} ` +
                             `attempts; not trying it again, and not applying any later test run on this repo`
                     )
-                    // Not "your solution has not been changed": applyChanges writes file by file, so
-                    // a diff that failed part way through has already put some of its files on disk.
+                    // Two different truths. applyChanges writes file by file, so a diff that failed
+                    // part way through has already put some of its files on disk — but a refusal
+                    // wrote nothing at all, and telling that customer their solution may be half
+                    // updated sends them looking for damage that does not exist.
                     await this.tellCustomer(
                         jobId,
                         step.StepId,
                         solutionRootPath,
-                        'Could not finish adding the generated unit tests to your solution after several ' +
-                            'attempts. Some files may already have been updated, and any file that was ' +
-                            `overwritten has a copy in ${workspaceFolderName}/${jobId}/checkpoints/` +
-                            'conflict-backups. Unit tests generated later in this job will not be added ' +
-                            'either, because they build on this run. Please report this.'
+                        outcome === 'apply-refused'
+                            ? 'Could not add the generated unit tests to your solution after several attempts, ' +
+                                  'and nothing in it was changed. Unit tests generated later in this job will ' +
+                                  'not be added either, because they build on this run. Please report this.'
+                            : 'Could not finish adding the generated unit tests to your solution after several ' +
+                                  'attempts. Some files may already have been updated, and any file that was ' +
+                                  `overwritten has a copy in ${workspaceFolderName}/${jobId}/checkpoints/` +
+                                  'conflict-backups. Unit tests generated later in this job will not be added ' +
+                                  'either, because they build on this run. Please report this.'
                     )
                     break
                 }
@@ -4075,9 +4099,6 @@ export class ATXTransformHandler {
         if (cards.length === 0) {
             return null
         }
-        if (cards.length === 1) {
-            return cards[0]
-        }
         const scope = new Set(
             (beamScopeStepIds || '')
                 .split(',')
@@ -4105,14 +4126,28 @@ export class ATXTransformHandler {
             }
             return null
         }
+        const inScope = (step: AtxPlanStep): boolean =>
+            scope.has(step.StepId) || step.Children.some(child => inScope(child))
+        if (cards.length === 1) {
+            // One card and no scope is the common, unambiguous case. One card and a scope that
+            // names none of its steps is not: that is the IDE saying the open solution belongs to
+            // some other repo, and writing this card's test project into it would put the wrong
+            // repo's project in the customer's solution. Fail closed, as the multi-card branch does
+            // on the same mismatch.
+            if (scope.size > 0 && !inScope(cards[0])) {
+                return unresolved(
+                    `the IDE's scope [${[...scope].join(', ')}] names nothing under the only beam card ` +
+                        `${cards[0].StepId}, so this solution is probably another repo`
+                )
+            }
+            return cards[0]
+        }
         if (scope.size === 0) {
             return unresolved(
                 `${cards.length} beam cards in the plan and no scope from the IDE, so the wrong repo's tests ` +
                     `could land in this solution`
             )
         }
-        const inScope = (step: AtxPlanStep): boolean =>
-            scope.has(step.StepId) || step.Children.some(child => inScope(child))
         const matched = cards.filter(inScope)
         if (matched.length !== 1) {
             return unresolved(
@@ -4532,6 +4567,13 @@ export class ATXTransformHandler {
             return result.artifacts || []
         } catch (error) {
             this.logging.error(`ATX: listArtifactsForStep error: ${String(error)}`)
+            // Without this a throttled listing looks exactly like "the artifact is not up yet", so
+            // the beam apply counted it against the arrival bound and kept listing — spending a
+            // permanent give-up on a healthy step, and feeding the throttle while doing it. The
+            // cooldown this sets is what the beam loop checks before its next attempt.
+            if (this.isThrottleError(error)) {
+                this.noteBeamThrottled()
+            }
             return null
         }
     }
@@ -5338,6 +5380,10 @@ export class ATXTransformHandler {
         writeFailed?: boolean
         // Refused before writing anything, on a verdict that cannot change on a retry.
         rejected?: boolean
+        // Refused before writing anything, whether or not the verdict can change. The caller needs
+        // this to tell the customer the truth: "nothing was changed" rather than "some files may
+        // already have been updated".
+        wroteNothing?: boolean
     }> {
         try {
             this.logging.log(`ATX: Starting applyChanges from ${checkpointFolderPath} to ${solutionRootPath}`)
@@ -5363,6 +5409,32 @@ export class ATXTransformHandler {
             // if the root were wrong, none of them would be, and we would scatter a test project
             // and a .sln over unrelated directories.
             if (beamApply) {
+                // Containment FIRST. The root probe below joins these paths onto the solution root,
+                // so an entry like '../x' would send it looking outside the solution — and a diff
+                // whose paths all escape would come back as the retryable wrong-root error instead
+                // of the settled refusal it is.
+                //
+                // A Merge Tests diff is a test project and the .sln, so it has no business outside
+                // the solution, and an entry that climbs out would be written AND backed up outside
+                // it, since the backup path is derived from the same relative path. PR #2969 adds
+                // this to the whole apply path; this is the beam slice of it, so the gap is not
+                // open while that one is in review.
+                const escaping = [
+                    ...filesAdded,
+                    ...filesRemoved,
+                    ...filesUpdated,
+                    ...movedFilesMap.flatMap((m: { before?: string; after?: string }) => [m.before, m.after]),
+                ].filter((relativePath: string | undefined) => relativePath && this.escapesRoot(relativePath))
+                if (escaping.length > 0) {
+                    return {
+                        success: false,
+                        rejected: true,
+                        wroteNothing: true,
+                        error:
+                            `this diff reaches outside ${solutionRootPath} (${escaping.join(', ')}), so nothing ` +
+                            `was written`,
+                    }
+                }
                 const mustAlreadyExist: string[] = [...filesUpdated, ...filesRemoved]
                 if (
                     mustAlreadyExist.length > 0 &&
@@ -5375,29 +5447,10 @@ export class ATXTransformHandler {
                     // retire the step and every later test run on the repo.
                     return {
                         success: false,
+                        wroteNothing: true,
                         error:
                             `none of the ${mustAlreadyExist.length} file(s) this diff updates or removes exist ` +
                             `under ${solutionRootPath}, so it was computed against a different root — nothing ` +
-                            `was written`,
-                    }
-                }
-                // And that it stays inside the solution. A Merge Tests diff is a test project and
-                // the .sln, so it has no business outside, and an entry that climbs out would be
-                // written AND backed up outside the solution, since the backup path is derived from
-                // the same relative path. PR #2969 adds this to the whole apply path; this is the
-                // beam slice of it, so the gap is not open while that one is in review.
-                const escaping = [
-                    ...filesAdded,
-                    ...filesRemoved,
-                    ...filesUpdated,
-                    ...movedFilesMap.flatMap((m: { before?: string; after?: string }) => [m.before, m.after]),
-                ].filter((relativePath: string | undefined) => relativePath && this.escapesRoot(relativePath))
-                if (escaping.length > 0) {
-                    return {
-                        success: false,
-                        rejected: true,
-                        error:
-                            `this diff reaches outside ${solutionRootPath} (${escaping.join(', ')}), so nothing ` +
                             `was written`,
                     }
                 }
