@@ -23,6 +23,7 @@ import {
     normalizePathFromUri,
 } from './mcp/mcpUtils'
 import { FsReplace, FsReplaceParams } from './fsReplace'
+import { recordFileUpdate, requireResolvedTarget, requireResolvedTargets } from './toolShared'
 import { CodeReviewUtils } from './qCodeAnalysis/codeReviewUtils'
 import { DEFAULT_AWS_Q_ENDPOINT_URL, DEFAULT_AWS_Q_REGION } from '../../../shared/constants'
 import { getUserAgent, makeUserContextObject } from '../../../shared/telemetryUtils'
@@ -32,6 +33,7 @@ import { AmazonQTokenServiceManager } from '../../../shared/amazonQServiceManage
 import { SERVICE_MANAGER_TIMEOUT_MS, SERVICE_MANAGER_POLL_INTERVAL_MS } from '../constants/constants'
 import { isUsingIAMAuth } from '../../../shared/utils'
 
+/** Register handlers for inputs prepared with withResolvedTargets after acceptance. */
 export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     const fsReadTool = new FsRead({ workspace, lsp, logging })
     const fsWriteTool = new FsWrite({ workspace, lsp, logging })
@@ -39,11 +41,14 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     const fileSearchTool = new FileSearch({ workspace, lsp, logging })
     const fsReplaceTool = new FsReplace({ workspace, lsp, logging })
 
+    // Validation and execution consume the same checked targets once, without re-resolving input paths.
+
     agent.addTool(
         fsReadTool.getSpec(),
         async (input: FsReadParams) => {
-            await fsReadTool.validate(input)
-            return await fsReadTool.invoke(input)
+            const targets = requireResolvedTargets(input, 'fsRead', input.paths?.length ?? 0)
+            await fsReadTool.validate(input, targets)
+            return await fsReadTool.invoke(input, targets)
         },
         ToolClassification.BuiltIn
     )
@@ -51,8 +56,11 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fsWriteTool.getSpec(),
         async (input: FsWriteParams) => {
-            await fsWriteTool.validate(input)
-            return await fsWriteTool.invoke(input)
+            const target = requireResolvedTarget(input, 'fsWrite')
+            await fsWriteTool.validate(input, target)
+            const { output, fileUpdate } = await fsWriteTool.invoke(input, target)
+            recordFileUpdate(input, fileUpdate)
+            return { output }
         },
         ToolClassification.BuiltInCanWrite
     )
@@ -60,8 +68,11 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fsReplaceTool.getSpec(),
         async (input: FsReplaceParams) => {
-            await fsReplaceTool.validate(input)
-            return await fsReplaceTool.invoke(input)
+            const target = requireResolvedTarget(input, 'fsReplace')
+            await fsReplaceTool.validate(input, target)
+            const { output, fileUpdate } = await fsReplaceTool.invoke(input, target)
+            recordFileUpdate(input, fileUpdate)
+            return { output }
         },
         ToolClassification.BuiltInCanWrite
     )
@@ -69,8 +80,9 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         listDirectoryTool.getSpec(),
         async (input: ListDirectoryParams, token?: CancellationToken) => {
-            await listDirectoryTool.validate(input)
-            return await listDirectoryTool.invoke(input, token)
+            const target = requireResolvedTarget(input, 'listDirectory').path
+            await listDirectoryTool.validate(input, target)
+            return await listDirectoryTool.invoke(input, target, token)
         },
         ToolClassification.BuiltIn
     )
@@ -78,8 +90,9 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fileSearchTool.getSpec(),
         async (input: FileSearchParams, token?: CancellationToken) => {
-            await fileSearchTool.validate(input)
-            return await fileSearchTool.invoke(input, token)
+            const target = requireResolvedTarget(input, 'fileSearch').path
+            await fileSearchTool.validate(input, target)
+            return await fileSearchTool.invoke(input, target, token)
         },
         ToolClassification.BuiltIn
     )

@@ -6,11 +6,21 @@ import {
     CancellationToken,
     CredentialsType,
     InitializeParams,
+    PartialInitializeResult,
     Server,
     UpdateConfigurationParams,
 } from '@aws/language-server-runtimes/server-interface'
-import { AmazonQServiceServerFactory } from './amazonQServer'
+import {
+    AMAZON_Q_SERVICE_SERVER_IAM_NAME,
+    AMAZON_Q_SERVICE_SERVER_TOKEN_NAME,
+    AmazonQServiceServerFactory,
+    AmazonQServiceServerIAM,
+    AmazonQServiceServerToken,
+} from './amazonQServer'
 import { BaseAmazonQServiceManager } from './amazonQServiceManager/BaseAmazonQServiceManager'
+import { AtxTokenServiceManager } from './amazonQServiceManager/AtxTokenServiceManager'
+
+const TEST_SERVER_NAME = 'Test Amazon Q Server'
 
 describe('AmazonQServiceServer', () => {
     let features: TestFeatures
@@ -23,7 +33,7 @@ describe('AmazonQServiceServer', () => {
         initBaseTestServiceManagerSpy = sinon.spy(initBaseTestServiceManager)
 
         TestAmazonQServiceManager.resetInstance()
-        server = AmazonQServiceServerFactory(() => initBaseTestServiceManagerSpy(features))
+        server = AmazonQServiceServerFactory(() => initBaseTestServiceManagerSpy(features), TEST_SERVER_NAME)
     })
 
     afterEach(() => {
@@ -41,6 +51,55 @@ describe('AmazonQServiceServer', () => {
 
         features.doSendInitializeRequest({} as InitializeParams, {} as CancellationToken)
         sinon.assert.calledOnce(initBaseTestServiceManagerSpy)
+    })
+
+    it('declares serverInfo so the runtime can deliver notifications to the client', async () => {
+        server(features)
+
+        // Invoke the registered initializer directly: doSendInitializeRequest returns void, so the
+        // result is only reachable through the handler the server registered.
+        const initializer = features.lsp.addInitializer.args[0]?.[0]
+        const result = (await initializer({} as InitializeParams, {} as CancellationToken)) as PartialInitializeResult
+
+        // The runtime only builds a notification router for servers that declare serverInfo, and
+        // notification.showNotification() is a silent no-op without one.
+        expect(result.serverInfo?.name).to.equal(TEST_SERVER_NAME)
+    })
+
+    it('gives the IAM and token servers distinct serverInfo names', async () => {
+        // Regression guard, asserted against the real exported servers rather than the constants, so
+        // it also catches the same name being passed to both factory calls.
+        //
+        // Runtimes such as agent-standalone register BOTH of these servers, and the runtime rejects
+        // initialize with `Duplicate servers defined` when two servers report the same name -- which
+        // fails the entire language server, not just the duplicate. A shared name here made every such
+        // runtime fall back to whatever server the client had bundled, visible only as a client-side
+        // warning, so Q kept working while silently running a different server.
+        const names: (string | undefined)[] = []
+
+        for (const qServer of [AmazonQServiceServerIAM, AmazonQServiceServerToken]) {
+            const serverFeatures = new TestFeatures()
+            try {
+                // The service managers refuse to initialize before the LSP connection has, so the
+                // client params have to be in place before the initializer runs.
+                serverFeatures.setClientParams({} as InitializeParams)
+                qServer(serverFeatures)
+
+                const initializer = serverFeatures.lsp.addInitializer.args[0]?.[0]
+                const result = (await initializer(
+                    {} as InitializeParams,
+                    {} as CancellationToken
+                )) as PartialInitializeResult
+
+                names.push(result.serverInfo?.name)
+            } finally {
+                serverFeatures.dispose()
+                TestAmazonQServiceManager.resetInstance()
+            }
+        }
+
+        expect(names).to.deep.equal([AMAZON_Q_SERVICE_SERVER_IAM_NAME, AMAZON_Q_SERVICE_SERVER_TOKEN_NAME])
+        expect(new Set(names).size, `server names must be unique: ${names.join(', ')}`).to.equal(names.length)
     })
 
     it('hooks handleDidChangeConfiguration to didChangeConfiguration and onInitialized handlers', async () => {
@@ -86,6 +145,21 @@ describe('AmazonQServiceServer', () => {
         sinon.assert.calledOnce(handleOnCredentialsDeletedSpy)
     })
 
+    it('forwards only IAM credential deletions to the AWS Transform service manager', async () => {
+        await features.initialize(server)
+        const atxHandleOnCredentialsDeletedSpy = sinon.spy(
+            AtxTokenServiceManager.prototype,
+            'handleOnCredentialsDeleted'
+        )
+        const onCredentialsDeleted = features.credentialsProvider.onCredentialsDeleted.args[0]?.[0]
+
+        onCredentialsDeleted('bearer' as CredentialsType)
+        sinon.assert.notCalled(atxHandleOnCredentialsDeletedSpy)
+
+        onCredentialsDeleted('iam' as CredentialsType)
+        sinon.assert.calledOnceWithExactly(atxHandleOnCredentialsDeletedSpy, 'iam')
+    })
+
     it('should handle ATX configuration updates', async () => {
         await features.initialize(server)
 
@@ -111,7 +185,7 @@ describe('AmazonQServiceServer', () => {
             throw new Error('Service manager initialization failed')
         }
 
-        const errorServer = AmazonQServiceServerFactory(errorFactory)
+        const errorServer = AmazonQServiceServerFactory(errorFactory, TEST_SERVER_NAME)
 
         expect(() => {
             errorServer(features)

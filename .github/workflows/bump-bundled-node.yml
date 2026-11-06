@@ -1,0 +1,122 @@
+name: Bump bundled Node.js
+
+# Opens a draft pull request when Node.js publishes a newer release of the major line
+# that app/aws-lsp-codewhisperer-runtimes/scripts/download-node.sh bundles.
+
+on:
+    schedule:
+        - cron: '0 6 * * *'
+    workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+    group: bump-bundled-node
+    cancel-in-progress: false
+
+jobs:
+    bump:
+        name: Bump bundled Node.js
+        # Run only from main, so the bump branch holds nothing but the version change.
+        if: github.repository == 'Amazon-Q-Developer/language-servers' && github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        permissions:
+            contents: write # push the bump branch
+            pull-requests: write # open the pull request
+        defaults:
+            run:
+                shell: bash
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Check for a newer Node.js release
+              id: check
+              run: ./app/aws-lsp-codewhisperer-runtimes/scripts/update-node-version.sh
+
+            - name: Check for an existing pull request
+              id: existing
+              if: steps.check.outputs.updated == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  BRANCH: automation/bump-bundled-node-${{ steps.check.outputs.latest }}
+                  LATEST: ${{ steps.check.outputs.latest }}
+              run: |
+                  # Any earlier pull request from this repository's bump branch, including a closed one, stops a new one.
+                  # Pull requests from forks are not counted, so a fork cannot block a bump by reusing the branch name.
+                  same_repo='[.[] | select(.isCrossRepository | not)] | length'
+                  branch_count=$(gh pr list --head "$BRANCH" --state all --json isCrossRepository --jq "$same_repo")
+                  # An open pull request that already updates to this version, on any branch, also stops a new one.
+                  title_count=$(gh pr list --state open --search "in:title \"bundled Node.js to $LATEST\"" --json number --jq length)
+                  if [ "$branch_count" -gt 0 ] || [ "$title_count" -gt 0 ]; then
+                      echo "A pull request for Node.js $LATEST already exists."
+                      echo "exists=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "exists=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Verify the new Node.js files
+              if: steps.existing.outputs.exists == 'false'
+              working-directory: app/aws-lsp-codewhisperer-runtimes
+              run: |
+                  mkdir -p build
+                  ./scripts/download-node.sh
+
+            - name: Open pull request
+              if: steps.existing.outputs.exists == 'false'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  CURRENT: ${{ steps.check.outputs.current }}
+                  LATEST: ${{ steps.check.outputs.latest }}
+                  SECURITY_VERSIONS: ${{ steps.check.outputs.security_versions }}
+                  BRANCH: automation/bump-bundled-node-${{ steps.check.outputs.latest }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  script_path=app/aws-lsp-codewhisperer-runtimes/scripts/download-node.sh
+                  if [ -n "$SECURITY_VERSIONS" ]; then
+                      title="fix: update bundled Node.js to $LATEST"
+                  else
+                      title="chore: update bundled Node.js to $LATEST"
+                  fi
+
+                  body_file="$RUNNER_TEMP/pr-body.md"
+                  {
+                      echo '## Problem'
+                      echo
+                      echo "The language server bundles Node.js $CURRENT. Node.js $LATEST is the newest release of the same major line."
+                      if [ -n "$SECURITY_VERSIONS" ]; then
+                          echo
+                          echo 'Node.js marks these releases since the bundled version as security releases:'
+                          for version in $SECURITY_VERSIONS; do
+                              echo "- [v$version](https://github.com/nodejs/node/releases/tag/v$version)"
+                          done
+                      fi
+                      echo
+                      echo '## Solution'
+                      echo
+                      echo "Update \`NODE_SEMVER\` in \`$script_path\` to $LATEST ([release notes](https://github.com/nodejs/node/releases/tag/v$LATEST))."
+                      echo
+                      echo '## Testing'
+                      echo
+                      echo "[This workflow run]($RUN_URL) downloaded the Node.js $LATEST files for all five platforms and checked each SHA-256 against the release's \`SHASUMS256.txt\`."
+                      echo
+                      echo 'Opened as a draft by the "Bump bundled Node.js" workflow. GitHub does not start CI for pull requests opened with the workflow token. To run CI, close and reopen this pull request, then mark it ready for review.'
+                  } > "$body_file"
+
+                  git config user.name 'github-actions[bot]'
+                  git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+                  git switch -c "$BRANCH"
+                  git add "$script_path"
+                  git commit -m "$title"
+
+                  remote_sha=$(git ls-remote --heads origin | awk -v ref="refs/heads/$BRANCH" '$2 == ref {print $1}')
+                  if [ -n "$remote_sha" ]; then
+                      # An earlier run pushed this branch but did not open the pull request.
+                      # Replace it with the commit verified in this run, unless it changed after it was read.
+                      git push --force-with-lease="refs/heads/$BRANCH:$remote_sha" origin "$BRANCH"
+                  else
+                      git push origin "$BRANCH"
+                  fi
+
+                  gh pr create --draft --base main --head "$BRANCH" --title "$title" --body-file "$body_file" --label dependencies
