@@ -16,6 +16,7 @@ export interface AtxPlanStep {
     Status: PlanStepStatus
     Children: AtxPlanStep[]
     HasCheckpoint?: boolean
+    IsStatusOnly?: boolean
 }
 
 /**
@@ -70,6 +71,18 @@ export interface AtxListOrCreateWorkspaceRequest extends ExecuteCommandParams {
 export interface AtxListOrCreateWorkspaceResponse {
     AvailableWorkspaces: AtxWorkspaceInfo[]
     CreatedWorkspace?: AtxCreatedWorkspaceInfo
+}
+
+/**
+ * Result of aws/atxTransform/validateSession: one read-only ListWorkspaces call that confirms the active
+ * credentials, tenant URL and permission work. On failure, Reason is one of AtxSessionValidationReason
+ * (see atxSessionValidation.ts); ErrorCode is the service error name. Never contains credential values.
+ */
+export interface AtxValidateSessionResponse {
+    Valid: boolean
+    Reason?: string
+    ErrorCode?: string
+    HttpStatus?: number
 }
 
 /**
@@ -140,12 +153,19 @@ export interface AtxGetTransformInfoResponse {
     TransformationPlan?: AtxTransformationPlan | null
     ArtifactPath?: string | null
     ErrorString?: string | null
+    // When GetJob failed: the service error code (e.g. AccessDeniedException) and HTTP status. Never the message.
+    ErrorCode?: string
+    StatusCode?: number
     StepInformation?: AtxStepInformation | null
     HitlTag?: string | null
     HitlTaskId?: string | null
     MissingPackageJsonPath?: string | null
     DiffApplyFailed?: boolean
     DiffApplyFailedStepIds?: string[]
+    // Interactive mode as resolved from the backend job objective (interactive_mode).
+    // Surfaced so the IDE can restore the correct mode instead of relying on its local
+    // settings store, which may be missing/stale (e.g. cold restart on another machine).
+    InteractiveMode?: InteractiveMode
 }
 
 /**

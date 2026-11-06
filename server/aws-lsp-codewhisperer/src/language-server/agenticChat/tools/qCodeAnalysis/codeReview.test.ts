@@ -8,6 +8,9 @@ import { CodeReviewUtils } from './codeReviewUtils'
 import { CODE_REVIEW_TOOL_NAME, FULL_REVIEW, CODE_DIFF_REVIEW } from './codeReviewConstants'
 import * as sinon from 'sinon'
 import * as path from 'path'
+import * as fs from 'fs'
+import * as os from 'os'
+import { URI } from 'vscode-uri'
 import { expect } from 'chai'
 import { CancellationError } from '@aws/lsp-core'
 import * as JSZip from 'jszip'
@@ -396,66 +399,85 @@ describe('CodeReview', () => {
     })
 
     describe('prepareFilesAndFoldersForUpload', () => {
-        beforeEach(() => {
-            mockFeatures.workspace.fs.readFile.resolves(Buffer.from('file content'))
-            mockFeatures.workspace.fs.readdir.resolves([
-                { name: 'file.js', parentPath: '/test', isFile: () => true, isDirectory: () => false },
-            ])
+        let wsRoot: string
+        let realFile: string
+        let realFolder: string
+        let getGitDiffNamesStub: sinon.SinonStub
+        let processArtifactWithDiffStub: sinon.SinonStub
 
-            sandbox.stub(require('fs'), 'existsSync').returns(true)
-            sandbox.stub(require('fs'), 'statSync').returns({ isFile: () => true })
+        beforeEach(() => {
+            const realTmp = fs.realpathSync(os.tmpdir())
+            wsRoot = fs.mkdtempSync(path.join(realTmp, 'cr-prep-'))
+            realFile = path.join(wsRoot, 'file.js')
+            fs.writeFileSync(realFile, 'console.log(1)\n')
+            realFolder = path.join(wsRoot, 'folder')
+            fs.mkdirSync(realFolder)
+            fs.writeFileSync(path.join(realFolder, 'nested.js'), 'console.log(2)\n')
+
+            // The workspace must contain the artifacts for the boundary check.
+            mockFeatures.workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+            // Read/readdir delegate to the real filesystem so realpath/stat and
+            // the folder walk see the fixtures created above.
+            mockFeatures.workspace.fs.readFile.callsFake((p: string) => fs.promises.readFile(p))
+            mockFeatures.workspace.fs.readdir.callsFake((p: string) => fs.promises.readdir(p, { withFileTypes: true }))
+
+            // Keep these prepare-focused tests off the real git binary.
+            getGitDiffNamesStub = sandbox.stub(CodeReviewUtils, 'getGitDiffNames').resolves(new Set<string>())
+            processArtifactWithDiffStub = sandbox.stub(CodeReviewUtils, 'processArtifactWithDiff').resolves('')
+        })
+
+        afterEach(() => {
+            fs.rmSync(wsRoot, { recursive: true, force: true })
         })
 
         it('should prepare files and folders for upload', async () => {
-            const fileArtifacts = [{ path: '/test/file.js' }]
-            const folderArtifacts = [{ path: '/test/folder' }]
-            const ruleArtifacts: any[] = []
-
             const result = await (codeReview as any).prepareFilesAndFoldersForUpload(
                 'Test requirement',
-                fileArtifacts,
-                folderArtifacts,
-                ruleArtifacts,
+                [{ path: realFile }],
+                [{ path: realFolder }],
+                [],
                 false
             )
 
             expect(result.zipBuffer).to.be.instanceOf(Buffer)
             expect(result.md5Hash).to.be.a('string')
             expect(result.isCodeDiffPresent).to.be.a('boolean')
+            // A code-diff scan (isFullReviewRequest=false) derives the diff from
+            // the per-file getGitDiff (processArtifactWithDiff); the separate
+            // name-only call is no longer used.
+            expect(getGitDiffNamesStub.called, 'name-only git must not be called').to.be.false
+            expect(processArtifactWithDiffStub.called, 'per-file diff must run for a code-diff scan').to.be.true
         })
 
         it('should handle code diff generation', async () => {
-            const fileArtifacts = [{ path: '/test/file.js' }]
-            const folderArtifacts: any[] = []
-            const ruleArtifacts: any[] = []
+            processArtifactWithDiffStub.resolves('diff content\n')
 
-            sandbox.stub(CodeReviewUtils, 'processArtifactWithDiff').resolves('diff content\n')
-
+            // isFullReviewRequest=false -> code-diff scan, so the gated per-file
+            // diff path runs and a non-empty diff marks the artifact present.
             const result = await (codeReview as any).prepareFilesAndFoldersForUpload(
                 'Test requirement',
-                fileArtifacts,
-                folderArtifacts,
-                ruleArtifacts,
-                true
+                [{ path: realFile }],
+                [],
+                [],
+                false
             )
 
             expect(result.isCodeDiffPresent).to.be.true
         })
 
         it('should throw error when no valid files to scan', async () => {
-            const fileArtifacts: any[] = []
-            const folderArtifacts: any[] = []
-            const ruleArtifacts = [{ path: '/test/rule.json' }]
+            const realRule = path.join(wsRoot, 'rule.json')
+            fs.writeFileSync(realRule, '{}')
 
-            // Mock countZipFiles to return only rule artifacts count
-            sandbox.stub(CodeReviewUtils, 'countZipFiles').returns([1, new Set<string>(['/test/rule.json'])])
+            // Mock countZipFiles to return only the rule artifact count
+            sandbox.stub(CodeReviewUtils, 'countZipFiles').returns([1, new Set<string>([realRule])])
 
             try {
                 await (codeReview as any).prepareFilesAndFoldersForUpload(
                     'Test requirement',
-                    fileArtifacts,
-                    folderArtifacts,
-                    ruleArtifacts,
+                    [],
+                    [],
+                    [{ path: realRule }],
                     false
                 )
                 expect.fail('Expected error was not thrown')
@@ -465,34 +487,34 @@ describe('CodeReview', () => {
         })
 
         it('should handle duplicate rule filenames with unique UUIDs', async () => {
-            const fileArtifacts = [{ path: '/test/file.js' }]
-            const folderArtifacts: any[] = []
-            const ruleArtifacts = [{ path: '/test/path1/rule.json' }, { path: '/test/path2/rule.json' }]
+            const path1 = path.join(wsRoot, 'path1')
+            const path2 = path.join(wsRoot, 'path2')
+            fs.mkdirSync(path1)
+            fs.mkdirSync(path2)
+            const rule1 = path.join(path1, 'rule.json')
+            const rule2 = path.join(path2, 'rule.json')
+            fs.writeFileSync(rule1, '{}')
+            fs.writeFileSync(rule2, '{}')
 
-            const mockZip = {
-                file: sandbox.stub(),
-                generateAsync: sandbox.stub().resolves(Buffer.from('test')),
-            }
-            sandbox.stub(JSZip.prototype, 'file').callsFake(mockZip.file)
-            sandbox.stub(JSZip.prototype, 'generateAsync').callsFake(mockZip.generateAsync)
-            sandbox
-                .stub(CodeReviewUtils, 'countZipFiles')
-                .returns([3, new Set<string>(['/test/file.js', '/test/path1/rule.json', '/test/path2/rule.json'])])
+            const fileStub = sandbox.stub()
+            sandbox.stub(JSZip.prototype, 'file').callsFake(fileStub)
+            sandbox.stub(JSZip.prototype, 'generateAsync').resolves(Buffer.from('test'))
+            sandbox.stub(CodeReviewUtils, 'countZipFiles').returns([3, new Set<string>([realFile, rule1, rule2])])
             sandbox.stub(require('crypto'), 'randomUUID').returns('test-uuid-123')
 
             await (codeReview as any).prepareFilesAndFoldersForUpload(
                 'Test requirement',
-                fileArtifacts,
-                folderArtifacts,
-                ruleArtifacts,
+                [{ path: realFile }],
+                [],
+                [{ path: rule1 }, { path: rule2 }],
                 false
             )
 
-            // Verify first file uses original name
-            expect(mockZip.file.firstCall.args[0]).to.include('/test/file.js')
-            expect(mockZip.file.secondCall.args[0]).to.include('rule.json')
-            // Verify second file gets UUID suffix
-            expect(mockZip.file.thirdCall.args[0]).to.include('rule_test-uuid-123.json')
+            // First zipped entry is the submitted file (intended name preserved).
+            expect(fileStub.firstCall.args[0]).to.include('file.js')
+            // Then the two rules: the first keeps its name, the duplicate gets a UUID suffix.
+            expect(fileStub.secondCall.args[0]).to.include('rule.json')
+            expect(fileStub.thirdCall.args[0]).to.include('rule_test-uuid-123.json')
         })
     })
 
