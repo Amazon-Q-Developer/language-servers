@@ -114,6 +114,16 @@ export const AmazonQServiceServerFactory =
         credentialsProvider.onCredentialsDeleted((type: CredentialsType) => {
             log('Received onCredentialsDeleted notification')
             amazonQServiceManager.handleOnCredentialsDeleted(type)
+
+            // AWS Transform IAM sign-out (aws/credentials/iam/delete) also clears the ATX tenant URL. Only IAM
+            // deletions are forwarded; bearer deletions keep their existing (Amazon Q only) handling.
+            if (type === 'iam') {
+                try {
+                    AtxTokenServiceManager.getInstance().handleOnCredentialsDeleted(type)
+                } catch (error) {
+                    log(`Unable to clear AWS Transform IAM session state: ${String(error)}`)
+                }
+            }
         })
 
         // Optional chaining rather than a capability check: the event was added to the runtime after
