@@ -77,7 +77,7 @@ export class QErrorTransformer {
         // Handle specific error types with retry context
         if (isUsageLimitError(error)) {
             return new AgenticChatError(
-                `Request failed after ${attempts} attempts`,
+                `You have reached your Amazon Q usage limit. Request failed after ${attempts} attempts`,
                 'AmazonQUsageLimitError',
                 error instanceof Error ? error : undefined,
                 requestId
@@ -88,7 +88,7 @@ export class QErrorTransformer {
         const bodyStr = this.extractResponseBody(error)
         if (bodyStr && bodyStr.includes(MONTHLY_LIMIT_ERROR_MARKER)) {
             return new AgenticChatError(
-                `Request failed after ${attempts} attempts`,
+                `You have reached your monthly Amazon Q request limit. Request failed after ${attempts} attempts`,
                 'AmazonQUsageLimitError',
                 error instanceof Error ? error : undefined,
                 requestId
