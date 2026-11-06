@@ -260,6 +260,33 @@ export enum OutputKind {
 }
 
 /**
+ * Path separators written the way `ChatSessionService.addApprovedPath` stores
+ * them, so the approval check and the recorded form agree. Without this, a
+ * Windows path recorded as `C:/project/file.ts` is never recognised when it
+ * comes back as `C:\project\file.ts`, and the user is asked about the same
+ * file on every call.
+ */
+function normalizePathSeparators(filePath: string): string {
+    return filePath.replace(/\\/g, '/')
+}
+
+/**
+ * Whether two paths name the same file. `isParentFolder` is a strict ancestor
+ * check — it reports two equal paths as unrelated — so identity is compared
+ * separately. Case is ignored on the platforms whose filesystems ignore it,
+ * which is the precedent `isParentFolder` already follows, and a trailing
+ * separator does not change identity.
+ */
+function isSamePath(left: string, right: string): boolean {
+    const comparable = (value: string) => {
+        const normalized = path.normalize(value).replace(/[\\/]+$/, '')
+        return process.platform === 'win32' || process.platform === 'darwin' ? normalized.toLowerCase() : normalized
+    }
+
+    return comparable(left) === comparable(right)
+}
+
+/**
  * Checks if a path has already been approved for a specific tool
  * @param path The path to check
  * @param toolName The name of the tool requesting access
@@ -277,19 +304,23 @@ export function isPathApproved(filePath: string, toolName: string, approvedPaths
     }
 
     // Normalize path separators for consistent comparison
-    const normalizedFilePath = filePath.replace(/\\\\/g, '/')
+    const normalizedFilePath = normalizePathSeparators(filePath)
 
     // Check if the exact path is approved for this tool
     if (toolPaths.has(filePath) || toolPaths.has(normalizedFilePath)) {
         return true
     }
 
-    // Get the root directory for traversal limits
-    const rootDir = path.parse(filePath).root.replace(/\\\\/g, '/')
-
-    // Check if any approved path is a parent of the file path using isParentFolder
+    // Check if any approved path is the file itself or one of its parents
     for (const approvedPath of toolPaths) {
-        const normalizedApprovedPath = approvedPath.replace(/\\\\/g, '/')
+        const normalizedApprovedPath = normalizePathSeparators(approvedPath)
+
+        // The approval may be for this very file, which isParentFolder does
+        // not report, and the two forms may differ only in case or a trailing
+        // separator.
+        if (isSamePath(normalizedApprovedPath, normalizedFilePath)) {
+            return true
+        }
 
         // Check using the isParentFolder utility
         if (workspaceUtils.isParentFolder(normalizedApprovedPath, normalizedFilePath)) {

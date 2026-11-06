@@ -296,6 +296,13 @@ export async function loadAgentConfig(
     // Track useLegacyMcpJson value - workspace takes precedence over global
     let useLegacyMcpJsonValue: boolean | undefined
 
+    // Server-scoped permission entries ('@server', '@server/tool') seen in any agent config file.
+    // They are applied immediately when the owning server is declared in the same file's
+    // 'mcpServers' block, but legacy mcp.json servers (and duplicates skipped below) are not
+    // declared there, so the entries are stashed here and drained once every server is known.
+    const pendingServerTools = new Set<string>()
+    const pendingServerAllowedTools = new Set<string>()
+
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
         // 1) Skip missing files or create default global
@@ -371,16 +378,24 @@ export async function loadAgentConfig(
         // 4) Process permissions (tools and allowedTools)
         if (Array.isArray(json.tools)) {
             for (const tool of json.tools) {
-                if (!tool.startsWith('@') && !agentConfig.tools.includes(tool)) {
-                    agentConfig.tools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.tools.includes(tool)) {
+                        agentConfig.tools.push(tool)
+                    }
+                } else {
+                    pendingServerTools.add(tool)
                 }
             }
         }
 
         if (Array.isArray(json.allowedTools)) {
             for (const tool of json.allowedTools) {
-                if (!tool.startsWith('@') && !agentConfig.allowedTools.includes(tool)) {
-                    agentConfig.allowedTools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.allowedTools.includes(tool)) {
+                        agentConfig.allowedTools.push(tool)
+                    }
+                } else {
+                    pendingServerAllowedTools.add(tool)
                 }
             }
         }
@@ -632,6 +647,13 @@ export async function loadAgentConfig(
 
         logging.info(`Loaded ${mcpResult.servers.size} servers from legacy MCP configs`)
     }
+
+    // Restore server-scoped permissions for every server that loaded, regardless of which file
+    // declared it. Legacy mcp.json servers are deliberately not written into an agent config's
+    // 'mcpServers' block (see saveServerSpecificAgentConfig), and duplicate servers are skipped
+    // before the per-server permission pass, so without this their '@server' / '@server/tool'
+    // entries were dropped on every load and "Always Allow" reverted to "Ask".
+    restoreServerScopedPermissions(agentConfig, serverNameMapping, pendingServerTools, pendingServerAllowedTools)
 
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
@@ -1353,4 +1375,93 @@ export function createNamespacedToolName(
 
         duplicateNum++
     }
+}
+
+/**
+ * True when a permission entry is scoped to the given MCP server, i.e. it is either the
+ * server-wide prefix ('@server') or a single tool on that server ('@server/tool').
+ */
+export function isPermissionForServer(entry: string, serverName: string): boolean {
+    return entry === `@${serverName}` || entry.startsWith(`@${serverName}/`)
+}
+
+/**
+ * Re-apply server-scoped permission entries ('@server', '@server/tool') collected from agent
+ * config files to every server that actually loaded.
+ *
+ * `loadAgentConfig` applies these entries while iterating a file's own `mcpServers` block, which
+ * leaves two gaps: servers that come from a legacy `mcp.json` are never written into an agent
+ * config's `mcpServers` block, and duplicate (workspace/global) servers are skipped before the
+ * permission pass. Entries for those servers would otherwise be discarded on every load.
+ *
+ * Only entries belonging to a loaded server are restored, so permissions for servers the user has
+ * removed stay dropped. Existing entries are left untouched, preserving the order the per-file
+ * pass established.
+ */
+export function restoreServerScopedPermissions(
+    agentConfig: AgentConfig,
+    serverNameMapping: Map<string, string>,
+    pendingServerTools: Iterable<string>,
+    pendingServerAllowedTools: Iterable<string>
+): void {
+    const serverNames = new Set(serverNameMapping.values())
+    if (serverNames.size === 0) {
+        return
+    }
+
+    const belongsToLoadedServer = (entry: string): boolean => {
+        for (const serverName of serverNames) {
+            if (isPermissionForServer(entry, serverName)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    for (const entry of pendingServerTools) {
+        if (belongsToLoadedServer(entry) && !agentConfig.tools.includes(entry)) {
+            agentConfig.tools.push(entry)
+        }
+    }
+
+    for (const entry of pendingServerAllowedTools) {
+        if (belongsToLoadedServer(entry) && !agentConfig.allowedTools.includes(entry)) {
+            agentConfig.allowedTools.push(entry)
+        }
+    }
+}
+
+/**
+ * Default MCP tool execution timeout, in milliseconds, used when a server config
+ * does not specify one (or specifies an unusable value).
+ */
+export const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
+
+/**
+ * Largest delay that can be handed to `setTimeout` without the runtime clamping it
+ * back to 1ms and firing immediately (2^31 - 1 ms, roughly 24.8 days). The MCP SDK
+ * arms its request deadline with `setTimeout`, so an "unbounded" tool call has to be
+ * expressed as a large finite value rather than `Infinity`/`Number.MAX_SAFE_INTEGER`.
+ */
+export const MAX_TOOL_EXEC_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * A configured timeout is usable when it is a finite, positive number of milliseconds
+ * that `setTimeout` will honour. `0` is handled separately — it means "no timeout".
+ */
+export function isUsableToolExecTimeout(timeout: number | undefined): boolean {
+    return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TOOL_EXEC_TIMEOUT_MS
+}
+
+/**
+ * Resolve the timeout, in milliseconds, to hand to the MCP SDK for a tool call.
+ * - `0` (documented as "no timeout") maps to the maximum timer value, because the SDK
+ *   always applies its own 60s default when no timeout is supplied.
+ * - `undefined`, negative, non-finite, or over-large values fall back to the default.
+ */
+export function resolveMcpRequestTimeoutMs(timeout: number | undefined): number {
+    if (timeout === 0) {
+        return MAX_TOOL_EXEC_TIMEOUT_MS
+    }
+    return isUsableToolExecTimeout(timeout) ? (timeout as number) : DEFAULT_TOOL_EXEC_TIMEOUT_MS
 }
