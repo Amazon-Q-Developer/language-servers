@@ -4,6 +4,7 @@ import { ATXTransformHandler } from '../atxTransformHandler'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 import { Utils } from '../utils'
+import got from 'got'
 
 describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
     let handler: ATXTransformHandler
@@ -166,6 +167,59 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
         expect(result.path).to.equal('')
         expect(result.outcome).to.equal('transfer-failed')
         expect(saveAppliedCheckpointStub.called).to.be.false
+    })
+})
+
+describe('ATXTransformHandler - the HITL caller reads the outcome, not the path', () => {
+    let handler: ATXTransformHandler
+    let logging: Logging
+
+    beforeEach(() => {
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            logging,
+            {} as Runtime
+        )
+        sinon.stub(handler as any, 'createArtifactDownloadUrl').resolves({
+            s3PresignedUrl: 'https://s3.example.com/hitl.json',
+            requestHeaders: {},
+        })
+        sinon.stub(got, 'get').resolves({ body: JSON.stringify({ diffArtifactId: 'diff-1' }) } as any)
+    })
+
+    afterEach(() => sinon.restore())
+
+    const callHitl = async () =>
+        (handler as any).downloadAndParseStepHitlArtifact(
+            'ws-1',
+            'job-1',
+            { taskId: 't-1', agentArtifact: { artifactId: 'agent-1' } },
+            'step-001',
+            '/solution/root'
+        )
+
+    it('calls a half-applied diff a failure even though it returns a path', async () => {
+        // A diff that was extracted and then only partly applied returns the folder it was
+        // extracted to, so an empty path no longer means failure.
+        sinon
+            .stub(handler as any, 'downloadDiffArtifact')
+            .resolves({ path: '/solution/root/.atx/job-1/checkpoints/step-001', outcome: 'apply-failed' })
+
+        const result = await callHitl()
+
+        expect(result.DiffApplyFailed).to.be.true
+    })
+
+    it('calls an applied diff applied', async () => {
+        sinon
+            .stub(handler as any, 'downloadDiffArtifact')
+            .resolves({ path: '/solution/root/.atx/job-1/checkpoints/step-001', outcome: 'applied' })
+
+        const result = await callHitl()
+
+        expect(result.DiffApplyFailed).to.be.false
     })
 })
 

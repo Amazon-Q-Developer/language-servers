@@ -1593,6 +1593,53 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             })
         })
 
+        it('writes nothing when the diff reaches outside the solution', async () => {
+            // A Merge Tests diff is a test project and the .sln, so it has no business outside. An
+            // entry that climbs out would be written AND backed up outside the solution, because
+            // the backup path is built from the same relative path.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(
+                    step,
+                    { 'App.sln': 'the agent version' },
+                    { filesUpdated: ['App.sln', '../outside/Other.sln'] }
+                )
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.success).to.be.false
+                expect(String(result.error)).to.include('reaches outside')
+                // Not even the entry that was inside: one bad path abandons the whole diff.
+                expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the customer version')
+            })
+        })
+
+        it('spots an escaping path in a move and an absolute one', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, {}, { movedFilesMap: [{ before: 'A.cs', after: '../B.cs' }] })
+                const moved = await (handler as any).applyChanges(step, root, 'job-1', true)
+                expect(moved.success).to.be.false
+
+                writeDiff(step, {}, { filesAdded: ['/etc/passwd'] })
+                const absolute = await (handler as any).applyChanges(step, root, 'job-1', true)
+                expect(absolute.success).to.be.false
+            })
+        })
+
+        it('leaves the non-beam apply to decide about paths outside the solution itself', async () => {
+            // The containment rule for every caller is PR #2969's; this is only the beam slice.
+            await withSolution(async (root, checkpoints) => {
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'Tests/T.cs': 'new' }, { filesAdded: ['Tests/T.cs', '../outside/X.cs'] })
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1')
+
+                expect(result.success).to.be.true
+            })
+        })
+
         it('keeps the beam apply state on disk, beside the applied-checkpoints file', async () => {
             // Stubbed out in the plan tests, so prove the real thing round-trips here. It must be a
             // file: clearJobCache runs on every poll of a COMPLETED job, and the give-up has to

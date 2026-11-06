@@ -3022,19 +3022,22 @@ export class ATXTransformHandler {
 
             // Extract diff artifact if present
             let diffArtifactPath = ''
+            let diffApplied = false
             if (artifactJson.diffArtifactId) {
-                diffArtifactPath = (
-                    await this.downloadDiffArtifact(
-                        workspaceId,
-                        jobId,
-                        artifactJson.diffArtifactId,
-                        solutionRootPath,
-                        stepId
-                    )
-                ).path
+                const diff = await this.downloadDiffArtifact(
+                    workspaceId,
+                    jobId,
+                    artifactJson.diffArtifactId,
+                    solutionRootPath,
+                    stepId
+                )
+                diffArtifactPath = diff.path
+                diffApplied = diff.outcome === 'applied'
             }
 
-            const diffApplyFailed = !!(artifactJson.diffArtifactId && diffArtifactPath === '')
+            // The outcome, not the path: a diff that was extracted and then only half applied
+            // returns the folder it was extracted to, so an empty path no longer means failure.
+            const diffApplyFailed = !!(artifactJson.diffArtifactId && !diffApplied)
             if (diffApplyFailed && this._currentDiffContext) {
                 this._currentDiffContext.failed = true
                 this._currentDiffContext.failedStepIds.push(stepId)
@@ -4142,6 +4145,19 @@ export class ATXTransformHandler {
 
     private beamApplyStatePath(solutionRootPath: string, jobId: string): string {
         return path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', BEAM_APPLY_STATE_FILE)
+    }
+
+    /**
+     * True when a diff entry's relative path does not stay under the solution root: absolute, or
+     * climbing out with `..`. Checked textually, before anything is written, because by the time a
+     * path is joined the escape is already a real destination.
+     */
+    private escapesRoot(relativePath: string): boolean {
+        if (path.isAbsolute(relativePath)) {
+            return true
+        }
+        const normalized = path.normalize(relativePath)
+        return normalized === '..' || normalized.startsWith(`..${path.sep}`) || normalized.startsWith('../')
     }
 
     /** SUCCEEDED "Merge Tests" steps under this card, in DFS (plan) order. */
@@ -5307,6 +5323,25 @@ export class ATXTransformHandler {
                         error:
                             `none of the ${mustAlreadyExist.length} file(s) this diff updates or removes exist ` +
                             `under ${solutionRootPath}, so it was computed against a different root — nothing ` +
+                            `was written`,
+                    }
+                }
+                // And that it stays inside the solution. A Merge Tests diff is a test project and
+                // the .sln, so it has no business outside, and an entry that climbs out would be
+                // written AND backed up outside the solution, since the backup path is derived from
+                // the same relative path. PR #2969 adds this to the whole apply path; this is the
+                // beam slice of it, so the gap is not open while that one is in review.
+                const escaping = [
+                    ...filesAdded,
+                    ...filesRemoved,
+                    ...filesUpdated,
+                    ...movedFilesMap.flatMap((m: { before?: string; after?: string }) => [m.before, m.after]),
+                ].filter((relativePath: string | undefined) => relativePath && this.escapesRoot(relativePath))
+                if (escaping.length > 0) {
+                    return {
+                        success: false,
+                        error:
+                            `this diff reaches outside ${solutionRootPath} (${escaping.join(', ')}), so nothing ` +
                             `was written`,
                     }
                 }
