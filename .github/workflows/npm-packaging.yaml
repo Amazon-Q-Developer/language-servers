@@ -5,6 +5,11 @@ on:
     pull_request:
         branches: [main, dev, feature/*, release/agentic/*]
 
+# Least-privilege default for GITHUB_TOKEN. This workflow only checks out code and
+# builds/packs npm packages, so read-only access is sufficient.
+permissions:
+    contents: read
+
 jobs:
     build:
         name: Test public NPM packages
