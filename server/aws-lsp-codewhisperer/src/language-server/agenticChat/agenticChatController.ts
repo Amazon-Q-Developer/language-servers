@@ -91,6 +91,7 @@ import {
     TabRemoveParams,
     TabChangeParams,
     InlineChatResult,
+    isFileUpdateError,
 } from '@aws/language-server-runtimes/server-interface'
 import { v4 as uuid } from 'uuid'
 import {
@@ -161,11 +162,22 @@ import {
 import { ContextCommandsProvider } from './context/contextCommandsProvider'
 import { LocalProjectContextController } from '../../shared/localProjectContextController'
 import { CancellationError, workspaceUtils } from '@aws/lsp-core'
+import { CheckedTarget, logFileAccess, readCheckedFile, updateCheckedFile } from './tools/checkedFileIo'
 import { FsRead, FsReadParams } from './tools/fsRead'
 import { ListDirectory, ListDirectoryParams } from './tools/listDirectory'
 import { FsWrite, FsWriteParams } from './tools/fsWrite'
 import { ExecuteBash, ExecuteBashParams } from './tools/executeBash'
-import { ExplanatoryParams, InvokeOutput, ToolApprovalException } from './tools/toolShared'
+import {
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    discardResolvedTargets,
+    withResolvedTargets,
+    getFileUpdate,
+    resolveCanonicalPath,
+    resolveSymlinkAwarePath,
+    ToolApprovalException,
+} from './tools/toolShared'
 import { validatePathBasic, validatePathExists, validatePaths as validatePathsSync } from './utils/pathValidation'
 import { calculateModifiedLines } from './utils/fileModificationMetrics'
 import { TokenLimitsCalculator } from './utils/tokenLimitsCalculator'
@@ -199,6 +211,7 @@ import {
     AgenticChatError,
     customerFacingErrorCodes,
     getCustomerFacingErrorMessage,
+    getModelFacingFileError,
     isRequestAbortedError,
     isThrottlingRelated,
     unactionableErrorCodes,
@@ -454,17 +467,14 @@ export class AgenticChatController implements ChatHandlers {
                     this.#abTestingAllocation?.userVariation
                 )
             } catch (err: any) {
-                return { success: false, failureReason: err.message }
+                return { success: false, failureReason: getCustomerFacingErrorMessage(err) }
             }
             return {
                 success: true,
             }
         } else if (params.buttonId === BUTTON_UNDO_ALL_CHANGES) {
             const toolUseId = params.messageId.replace(SUFFIX_UNDOALL, '')
-            await this.#undoAllFileChanges(params.tabId, toolUseId, session.data)
-            return {
-                success: true,
-            }
+            return this.#undoAllFileChanges(params.tabId, toolUseId, session.data)
         } else if (params.buttonId === BUTTON_STOP_SHELL_COMMAND) {
             this.#stoppedToolUses.add(params.messageId)
             await this.#renderStoppedShellCommand(params.tabId, params.messageId)
@@ -485,17 +495,74 @@ export class AgenticChatController implements ChatHandlers {
         }
     }
 
+    async #getFileChangeDocument(requestedPath: string, target: CheckedTarget, useWorkspace: boolean) {
+        const targetPath = target.path
+        if (target.state === 'missing') return undefined
+        try {
+            const content = await readCheckedFile(this.#features.workspace, target, this.#features.logging)
+            if (useWorkspace) {
+                const documentTarget =
+                    requestedPath === targetPath
+                        ? targetPath
+                        : await resolveCanonicalPath(requestedPath).catch(() => undefined)
+                if (documentTarget === targetPath) {
+                    const document = await this.#triggerContext.getTextDocumentFromPath(requestedPath, true, false)
+                    if (document) return document
+                }
+                if (requestedPath !== targetPath) {
+                    const document = await this.#triggerContext.getTextDocumentFromPath(targetPath, true, false)
+                    if (document) return document
+                }
+            }
+            return TextDocument.create(requestedPath, '', 0, content)
+        } catch (error) {
+            logFileAccess(this.#features.logging, 'snapshot.unavailable', { targetPath }, error)
+            if (useWorkspace && (target.state !== 'unverified' || (error as NodeJS.ErrnoException).code !== 'ENOENT'))
+                throw error
+            return undefined
+        }
+    }
+
     async #undoFileChange(toolUseId: string, session: ChatSessionService | undefined): Promise<void> {
         this.#log(`Reverting file change for tooluseId: ${toolUseId}`)
         const toolUse = session?.toolUseLookup.get(toolUseId)
 
         const input = toolUse?.input as unknown as FsWriteParams | FsReplaceParams
-        if (toolUse?.fileChange?.before) {
-            await this.#features.workspace.fs.writeFile(input.path, toolUse.fileChange.before)
+        const change = toolUse?.fileChange
+        if (!change || !input?.path) {
+            throw new Error('No recorded file change is available to undo.')
+        }
+        const targetPath = change.targetPath ?? input.path
+        const previousContent = change.before
+        if (previousContent !== undefined) {
+            if (change.target) {
+                await updateCheckedFile(
+                    this.#features.workspace,
+                    change.target,
+                    current => {
+                        if (change.after === undefined || current !== change.after) {
+                            throw new Error('The file has changed since this edit. Review it before undoing.')
+                        }
+                        return previousContent
+                    },
+                    {},
+                    this.#features.logging
+                )
+            } else if (change.targetPath && process.platform !== 'win32') {
+                throw new Error('This edit has no recorded file identity. Restore it manually.')
+            } else {
+                await this.#features.workspace.fs.writeFile(targetPath, previousContent)
+            }
         } else {
-            await this.#features.workspace.fs.rm(input.path)
+            if (change.target && process.platform !== 'win32') {
+                throw new Error('This edit created a new file. Review and remove it manually to undo the creation.')
+            }
+            if (change.targetPath && process.platform !== 'win32') {
+                throw new Error('This edit has no recorded file identity. Review it before removing the file.')
+            }
+            await this.#features.workspace.fs.rm(targetPath)
             void LocalProjectContextController.getInstance().then(controller => {
-                const filePath = URI.file(input.path).fsPath
+                const filePath = URI.file(targetPath).fsPath
                 return controller.updateIndexAndContextCommand([filePath], false)
             })
         }
@@ -555,15 +622,23 @@ export class AgenticChatController implements ChatHandlers {
         tabId: string,
         toolUseId: string,
         session: ChatSessionService | undefined
-    ): Promise<void> {
+    ): Promise<ButtonClickResult> {
         this.#log(`Reverting all file changes starting from ${toolUseId}`)
         const toUndo = session?.toolUseLookup.get(toolUseId)?.relatedToolUses
-        if (!toUndo) {
-            return
-        }
+        if (!toUndo) return { success: true }
+        const failures: string[] = []
         for (const messageId of [...toUndo].reverse()) {
-            await this.onButtonClick({ buttonId: BUTTON_UNDO_CHANGES, messageId, tabId })
+            const result = await this.onButtonClick({ buttonId: BUTTON_UNDO_CHANGES, messageId, tabId })
+            if (result.success) {
+                toUndo.delete(messageId)
+            } else {
+                const input = session?.toolUseLookup.get(messageId)?.input as { path?: string } | undefined
+                failures.push(`${input?.path ?? messageId}: ${result.failureReason ?? 'Could not undo this change.'}`)
+            }
         }
+        return failures.length > 0
+            ? { success: false, failureReason: `Some changes could not be undone:\n${failures.join('\n')}` }
+            : { success: true }
     }
 
     async onOpenFileDialog(params: OpenFileDialogParams, token: CancellationToken): Promise<OpenFileDialogResult> {
@@ -1992,6 +2067,12 @@ export class AgenticChatController implements ChatHandlers {
         for (const toolUse of toolUses) {
             // Store buttonBlockId to use it in `catch` block if needed
             let cachedButtonBlockId
+            // Set once the user has been asked about this tool use and allowed it.
+            let toolApprovalGranted = false
+            // Retain acceptance-check targets for execution and approval caching.
+            let checkedCanonicalPaths: string[] | undefined
+            let checkedTargets: readonly CheckedTarget[] | undefined
+            let executionInput: object | undefined
             if (!toolUse.name || !toolUse.toolUseId) continue
             session.toolUseLookup.set(toolUse.toolUseId, toolUse)
 
@@ -2064,21 +2145,58 @@ export class AgenticChatController implements ChatHandlers {
                         const approvedPaths = session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
-                        const { requiresAcceptance, warning, commandCategory } = await tool.requiresAcceptance(
-                            toolUse.input as any,
-                            approvedPaths
+                        const {
+                            requiresAcceptance,
+                            warning,
+                            commandCategory,
+                            acceptanceReason,
+                            canonicalPaths,
+                            checkedTargets: acceptedTargets,
+                            validationError,
+                        } = await tool.requiresAcceptance(toolUse.input as any, approvedPaths)
+
+                        // Filesystem execution requires the canonical targets returned by acceptance.
+                        const isFsTool = [FS_READ, FS_WRITE, FS_REPLACE, FILE_SEARCH, LIST_DIRECTORY].includes(
+                            toolUse.name
                         )
+                        if (isFsTool) {
+                            logFileAccess(this.#features.logging, 'check.completed', {
+                                toolUseId: toolUse.toolUseId,
+                                toolName: toolUse.name,
+                                canonicalPaths,
+                                requiresAcceptance,
+                            })
+                            if (!acceptedTargets?.length) {
+                                throw validationError ?? new Error(`Could not resolve the path for ${toolUse.name}`)
+                            }
+                            checkedTargets = Object.freeze(acceptedTargets.map(target => Object.freeze({ ...target })))
+                            checkedCanonicalPaths = checkedTargets.map(target => target.path)
+                        }
 
                         // Honor built-in permission if available, otherwise use tool's requiresAcceptance
                         // const requiresAcceptance = builtInPermission || toolRequiresAcceptance
 
                         if (requiresAcceptance || toolUse.name === EXECUTE_BASH) {
                             // for executeBash, we till send the confirmation message without action buttons
+                            const confirmationToolUse: ToolUse = checkedCanonicalPaths
+                                ? {
+                                      ...toolUse,
+                                      input: {
+                                          ...(toolUse.input as object),
+                                          ...(toolUse.name === FS_READ
+                                              ? { paths: [...checkedCanonicalPaths] }
+                                              : { path: checkedCanonicalPaths[0] }),
+                                      },
+                                  }
+                                : toolUse
                             const confirmationResult = this.#processToolConfirmation(
-                                toolUse,
+                                confirmationToolUse,
                                 requiresAcceptance,
                                 warning,
-                                commandCategory
+                                commandCategory,
+                                undefined,
+                                undefined,
+                                acceptanceReason
                             )
                             cachedButtonBlockId = await chatResultStream.writeResultBlock(confirmationResult)
                             const isExecuteBash = toolUse.name === EXECUTE_BASH
@@ -2100,6 +2218,8 @@ export class AgenticChatController implements ChatHandlers {
                                     session,
                                     toolUse.name
                                 )
+                                // waitForToolApproval throws when the user rejects.
+                                toolApprovalGranted = true
                             }
                             if (isExecuteBash) {
                                 this.#telemetryController.emitInteractWithAgenticChat(
@@ -2112,6 +2232,7 @@ export class AgenticChatController implements ChatHandlers {
                                 )
                             }
                         }
+
                         break
                     }
                     case CodeReview.toolName:
@@ -2181,6 +2302,7 @@ export class AgenticChatController implements ChatHandlers {
                                         session,
                                         toolName
                                     )
+                                    toolApprovalGranted = true
                                 }
 
                                 // Store the blockId in the session for later use
@@ -2199,13 +2321,18 @@ export class AgenticChatController implements ChatHandlers {
                         break
                 }
 
+                if (checkedCanonicalPaths && token?.isCancellationRequested) {
+                    throw new CancellationError('user')
+                }
                 if (toolUse.name === FS_WRITE || toolUse.name === FS_REPLACE) {
                     const input = toolUse.input as unknown as FsWriteParams | FsReplaceParams
-                    const document = await this.#triggerContext.getTextDocumentFromPath(input.path, true, true)
+                    const target = checkedTargets?.[0]
+                    if (!target) throw new Error('No checked target is available for this file operation.')
+                    const document = await this.#getFileChangeDocument(input.path, target, true)
 
                     session.toolUseLookup.set(toolUse.toolUseId, {
                         ...toolUse,
-                        fileChange: { before: document?.getText() },
+                        fileChange: { targetPath: target.path, before: document?.getText() },
                     })
                 }
 
@@ -2225,14 +2352,58 @@ export class AgenticChatController implements ChatHandlers {
                     }
                 }
 
-                // After approval, add the path to the approved paths in the session
+                // Record the path only when the user was actually asked and
+                // allowed it. Recording every path a tool touches turns this map
+                // into "paths the tool has seen", which then short-circuits the
+                // acceptance check on later calls — so a path that was harmless
+                // on first use (an ordinary file inside the workspace) would
+                // skip the check after it becomes something the user should be
+                // asked about, such as a name that a hard link now shares with a
+                // file outside the workspace.
                 const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
-                if (inputPath) {
+                if (toolApprovalGranted && checkedCanonicalPaths) {
+                    for (const checkedPath of checkedCanonicalPaths) {
+                        session.addApprovedPath(checkedPath, toolUse.name)
+                    }
+                } else if (inputPath && toolApprovalGranted) {
                     session.addApprovedPath(inputPath, toolUse.name)
+                    // The acceptance check compares the canonical path, so also
+                    // record that form; otherwise an approval never matches when
+                    // the input reaches the file through a symlinked ancestor
+                    // (a symlinked home directory, or macOS /tmp) and the user is
+                    // asked again on every call. Resolved the same way as
+                    // requiresPathAcceptance.
+                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
+                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
+                        session.addApprovedPath(canonicalInputPath, toolUse.name)
+                    }
                 }
 
                 const ws = this.#getWritableStream(chatResultStream, toolUse)
-                const result = await this.#features.agent.runTool(toolUse.name, toolUse.input, token, ws)
+                if (checkedTargets) {
+                    if (token?.isCancellationRequested) {
+                        throw new CancellationError('user')
+                    }
+                    executionInput = withResolvedTargets(toolUse.input as object, toolUse.name, checkedTargets)
+                    logFileAccess(this.#features.logging, 'execution.started', {
+                        toolUseId: toolUse.toolUseId,
+                        toolName: toolUse.name,
+                        canonicalPaths: checkedCanonicalPaths,
+                    })
+                }
+                const result = await this.#features.agent.runTool(
+                    toolUse.name,
+                    executionInput ?? toolUse.input,
+                    token,
+                    ws
+                )
+                if (checkedCanonicalPaths) {
+                    logFileAccess(this.#features.logging, 'execution.completed', {
+                        toolUseId: toolUse.toolUseId,
+                        toolName: toolUse.name,
+                        canonicalPaths: checkedCanonicalPaths,
+                    })
+                }
 
                 let toolResultContent: ToolResultContentBlock
 
@@ -2314,14 +2485,18 @@ export class AgenticChatController implements ChatHandlers {
                         // will only update their file contents (which
                         // then propagates to the LSP) if/when that
                         // document receives focus.
-                        const doc = await this.#triggerContext.getTextDocumentFromPath(input.path, false, true)
+                        const outcome = executionInput ? getFileUpdate(executionInput) : undefined
+                        const target =
+                            outcome?.target ?? (process.platform === 'win32' ? checkedTargets?.[0] : undefined)
+                        if (!target) throw new Error('The file update completed without a recorded file identity.')
+                        const doc = await this.#getFileChangeDocument(input.path, target, false)
                         const chatResult = await this.#getFsWriteChatResult(toolUse, doc, session)
                         const cachedToolUse = session.toolUseLookup.get(toolUse.toolUseId)
                         if (cachedToolUse) {
                             session.toolUseLookup.set(toolUse.toolUseId, {
                                 ...cachedToolUse,
                                 chatResult,
-                                fileChange: { ...cachedToolUse.fileChange, after: doc?.getText() },
+                                fileChange: { ...cachedToolUse.fileChange, target, after: doc?.getText() },
                             })
                         }
                         this.#telemetryController.emitInteractWithAgenticChat(
@@ -2404,6 +2579,33 @@ export class AgenticChatController implements ChatHandlers {
                     )
                 }
             } catch (err) {
+                if (isFileUpdateError(err) && err.outcome.mayHaveChanged && toolUse.toolUseId) {
+                    const cached = session.toolUseLookup.get(toolUse.toolUseId)
+                    if (cached?.fileChange) {
+                        const input = toolUse.input as unknown as FsWriteParams | FsReplaceParams
+                        const target = err.outcome.target
+                        const document = target
+                            ? await this.#getFileChangeDocument(input.path, target, false)
+                            : undefined
+                        session.toolUseLookup.set(toolUse.toolUseId, {
+                            ...cached,
+                            fileChange: { ...cached.fileChange, target, after: document?.getText() },
+                        })
+                        this.#updateUndoAllState(toolUse, session)
+                    }
+                }
+                if (checkedCanonicalPaths) {
+                    logFileAccess(
+                        this.#features.logging,
+                        'operation.failed',
+                        {
+                            toolUseId: toolUse.toolUseId,
+                            toolName: toolUse.name,
+                            canonicalPaths: checkedCanonicalPaths,
+                        },
+                        err
+                    )
+                }
                 await this.#showUndoAllIfRequired(chatResultStream, session)
                 if (this.isUserAction(err, token)) {
                     // Handle ToolApprovalException for any tool
@@ -2511,10 +2713,20 @@ export class AgenticChatController implements ChatHandlers {
                     if (fsParam.path) {
                         const fileName = path.basename(fsParam.path)
                         const customerFacingError = getCustomerFacingErrorMessage(err)
+                        const change = session.toolUseLookup.get(toolUse.toolUseId)?.fileChange
+                        const canUndoPartial =
+                            isFileUpdateError(err) &&
+                            err.outcome.mayHaveChanged &&
+                            change?.target !== undefined &&
+                            change.before !== undefined &&
+                            change.after !== undefined
                         const errorResult = {
                             type: 'tool',
                             messageId: toolUse.toolUseId,
                             header: {
+                                buttons: canUndoPartial
+                                    ? [{ id: BUTTON_UNDO_CHANGES, text: 'Undo', icon: 'undo' }]
+                                    : [],
                                 fileList: {
                                     filePaths: [fileName],
                                     details: {
@@ -2532,6 +2744,8 @@ export class AgenticChatController implements ChatHandlers {
                             },
                         } as ChatResult
 
+                        const cached = session.toolUseLookup.get(toolUse.toolUseId)
+                        if (cached) session.toolUseLookup.set(toolUse.toolUseId, { ...cached, chatResult: errorResult })
                         if (existingCard) {
                             await chatResultStream.overwriteResultBlock(errorResult, existingCard)
                         } else {
@@ -2574,8 +2788,24 @@ export class AgenticChatController implements ChatHandlers {
                 results.push({
                     toolUseId: toolUse.toolUseId,
                     status: ToolResultStatus.ERROR,
-                    content: [{ json: { error: err instanceof Error ? err.message : 'Unknown error' } }],
+                    content: [
+                        {
+                            json: {
+                                error: [FS_READ, FS_WRITE, FS_REPLACE, FILE_SEARCH, LIST_DIRECTORY].includes(
+                                    toolUse.name
+                                )
+                                    ? getModelFacingFileError(err, toolUse.input)
+                                    : err instanceof Error
+                                      ? err.message
+                                      : 'Unknown error',
+                            },
+                        },
+                    ],
                 })
+            } finally {
+                if (executionInput) {
+                    discardResolvedTargets(executionInput)
+                }
             }
         }
 
@@ -3047,9 +3277,14 @@ export class AgenticChatController implements ChatHandlers {
         warning?: string,
         commandCategory?: CommandCategory,
         toolType?: string,
-        builtInPermission?: boolean
+        builtInPermission?: boolean,
+        acceptanceReason?: CommandValidation['acceptanceReason']
     ): ChatResult {
         const toolName = toolType || toolUse.name
+        // A multiply linked path is inside the workspace, so the filesystem
+        // prompts below describe the shared file rather than a location outside
+        // the workspace.
+        const isMultiplyLinkedFile = acceptanceReason === 'multiplyLinkedFile'
         let buttons: Button[] = []
         let header: {
             body: string
@@ -3138,14 +3373,16 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
-                    body: builtInPermission
-                        ? '#### Allow file modification'
-                        : '#### Allow file modification outside of your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow file modification'
+                            : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
-                body = builtInPermission
-                    ? `I need permission to modify files.\n\`${writeFilePath}\``
-                    : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                body =
+                    builtInPermission || isMultiplyLinkedFile
+                        ? `I need permission to modify files.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
             }
 
@@ -3160,14 +3397,16 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
-                    body: builtInPermission
-                        ? '#### Allow file modification'
-                        : '#### Allow file modification outside of your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow file modification'
+                            : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
-                body = builtInPermission
-                    ? `I need permission to modify files.\n\`${writeFilePath}\``
-                    : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                body =
+                    builtInPermission || isMultiplyLinkedFile
+                        ? `I need permission to modify files.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
                 break
             }
 
@@ -3177,9 +3416,10 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'tools',
                     iconForegroundStatus: 'tools',
-                    body: builtInPermission
-                        ? '#### Allow read-only tools'
-                        : '#### Allow read-only tools outside your workspace',
+                    body:
+                        builtInPermission || isMultiplyLinkedFile
+                            ? '#### Allow read-only tools'
+                            : '#### Allow read-only tools outside your workspace',
                     buttons,
                 }
 
@@ -3192,9 +3432,10 @@ export class AgenticChatController implements ChatHandlers {
                     this.#debug(`Processing ${toolUse.name} for paths: ${JSON.stringify(paths)}`)
                     const formattedPaths: string[] = []
                     paths.forEach(element => formattedPaths.push(`\`${element}\``))
-                    body = builtInPermission
-                        ? `I need permission to read files.\n${formattedPaths.join('\n')}`
-                        : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
+                    body =
+                        builtInPermission || isMultiplyLinkedFile
+                            ? `I need permission to read files.\n${formattedPaths.join('\n')}`
+                            : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
                 } else {
                     const readFilePath = (toolUse.input as unknown as ListDirectoryParams).path
 
@@ -3231,7 +3472,9 @@ export class AgenticChatController implements ChatHandlers {
                 type: 'tool',
                 messageId: this.#getMessageIdForToolUse(toolType, toolUse),
                 header,
-                body: warning ? (toolName === EXECUTE_BASH ? '' : '\n\n') + body : body,
+                // The warning explains why acceptance is needed, so show it above
+                // the body rather than using it only as a spacing flag.
+                body: warning ? (toolName === EXECUTE_BASH ? '' : warning + '\n\n') + body : body,
             }
         } else {
             return {
@@ -3975,7 +4218,7 @@ export class AgenticChatController implements ChatHandlers {
             if (toolUse?.name === FS_WRITE || toolUse?.name === FS_REPLACE) {
                 const input = toolUse.input as unknown as FsWriteParams | FsReplaceParams
                 this.#features.lsp.workspace.openFileDiff({
-                    originalFileUri: input.path,
+                    originalFileUri: toolUse.fileChange?.targetPath ?? input.path,
                     originalFileContent: toolUse.fileChange?.before,
                     isDeleted: false,
                     fileContent: toolUse.fileChange?.after,
