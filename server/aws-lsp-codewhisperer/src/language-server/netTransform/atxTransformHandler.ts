@@ -3871,17 +3871,27 @@ export class ATXTransformHandler {
                 if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
                     continue
                 }
-                // Given up on earlier, and recorded on disk so this holds across sessions: a step
-                // that could apply later must never land AFTER a step that comes later in the plan,
-                // because applyChanges copies whole after/ files and would overwrite that step's
-                // .sln, dropping its test project from the solution.
+                // Given up on earlier, and recorded on disk so this holds across sessions. Nothing
+                // after it may be applied either: the agent's .sln is the server's WHOLE solution,
+                // so a later step's .sln already names this step's test project. Applying it on top
+                // of a tree that never received this step's project files would leave Visual Studio
+                // with a solution pointing at a .csproj that does not exist. The customer was told
+                // once, when the step was given up on; staying quiet here keeps every later poll
+                // from repeating it.
                 if (state.skipped.includes(step.StepId)) {
-                    continue
+                    break
                 }
                 this.logging.log(`ATX: [BEAM] applying merged unit tests from step ${step.StepId}`)
                 // Downloads, extracts, applies and records the step as applied, with its own
-                // retries. Failures are logged inside and leave the step unapplied.
-                await this.downloadCompletedStepArtifact(workspaceId, jobId, step.StepId, solutionRootPath, true)
+                // retries. Failures are logged inside and leave the step unapplied. The return value
+                // says only whether an artifact was there to apply.
+                const artifactFound = await this.downloadCompletedStepArtifact(
+                    workspaceId,
+                    jobId,
+                    step.StepId,
+                    solutionRootPath,
+                    true
+                )
 
                 if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
                     await this.tellCustomer(
@@ -3892,9 +3902,17 @@ export class ATXTransformHandler {
                     )
                     continue
                 }
-                // Still not applied. The artifact may not be uploaded yet, so retry on later polls
-                // — but stop here rather than applying anything after it, for the ordering reason
-                // above.
+                // Still not applied, so stop here rather than applying anything after it, for the
+                // ordering reason above. Only a poll that HAD an artifact and failed to apply it
+                // counts against the bound: an empty or errored listing means the upload has not
+                // landed yet, and letting throttling or a sleeping laptop spend the budget would
+                // retire a step the customer is still waiting for.
+                if (!artifactFound) {
+                    this.logging.log(
+                        `ATX: [BEAM] no artifact yet for merged unit tests from step ${step.StepId}, will look again`
+                    )
+                    break
+                }
                 const polls = (state.polls[step.StepId] ?? 0) + 1
                 state.polls[step.StepId] = polls
                 if (polls >= this._beamGiveUpPolls) {
@@ -3902,16 +3920,17 @@ export class ATXTransformHandler {
                     this.writeBeamApplyState(solutionRootPath, jobId, state)
                     this.logging.error(
                         `ATX: [BEAM] merged unit tests from step ${step.StepId} did not apply after ${polls} ` +
-                            `polls; not trying it again`
+                            `attempts; not trying it again, and not applying any later test run on this repo`
                     )
                     await this.tellCustomer(
                         jobId,
                         step.StepId,
                         solutionRootPath,
-                        'Could not add the generated unit tests to your solution after several attempts. ' +
-                            "They are still available from the job's artifacts."
+                        'Could not add the generated unit tests to your solution after several attempts. Your ' +
+                            'solution has not been changed, and unit tests generated later in this job will not ' +
+                            'be added either, because they build on this run. Please report this.'
                     )
-                    continue
+                    break
                 }
                 this.writeBeamApplyState(solutionRootPath, jobId, state)
                 this.logging.log(
@@ -4012,8 +4031,9 @@ export class ATXTransformHandler {
 
     /**
      * Per-job beam apply state, next to checkpoints-applied.json so it survives both clearJobCache
-     * and a Visual Studio restart. `polls` counts the polls that have seen a step still unapplied;
-     * `skipped` is the steps given up on.
+     * and a Visual Studio restart. `polls` counts the polls that found the step's artifact and
+     * still failed to apply it; `skipped` is the steps given up on, which also stops every later
+     * test run on the same card.
      *
      * It has to be on disk. The give-up count in memory never reached its bound, because
      * getTransformInfo calls clearJobCache on every poll of a COMPLETED job, immediately before
@@ -4270,6 +4290,10 @@ export class ATXTransformHandler {
 
     /**
      * Downloads and extracts the artifact for a completed step.
+     *
+     * Returns whether an artifact was actually found to work with. Callers that bound their retries
+     * need that apart from success: an empty or errored listing means "not there yet" — throttling,
+     * an offline laptop, an upload still in flight — and must not be counted as a failed apply.
      */
     private async downloadCompletedStepArtifact(
         workspaceId: string,
@@ -4277,7 +4301,7 @@ export class ATXTransformHandler {
         stepId: string,
         solutionRootPath: string,
         backupBeforeOverwrite: boolean = false
-    ): Promise<void> {
+    ): Promise<boolean> {
         try {
             this.logging.log(`ATX: Downloading artifact for completed step: ${stepId}`)
 
@@ -4286,7 +4310,7 @@ export class ATXTransformHandler {
 
             if (!artifacts || artifacts.length === 0) {
                 this.logging.log(`ATX: No CUSTOMER_OUTPUT artifact found for step: ${stepId}`)
-                return
+                return false
             }
 
             // There should be only one artifact that matches
@@ -4302,8 +4326,12 @@ export class ATXTransformHandler {
                 stepId,
                 backupBeforeOverwrite
             )
+            return true
         } catch (error) {
             this.logging.error(`ATX: downloadCompletedStepArtifact error for step ${stepId}: ${String(error)}`)
+            // listArtifactsForStep returns null rather than throwing, so anything thrown here
+            // happened after the artifact was found: a real failure to apply it, not a missing one.
+            return true
         }
     }
 

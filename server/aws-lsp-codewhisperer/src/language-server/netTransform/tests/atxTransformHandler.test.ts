@@ -1011,11 +1011,13 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             sinon.stub(handler as any, 'tellCustomer').callsFake(async (_j: any, _s: any, _r: any, message: any) => {
                 worklogs.push(String(message))
             })
-            // Stands in for the shared downloader, which applies and records the step itself.
+            // Stands in for the shared downloader, which applies and records the step itself. Its
+            // return value says only whether there was an artifact to apply.
             downloadStub = sinon
                 .stub(handler as any, 'downloadCompletedStepArtifact')
                 .callsFake(async (_w: any, _j: any, stepId: any) => {
                     applied.push(stepId)
+                    return true
                 })
         })
 
@@ -1136,7 +1138,8 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             )
             sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
             downloadStub.callsFake(async () => {
-                /* artifact not up yet: nothing gets recorded as applied */
+                /* the artifact is there, but applying it fails: nothing gets recorded as applied */
+                return true
             })
 
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
@@ -1148,7 +1151,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
         it('retries a step that did not apply, then gives up once after the poll bound', async () => {
             sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
-            downloadStub.callsFake(async () => {})
+            downloadStub.callsFake(async () => true)
             ;(handler as any)._beamGiveUpPolls = 3
 
             for (let i = 0; i < 5; i++) {
@@ -1172,13 +1175,52 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
         it('tells the customer when it gives up, not just the log', async () => {
             sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
-            downloadStub.callsFake(async () => {})
+            downloadStub.callsFake(async () => true)
             ;(handler as any)._beamGiveUpPolls = 2
 
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
 
             expect(worklogs.some(m => m.includes('Could not add the generated unit tests'))).to.be.true
+            // And that nothing was half-written, and that later runs are blocked too.
+            const giveUp = worklogs.find(m => m.includes('Could not add the generated unit tests'))!
+            expect(giveUp).to.include('has not been changed')
+            expect(giveUp).to.include('will not')
+        })
+
+        it('does not spend the give-up bound while the artifact is still missing', async () => {
+            // An empty listing is what throttling and an offline laptop look like, and it is also
+            // the normal state for the second or two after the step is marked SUCCEEDED.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => false)
+            ;(handler as any)._beamGiveUpPolls = 2
+
+            for (let i = 0; i < 6; i++) {
+                await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            }
+
+            expect(beamState.skipped).to.be.empty
+            expect(beamState.polls).to.deep.equal({})
+            expect(downloadStub.callCount).to.equal(6)
+            const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(logged.some(l => l.includes('no artifact yet'))).to.be.true
+        })
+
+        it('applies nothing after a given-up step, whose test project never landed', async () => {
+            // The agent's .sln is the server's whole solution, so a later run's .sln already names
+            // the given-up run's test project. Applying it would leave Visual Studio with a
+            // solution pointing at a .csproj that is not on disk.
+            const plan = beamPlan()
+            plan.Root.Children[1].Children[0].Children.push(
+                node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
+            )
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+            beamState = { polls: {}, skipped: ['a-merge'] }
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(downloadStub.called).to.be.false
+            expect(applied).to.be.empty
         })
 
         it('tells the customer when it cannot tell which beamed repo this is', async () => {
@@ -1199,10 +1241,11 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             )
             sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
             downloadStub.callsFake(async (_w: any, _j: any, stepId: any) => {
-                // a-merge never applies; a-merge2 would if it were reached.
+                // a-merge's artifact is there but never applies; a-merge2 would if it were reached.
                 if (stepId !== 'a-merge') {
                     applied.push(stepId)
                 }
+                return true
             })
             ;(handler as any)._beamGiveUpPolls = 1
 
@@ -1219,15 +1262,15 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             sinon.stub(fresh as any, 'readBeamApplyState').callsFake(() => beamState)
             sinon.stub(fresh as any, 'writeBeamApplyState').callsFake(() => {})
             sinon.stub(fresh as any, 'tellCustomer').resolves(undefined)
-            const freshDownload = sinon.stub(fresh as any, 'downloadCompletedStepArtifact').resolves(undefined)
+            const freshDownload = sinon.stub(fresh as any, 'downloadCompletedStepArtifact').resolves(true)
 
             await fresh.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
 
-            // a-merge2 already applied in the first session. a-merge must NEVER be retried now:
-            // applying it here would copy its older .sln over a-merge2's and drop a-merge2's test
-            // project from the solution.
-            expect(freshDownload.args.map(a => a[2])).to.not.include('a-merge')
-            expect(applied).to.deep.equal(['a-merge2'])
+            // a-merge must NEVER be retried: applying it after a-merge2 would copy its older .sln
+            // over a-merge2's and drop a-merge2's test project. And a-merge2 stays blocked, because
+            // its .sln names a-merge's test project, which never landed on disk.
+            expect(freshDownload.called).to.be.false
+            expect(applied).to.be.empty
         })
 
         it('logs when a finished unit test run on the card has no Merge Tests step', async () => {
