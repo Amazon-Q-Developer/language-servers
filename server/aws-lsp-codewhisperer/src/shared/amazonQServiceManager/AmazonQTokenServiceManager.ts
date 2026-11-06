@@ -76,6 +76,7 @@ export class AmazonQTokenServiceManager extends BaseAmazonQServiceManager<
     private region?: string
     private endpoint?: string
     private regionChangeListeners: Array<(region: string) => void> = []
+    private cachedQDevAccessBlockedNotifier?: (error: unknown) => void
 
     /**
      * Internal state of Service connection, based on status of bearer token and Amazon Q Developer profile selection.
@@ -163,12 +164,41 @@ export class AmazonQTokenServiceManager extends BaseAmazonQServiceManager<
         ProfileStatusMonitor.resetMcpState()
     }
 
-    public handleOnCredentialsUpdated(type: CredentialsType): void {
+    /**
+     * Constructs the Q services as soon as bearer credentials arrive, rather than leaving it to
+     * whichever consumer asks first.
+     *
+     * That consumer is in practice the chat webview finishing boot, which measured ~0.66s after the
+     * credentials landed -- time in which nothing had contacted the service yet, so a rejected
+     * identity could not be discovered and the user sat in front of a chat view that was never going
+     * to work.
+     *
+     * Deliberately reuses handleSsoConnectionChange rather than constructing anything here, so this
+     * changes only *when* initialization happens and not *how*:
+     * - It is idempotent. createCodewhispererServiceInstances records the connection type, so the
+     *   consumer's later call short-circuits on "Connection type did not change" instead of resetting
+     *   live services. Token refreshes, which fire this event repeatedly, are no-ops for the same
+     *   reason.
+     * - IdC with developer profile support still stops at PENDING_Q_PROFILE and creates nothing, so no
+     *   request is made before a profile is chosen.
+     *
+     * Failures are logged rather than thrown: this runs inside the client's credentials request, and
+     * the lazy path still runs for whoever asks first, so a failure here costs the head start and
+     * nothing else.
+     */
+    public override handleOnCredentialsUpdated(type: CredentialsType): void {
         this.logging.log(`Received credentials update event for type: ${type}`)
 
-        if (type === ('bearer' as CredentialsType)) {
-            // Check Q credentials
-            const qCreds = this.features.credentialsProvider.getCredentials('bearer' as CredentialsType)
+        if (type !== ('bearer' as CredentialsType)) {
+            return
+        }
+
+        try {
+            this.handleSsoConnectionChange()
+        } catch (e) {
+            this.logging.log(
+                `Could not initialize Q services on credentials update, deferring to first use: ${(e as Error)?.message}`
+            )
         }
     }
 
@@ -525,12 +555,34 @@ export class AmazonQTokenServiceManager extends BaseAmazonQServiceManager<
         return this.cachedStreamingClient
     }
 
+    /**
+     * One notifier shared by the token and streaming clients, so a blocked identity produces a single
+     * notification regardless of which client observes it first (the notifier dedupes per instance).
+     *
+     * Deliberately scoped to the current service generation and cleared by
+     * {@link resetCodewhispererService}: signing out and back in with another blocked identity must
+     * notify again, which a manager-lifetime notifier would suppress.
+     */
+    private getQDevAccessBlockedNotifier(): ((error: unknown) => void) | undefined {
+        if (!this.features.notification) {
+            return undefined
+        }
+
+        this.cachedQDevAccessBlockedNotifier ??= createQDevAccessBlockedNotifier(
+            this.features.notification,
+            this.features.logging
+        )
+
+        return this.cachedQDevAccessBlockedNotifier
+    }
+
     private resetCodewhispererService() {
         this.logging.log('Resetting Q-only services')
         this.cachedCodewhispererService?.abortInflightRequests()
         this.cachedCodewhispererService = undefined
         this.cachedStreamingClient?.abortInflightRequests()
         this.cachedStreamingClient = undefined
+        this.cachedQDevAccessBlockedNotifier = undefined
         this.activeIdcProfile = undefined
         this.region = undefined
         this.endpoint = undefined
@@ -597,9 +649,7 @@ export class AmazonQTokenServiceManager extends BaseAmazonQServiceManager<
 
         service.customizationArn = this.configurationCache.getProperty('customizationArn')
         service.profileArn = this.activeIdcProfile?.arn
-        if (this.features.notification) {
-            service.onAccessBlocked = createQDevAccessBlockedNotifier(this.features.notification, this.features.logging)
-        }
+        service.onAccessBlocked = this.getQDevAccessBlockedNotifier()
         service.shareCodeWhispererContentWithAWS = this.configurationCache.getProperty(
             'shareCodeWhispererContentWithAWS'
         )
@@ -638,6 +688,9 @@ export class AmazonQTokenServiceManager extends BaseAmazonQServiceManager<
             endpoint,
             this.getCustomUserAgent()
         )
+        // Chat runs through the streaming client, so it needs the same observer as the token client --
+        // otherwise a blocked identity goes unnoticed unless some other client happens to be called.
+        streamingClient.onAccessBlocked = this.getQDevAccessBlockedNotifier()
         streamingClient.profileArn = this.activeIdcProfile?.arn
         streamingClient.shareCodeWhispererContentWithAWS = this.configurationCache.getProperty(
             'shareCodeWhispererContentWithAWS'
