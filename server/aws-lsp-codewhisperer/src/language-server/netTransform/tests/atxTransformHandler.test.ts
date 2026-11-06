@@ -992,12 +992,17 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
         let applied: string[]
         let downloadStub: sinon.SinonStub
-        let beamState: { polls: Record<string, number>; skipped: string[]; reported: string[] }
+        let beamState: {
+            polls: Record<string, number>
+            waits: Record<string, number>
+            skipped: string[]
+            reported: string[]
+        }
         let worklogs: string[]
 
         beforeEach(() => {
             applied = []
-            beamState = { polls: {}, skipped: [], reported: [] }
+            beamState = { polls: {}, waits: {}, skipped: [], reported: [] }
             worklogs = []
             sinon.stub(handler as any, 'fetchWorklogs').resolves(undefined)
             sinon.stub(handler as any, 'downloadCompletedStepArtifacts').resolves(false)
@@ -1203,6 +1208,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
             expect(beamState.skipped).to.be.empty
             expect(beamState.polls).to.deep.equal({})
+            expect(beamState.waits).to.deep.equal({ 'a-merge': 6 })
             expect(downloadStub.callCount).to.equal(6)
             const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
             expect(logged.some(l => l.includes('did not arrive (no-artifact)'))).to.be.true
@@ -1221,8 +1227,32 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
             expect(beamState.skipped).to.be.empty
             expect(beamState.polls).to.deep.equal({})
+            expect(beamState.waits).to.deep.equal({ 'a-merge': 6 })
             const logged = (logging.log as sinon.SinonStub).args.map(a => String(a[0]))
             expect(logged.some(l => l.includes('did not arrive (transfer-failed)'))).to.be.true
+        })
+
+        it('gives up, loudly, on a diff that never arrives at all', async () => {
+            // A never-uploaded artifact or a corrupt archive does not clear up. Waiting in silence
+            // forever, re-downloading on every poll, is the failure this change exists to remove.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => 'transfer-failed')
+            ;(handler as any)._beamWaitGiveUpPolls = 3
+
+            for (let i = 0; i < 5; i++) {
+                await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            }
+
+            expect(downloadStub.callCount).to.equal(3)
+            expect(beamState.skipped).to.deep.equal(['a-merge'])
+            const giveUp = worklogs.filter(m => m.includes('could not be downloaded'))
+            expect(giveUp.length).to.equal(1)
+            expect(giveUp[0]).to.include('will not be added either')
+        })
+
+        it('is much more patient about a diff that has not arrived than one that will not apply', async () => {
+            // The two bounds are not the same number, and must not be read from the same counter.
+            expect((handler as any)._beamWaitGiveUpPolls).to.be.greaterThan((handler as any)._beamGiveUpPolls)
         })
 
         it('applies nothing after a given-up step, whose test project never landed', async () => {
@@ -1234,7 +1264,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 node('a-ut2', 'Generate Unit Tests', 'SUCCEEDED', [node('a-merge2', 'Merge Tests', 'SUCCEEDED')])
             )
             sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
-            beamState = { polls: {}, skipped: ['a-merge'], reported: [] }
+            beamState = { polls: {}, waits: {}, skipped: ['a-merge'], reported: [] }
 
             await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
 
@@ -1358,6 +1388,40 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(beamState.reported).to.deep.equal(['a-ut'])
         })
 
+        it('stays quiet about an unidentifiable repo when no tests are waiting', async () => {
+            // Most multi-repo batches never ask for unit tests. Telling those customers that tests
+            // "could not be added - please report this" is a false alarm and a support ticket.
+            const plan = beamPlan()
+            // Two cards, no scope, and no Merge Tests step anywhere under them.
+            plan.Root.Children[1].Children[0].Children = [node('a-lbv', 'Local Build Verification', 'SUCCEEDED')]
+            plan.Root.Children[1].Children.push(node('cardB', 'RepoB (beamed)', 'IN_PROGRESS', []))
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(plan)
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs).to.be.empty
+            // The diagnosis still reaches the log unconditionally.
+            const errors = (logging.error as sinon.SinonStub).args.map(a => String(a[0]))
+            expect(errors.some(l => l.includes('no scope from the IDE'))).to.be.true
+        })
+
+        it('still speaks up when a test run IS waiting on an unidentifiable repo', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs.some(m => m.includes('not clear which beamed repository'))).to.be.true
+        })
+
+        it('says nothing when the waiting run has already been applied', async () => {
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(withSecondCard(beamPlan()))
+            applied = ['a-merge', 'b-merge']
+
+            await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+
+            expect(worklogs).to.be.empty
+        })
+
         it('does nothing when the plan has no beam card', async () => {
             const plan = beamPlan()
             plan.Root.Children.splice(1, 1)
@@ -1472,6 +1536,63 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             })
         })
 
+        it('reports a write that failed, so the step is not recorded as applied', async () => {
+            // A Merge Tests diff is one test project plus the .sln, so one unwritable file leaves
+            // the solution naming a project that is not on disk. applyChanges logs each per-file
+            // error and returns success, which on its own would retire the step for good.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(
+                    step,
+                    { 'App.sln': 'the agent version', 'Tests/sub/T.cs': 'new' },
+                    { filesUpdated: ['App.sln'], filesAdded: ['Tests/sub/T.cs'] }
+                )
+                // A FILE where the added file's folder should go: mkdir throws ENOTDIR.
+                fs.mkdirSync(path.join(root, 'Tests'), { recursive: true })
+                fs.writeFileSync(path.join(root, 'Tests', 'sub'), 'in the way')
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.writeFailed).to.be.true
+                // The .sln still landed, which is exactly why the step must be retried.
+                expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the agent version')
+            })
+        })
+
+        it('leaves writeFailed off the non-beam apply, which has always logged and carried on', async () => {
+            await withSolution(async (root, checkpoints) => {
+                const step = path.join(checkpoints, 'a-merge')
+                writeDiff(step, { 'Tests/sub/T.cs': 'new' }, { filesAdded: ['Tests/sub/T.cs'] })
+                fs.mkdirSync(path.join(root, 'Tests'), { recursive: true })
+                fs.writeFileSync(path.join(root, 'Tests', 'sub'), 'in the way')
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1')
+
+                expect(result.success).to.be.true
+                expect(result.writeFailed).to.be.undefined
+            })
+        })
+
+        it('does not claim a file was updated when the write then failed', async () => {
+            // The backup is taken before the write is attempted. Reporting it then would tell the
+            // customer their file was replaced when it was not touched.
+            await withSolution(async (root, checkpoints) => {
+                fs.writeFileSync(path.join(root, 'App.sln'), 'the customer version')
+                const step = path.join(checkpoints, 'a-merge')
+                // Metadata names App.sln, but no after/App.sln exists: the copy throws ENOENT.
+                writeDiff(step, {}, { filesUpdated: ['App.sln'] })
+
+                const result = await (handler as any).applyChanges(step, root, 'job-1', true)
+
+                expect(result.writeFailed).to.be.true
+                expect(result.backedUpFiles).to.be.undefined
+                expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the customer version')
+                // The copy is still on disk for the customer, it is just not announced as an update.
+                expect(fs.existsSync(path.join(checkpoints, 'conflict-backups', 'App.sln'))).to.be.true
+            })
+        })
+
         it('keeps the beam apply state on disk, beside the applied-checkpoints file', async () => {
             // Stubbed out in the plan tests, so prove the real thing round-trips here. It must be a
             // file: clearJobCache runs on every poll of a COMPLETED job, and the give-up has to
@@ -1479,11 +1600,13 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             await withSolution(async (root, checkpoints) => {
                 expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({
                     polls: {},
+                    waits: {},
                     skipped: [],
                     reported: [],
                 })
                 ;(handler as any).writeBeamApplyState(root, 'job-1', {
                     polls: { 'a-merge': 2 },
+                    waits: { 'a-merge2': 7 },
                     skipped: ['a-old'],
                     reported: ['a-ut'],
                 })
@@ -1491,6 +1614,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 expect(fs.existsSync(path.join(checkpoints, 'beam-apply-state.json'))).to.be.true
                 expect((handler as any).readBeamApplyState(root, 'job-1')).to.deep.equal({
                     polls: { 'a-merge': 2 },
+                    waits: { 'a-merge2': 7 },
                     skipped: ['a-old'],
                     reported: ['a-ut'],
                 })
