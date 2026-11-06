@@ -95,6 +95,24 @@ describe('atxModels test-run contract', () => {
                 ['artifactId', 'limits', 'project', 'runId', 'schemaVersion', 'side', 'tests'].sort()
             )
         })
+
+        it('carries the testOrder the agent asks for, and leaves it out when it does not', () => {
+            const base: AtxTestRunRequest = {
+                schemaVersion: ATX_TEST_RUN_SCHEMA_VERSION,
+                runId: 'r3',
+                side: 'original',
+                project: 'SampleWebApi',
+                artifactId: '9d2c41e7-sample-web-api-repo',
+                tests: { projectPath: 'GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj' },
+                limits: { projectTimeoutSeconds: 1800 },
+            }
+
+            // The second of the 2 orders a suite passes in before the agent freezes it; the IDE sets AB_TEST_ORDER
+            expect(JSON.parse(JSON.stringify({ ...base, testOrder: 'reverse' })).testOrder).to.equal('reverse')
+
+            // A 1.0 request carries no testOrder, and the suite orders by name itself
+            expect(Object.keys(JSON.parse(JSON.stringify(base)))).to.not.include('testOrder')
+        })
     })
 
     describe('AtxTestRunSummary', () => {
