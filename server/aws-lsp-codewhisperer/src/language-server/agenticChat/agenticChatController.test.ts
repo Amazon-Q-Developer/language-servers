@@ -3792,6 +3792,29 @@ ${' '.repeat(8)}}
             assert.ok(confirmation.body?.includes(target))
         })
 
+        it('records every checked path of a multi-path read after approval', async () => {
+            const second = path.resolve(__dirname, 'errors.ts')
+            check.resolves({
+                requiresAcceptance: true,
+                canonicalPaths: [target, second],
+                checkedTargets: [target, second].map(path => ({ path, state: 'unverified' })),
+            })
+            sinon.stub(chatController, 'waitForToolApproval').resolves()
+            run.resolves({ output: { kind: 'json', content: [] } })
+            const toolUse = {
+                name: 'fsRead',
+                toolUseId: 'checked-multi-read',
+                input: { paths: ['first-alias', 'second-alias'] },
+                stop: true,
+            }
+            await chatController.processToolUses([toolUse], stream, session, 'tabId', mockCancellationToken)
+            sinon.assert.calledTwice(session.addApprovedPath)
+            sinon.assert.calledWithExactly(session.addApprovedPath, target, 'fsRead')
+            sinon.assert.calledWithExactly(session.addApprovedPath, second, 'fsRead')
+            sinon.assert.neverCalledWith(session.addApprovedPath, 'first-alias', sinon.match.any)
+            sinon.assert.neverCalledWith(session.addApprovedPath, 'second-alias', sinon.match.any)
+        })
+
         it('preserves literal Windows paths in the permission body', async () => {
             const windowsTarget = 'C:\\workspace\\notes.txt'
             const validate = sinon.stub(pathValidation, 'validatePaths')
