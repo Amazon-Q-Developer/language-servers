@@ -194,7 +194,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
     describe('beamed repo', () => {
         const SCOPE = 'repo-a,repo-a-lv,step-launch,step-run'
         const siblingLaunch = { taskId: 'task-sib', tag: ATX_HITL_TAG_INTEG_APP_LAUNCH, planStepId: 'repo-b-launch' }
-        let listBeamedStub: sinon.SinonStub
+        let beamMapStub: sinon.SinonStub
         let beamOptIn: boolean
         // The beam-map read finishes only when a test releases it, like a real scan that takes a while.
         let releaseBeamMap: () => void
@@ -213,13 +213,10 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             setItGen(false)
             beamOptIn = true
             beamMapRead = new Promise<void>(resolve => (releaseBeamMap = resolve))
-            // What listBeamedRepos does with a beam-map entry that has generateIntegrationTests: true.
-            listBeamedStub = sinon.stub(handler, 'listBeamedRepos').callsFake(async () => {
+            // The gate's beam-map reader: true when a beam-map entry has generateIntegrationTests: true.
+            beamMapStub = sinon.stub(handler as any, 'readBeamOptIn').callsFake(async () => {
                 await beamMapRead
-                if (beamOptIn) {
-                    ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
-                }
-                return []
+                return beamOptIn
             })
         })
 
@@ -236,7 +233,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_APP_LAUNCH)
             expect(result?.HitlTaskId).to.equal('task-launch')
-            expect(listBeamedStub.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+            expect(beamMapStub.calledOnceWith(WS_ID, JOB_ID)).to.be.true
             expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-launch'])
         })
 
@@ -249,6 +246,30 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(result?.HitlTaskId).to.equal('task-run')
             expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
         })
+
+        for (const status of ['PLANNING', 'AWAITING_HUMAN_INPUT']) {
+            it(`never surfaces a sibling repo's integ-* HITL on a ${status} job`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch, testRunHitl]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.equal('task-run')
+                expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
+            })
+
+            it(`surfaces nothing on a ${status} job when only a sibling repo's integ-* HITL is open`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.be.undefined
+                expect(result?.OpenHitls).to.deep.equal([])
+            })
+        }
 
         it("surfaces nothing when only a sibling repo's integ-* HITL is open", async () => {
             ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
@@ -284,7 +305,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             // OpenHitls is ITGen-only; with ITGen off the integ-* tag is just an unknown tag, as before.
             expect(first?.OpenHitls).to.be.undefined
-            expect(listBeamedStub.calledOnce).to.be.true
+            expect(beamMapStub.calledOnce).to.be.true
         })
 
         it('never delays a poll for a beam-map read that is still running', async () => {
@@ -294,7 +315,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             const result = await beamPoll()
 
             expect(result).to.not.be.null
-            expect(listBeamedStub.calledOnce).to.be.true
+            expect(beamMapStub.calledOnce).to.be.true
         })
 
         it('never reads the beam-map for a job that is not beamed', async () => {
@@ -302,7 +323,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             await poll()
 
-            expect(listBeamedStub.called).to.be.false
+            expect(beamMapStub.called).to.be.false
         })
     })
 

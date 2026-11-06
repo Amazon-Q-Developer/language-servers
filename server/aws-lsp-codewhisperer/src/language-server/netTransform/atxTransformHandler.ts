@@ -240,10 +240,6 @@ const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 // size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
 const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 
-// ITGen for beamed repos: how long a parent job whose beam-map had no opt-in goes before the beam-map is read
-// again. Long enough that a beamed session without tests adds almost no FES calls.
-const BEAM_ITGEN_RECHECK_MS = 5 * 60_000
-
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
@@ -272,10 +268,9 @@ export class ATXTransformHandler {
     // ITGen: whether each job's objective has generate_integration_tests: true (see ItGenJobGate).
     private readonly itGenJobs = new ItGenJobGate(
         (workspaceId, jobId) => this.getJob(workspaceId, jobId, true),
-        message => this.logging.log(message)
+        message => this.logging.log(message),
+        (workspaceId, jobId) => this.readBeamOptIn(workspaceId, jobId)
     )
-    // ITGen for beamed repos: when each parent job's beam-map was last read without finding an opt-in.
-    private readonly beamItGenCheckedAt = new Map<string, number>()
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -471,7 +466,6 @@ export class ATXTransformHandler {
             this._worklogNextTokenByJob.delete(jobId)
             Utils.clearWorklogCacheForJob(jobId)
             this.itGenJobs.forget(jobId)
-            this.beamItGenCheckedAt.delete(jobId)
         }
         this.logging.log('ATX: Cleared job cache')
     }
@@ -785,6 +779,24 @@ export class ATXTransformHandler {
      * by listing the parent job's artifacts and picking the beam-map JSON.
      */
     async listBeamedRepos(workspaceId: string, parentJobId: string, lightweight = false): Promise<BeamedRepoInfo[]> {
+        return (await this.discoverBeamedRepos(workspaceId, parentJobId, lightweight)).repos
+    }
+
+    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob). Undefined when the beam-map wasn't read. */
+    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | undefined> {
+        const { repos, beamMapScanned } = await this.discoverBeamedRepos(workspaceId, jobId, false)
+        return beamMapScanned ? repos.some(r => r.GenerateIntegrationTests) : undefined
+    }
+
+    /**
+     * listBeamedRepos, plus whether the beam-map scan ran to the end, so a "no opt-in" answer can be told apart
+     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error).
+     */
+    private async discoverBeamedRepos(
+        workspaceId: string,
+        parentJobId: string,
+        lightweight: boolean
+    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -910,6 +922,7 @@ export class ATXTransformHandler {
                 )
             }
             const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
+            let scanCutShort = false
             this.logging.log(
                 `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
             )
@@ -919,6 +932,7 @@ export class ATXTransformHandler {
                     this.logging.log(
                         `[BEAM-PKG] beam-map scan: time budget (${BEAM_MAP_SCAN_BUDGET_MS}ms) exceeded — stopping scan`
                     )
+                    scanCutShort = true
                     break
                 }
                 try {
@@ -1085,13 +1099,16 @@ export class ATXTransformHandler {
 
             // ITGen: the parent job runs Local Verification for its beamed repos when any of them opts in.
             if (beamed.some(r => r.GenerateIntegrationTests)) {
-                this.itGenJobs.rememberFlag(parentJobId, true)
+                this.itGenJobs.rememberBeamOptIn(parentJobId)
             }
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
-            return beamed
+            return {
+                repos: beamed,
+                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort,
+            }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return []
+            return { repos: [], beamMapScanned: false }
         }
     }
 
@@ -1380,7 +1397,7 @@ export class ATXTransformHandler {
             return { Success: false, Error: 'Invalid job id for original code' }
         }
         // Only beamed repos download their original, and for them `jobId` is the parent web job.
-        if (!(await this.isBeamItGenJob(workspaceId, jobId))) {
+        if (!(await this.itGenJobs.isBeamItGenJob(workspaceId, jobId))) {
             return { Success: false, Error: 'downloadOriginalCode requires a job with generate_integration_tests' }
         }
         const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
@@ -1411,12 +1428,12 @@ export class ATXTransformHandler {
         try {
             // Before the reuse check, so leftovers from an earlier interrupted call go even when the copy is reused.
             await this.removeOriginalCodeLeftovers(originalDir)
-            const current = this.readOriginalCodeMarker(marker)
+            const current = await this.readOriginalCodeMarker(marker)
             // A copy without the IDE's marker (written before it was added) is replaced: VS wouldn't start it.
             if (
                 current?.jobId === jobId &&
                 current.codeArtifactId === codeArtifactId &&
-                this.readOriginalCodeIdeMarker(ideMarker) === jobId
+                (await this.readOriginalCodeIdeMarker(ideMarker)) === jobId
             ) {
                 this.logging.log(`ATX: downloadOriginalCode: reusing ${codeArtifactId} at ${originalDir}`)
                 return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
@@ -1448,8 +1465,8 @@ export class ATXTransformHandler {
                 }
             }
             const newMarker: OriginalCodeMarker = { jobId, codeArtifactId }
-            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
-            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_IDE_JOB_MARKER), jobId, 'utf8')
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_IDE_JOB_MARKER), jobId, 'utf8')
 
             // Swap. The old markers go first: from here on the old copy is never reused or started.
             fs.rmSync(marker, { force: true })
@@ -1496,19 +1513,18 @@ export class ATXTransformHandler {
     }
 
     /** The job id in the IDE's marker; null when it's missing or unreadable. */
-    private readOriginalCodeIdeMarker(markerPath: string): string | null {
+    private async readOriginalCodeIdeMarker(markerPath: string): Promise<string | null> {
         try {
-            return fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf8').trim() : null
+            return (await fs.promises.readFile(markerPath, 'utf8')).trim()
         } catch {
             return null
         }
     }
 
     /** Null for a missing, unreadable or older plain-text marker, so those copies are replaced. */
-    private readOriginalCodeMarker(markerPath: string): OriginalCodeMarker | null {
+    private async readOriginalCodeMarker(markerPath: string): Promise<OriginalCodeMarker | null> {
         try {
-            if (!fs.existsSync(markerPath)) return null
-            const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+            const parsed = JSON.parse(await fs.promises.readFile(markerPath, 'utf8'))
             return typeof parsed?.jobId === 'string' && typeof parsed?.codeArtifactId === 'string' ? parsed : null
         } catch {
             return null
@@ -1785,31 +1801,6 @@ export class ATXTransformHandler {
      */
     async isItGenJob(workspaceId: string, jobId: string): Promise<boolean> {
         return this.itGenJobs.isItGenJob(workspaceId, jobId)
-    }
-
-    /**
-     * ITGen for a beamed repo: `jobId` is the parent web job, whose objective never opts in; its beam-map entries
-     * do (listBeamedRepos remembers an opt-in). Reads the beam-map when the gate doesn't know yet, so ITGen still
-     * turns on after an LS restart. A job without an opt-in is read again at most every few minutes.
-     * With `waitForBeamMap` false (a poll) the read runs in the background, so a poll never waits for the scan;
-     * the gate turns on from the next poll.
-     */
-    private async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
-        if (await this.isItGenJob(workspaceId, jobId)) {
-            return true
-        }
-        const checkedAt = this.beamItGenCheckedAt.get(jobId)
-        if (checkedAt !== undefined && Date.now() - checkedAt < BEAM_ITGEN_RECHECK_MS) {
-            return false
-        }
-        this.beamItGenCheckedAt.set(jobId, Date.now())
-        // listBeamedRepos never throws (it logs and returns []).
-        const read = this.listBeamedRepos(workspaceId, jobId)
-        if (!waitForBeamMap) {
-            return false
-        }
-        await read
-        return this.itGenJobs.isKnownItGenJob(jobId)
     }
 
     async getJob(workspaceId: string, jobId: string, includeObjective: boolean = false): Promise<JobInfo | null> {
@@ -2747,7 +2738,7 @@ export class ATXTransformHandler {
             // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never reads
             // the job's objective otherwise. A beam-map read it needs runs in the background, so it never delays a poll.
             if (request.IsBeam === true) {
-                await this.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
+                await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
             }
             const result = await this._getTransformInfoInternal(request, diffContext)
             if (result && diffContext.failed) {
@@ -3336,10 +3327,12 @@ export class ATXTransformHandler {
      * Handles HITL during planning phase - downloads plan.md and report.md for user review.
      */
     private async handlePlanningPhaseHitl(request: AtxGetTransformInfoRequest): Promise<AtxGetTransformInfoResponse> {
+        // Beam-to-IDE: the loaded repo's scope, as in handleAwaitingHumanInput, so a sibling repo's HITL isn't picked.
         const response = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
-            request.SolutionRootPath
+            request.SolutionRootPath,
+            request.beamScopeStepIds
         )
 
         this.logging.log(

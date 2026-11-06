@@ -5478,6 +5478,25 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect((handler as any).itGenJobs.isKnownItGenJob('job-2')).to.be.false
         })
 
+        it("tells the gate whether a beam-map opts in, and that it can't tell when the scan was skipped", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            })
+            const readBeamOptIn = (jobId: string) => (handler as any).readBeamOptIn('ws-1', jobId)
+
+            expect(await readBeamOptIn('job-1')).to.equal(true)
+
+            mapStub.resolves({ repos: [{ repoName: 'alice', stepId: 's1' }] })
+            expect(await readBeamOptIn('job-2')).to.equal(false)
+
+            // Throttle cooldown: the beam-map scan is skipped, so "no opt-in" can't be told apart from "not read".
+            ;(handler as any).beamThrottleCooldownUntilMs = Date.now() + 60_000
+            expect(await readBeamOptIn('job-3')).to.equal(undefined)
+        })
+
         it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
             sendStub.resolves({
                 artifacts: [
@@ -5618,7 +5637,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
 
         it('refuses for a job without generate_integration_tests and touches nothing', async () => {
             ;(handler as any).itGenJobs.rememberFlag('job-1', false)
-            sinon.stub(handler, 'listBeamedRepos').resolves([]) // no beamed repo opts in either
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
             const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
 
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
@@ -5688,10 +5707,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         it("downloads for a beamed repo's parent web job once its beam-map opts in", async () => {
             ;(handler as any).itGenJobs.forget('job-1')
             sinon.stub(handler, 'getJob').resolves({ objective: '{}' } as any)
-            const listStub = sinon.stub(handler, 'listBeamedRepos').callsFake(async () => {
-                ;(handler as any).itGenJobs.rememberFlag('job-1', true)
-                return []
-            })
+            const listStub = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
             presigned()
             stubExtract()
 
