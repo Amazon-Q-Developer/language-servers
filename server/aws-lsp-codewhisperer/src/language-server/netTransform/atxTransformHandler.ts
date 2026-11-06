@@ -67,6 +67,7 @@ import {
     AtxUploadCustomPlanRequest,
     AtxUploadCustomPlanResponse,
     AtxValidateSessionResponse,
+    AtxSkippedCheckpointEntry,
 } from './atxModels'
 import { classifyAtxSessionValidationError } from './atxSessionValidation'
 import { AtxErrorInfo, getAtxErrorInfo } from './atxErrorInfo'
@@ -81,6 +82,26 @@ import { Utils, workspaceFolderName } from './utils'
 interface DiffApplyContext {
     failed: boolean
     failedStepIds: string[]
+    // Checkpoint entries that were not applied because their path is not allowed
+    skippedEntries?: AtxSkippedCheckpointEntry[]
+}
+
+/**
+ * True when the value can name one folder: the job and step IDs from the transform service name the folders that
+ * job data and checkpoints are written to.
+ */
+function isFolderName(name: unknown): name is string {
+    return (
+        typeof name === 'string' &&
+        name !== '' &&
+        name !== '.' &&
+        name !== '..' &&
+        !name.includes('/') &&
+        !name.includes('\\') &&
+        ![...name].some(c => c.charCodeAt(0) < 0x20) &&
+        // On Windows a colon names a drive or a stream, and trailing dots and spaces are trimmed
+        !(process.platform === 'win32' && (name.includes(':') || /[. ]$/.test(name)))
+    )
 }
 
 /**
@@ -1525,15 +1546,14 @@ export class ATXTransformHandler {
                 throw new Error('Failed to start ATX transformation job')
             }
 
-            // Step 7: Write source files list to checkpoints folder for tracking (only in interactive mode)
-            if (request.interactiveMode && request.interactiveMode !== 'Autonomous') {
-                const startTransformReq = request.startTransformRequest as any
-                this.writeSourceFilesManifest(
-                    startTransformReq.SolutionRootPath,
-                    createJobResponse.jobId,
-                    startTransformReq
-                )
-            }
+            // Step 7: Write source files list to checkpoints folder for tracking. Every job needs it: checkpoint
+            // changes to files outside the solution folder apply only to the files it lists.
+            const startTransformReq = request.startTransformRequest as any
+            this.writeSourceFilesManifest(
+                startTransformReq.SolutionRootPath,
+                createJobResponse.jobId,
+                startTransformReq
+            )
 
             this.logging.log('ATX: Transform workflow completed successfully')
 
@@ -2084,13 +2104,16 @@ export class ATXTransformHandler {
      * Get transform info
      */
     async getTransformInfo(request: AtxGetTransformInfoRequest): Promise<AtxGetTransformInfoResponse | null> {
-        const diffContext: DiffApplyContext = { failed: false, failedStepIds: [] }
+        const diffContext: DiffApplyContext = { failed: false, failedStepIds: [], skippedEntries: [] }
         this._currentDiffContext = diffContext
         try {
             const result = await this._getTransformInfoInternal(request, diffContext)
             if (result && diffContext.failed) {
                 result.DiffApplyFailed = true
                 result.DiffApplyFailedStepIds = diffContext.failedStepIds
+            }
+            if (result && diffContext.skippedEntries?.length) {
+                result.SkippedCheckpointEntries = diffContext.skippedEntries
             }
             // Surface the resolved interactive mode on every response so the IDE can restore it.
             // Single injection point covers all internal return paths; the cache is populated in
@@ -3011,6 +3034,12 @@ export class ATXTransformHandler {
         solutionRootPath: string,
         stepId: string
     ): Promise<string> {
+        if (!isFolderName(jobId) || !isFolderName(stepId)) {
+            this.logging.error(
+                `ATX: Skipped the checkpoint of step ${JSON.stringify(stepId)} because the job or step ID is not a folder name`
+            )
+            return ''
+        }
         const maxRetries = 3
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -3038,6 +3067,7 @@ export class ATXTransformHandler {
                 const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId)
                 if (result.success) {
                     this.logging.log(`ATX: Changes applied immediately for step: ${stepId}`)
+                    this.recordSkippedEntries(stepId, result.skippedEntries)
 
                     // Update source files manifest with newly added files
                     if (result.addedFiles && result.addedFiles.length > 0) {
@@ -3132,6 +3162,12 @@ export class ATXTransformHandler {
      */
     private writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): void {
         try {
+            if (!isFolderName(jobId)) {
+                this.logging.error(
+                    'ATX: Did not write the source files manifest because the job ID is not a folder name'
+                )
+                return
+            }
             const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
 
             if (!fs.existsSync(checkpointsDir)) {
@@ -3770,7 +3806,22 @@ export class ATXTransformHandler {
 
             this.logging.log(`ATX: Found ${completedSteps.length} completed steps to check for artifacts`)
 
+            if (completedSteps.length > 0 && !isFolderName(jobId)) {
+                this.logging.error('ATX: Skipped the completed steps because the job ID is not a folder name')
+                return true
+            }
+
             for (const step of completedSteps) {
+                if (!isFolderName(step.StepId)) {
+                    this.logging.error(
+                        `ATX: Skipped completed step ${JSON.stringify(step.StepId)} because its ID is not a folder name`
+                    )
+                    anyFailed = true
+                    if (this._currentDiffContext) {
+                        this._currentDiffContext.failedStepIds.push(String(step.StepId))
+                    }
+                    continue
+                }
                 const stepCheckpointPath = path.join(
                     solutionRootPath,
                     workspaceFolderName,
@@ -3800,6 +3851,7 @@ export class ATXTransformHandler {
                             // Mark this step as applied
                             this.saveAppliedCheckpoint(solutionRootPath, jobId, step.StepId)
                             this.logging.log(`ATX: Applied changes for step: ${step.StepId}`)
+                            this.recordSkippedEntries(step.StepId, result.skippedEntries)
 
                             // Update source files manifest with newly added files
                             if (result.addedFiles && result.addedFiles.length > 0) {
@@ -3921,6 +3973,17 @@ export class ATXTransformHandler {
         }
 
         return completedSteps
+    }
+
+    /**
+     * Records the checkpoint entries of a step that were not applied, for the response of the current
+     * getTransformInfo call.
+     */
+    private recordSkippedEntries(stepId: string, entries: string[] | undefined): void {
+        if (entries?.length && this._currentDiffContext) {
+            this._currentDiffContext.skippedEntries ??= []
+            this._currentDiffContext.skippedEntries.push(...entries.map(entry => ({ StepId: stepId, Entry: entry })))
+        }
     }
 
     /**
@@ -4751,8 +4814,167 @@ export class ATXTransformHandler {
     }
 
     /**
+     * The path with the symlinks in its existing part resolved, or undefined when that part cannot be resolved
+     * (for example a symlink whose target is missing).
+     */
+    private realPath(filePath: string): string | undefined {
+        let existingPath = path.resolve(filePath)
+        const missingSegments: string[] = []
+        for (;;) {
+            try {
+                return path.join(fs.realpathSync.native(existingPath), ...missingSegments)
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code
+                const parentPath = path.dirname(existingPath)
+                if (
+                    (code !== 'ENOENT' && code !== 'ENOTDIR') ||
+                    parentPath === existingPath ||
+                    this.isLink(existingPath)
+                ) {
+                    return undefined
+                }
+                missingSegments.unshift(path.basename(existingPath))
+                existingPath = parentPath
+            }
+        }
+    }
+
+    private isLink(filePath: string): boolean {
+        try {
+            return fs.lstatSync(filePath).isSymbolicLink()
+        } catch {
+            return false
+        }
+    }
+
+    /** True when the path is a file with more than one hard link, so writing to it also changes its other paths */
+    private isHardLinkedFile(filePath: string): boolean {
+        try {
+            const stats = fs.lstatSync(filePath)
+            return stats.isFile() && stats.nlink > 1
+        } catch {
+            return false
+        }
+    }
+
+    private isInsideFolder(folderPath: string, filePath: string): boolean {
+        const relative = path.relative(folderPath, filePath)
+        return !!relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative)
+    }
+
+    /** Key for comparing real paths; Windows paths are not case-sensitive */
+    private pathKey(realPath: string): string {
+        return process.platform === 'win32' ? realPath.toLowerCase() : realPath
+    }
+
+    /**
+     * Path of a checkpoint metadata entry under rootPath, or undefined when the entry is not a path inside
+     * rootPath once symlinks are resolved, or is itself a symlink. With outsidePaths, an entry outside rootPath
+     * whose real path is in outsidePaths (see pathKey) is allowed too.
+     */
+    private checkpointEntryPath(
+        rootPath: string,
+        relativePath: unknown,
+        outsidePaths?: Set<string>
+    ): string | undefined {
+        if (typeof relativePath !== 'string' || !relativePath) {
+            return undefined
+        }
+        // On Windows a colon in an entry names a drive or an alternate data stream
+        if (process.platform === 'win32' && relativePath.includes(':')) {
+            return undefined
+        }
+        const entryPath = path.join(rootPath, relativePath)
+        const realRootPath = this.realPath(rootPath)
+        const realEntryPath = this.realPath(entryPath)
+        if (!realRootPath || !realEntryPath || this.isLink(entryPath)) {
+            return undefined
+        }
+        if (this.isInsideFolder(realRootPath, realEntryPath)) {
+            return entryPath
+        }
+        return outsidePaths?.has(this.pathKey(realEntryPath)) ? entryPath : undefined
+    }
+
+    /**
+     * Path of the new content of an added or updated file, which is at after/<entry> in the checkpoint folder,
+     * or undefined when that path is not inside the checkpoint folder.
+     */
+    private checkpointSourcePath(checkpointFolderPath: string, relativePath: unknown): string | undefined {
+        if (typeof relativePath !== 'string' || !relativePath) {
+            return undefined
+        }
+        return this.checkpointEntryPath(checkpointFolderPath, path.join('after', relativePath))
+    }
+
+    /**
+     * Path of a checkpoint metadata entry in the solution folder, or undefined when the entry is not a path
+     * inside the solution folder (see checkpointEntryPath) or is in the folder that holds the job data
+     * (workspaceFolderName). A file outside the solution folder is allowed when it is in outsidePaths.
+     */
+    private solutionEntryPath(
+        solutionRootPath: string,
+        relativePath: unknown,
+        outsidePaths?: Set<string>
+    ): string | undefined {
+        const entryPath = this.checkpointEntryPath(solutionRootPath, relativePath, outsidePaths)
+        const realRootPath = this.realPath(solutionRootPath)
+        const realEntryPath = entryPath && this.realPath(entryPath)
+        if (!entryPath || !realRootPath || !realEntryPath) {
+            return undefined
+        }
+        if (!this.isInsideFolder(realRootPath, realEntryPath)) {
+            return entryPath
+        }
+        const [firstSegment] = path.relative(realRootPath, realEntryPath).split(path.sep)
+        // Windows trims trailing dots and spaces from a path segment, so compare without them
+        const normalizedFirstSegment = firstSegment.replace(/[. ]+$/, '')
+        return normalizedFirstSegment.toLowerCase() === workspaceFolderName.toLowerCase() ? undefined : entryPath
+    }
+
+    /**
+     * Keys (see pathKey) of the real paths of the job's source files that are outside the solution folder,
+     * read from the job's source-files.json. A checkpoint can change these files too.
+     */
+    private sourceFilesOutsideSolution(solutionRootPath: string, jobId: string): Set<string> {
+        const outsidePaths = new Set<string>()
+        if (!isFolderName(jobId)) {
+            return outsidePaths
+        }
+        try {
+            const manifestPath = path.join(
+                solutionRootPath,
+                workspaceFolderName,
+                jobId,
+                'checkpoints',
+                'source-files.json'
+            )
+            if (!fs.existsSync(manifestPath)) {
+                return outsidePaths
+            }
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'))
+            const realRootPath = this.realPath(solutionRootPath)
+            for (const sourceFile of Array.isArray(manifest?.sourceFiles) ? manifest.sourceFiles : []) {
+                const realSourcePath =
+                    typeof sourceFile === 'string' && path.isAbsolute(sourceFile)
+                        ? this.realPath(sourceFile)
+                        : undefined
+                if (realRootPath && realSourcePath && !this.isInsideFolder(realRootPath, realSourcePath)) {
+                    outsidePaths.add(this.pathKey(realSourcePath))
+                }
+            }
+        } catch (error) {
+            this.logging.error(`ATX: Failed to read the source files manifest: ${String(error)}`)
+        }
+        return outsidePaths
+    }
+
+    /**
      * Apply changes from a checkpoint folder to the solution root.
      * Reads metadata.json and applies file additions, removals, updates, and moves.
+     * Entries are skipped when they are not inside the solution root once symlinks are resolved, are symlinks,
+     * or are in its job data folder, and an entry is not written to a file that has more than one hard link.
+     * A file outside the solution root is changed only when the job's source-files.json lists it.
      */
     private async applyChanges(
         checkpointFolderPath: string,
@@ -4767,6 +4989,7 @@ export class ATXTransformHandler {
         filesMoved?: number
         addedFiles?: string[]
         conflictedFiles?: string[]
+        skippedEntries?: string[]
     }> {
         try {
             this.logging.log(`ATX: Starting applyChanges from ${checkpointFolderPath} to ${solutionRootPath}`)
@@ -4790,6 +5013,8 @@ export class ATXTransformHandler {
             let updatedCount = 0
             let movedCount = 0
             const successfullyAddedFiles: string[] = []
+            // Entries that are not applied because their path is not allowed
+            const skippedEntries: string[] = []
 
             // Files the customer edited locally since the last checkpoint apply. Applying
             // the transform's version on top of these silently destroys the customer's
@@ -4804,12 +5029,24 @@ export class ATXTransformHandler {
                 (jobId ? this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId) : []).map(p => path.resolve(p))
             )
             const conflictedFiles: string[] = []
+            // Files outside the solution folder that the job's source files include
+            const outsidePaths = this.sourceFilesOutsideSolution(solutionRootPath, jobId)
 
             // Handle filesAdded: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesAdded) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = this.checkpointSourcePath(checkpointFolderPath, relativePath)
+                    const destPath = this.solutionEntryPath(solutionRootPath, relativePath, outsidePaths)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped added file with a path that is not allowed: ${relativePath}`)
+                        skippedEntries.push(String(relativePath))
+                        continue
+                    }
+                    if (this.isHardLinkedFile(destPath)) {
+                        this.logging.error(`ATX: Skipped added file that has more than one hard link: ${relativePath}`)
+                        skippedEntries.push(String(relativePath))
+                        continue
+                    }
 
                     // Preserve a customer edit rather than clobber it (see userModifiedFiles).
                     if (
@@ -4845,7 +5082,12 @@ export class ATXTransformHandler {
             // and record the conflict rather than silently deleting their work.
             for (const relativePath of filesRemoved) {
                 try {
-                    const filePath = path.join(solutionRootPath, relativePath)
+                    const filePath = this.solutionEntryPath(solutionRootPath, relativePath, outsidePaths)
+                    if (!filePath) {
+                        this.logging.error(`ATX: Skipped removed file with a path that is not allowed: ${relativePath}`)
+                        skippedEntries.push(String(relativePath))
+                        continue
+                    }
                     if (fs.existsSync(filePath)) {
                         if (userModifiedFiles.size > 0 && userModifiedFiles.has(path.resolve(filePath))) {
                             try {
@@ -4871,8 +5113,20 @@ export class ATXTransformHandler {
             // Handle filesUpdated: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesUpdated) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = this.checkpointSourcePath(checkpointFolderPath, relativePath)
+                    const destPath = this.solutionEntryPath(solutionRootPath, relativePath, outsidePaths)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped updated file with a path that is not allowed: ${relativePath}`)
+                        skippedEntries.push(String(relativePath))
+                        continue
+                    }
+                    if (this.isHardLinkedFile(destPath)) {
+                        this.logging.error(
+                            `ATX: Skipped updated file that has more than one hard link: ${relativePath}`
+                        )
+                        skippedEntries.push(String(relativePath))
+                        continue
+                    }
 
                     // The DealerFx clobber: if the customer edited this already-applied file
                     // since the last sync, preserve their version instead of overwriting it.
@@ -4906,8 +5160,22 @@ export class ATXTransformHandler {
             // Handle filesMoved: Use movedFilesMap to copy content from before to after location, delete before file
             for (const mapping of movedFilesMap) {
                 try {
-                    const beforePath = path.join(solutionRootPath, mapping.before)
-                    const afterPath = path.join(solutionRootPath, mapping.after)
+                    const beforePath = this.solutionEntryPath(solutionRootPath, mapping.before, outsidePaths)
+                    const afterPath = this.solutionEntryPath(solutionRootPath, mapping.after, outsidePaths)
+                    if (!beforePath || !afterPath) {
+                        this.logging.error(
+                            `ATX: Skipped moved file with a path that is not allowed: ${mapping.before} -> ${mapping.after}`
+                        )
+                        skippedEntries.push(`${mapping.before} -> ${mapping.after}`)
+                        continue
+                    }
+                    if (this.isHardLinkedFile(afterPath)) {
+                        this.logging.error(
+                            `ATX: Skipped moved file whose target has more than one hard link: ${mapping.before} -> ${mapping.after}`
+                        )
+                        skippedEntries.push(`${mapping.before} -> ${mapping.after}`)
+                        continue
+                    }
 
                     // Ensure destination directory exists
                     const afterDir = path.dirname(afterPath)
@@ -4967,6 +5235,7 @@ export class ATXTransformHandler {
                 filesMoved: movedCount,
                 addedFiles: successfullyAddedFiles,
                 ...(conflictedFiles.length > 0 ? { conflictedFiles } : {}),
+                ...(skippedEntries.length > 0 ? { skippedEntries } : {}),
             }
         } catch (error) {
             this.logging.error(`ATX: applyChanges error: ${String(error)}`)
@@ -5043,7 +5312,13 @@ export class ATXTransformHandler {
      */
     private backupConflictedFile(destPath: string, jobId: string, solutionRootPath: string): string {
         const backupRoot = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'conflict-backups')
-        const relForBackup = path.relative(solutionRootPath, destPath)
+        let relForBackup = path.relative(solutionRootPath, destPath)
+        if (!this.isInsideFolder(path.resolve(solutionRootPath), path.resolve(destPath))) {
+            // A source file outside the solution folder is backed up under outside-solution/<its absolute path>
+            const absolutePath = path.resolve(destPath)
+            const { root } = path.parse(absolutePath)
+            relForBackup = path.join('outside-solution', root.replace(/[\\/:]+/g, ''), absolutePath.slice(root.length))
+        }
         const backupPath = path.join(backupRoot, relForBackup)
         fs.mkdirSync(path.dirname(backupPath), { recursive: true })
         fs.copyFileSync(destPath, backupPath)
