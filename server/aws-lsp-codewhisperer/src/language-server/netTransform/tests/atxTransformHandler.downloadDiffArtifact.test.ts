@@ -54,7 +54,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(createArtifactDownloadUrlStub.calledOnce).to.be.true
         expect(applyChangesStub.calledOnce).to.be.true
         expect(saveAppliedCheckpointStub.calledOnce).to.be.true
@@ -77,12 +78,13 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(createArtifactDownloadUrlStub.calledTwice).to.be.true
         expect(applyChangesStub.calledOnce).to.be.true
     })
 
-    it('should return empty string after all retries exhausted', async () => {
+    it('should report a transfer failure, not an apply failure, when the download URL never comes', async () => {
         createArtifactDownloadUrlStub.resolves(null)
 
         const result = await (handler as any).downloadDiffArtifact(
@@ -93,7 +95,9 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        // The diff never arrived, so a caller that bounds its retries must not count this.
+        expect(result.outcome).to.equal('transfer-failed')
         expect(createArtifactDownloadUrlStub.calledThrice).to.be.true
         expect(applyChangesStub.called).to.be.false
         expect(saveAppliedCheckpointStub.called).to.be.false
@@ -116,12 +120,13 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.not.equal('')
+        expect(result.path).to.not.equal('')
+        expect(result.outcome).to.equal('applied')
         expect(applyChangesStub.calledTwice).to.be.true
         expect(saveAppliedCheckpointStub.calledOnce).to.be.true
     })
 
-    it('should return empty string when applyChanges fails on all retries', async () => {
+    it('should report an apply failure when applyChanges fails on all retries', async () => {
         createArtifactDownloadUrlStub.resolves({
             s3PresignedUrl: 'https://s3.example.com/artifact.zip',
             requestHeaders: {},
@@ -137,7 +142,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        expect(result.outcome).to.equal('apply-failed')
         expect(applyChangesStub.calledThrice).to.be.true
         expect(saveAppliedCheckpointStub.called).to.be.false
     })
@@ -157,7 +163,8 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
             'step-001'
         )
 
-        expect(result).to.equal('')
+        expect(result.path).to.equal('')
+        expect(result.outcome).to.equal('transfer-failed')
         expect(saveAppliedCheckpointStub.called).to.be.false
     })
 })

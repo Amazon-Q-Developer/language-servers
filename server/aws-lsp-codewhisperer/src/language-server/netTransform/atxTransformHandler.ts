@@ -121,6 +121,24 @@ const BEAM_MERGE_TESTS_GIVE_UP_POLLS = 5
 // survive clearJobCache and a Visual Studio restart. See readBeamApplyState.
 const BEAM_APPLY_STATE_FILE = 'beam-apply-state.json'
 
+/**
+ * How far a step's diff got. `transfer-failed` means it never arrived — a throttled presigned URL,
+ * a dropped download, a bad archive — which says nothing about whether it can apply and clears up
+ * on its own, so a caller that bounds its retries must not spend that bound on it. `apply-failed`
+ * means the diff was on disk and writing it into the solution did not fully work.
+ */
+type DiffApplyOutcome = 'applied' | 'apply-failed' | 'transfer-failed'
+
+/** See readBeamApplyState. */
+interface BeamApplyState {
+    /** Per step: polls that had the diff on disk and still failed to apply it. */
+    polls: Record<string, number>
+    /** Steps given up on. Stops every later test run on the same card too. */
+    skipped: string[]
+    /** Unit test runs the customer has already been told have no Merge Tests step. */
+    reported: string[]
+}
+
 /** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
 interface BeamedRepoInfo {
     RepositoryName: string
@@ -2994,13 +3012,15 @@ export class ATXTransformHandler {
             // Extract diff artifact if present
             let diffArtifactPath = ''
             if (artifactJson.diffArtifactId) {
-                diffArtifactPath = await this.downloadDiffArtifact(
-                    workspaceId,
-                    jobId,
-                    artifactJson.diffArtifactId,
-                    solutionRootPath,
-                    stepId
-                )
+                diffArtifactPath = (
+                    await this.downloadDiffArtifact(
+                        workspaceId,
+                        jobId,
+                        artifactJson.diffArtifactId,
+                        solutionRootPath,
+                        stepId
+                    )
+                ).path
             }
 
             const diffApplyFailed = !!(artifactJson.diffArtifactId && diffArtifactPath === '')
@@ -3037,11 +3057,17 @@ export class ATXTransformHandler {
         solutionRootPath: string,
         stepId: string,
         backupBeforeOverwrite: boolean = false
-    ): Promise<string> {
+    ): Promise<{ path: string; outcome: DiffApplyOutcome }> {
         const maxRetries = 3
+        // Which half of the work failed last, for the caller. A caller that bounds its retries must
+        // not spend that bound on a download that never arrived: throttling, a presigned URL that
+        // could not be fetched, or a dropped connection say nothing about whether the diff can
+        // apply, and they clear up on their own.
+        let lastFailure: DiffApplyOutcome = 'transfer-failed'
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
+                lastFailure = 'transfer-failed'
                 this.logging.log(`ATX: Downloading diff artifact: ${diffArtifactId} (attempt ${attempt}/${maxRetries})`)
 
                 const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, diffArtifactId)
@@ -3060,6 +3086,9 @@ export class ATXTransformHandler {
                 )
 
                 this.logging.log(`ATX: Diff artifact extracted to: ${pathToDownload}`)
+
+                // The diff is on disk from here on, so any failure below is a failure to APPLY it.
+                lastFailure = 'apply-failed'
 
                 // Immediately apply changes after extraction
                 const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId, backupBeforeOverwrite)
@@ -3096,7 +3125,7 @@ export class ATXTransformHandler {
                             `Could not update ${(result.conflictedFiles || []).join(', ')} because a backup copy ` +
                                 `could not be written. Your file was left as it is, and this will be retried.`
                         )
-                        return pathToDownload
+                        return { path: pathToDownload, outcome: 'apply-failed' }
                     }
 
                     // Mark this step as applied
@@ -3105,7 +3134,7 @@ export class ATXTransformHandler {
                     // Save timestamp after changes are applied for tracking user modifications
                     this.saveLastAppliedTimestamp(solutionRootPath, jobId, stepId)
 
-                    return pathToDownload
+                    return { path: pathToDownload, outcome: 'applied' }
                 } else {
                     throw new Error(`Failed to apply changes: ${result.error}`)
                 }
@@ -3122,8 +3151,10 @@ export class ATXTransformHandler {
         }
 
         // All retries exhausted
-        this.logging.error(`ATX: downloadDiffArtifact failed after ${maxRetries} attempts for step ${stepId}`)
-        return ''
+        this.logging.error(
+            `ATX: downloadDiffArtifact failed after ${maxRetries} attempts for step ${stepId} (${lastFailure})`
+        )
+        return { path: '', outcome: lastFailure }
     }
 
     /**
@@ -3842,24 +3873,6 @@ export class ATXTransformHandler {
             return
         }
         const steps = this.findMergeTestsSteps(card)
-        if (steps.length === 0) {
-            // A finished unit test run with no Merge Tests step under it means a step name drifted
-            // out from under the match. Surface it, or the customer silently gets no tests again.
-            if (this.hasUnmatchedUnitTestRun(card)) {
-                this.logging.log(
-                    `ATX: [BEAM] job ${jobId}: beam card ${card.StepId} has a SUCCEEDED "Generate Unit Tests" ` +
-                        `run but no "${MERGE_TESTS_STEP_NAME}" step under it — a step was likely renamed`
-                )
-                await this.tellCustomer(
-                    jobId,
-                    card.StepId,
-                    solutionRootPath,
-                    'Unit tests were generated but could not be added to your solution: the plan step that ' +
-                        'carries them was not recognised. Please report this.'
-                )
-            }
-            return
-        }
         if (this._applyingCheckpoints) {
             this.logging.log('ATX: [BEAM] merged-tests apply already in progress, skipping')
             return
@@ -3867,6 +3880,7 @@ export class ATXTransformHandler {
         this._applyingCheckpoints = true
         try {
             const state = this.readBeamApplyState(solutionRootPath, jobId)
+            await this.reportRunsWithNoMergeStep(card, jobId, solutionRootPath, state)
             for (const step of steps) {
                 if (this.loadAppliedCheckpoints(solutionRootPath, jobId).includes(step.StepId)) {
                     continue
@@ -3884,8 +3898,8 @@ export class ATXTransformHandler {
                 this.logging.log(`ATX: [BEAM] applying merged unit tests from step ${step.StepId}`)
                 // Downloads, extracts, applies and records the step as applied, with its own
                 // retries. Failures are logged inside and leave the step unapplied. The return value
-                // says only whether an artifact was there to apply.
-                const artifactFound = await this.downloadCompletedStepArtifact(
+                // says how far the diff got.
+                const outcome = await this.downloadCompletedStepArtifact(
                     workspaceId,
                     jobId,
                     step.StepId,
@@ -3903,13 +3917,15 @@ export class ATXTransformHandler {
                     continue
                 }
                 // Still not applied, so stop here rather than applying anything after it, for the
-                // ordering reason above. Only a poll that HAD an artifact and failed to apply it
-                // counts against the bound: an empty or errored listing means the upload has not
-                // landed yet, and letting throttling or a sleeping laptop spend the budget would
-                // retire a step the customer is still waiting for.
-                if (!artifactFound) {
+                // ordering reason above. Only a poll that got the diff onto disk and failed to apply
+                // it counts against the bound. A missing artifact or a failed transfer — a throttled
+                // download URL, a dropped connection, an upload still in flight — says nothing about
+                // whether the diff can apply and clears up on its own, so letting it spend the
+                // budget would permanently retire a step the customer is still waiting for.
+                if (outcome !== 'apply-failed') {
                     this.logging.log(
-                        `ATX: [BEAM] no artifact yet for merged unit tests from step ${step.StepId}, will look again`
+                        `ATX: [BEAM] merged unit tests from step ${step.StepId} did not arrive (${outcome}), ` +
+                            `will try again on a later poll without counting it`
                     )
                     break
                 }
@@ -3922,13 +3938,17 @@ export class ATXTransformHandler {
                         `ATX: [BEAM] merged unit tests from step ${step.StepId} did not apply after ${polls} ` +
                             `attempts; not trying it again, and not applying any later test run on this repo`
                     )
+                    // Not "your solution has not been changed": applyChanges writes file by file, so
+                    // a diff that failed part way through has already put some of its files on disk.
                     await this.tellCustomer(
                         jobId,
                         step.StepId,
                         solutionRootPath,
-                        'Could not add the generated unit tests to your solution after several attempts. Your ' +
-                            'solution has not been changed, and unit tests generated later in this job will not ' +
-                            'be added either, because they build on this run. Please report this.'
+                        'Could not finish adding the generated unit tests to your solution after several ' +
+                            'attempts. Some files may already have been updated, and any file that was ' +
+                            `overwritten has a copy in ${workspaceFolderName}/${jobId}/checkpoints/` +
+                            'conflict-backups. Unit tests generated later in this job will not be added ' +
+                            'either, because they build on this run. Please report this.'
                     )
                     break
                 }
@@ -4031,9 +4051,9 @@ export class ATXTransformHandler {
 
     /**
      * Per-job beam apply state, next to checkpoints-applied.json so it survives both clearJobCache
-     * and a Visual Studio restart. `polls` counts the polls that found the step's artifact and
+     * and a Visual Studio restart. `polls` counts the polls that got the step's diff onto disk and
      * still failed to apply it; `skipped` is the steps given up on, which also stops every later
-     * test run on the same card.
+     * test run on the same card; `reported` keeps the rename warning to once per run.
      *
      * It has to be on disk. The give-up count in memory never reached its bound, because
      * getTransformInfo calls clearJobCache on every poll of a COMPLETED job, immediately before
@@ -4042,27 +4062,20 @@ export class ATXTransformHandler {
      * plan — overwriting that step's .sln and dropping its test project, the exact hazard the
      * in-loop stop exists to prevent.
      */
-    private readBeamApplyState(
-        solutionRootPath: string,
-        jobId: string
-    ): { polls: Record<string, number>; skipped: string[] } {
+    private readBeamApplyState(solutionRootPath: string, jobId: string): BeamApplyState {
         try {
             const statePath = this.beamApplyStatePath(solutionRootPath, jobId)
             if (fs.existsSync(statePath)) {
                 const data = JSON.parse(fs.readFileSync(statePath, 'utf-8'))
-                return { polls: data.polls || {}, skipped: data.skipped || [] }
+                return { polls: data.polls || {}, skipped: data.skipped || [], reported: data.reported || [] }
             }
         } catch (error) {
             this.logging.error(`ATX: [BEAM] could not read the apply state: ${String(error)}`)
         }
-        return { polls: {}, skipped: [] }
+        return { polls: {}, skipped: [], reported: [] }
     }
 
-    private writeBeamApplyState(
-        solutionRootPath: string,
-        jobId: string,
-        state: { polls: Record<string, number>; skipped: string[] }
-    ): void {
+    private writeBeamApplyState(solutionRootPath: string, jobId: string, state: BeamApplyState): void {
         try {
             const statePath = this.beamApplyStatePath(solutionRootPath, jobId)
             fs.mkdirSync(path.dirname(statePath), { recursive: true })
@@ -4088,16 +4101,59 @@ export class ATXTransformHandler {
         return found
     }
 
-    /** True when a finished unit test run under this card has no Merge Tests step beneath it. */
-    private hasUnmatchedUnitTestRun(step: AtxPlanStep): boolean {
-        if (
-            step.Status === 'SUCCEEDED' &&
-            this.isUnitTestGenerationStep(step.StepName) &&
-            this.findMergeTestsSteps(step).length === 0
-        ) {
-            return true
+    /**
+     * Tells the customer about any finished unit test run on this card with no step NAMED
+     * "Merge Tests" beneath it, which is what a renamed step looks like.
+     *
+     * Matched on the name alone, and checked for every run on the card. Both matter. Requiring
+     * SUCCEEDED as well would call a FAILED or SKIPPED merge step a rename, sending the customer to
+     * report a non-bug — a run that generated no tests looks exactly like that. And only looking
+     * when the card yields no steps at all would miss a rename that lands mid-job, after an earlier
+     * run already matched, which is the very case this exists to catch.
+     *
+     * Recorded in the apply state, so the customer is told once rather than on every poll.
+     */
+    private async reportRunsWithNoMergeStep(
+        card: AtxPlanStep,
+        jobId: string,
+        solutionRootPath: string,
+        state: BeamApplyState
+    ): Promise<void> {
+        for (const run of this.findUnitTestRuns(card)) {
+            if (this.hasStepNamedMergeTests(run) || state.reported.includes(run.StepId)) {
+                continue
+            }
+            state.reported.push(run.StepId)
+            this.writeBeamApplyState(solutionRootPath, jobId, state)
+            this.logging.log(
+                `ATX: [BEAM] job ${jobId}: unit test run ${run.StepId} on beam card ${card.StepId} has no ` +
+                    `"${MERGE_TESTS_STEP_NAME}" step under it — a step was likely renamed`
+            )
+            await this.tellCustomer(
+                jobId,
+                run.StepId,
+                solutionRootPath,
+                'Unit tests were generated but could not be added to your solution: the plan step that ' +
+                    'carries them was not recognised. Please report this.'
+            )
         }
-        return step.Children.some(child => this.hasUnmatchedUnitTestRun(child))
+    }
+
+    /** SUCCEEDED "Generate Unit Tests" runs under this card, in DFS (plan) order. */
+    private findUnitTestRuns(step: AtxPlanStep): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if (step.Status === 'SUCCEEDED' && this.isUnitTestGenerationStep(step.StepName)) {
+            found.push(step)
+        }
+        for (const child of step.Children) {
+            found.push(...this.findUnitTestRuns(child))
+        }
+        return found
+    }
+
+    /** Any status: this answers "is the step there at all", not "did it succeed". */
+    private hasStepNamedMergeTests(step: AtxPlanStep): boolean {
+        return step.Children.some(child => this.isMergeTestsStep(child.StepName) || this.hasStepNamedMergeTests(child))
     }
 
     /** Normalized, because the service sends no machine-readable step label. */
@@ -4291,9 +4347,9 @@ export class ATXTransformHandler {
     /**
      * Downloads and extracts the artifact for a completed step.
      *
-     * Returns whether an artifact was actually found to work with. Callers that bound their retries
-     * need that apart from success: an empty or errored listing means "not there yet" — throttling,
-     * an offline laptop, an upload still in flight — and must not be counted as a failed apply.
+     * Returns how far the diff got, which callers that bound their retries need apart from success.
+     * `no-artifact` is an empty or errored listing: the upload is not there yet, which is also what
+     * throttling and an offline laptop look like.
      */
     private async downloadCompletedStepArtifact(
         workspaceId: string,
@@ -4301,7 +4357,7 @@ export class ATXTransformHandler {
         stepId: string,
         solutionRootPath: string,
         backupBeforeOverwrite: boolean = false
-    ): Promise<boolean> {
+    ): Promise<DiffApplyOutcome | 'no-artifact'> {
         try {
             this.logging.log(`ATX: Downloading artifact for completed step: ${stepId}`)
 
@@ -4310,7 +4366,7 @@ export class ATXTransformHandler {
 
             if (!artifacts || artifacts.length === 0) {
                 this.logging.log(`ATX: No CUSTOMER_OUTPUT artifact found for step: ${stepId}`)
-                return false
+                return 'no-artifact'
             }
 
             // There should be only one artifact that matches
@@ -4318,7 +4374,7 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: Found artifact ${artifact.artifactId} for step: ${stepId}`)
 
             // Download and extract the artifact
-            await this.downloadDiffArtifact(
+            const { outcome } = await this.downloadDiffArtifact(
                 workspaceId,
                 jobId,
                 artifact.artifactId,
@@ -4326,12 +4382,13 @@ export class ATXTransformHandler {
                 stepId,
                 backupBeforeOverwrite
             )
-            return true
+            return outcome
         } catch (error) {
             this.logging.error(`ATX: downloadCompletedStepArtifact error for step ${stepId}: ${String(error)}`)
-            // listArtifactsForStep returns null rather than throwing, so anything thrown here
-            // happened after the artifact was found: a real failure to apply it, not a missing one.
-            return true
+            // listArtifactsForStep returns null rather than throwing, and downloadDiffArtifact
+            // reports its own failures, so anything thrown here is unexpected and will not fix
+            // itself — treat it as a failed apply so the caller's bound still ends the retries.
+            return 'apply-failed'
         }
     }
 
@@ -5175,6 +5232,28 @@ export class ATXTransformHandler {
             const filesRemoved = metadata.filesRemoved || []
             const filesUpdated = metadata.filesUpdated || []
             const movedFilesMap = metadata.movedFilesMap || []
+
+            // Beam apply only: check this diff was computed against the tree we are about to write
+            // into. Every path in metadata.json is relative, and on a beam the solution root comes
+            // from the toolkit rather than from an upload by this LSP, so nothing else guarantees
+            // the two agree. filesUpdated and filesRemoved name files that MUST already be there;
+            // if the root were wrong, none of them would be, and we would scatter a test project
+            // and a .sln over unrelated directories.
+            if (backupBeforeOverwrite) {
+                const mustAlreadyExist: string[] = [...filesUpdated, ...filesRemoved]
+                if (
+                    mustAlreadyExist.length > 0 &&
+                    !mustAlreadyExist.some(relativePath => fs.existsSync(path.join(solutionRootPath, relativePath)))
+                ) {
+                    return {
+                        success: false,
+                        error:
+                            `none of the ${mustAlreadyExist.length} file(s) this diff updates or removes exist ` +
+                            `under ${solutionRootPath}, so it was computed against a different root — nothing ` +
+                            `was written`,
+                    }
+                }
+            }
 
             let addedCount = 0
             let removedCount = 0
