@@ -133,9 +133,11 @@ const BEAM_APPLY_STATE_FILE = 'beam-apply-state.json'
  * How far a step's diff got. `transfer-failed` means it never arrived — a throttled presigned URL,
  * a dropped download, a bad archive — which says nothing about whether it can apply and clears up
  * on its own, so a caller that bounds its retries must not spend that bound on it. `apply-failed`
- * means the diff was on disk and writing it into the solution did not fully work.
+ * means the diff was on disk and writing it into the solution did not fully work. `rejected` means
+ * the apply refused it outright and wrote nothing: that verdict comes from the diff's own contents,
+ * so it is settled — retrying is pure waste, and the customer can be told the truth at once.
  */
-type DiffApplyOutcome = 'applied' | 'apply-failed' | 'transfer-failed'
+type DiffApplyOutcome = 'applied' | 'apply-failed' | 'transfer-failed' | 'rejected'
 
 /** See readBeamApplyState. */
 interface BeamApplyState {
@@ -3070,7 +3072,7 @@ export class ATXTransformHandler {
         diffArtifactId: string,
         solutionRootPath: string,
         stepId: string,
-        backupBeforeOverwrite: boolean = false
+        beamApply: boolean = false
     ): Promise<{ path: string; outcome: DiffApplyOutcome }> {
         const maxRetries = 3
         // Which half of the work failed last, for the caller. A caller that bounds its retries must
@@ -3105,7 +3107,7 @@ export class ATXTransformHandler {
                 lastFailure = 'apply-failed'
 
                 // Immediately apply changes after extraction
-                const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId, backupBeforeOverwrite)
+                const result = await this.applyChanges(pathToDownload, solutionRootPath, jobId, beamApply)
                 if (result.success) {
                     this.logging.log(`ATX: Changes applied immediately for step: ${stepId}`)
 
@@ -3155,6 +3157,19 @@ export class ATXTransformHandler {
                     this.saveLastAppliedTimestamp(solutionRootPath, jobId, stepId)
 
                     return { path: pathToDownload, outcome: 'applied' }
+                } else if (result.rejected) {
+                    // Settled by the diff's own contents, so the retry loop cannot change it and
+                    // every attempt costs another presigned URL and another download against a
+                    // service that throttles us. Stop, and tell the customer the truth now.
+                    this.logging.error(`ATX: [BEAM] refused the diff for step ${stepId}: ${result.error}`)
+                    await this.tellCustomer(
+                        jobId,
+                        stepId,
+                        solutionRootPath,
+                        'Unit tests were generated but could not be added to your solution, and nothing in it ' +
+                            `was changed: ${result.error}. Please report this.`
+                    )
+                    return { path: pathToDownload, outcome: 'rejected' }
                 } else {
                     throw new Error(`Failed to apply changes: ${result.error}`)
                 }
@@ -3943,6 +3958,18 @@ export class ATXTransformHandler {
                 // download URL, a dropped connection, an upload still in flight — says nothing about
                 // whether the diff can apply and clears up on its own, so letting it spend the
                 // budget would permanently retire a step the customer is still waiting for.
+                if (outcome === 'rejected') {
+                    // The apply refused the diff on its own contents, so no number of polls will
+                    // change the answer and nothing was written. downloadDiffArtifact has already
+                    // told the customer why.
+                    state.skipped.push(step.StepId)
+                    this.writeBeamApplyState(solutionRootPath, jobId, state)
+                    this.logging.error(
+                        `ATX: [BEAM] the diff for step ${step.StepId} was refused; not trying it again, and not ` +
+                            `applying any later test run on this repo`
+                    )
+                    break
+                }
                 if (outcome !== 'apply-failed') {
                     const waits = (state.waits[step.StepId] ?? 0) + 1
                     state.waits[step.StepId] = waits
@@ -4427,7 +4454,7 @@ export class ATXTransformHandler {
         jobId: string,
         stepId: string,
         solutionRootPath: string,
-        backupBeforeOverwrite: boolean = false
+        beamApply: boolean = false
     ): Promise<DiffApplyOutcome | 'no-artifact'> {
         try {
             this.logging.log(`ATX: Downloading artifact for completed step: ${stepId}`)
@@ -4451,7 +4478,7 @@ export class ATXTransformHandler {
                 artifact.artifactId,
                 solutionRootPath,
                 stepId,
-                backupBeforeOverwrite
+                beamApply
             )
             return outcome
         } catch (error) {
@@ -5267,10 +5294,17 @@ export class ATXTransformHandler {
         checkpointFolderPath: string,
         solutionRootPath: string,
         jobId: string = '',
-        // Beam apply only: copy any existing destination into conflict-backups before overwriting
-        // it. A beam job has no source-files.json, so ``userModifiedFiles`` below is always empty
-        // and the customer's edits are not preserved — this is what keeps them recoverable.
-        backupBeforeOverwrite: boolean = false
+        // Everything the beam apply needs and no other caller has asked for, which is why it is
+        // one flag named for the caller rather than four named for their effects:
+        //   - copy any existing destination into conflict-backups before overwriting it. A beam job
+        //     has no source-files.json, so ``userModifiedFiles`` below is always empty and the
+        //     customer's edits are not preserved — this is what keeps them recoverable;
+        //   - refuse the whole diff when it was computed against a different root, or when it
+        //     reaches outside the solution;
+        //   - report a per-file write failure instead of logging it and carrying on.
+        // Split it into an options object when a second caller wants some of these and not others;
+        // today that would be four parameters no live call site sets.
+        beamApply: boolean = false
     ): Promise<{
         success: boolean
         error?: string
@@ -5288,6 +5322,8 @@ export class ATXTransformHandler {
         backedUpFiles?: string[]
         backupFailed?: boolean
         writeFailed?: boolean
+        // Refused before writing anything, on a verdict that cannot change on a retry.
+        rejected?: boolean
     }> {
         try {
             this.logging.log(`ATX: Starting applyChanges from ${checkpointFolderPath} to ${solutionRootPath}`)
@@ -5312,7 +5348,7 @@ export class ATXTransformHandler {
             // the two agree. filesUpdated and filesRemoved name files that MUST already be there;
             // if the root were wrong, none of them would be, and we would scatter a test project
             // and a .sln over unrelated directories.
-            if (backupBeforeOverwrite) {
+            if (beamApply) {
                 const mustAlreadyExist: string[] = [...filesUpdated, ...filesRemoved]
                 if (
                     mustAlreadyExist.length > 0 &&
@@ -5320,6 +5356,7 @@ export class ATXTransformHandler {
                 ) {
                     return {
                         success: false,
+                        rejected: true,
                         error:
                             `none of the ${mustAlreadyExist.length} file(s) this diff updates or removes exist ` +
                             `under ${solutionRootPath}, so it was computed against a different root — nothing ` +
@@ -5340,6 +5377,7 @@ export class ATXTransformHandler {
                 if (escaping.length > 0) {
                     return {
                         success: false,
+                        rejected: true,
                         error:
                             `this diff reaches outside ${solutionRootPath} (${escaping.join(', ')}), so nothing ` +
                             `was written`,
@@ -5402,7 +5440,7 @@ export class ATXTransformHandler {
                         jobId,
                         solutionRootPath,
                         conflictedFiles,
-                        backupBeforeOverwrite
+                        beamApply
                     )
                     if (backup.skip) {
                         backupFailed = true
@@ -5453,7 +5491,7 @@ export class ATXTransformHandler {
                             jobId,
                             solutionRootPath,
                             conflictedFiles,
-                            backupBeforeOverwrite
+                            beamApply
                         )
                         if (backup.skip) {
                             backupFailed = true
@@ -5498,7 +5536,7 @@ export class ATXTransformHandler {
                         jobId,
                         solutionRootPath,
                         conflictedFiles,
-                        backupBeforeOverwrite
+                        beamApply
                     )
                     if (backup.skip) {
                         backupFailed = true
@@ -5571,7 +5609,7 @@ export class ATXTransformHandler {
                             jobId,
                             solutionRootPath,
                             conflictedFiles,
-                            backupBeforeOverwrite
+                            beamApply
                         )
                         if (backup.skip) {
                             backupFailed = true
@@ -5605,7 +5643,7 @@ export class ATXTransformHandler {
                 ...(conflictedFiles.length > 0 ? { conflictedFiles } : {}),
                 ...(backedUpFiles.length > 0 ? { backedUpFiles } : {}),
                 ...(backupFailed ? { backupFailed } : {}),
-                ...(writeFailed && backupBeforeOverwrite ? { writeFailed } : {}),
+                ...(writeFailed && beamApply ? { writeFailed } : {}),
             }
         } catch (error) {
             this.logging.error(`ATX: applyChanges error: ${String(error)}`)
@@ -5687,9 +5725,9 @@ export class ATXTransformHandler {
         jobId: string,
         solutionRootPath: string,
         conflictedFiles: string[],
-        backupBeforeOverwrite: boolean
+        beamApply: boolean
     ): { skip: boolean; backedUp?: string } {
-        if (!backupBeforeOverwrite || !fs.existsSync(destPath)) {
+        if (!beamApply || !fs.existsSync(destPath)) {
             return { skip: false }
         }
         if (sourcePath && this.filesEqual(sourcePath, destPath)) {

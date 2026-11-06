@@ -1232,6 +1232,25 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(logged.some(l => l.includes('did not arrive (transfer-failed)'))).to.be.true
         })
 
+        it('gives up at once on a diff the apply refused, without spending a bound', async () => {
+            // A wrong root or an escaping path is settled by the diff itself. Polling it five times
+            // costs fifteen presigned URLs and downloads for the same answer, and the customer has
+            // already been told the real reason.
+            sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+            downloadStub.callsFake(async () => 'rejected')
+
+            for (let i = 0; i < 4; i++) {
+                await handler.getTransformationPlan('ws-1', 'job-1', 'C:/repoA', true)
+            }
+
+            expect(downloadStub.callCount).to.equal(1)
+            expect(beamState.skipped).to.deep.equal(['a-merge'])
+            expect(beamState.polls).to.deep.equal({})
+            expect(beamState.waits).to.deep.equal({})
+            // downloadDiffArtifact tells the customer why; the loop does not repeat it.
+            expect(worklogs).to.be.empty
+        })
+
         it('gives up, loudly, on a diff that never arrives at all', async () => {
             // A never-uploaded artifact or a corrupt archive does not clear up. Waiting in silence
             // forever, re-downloading on every poll, is the failure this change exists to remove.
@@ -1498,6 +1517,8 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 const result = await (handler as any).applyChanges(step, root, 'job-1', true)
 
                 expect(result.success).to.be.false
+                // rejected, not merely failed: the caller must not retry a settled verdict.
+                expect(result.rejected).to.be.true
                 expect(String(result.error)).to.include('computed against a different root')
                 // Not even the added files, which would otherwise have landed somewhere wrong.
                 expect(fs.existsSync(path.join(root, 'src', 'Tests', 'T.cs'))).to.be.false
@@ -1609,6 +1630,7 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 const result = await (handler as any).applyChanges(step, root, 'job-1', true)
 
                 expect(result.success).to.be.false
+                expect(result.rejected).to.be.true
                 expect(String(result.error)).to.include('reaches outside')
                 // Not even the entry that was inside: one bad path abandons the whole diff.
                 expect(fs.readFileSync(path.join(root, 'App.sln'), 'utf-8')).to.equal('the customer version')

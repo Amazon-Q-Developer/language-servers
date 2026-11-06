@@ -127,6 +127,40 @@ describe('ATXTransformHandler - downloadDiffArtifact retry logic', () => {
         expect(saveAppliedCheckpointStub.calledOnce).to.be.true
     })
 
+    it('does not retry a diff the apply refused, and says nothing was written', async () => {
+        // The verdict comes from the diff's own contents, so each retry is another presigned URL
+        // and another download against a throttling service, for the same answer.
+        createArtifactDownloadUrlStub.resolves({
+            s3PresignedUrl: 'https://s3.example.com/artifact.zip',
+            requestHeaders: {},
+        })
+        downloadAndExtractStub.resolves()
+        applyChangesStub.resolves({
+            success: false,
+            rejected: true,
+            error: 'it was computed against a different root',
+        })
+        const told = sinon.stub(handler as any, 'tellCustomer').resolves(undefined)
+
+        const result = await (handler as any).downloadDiffArtifact(
+            'ws-123',
+            'job-456',
+            'artifact-789',
+            '/solution/root',
+            'step-001',
+            true
+        )
+
+        expect(result.outcome).to.equal('rejected')
+        expect(applyChangesStub.calledOnce).to.be.true
+        expect(createArtifactDownloadUrlStub.calledOnce).to.be.true
+        expect(saveAppliedCheckpointStub.called).to.be.false
+        // The real reason, and no claim that files may have changed.
+        const message = String(told.firstCall.args[3])
+        expect(message).to.include('nothing in it was changed')
+        expect(message).to.include('computed against a different root')
+    })
+
     it('should report an apply failure when applyChanges fails on all retries', async () => {
         createArtifactDownloadUrlStub.resolves({
             s3PresignedUrl: 'https://s3.example.com/artifact.zip',
