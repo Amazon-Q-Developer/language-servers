@@ -19,18 +19,32 @@ export function objectiveHasIntegrationTests(objective: string | undefined): boo
 export type ReadJobObjective = (workspaceId: string, jobId: string) => Promise<{ objective?: string } | null>
 
 /**
+ * Reads a job's beam-map: true when any beamed repo has generateIntegrationTests: true, false when none does, and
+ * undefined when the beam-map couldn't be read (for example while FES throttles us).
+ */
+export type ReadBeamOptIn = (workspaceId: string, jobId: string) => Promise<boolean | undefined>
+
+/**
  * Remembers, per job id, whether the job has generate_integration_tests: true. createJob records the flag it
  * sent; a job this LS didn't create (resume, job history, beam) is read once from its objective. Entries are
  * dropped when the job ends, and the map is capped so a long session can't grow it without bound.
  */
 export class ItGenJobGate {
     static readonly maxJobs = 200
+    /** How long a beamed job whose beam-map has no opt-in goes before its beam-map is read again. */
+    static readonly beamRecheckMs = 5 * 60_000
+    /** How long after a beam-map read that couldn't tell (or is still running) the next read may start. */
+    static readonly beamRetryMs = 60_000
 
     private readonly jobs = new Map<string, boolean>()
+    // Beamed jobs without a known opt-in: the time their beam-map may be read again.
+    private readonly beamChecks = new Map<string, number>()
 
     constructor(
         private readonly readObjective: ReadJobObjective,
-        private readonly log: (message: string) => void
+        private readonly log: (message: string) => void,
+        private readonly readBeamOptIn?: ReadBeamOptIn,
+        private readonly now: () => number = Date.now
     ) {}
 
     /** Whether the job is known (either way), so its objective doesn't need to be read again. */
@@ -44,15 +58,16 @@ export class ItGenJobGate {
     }
 
     rememberFlag(jobId: string, itGen: boolean): void {
-        this.jobs.delete(jobId)
-        this.jobs.set(jobId, itGen)
-        while (this.jobs.size > ItGenJobGate.maxJobs) {
-            const oldest = this.jobs.keys().next().value
-            if (oldest === undefined) {
-                break
-            }
-            this.jobs.delete(oldest)
+        ItGenJobGate.setCapped(this.jobs, jobId, itGen)
+    }
+
+    /** A beamed repo of this job (the parent web job) opts in through its beam-map entry. */
+    rememberBeamOptIn(jobId: string): void {
+        if (!this.isKnownItGenJob(jobId)) {
+            this.log(`ATX: job ${jobId} has a beamed repo with generateIntegrationTests`)
         }
+        this.rememberFlag(jobId, true)
+        this.beamChecks.delete(jobId)
     }
 
     rememberObjective(jobId: string, objective: string | undefined): boolean {
@@ -75,7 +90,58 @@ export class ItGenJobGate {
         return this.rememberObjective(jobId, job.objective)
     }
 
+    /**
+     * For a beamed repo, whose job is the parent web job: its objective never opts in, its beam-map entries do. When
+     * neither the objective nor an earlier read says yes, reads the beam-map (at most once per beamRecheckMs, or
+     * beamRetryMs when the last read couldn't tell). With `waitForBeamMap` false (a poll) the read runs in the
+     * background and the gate turns on from the next call.
+     */
+    async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
+        if (await this.isItGenJob(workspaceId, jobId)) {
+            return true
+        }
+        // A background read can record the opt-in while isItGenJob is awaited: check again before reading.
+        if (this.isKnownItGenJob(jobId)) {
+            return true
+        }
+        const nextCheck = this.beamChecks.get(jobId)
+        if (!this.readBeamOptIn || (nextCheck !== undefined && this.now() < nextCheck)) {
+            return false
+        }
+        // Set before the read starts, so calls while it runs don't start another one.
+        ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRetryMs)
+        const read = this.readBeamOptIn(workspaceId, jobId).then(
+            optIn => {
+                if (optIn === true) {
+                    this.rememberBeamOptIn(jobId)
+                } else if (optIn === false) {
+                    ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRecheckMs)
+                }
+            },
+            error => this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)
+        )
+        if (!waitForBeamMap) {
+            return false
+        }
+        await read
+        return this.isKnownItGenJob(jobId)
+    }
+
     forget(jobId: string): void {
         this.jobs.delete(jobId)
+        this.beamChecks.delete(jobId)
+    }
+
+    // Insert as the newest entry; drop the oldest beyond maxJobs.
+    private static setCapped<T>(map: Map<string, T>, jobId: string, value: T): void {
+        map.delete(jobId)
+        map.set(jobId, value)
+        while (map.size > ItGenJobGate.maxJobs) {
+            const oldest = map.keys().next().value
+            if (oldest === undefined) {
+                break
+            }
+            map.delete(oldest)
+        }
     }
 }

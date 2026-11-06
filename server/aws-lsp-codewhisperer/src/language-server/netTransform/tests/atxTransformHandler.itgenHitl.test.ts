@@ -189,6 +189,144 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         })
     })
 
+    // A beamed repo: the job is the parent web job, whose objective never opts in; the repo's beam-map entry does.
+    // Sibling beamed repos in the same parent job have their own integ-* HITLs.
+    describe('beamed repo', () => {
+        const SCOPE = 'repo-a,repo-a-lv,step-launch,step-run'
+        const siblingLaunch = { taskId: 'task-sib', tag: ATX_HITL_TAG_INTEG_APP_LAUNCH, planStepId: 'repo-b-launch' }
+        let beamMapStub: sinon.SinonStub
+        let beamOptIn: boolean
+        // The beam-map read finishes only when a test releases it, like a real scan that takes a while.
+        let releaseBeamMap: () => void
+        let beamMapRead: Promise<void>
+
+        const beamPoll = (scope = SCOPE) =>
+            handler.getTransformInfo({
+                TransformationJobId: JOB_ID,
+                WorkspaceId: WS_ID,
+                SolutionRootPath: tmpRoot,
+                IsBeam: true,
+                beamScopeStepIds: scope,
+            } as any)
+
+        beforeEach(() => {
+            setItGen(false)
+            beamOptIn = true
+            beamMapRead = new Promise<void>(resolve => (releaseBeamMap = resolve))
+            // The gate's beam-map reader: true when a beam-map entry has generateIntegrationTests: true.
+            beamMapStub = sinon.stub(handler as any, 'readBeamOptIn').callsFake(async () => {
+                await beamMapRead
+                return beamOptIn
+            })
+        })
+
+        it("turns ITGen on from the repo's beam-map opt-in, without the objective, from the next poll", async () => {
+            hitls = [appLaunchHitl]
+
+            // The poll doesn't wait for the beam-map read.
+            const first = await beamPoll()
+            expect(first?.OpenHitls).to.be.undefined
+            releaseBeamMap()
+            await beamMapRead
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_APP_LAUNCH)
+            expect(result?.HitlTaskId).to.equal('task-launch')
+            expect(beamMapStub.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+            expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-launch'])
+        })
+
+        it("never surfaces or lists a sibling repo's integ-* HITL", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [siblingLaunch, testRunHitl]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTaskId).to.equal('task-run')
+            expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
+        })
+
+        for (const status of ['PLANNING', 'AWAITING_HUMAN_INPUT']) {
+            it(`never surfaces a sibling repo's integ-* HITL on a ${status} job`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch, testRunHitl]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.equal('task-run')
+                expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
+            })
+
+            it(`surfaces nothing on a ${status} job when only a sibling repo's integ-* HITL is open`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.be.undefined
+                expect(result?.OpenHitls).to.deep.equal([])
+            })
+        }
+
+        it("surfaces nothing when only a sibling repo's integ-* HITL is open", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [siblingLaunch]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(result?.OpenHitls).to.deep.equal([])
+        })
+
+        it("doesn't count a sibling's integ-* HITL next to sibling LBVs as in scope", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [
+                { taskId: 'task-sib-lbv', tag: 'local-build-verification', planStepId: 'repo-b-lbv' },
+                siblingLaunch,
+            ]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTaskId).to.be.undefined
+        })
+
+        it("keeps ITGen off when the beam-map doesn't opt in, and doesn't re-read it every poll", async () => {
+            beamOptIn = false
+            releaseBeamMap()
+            hitls = [appLaunchHitl]
+
+            const first = await beamPoll()
+            await beamMapRead
+            await beamPoll()
+
+            // OpenHitls is ITGen-only; with ITGen off the integ-* tag is just an unknown tag, as before.
+            expect(first?.OpenHitls).to.be.undefined
+            expect(beamMapStub.calledOnce).to.be.true
+        })
+
+        it('never delays a poll for a beam-map read that is still running', async () => {
+            hitls = [appLaunchHitl]
+
+            // beamMapRead is never released here: the poll must still come back.
+            const result = await beamPoll()
+
+            expect(result).to.not.be.null
+            expect(beamMapStub.calledOnce).to.be.true
+        })
+
+        it('never reads the beam-map for a job that is not beamed', async () => {
+            hitls = [appLaunchHitl]
+
+            await poll()
+
+            expect(beamMapStub.called).to.be.false
+        })
+    })
+
     // For a job without generate_integration_tests an integ-* tag is just an unknown tag: every path must behave exactly as it
     // did before ITGen, and nothing ITGen-specific (request.json, tests download) may happen.
     describe('job without generate_integration_tests: existing behavior unchanged', () => {

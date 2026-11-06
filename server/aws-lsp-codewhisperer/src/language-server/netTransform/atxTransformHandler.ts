@@ -155,6 +155,8 @@ interface DiffApplyContext {
 // and the original-code artifact it came from; a copy is reused only when both match.
 const ORIGINAL_CODE_FOLDER = 'before'
 const ORIGINAL_CODE_JOB_MARKER = '.atx-itgen-job'
+// The marker the VS coordinator checks before it starts the original app: the plain job id (OriginalCodeBackup).
+const ORIGINAL_CODE_IDE_JOB_MARKER = '.atx-job-id'
 
 interface OriginalCodeMarker {
     jobId: string
@@ -189,6 +191,9 @@ interface BeamMapRepo {
     // ITGen: the repo's ORIGINAL (pre-transformation) source zip, saved by the web job before
     // transforming. The IDE builds and starts it to record the test baseline.
     originalArtifactId?: string
+    // ITGen: true when this beamed repo runs Local Verification. The parent web job's objective never has
+    // generate_integration_tests, so this is the only signal for a beamed repo.
+    generateIntegrationTests?: boolean
 }
 
 /** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
@@ -200,6 +205,8 @@ interface BeamedRepoInfo {
     BeamScenario: string
     // '' when the web job didn't save an original (tests not requested, or flag off).
     OriginalArtifactId: string
+    // false when the beam-map entry doesn't opt in, or the repo came from the beam-status fallback.
+    GenerateIntegrationTests: boolean
     IsLbvOpen: boolean
     // Beamed but LBV HITL not created yet (no beamed node / no LBV child / no plan). IDE shows Load
     // only when IsLbvOpen && !IsLbvPending, so a repo can't be Loaded before its HITL exists.
@@ -261,7 +268,8 @@ export class ATXTransformHandler {
     // ITGen: whether each job's objective has generate_integration_tests: true (see ItGenJobGate).
     private readonly itGenJobs = new ItGenJobGate(
         (workspaceId, jobId) => this.getJob(workspaceId, jobId, true),
-        message => this.logging.log(message)
+        message => this.logging.log(message),
+        (workspaceId, jobId) => this.readBeamOptIn(workspaceId, jobId)
     )
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
@@ -771,6 +779,24 @@ export class ATXTransformHandler {
      * by listing the parent job's artifacts and picking the beam-map JSON.
      */
     async listBeamedRepos(workspaceId: string, parentJobId: string, lightweight = false): Promise<BeamedRepoInfo[]> {
+        return (await this.discoverBeamedRepos(workspaceId, parentJobId, lightweight)).repos
+    }
+
+    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob). Undefined when the beam-map wasn't read. */
+    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | undefined> {
+        const { repos, beamMapScanned } = await this.discoverBeamedRepos(workspaceId, jobId, false)
+        return beamMapScanned ? repos.some(r => r.GenerateIntegrationTests) : undefined
+    }
+
+    /**
+     * listBeamedRepos, plus whether the beam-map scan ran to the end, so a "no opt-in" answer can be told apart
+     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error).
+     */
+    private async discoverBeamedRepos(
+        workspaceId: string,
+        parentJobId: string,
+        lightweight: boolean
+    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -896,6 +922,7 @@ export class ATXTransformHandler {
                 )
             }
             const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
+            let scanCutShort = false
             this.logging.log(
                 `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
             )
@@ -905,6 +932,7 @@ export class ATXTransformHandler {
                     this.logging.log(
                         `[BEAM-PKG] beam-map scan: time budget (${BEAM_MAP_SCAN_BUDGET_MS}ms) exceeded — stopping scan`
                     )
+                    scanCutShort = true
                     break
                 }
                 try {
@@ -990,6 +1018,7 @@ export class ATXTransformHandler {
                         BeamTargetFramework: nr.BeamTargetFramework || '',
                         BeamScenario: nr.BeamScenario || 'transformed',
                         OriginalArtifactId: nr.OriginalArtifactId || '',
+                        GenerateIntegrationTests: nr.GenerateIntegrationTests,
                         IsLbvOpen: lbvOpen,
                         IsLbvPending: lbvPending,
                     })
@@ -1046,8 +1075,9 @@ export class ATXTransformHandler {
                             BeamStepId: '',
                             BeamTargetFramework: '',
                             BeamScenario: 'transformed',
-                            // Beam-status fallback has no beam-map entry, so no original id.
+                            // Beam-status fallback has no beam-map entry, so no original id and no ITGen.
                             OriginalArtifactId: '',
+                            GenerateIntegrationTests: false,
                             IsLbvOpen: lbvOpen,
                             IsLbvPending: lbvPending,
                         })
@@ -1067,11 +1097,18 @@ export class ATXTransformHandler {
                 }
             }
 
+            // ITGen: the parent job runs Local Verification for its beamed repos when any of them opts in.
+            if (beamed.some(r => r.GenerateIntegrationTests)) {
+                this.itGenJobs.rememberBeamOptIn(parentJobId)
+            }
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
-            return beamed
+            return {
+                repos: beamed,
+                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort,
+            }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return []
+            return { repos: [], beamMapScanned: false }
         }
     }
 
@@ -1111,6 +1148,24 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Beam-to-IDE, ITGen: drops the integ-* HITLs outside the loaded repo's subtree (a sibling beamed repo's) and
+     * the ones with no step id, which can't be shown to belong to it. Unchanged when no scope is set (non-beam).
+     */
+    private withoutSiblingItGenHitls(hitls: any[], scopeStepIds: string[]): any[] {
+        if (scopeStepIds.length === 0) {
+            return hitls
+        }
+        return hitls.filter(h => !isItGenHitlTag(h.tag) || scopeStepIds.includes(String(this.getStepId(h) ?? '')))
+    }
+
+    private static parseScopeStepIds(beamScopeStepIds: string | undefined): string[] {
+        return (beamScopeStepIds || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+    }
+
+    /**
      * Normalize a beam-map repo item into the PascalCase shape the C# IDE consumes,
      * tolerant of key-name variants from the web writer (repoName/repo/name,
      * artifactId/beamArtifactId, stepId/planStepId, targetFramework/tfm).
@@ -1124,6 +1179,7 @@ export class ATXTransformHandler {
             BeamTargetFramework: o.targetFramework ?? o.tfm ?? o.target_framework ?? '',
             BeamScenario: o.scenario ?? 'transformed',
             OriginalArtifactId: o.originalArtifactId ?? '',
+            GenerateIntegrationTests: o.generateIntegrationTests === true,
         }
     }
 
@@ -1340,7 +1396,8 @@ export class ATXTransformHandler {
         if (!isSafePathSegment(jobId)) {
             return { Success: false, Error: 'Invalid job id for original code' }
         }
-        if (!(await this.isItGenJob(workspaceId, jobId))) {
+        // Only beamed repos download their original, and for them `jobId` is the parent web job.
+        if (!(await this.itGenJobs.isBeamItGenJob(workspaceId, jobId))) {
             return { Success: false, Error: 'downloadOriginalCode requires a job with generate_integration_tests' }
         }
         const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
@@ -1366,12 +1423,18 @@ export class ATXTransformHandler {
         originalDir: string
     ): Promise<AtxDownloadOriginalCodeResponse> {
         const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
+        const ideMarker = path.join(originalDir, ORIGINAL_CODE_IDE_JOB_MARKER)
         let stagingDir: string | undefined
         try {
             // Before the reuse check, so leftovers from an earlier interrupted call go even when the copy is reused.
             await this.removeOriginalCodeLeftovers(originalDir)
-            const current = this.readOriginalCodeMarker(marker)
-            if (current?.jobId === jobId && current.codeArtifactId === codeArtifactId) {
+            const current = await this.readOriginalCodeMarker(marker)
+            // A copy without the IDE's marker (written before it was added) is replaced: VS wouldn't start it.
+            if (
+                current?.jobId === jobId &&
+                current.codeArtifactId === codeArtifactId &&
+                (await this.readOriginalCodeIdeMarker(ideMarker)) === jobId
+            ) {
                 this.logging.log(`ATX: downloadOriginalCode: reusing ${codeArtifactId} at ${originalDir}`)
                 return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
             }
@@ -1402,10 +1465,12 @@ export class ATXTransformHandler {
                 }
             }
             const newMarker: OriginalCodeMarker = { jobId, codeArtifactId }
-            fs.writeFileSync(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_IDE_JOB_MARKER), jobId, 'utf8')
 
-            // Swap. The old marker goes first: from here on the old copy is never reused.
+            // Swap. The old markers go first: from here on the old copy is never reused or started.
             fs.rmSync(marker, { force: true })
+            fs.rmSync(ideMarker, { force: true })
             let aside: string | undefined
             if (fs.existsSync(originalDir)) {
                 aside = `${originalDir}.old-${uuidv4()}`
@@ -1447,11 +1512,19 @@ export class ATXTransformHandler {
         }
     }
 
-    /** Null for a missing, unreadable or older plain-text marker, so those copies are replaced. */
-    private readOriginalCodeMarker(markerPath: string): OriginalCodeMarker | null {
+    /** The job id in the IDE's marker; null when it's missing or unreadable. */
+    private async readOriginalCodeIdeMarker(markerPath: string): Promise<string | null> {
         try {
-            if (!fs.existsSync(markerPath)) return null
-            const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'))
+            return (await fs.promises.readFile(markerPath, 'utf8')).trim()
+        } catch {
+            return null
+        }
+    }
+
+    /** Null for a missing, unreadable or older plain-text marker, so those copies are replaced. */
+    private async readOriginalCodeMarker(markerPath: string): Promise<OriginalCodeMarker | null> {
+        try {
+            const parsed = JSON.parse(await fs.promises.readFile(markerPath, 'utf8'))
             return typeof parsed?.jobId === 'string' && typeof parsed?.codeArtifactId === 'string' ? parsed : null
         } catch {
             return null
@@ -2476,13 +2549,15 @@ export class ATXTransformHandler {
                 return null
             }
 
-            const hitls = await this.listHitls(workspaceId, jobId)
+            const listedHitls = await this.listHitls(workspaceId, jobId)
 
-            if (!hitls) {
+            if (!listedHitls) {
                 this.logging.log(`ATX: Could not list hitls`)
                 lookup.failed = true
                 return null
             }
+            const scopeStepIds = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
+            const hitls = this.withoutSiblingItGenHitls(listedHitls, scopeStepIds)
 
             if (hitls.length === 0) {
                 this.logging.log(`ATX: No hitls available`)
@@ -2499,10 +2574,6 @@ export class ATXTransformHandler {
             // picking the plain first (below) may return a SIBLING's, shadowing the loaded repo's
             // own HITL so it never builds unless loaded in list order. Tolerate any stepId field
             // spelling (stepId/planStepId/parentStepId), same as the forwarding path.
-            const scopeStepIds = (beamScopeStepIds || '')
-                .split(',')
-                .map(s => s.trim())
-                .filter(s => s.length > 0)
             const { scopedLbv, allOutOfScopeLbv } = this.selectScopedLbvHitl(hitls, scopeStepIds)
             if (scopeStepIds.length > 0) {
                 this.logging.log(
@@ -2664,6 +2735,11 @@ export class ATXTransformHandler {
         const diffContext: DiffApplyContext = { failed: false, failedStepIds: [] }
         this._currentDiffContext = diffContext
         try {
+            // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never reads
+            // the job's objective otherwise. A beam-map read it needs runs in the background, so it never delays a poll.
+            if (request.IsBeam === true) {
+                await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
+            }
             const result = await this._getTransformInfoInternal(request, diffContext)
             if (result && diffContext.failed) {
                 result.DiffApplyFailed = true
@@ -2687,7 +2763,10 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    this._currentPollHitls
+                    this.withoutSiblingItGenHitls(
+                        this._currentPollHitls,
+                        ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                    )
                 )
             }
             return result
@@ -2857,12 +2936,11 @@ export class ATXTransformHandler {
                     // list (which may be a sibling's on a multi-repo beam job → shadows the loaded
                     // repo). Same selection rule as getHitlAgentArtifact; applies to the EXECUTING
                     // path too since a beam job surfaces its LBV HITL here.
-                    const execScopeStepIds = (request.beamScopeStepIds || '')
-                        .split(',')
-                        .map(s => s.trim())
-                        .filter(s => s.length > 0)
+                    const execScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                    // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
+                    const scopedBlockingHitls = this.withoutSiblingItGenHitls(blockingHitls, execScopeStepIds)
                     const { scopedLbv: scopedExecLbv, allOutOfScopeLbv: execAllOutOfScope } = this.selectScopedLbvHitl(
-                        blockingHitls,
+                        scopedBlockingHitls,
                         execScopeStepIds
                     )
                     if (execScopeStepIds.length > 0) {
@@ -2894,8 +2972,8 @@ export class ATXTransformHandler {
                     // from the fallback pool in that case; only non-LBV blocking HITLs remain.
                     const execFallbackPool =
                         execScopeStepIds.length > 0 && !scopedExecLbv
-                            ? blockingHitls.filter(h => h.tag !== 'local-build-verification')
-                            : blockingHitls
+                            ? scopedBlockingHitls.filter(h => h.tag !== 'local-build-verification')
+                            : scopedBlockingHitls
                     const execHitl =
                         scopedExecLbv ||
                         execFallbackPool.find(h => h.tag === 'local-build-verification') ||
@@ -2973,16 +3051,15 @@ export class ATXTransformHandler {
                 // in-scope one (parity with AWAITING_HUMAN_INPUT). No-op when scope is empty, so non-beam is unchanged.
                 const hitls = await this.listHitls(request.WorkspaceId, request.TransformationJobId)
                 if (hitls && hitls.length > 0) {
-                    const planScopeStepIds = (request.beamScopeStepIds || '')
-                        .split(',')
-                        .map(s => s.trim())
-                        .filter(s => s.length > 0)
+                    const planScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                    // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
+                    const scopedPlanHitls = this.withoutSiblingItGenHitls(hitls, planScopeStepIds)
                     const { scopedLbv: scopedPlanLbv, allOutOfScopeLbv: planAllOutOfScopeLbv } =
-                        this.selectScopedLbvHitl(hitls, planScopeStepIds)
+                        this.selectScopedLbvHitl(scopedPlanHitls, planScopeStepIds)
                     // Beam multi-repo parity with EXECUTING / getHitlAgentArtifact: if scope is set and every
-                    // pending HITL is a sibling repo's LBV (none in the loaded repo's subtree), do NOT surface a
-                    // sibling's LBV — return plan-only. Prevents handing the IDE another repo's build HITL.
-                    if (planScopeStepIds.length > 0 && planAllOutOfScopeLbv) {
+                    // pending HITL is a sibling repo's (none in the loaded repo's subtree), do NOT surface a
+                    // sibling's HITL — return plan-only. Prevents handing the IDE another repo's HITL.
+                    if (planScopeStepIds.length > 0 && (planAllOutOfScopeLbv || scopedPlanHitls.length === 0)) {
                         this.logging.log(
                             'ATX: PLANNING job — all pending HITLs are sibling-repo LBV (none in loaded scope); not surfacing'
                         )
@@ -2999,8 +3076,8 @@ export class ATXTransformHandler {
                     // pool so the plain find() below can't select a sibling's LBV (mixed pending-set case).
                     const planFallbackPool =
                         planScopeStepIds.length > 0 && !scopedPlanLbv
-                            ? hitls.filter(h => h.tag !== 'local-build-verification')
-                            : hitls
+                            ? scopedPlanHitls.filter(h => h.tag !== 'local-build-verification')
+                            : scopedPlanHitls
                     const hitl =
                         scopedPlanLbv ||
                         planFallbackPool.find(h => h.tag === 'local-build-verification') ||
@@ -3250,10 +3327,12 @@ export class ATXTransformHandler {
      * Handles HITL during planning phase - downloads plan.md and report.md for user review.
      */
     private async handlePlanningPhaseHitl(request: AtxGetTransformInfoRequest): Promise<AtxGetTransformInfoResponse> {
+        // Beam-to-IDE: the loaded repo's scope, as in handleAwaitingHumanInput, so a sibling repo's HITL isn't picked.
         const response = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
-            request.SolutionRootPath
+            request.SolutionRootPath,
+            request.beamScopeStepIds
         )
 
         this.logging.log(

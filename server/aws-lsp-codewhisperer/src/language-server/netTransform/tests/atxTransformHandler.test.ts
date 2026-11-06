@@ -5383,6 +5383,16 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const nr = (handler as any).normalizeBeamRepo({ repoName: 'alice', originalArtifactId: 'orig-1' })
             expect(nr.OriginalArtifactId).to.equal('orig-1')
         })
+
+        it('maps generateIntegrationTests only as a real true', () => {
+            const flag = (value: unknown) =>
+                (handler as any).normalizeBeamRepo({ repoName: 'alice', generateIntegrationTests: value })
+                    .GenerateIntegrationTests
+            expect(flag(true)).to.equal(true)
+            for (const value of [false, 'true', 1, undefined, null]) {
+                expect(flag(value)).to.equal(false)
+            }
+        })
     })
 
     // --- listBeamedRepos: the core discovery function (empty / beam-map / beam-status / regex) ---
@@ -5433,6 +5443,72 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(result[0].OriginalArtifactId).to.equal('orig-alice')
             // The transformed source stays the beam artifact; the original never replaces it.
             expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('turns ITGen on for the parent job when a beamed repo opts in, and only then', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [
+                    {
+                        repoName: 'alice',
+                        stepId: 's1',
+                        originalArtifactId: 'orig-alice',
+                        generateIntegrationTests: true,
+                    },
+                    { repoName: 'bob', stepId: 's2' },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result.map((r: any) => [r.RepositoryName, r.GenerateIntegrationTests])).to.deep.equal([
+                ['alice', true],
+                ['bob', false],
+            ])
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+
+            mapStub.resolves({ repos: [{ repoName: 'alice', stepId: 's1' }] })
+            await handler.listBeamedRepos('ws-1', 'job-2')
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-2')).to.be.false
+        })
+
+        it("tells the gate whether a beam-map opts in, and that it can't tell when the scan was skipped", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            })
+            const readBeamOptIn = (jobId: string) => (handler as any).readBeamOptIn('ws-1', jobId)
+
+            expect(await readBeamOptIn('job-1')).to.equal(true)
+
+            mapStub.resolves({ repos: [{ repoName: 'alice', stepId: 's1' }] })
+            expect(await readBeamOptIn('job-2')).to.equal(false)
+
+            // Throttle cooldown: the beam-map scan is skipped, so "no opt-in" can't be told apart from "not read".
+            ;(handler as any).beamThrottleCooldownUntilMs = Date.now() + 60_000
+            expect(await readBeamOptIn('job-3')).to.equal(undefined)
+        })
+
+        it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'st-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result[0].GenerateIntegrationTests).to.equal(false)
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.false
         })
 
         it('rejects malformed beam-map entries (no usable repo name)', async () => {
@@ -5520,8 +5596,12 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         const originalDir = () => path.join(workspaceDir(), 'before')
         const marker = () => path.join(originalDir(), '.atx-itgen-job')
         const readMarker = () => JSON.parse(fs.readFileSync(marker(), 'utf8'))
-        const writeMarker = (jobId: string, codeArtifactId: string) =>
+        const ideMarker = () => path.join(originalDir(), '.atx-job-id')
+        // A complete copy has both markers: the LS's and the plain job id the VS coordinator checks.
+        const writeMarker = (jobId: string, codeArtifactId: string) => {
             fs.writeFileSync(marker(), JSON.stringify({ jobId, codeArtifactId }))
+            fs.writeFileSync(ideMarker(), jobId)
+        }
         // Staging (before.partial-*) and moved-aside (before.old-*) folders left next to before.
         const leftovers = () =>
             fs.existsSync(workspaceDir()) ? fs.readdirSync(workspaceDir()).filter(n => n.startsWith('before.')) : []
@@ -5557,6 +5637,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
 
         it('refuses for a job without generate_integration_tests and touches nothing', async () => {
             ;(handler as any).itGenJobs.rememberFlag('job-1', false)
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
             const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
 
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
@@ -5606,6 +5687,35 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(fs.existsSync(path.join(originalDir(), 'original-source.zip'))).to.be.false
             expect(leftovers()).to.deep.equal([])
             expect(readMarker()).to.deep.equal({ jobId: 'job-1', codeArtifactId: 'orig-1' })
+            // Exactly the job id, no newline or BOM: what OriginalCodeBackup writes and the coordinator compares.
+            expect(fs.readFileSync(ideMarker())).to.deep.equal(Buffer.from('job-1', 'utf8'))
+        })
+
+        it("downloads again over a copy that has only the LS's marker (written before the IDE's marker existed)", async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(marker(), JSON.stringify({ jobId: 'job-1', codeArtifactId: 'orig-1' }))
+            const urlStub = presigned()
+            stubExtract()
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.AlreadyPresent).to.be.false
+            expect(urlStub.calledOnce).to.be.true
+            expect(fs.readFileSync(ideMarker(), 'utf8')).to.equal('job-1')
+        })
+
+        it("downloads for a beamed repo's parent web job once its beam-map opts in", async () => {
+            ;(handler as any).itGenJobs.forget('job-1')
+            sinon.stub(handler, 'getJob').resolves({ objective: '{}' } as any)
+            const listStub = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
+            presigned()
+            stubExtract()
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.true
+            expect(listStub.calledOnceWith('ws-1', 'job-1')).to.be.true
+            expect(fs.readFileSync(ideMarker(), 'utf8')).to.equal('job-1')
         })
 
         it('stubs the MSBuild walk-up files the original lacks and keeps the ones it has', async () => {
