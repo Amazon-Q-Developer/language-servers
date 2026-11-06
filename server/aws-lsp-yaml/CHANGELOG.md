@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.28](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-yaml/v0.1.27...lsp-yaml/v0.1.28) (2026-11-05)
+
+
+### Bug Fixes
+
+* **lsp-yaml:** load the schema once instead of on every request ([#3017](https://github.com/Amazon-Q-Developer/language-servers/issues/3017)) ([86a471c](https://github.com/Amazon-Q-Developer/language-servers/commit/86a471c9c156a18222c0b6cba1e8ceb08ca4718a))
+
 ## [0.1.27](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-yaml/v0.1.26...lsp-yaml/v0.1.27) (2026-08-18)
 
 

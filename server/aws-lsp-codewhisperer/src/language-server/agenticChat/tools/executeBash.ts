@@ -199,6 +199,11 @@ export class ExecuteBash {
                 }
             }
 
+            // Tokenization does not evaluate shell syntax. Retain the raw approval requirement,
+            // including quoted or escaped markers, while collecting category and warning metadata.
+            const expansionPattern = IS_WINDOWS_PLATFORM ? /[%!^*?[\]]/ : /[$`{}*?[\]]/
+            const requiresShellApproval = expansionPattern.test(params.command) || /[<>();&|\r\n]/.test(params.command)
+
             const args = split(params.command)
             if (!args || args.length === 0) {
                 return { requiresAcceptance: true }
@@ -398,8 +403,8 @@ export class ExecuteBash {
                 }
             }
 
-            // If we've checked all commands and none required acceptance, we're good
-            return { requiresAcceptance: false, commandCategory: highestCommandCategory }
+            // Only simple commands that passed every check can run without approval.
+            return { requiresAcceptance: requiresShellApproval, commandCategory: highestCommandCategory }
         } catch (error) {
             this.logging.warn(`Error while checking acceptance: ${(error as Error).message}`)
             return { requiresAcceptance: true, commandCategory: CommandCategory.ReadOnly }

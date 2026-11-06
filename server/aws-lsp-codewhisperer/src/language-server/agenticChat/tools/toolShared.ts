@@ -60,6 +60,10 @@ export function requireResolvedTarget(input: object, toolName: string): CheckedT
     return requireResolvedTargets(input, toolName, 1)[0]
 }
 
+function errnoError(code: string, message: string): NodeJS.ErrnoException {
+    return Object.assign(new Error(message), { code })
+}
+
 /**
  * Resolve a path to its canonical on-disk location in a symlink-aware way,
  * including when the final path segment is a symlink whose target does not
@@ -72,8 +76,10 @@ export function requireResolvedTarget(input: object, toolName: string): CheckedT
  * remaining not-yet-created segments. The returned path therefore reflects
  * where a subsequent read or write would actually land, so a workspace
  * boundary check cannot be fooled by an in-workspace link name whose target
- * points outside the workspace. A `visited` set bounds symlink-cycle
- * traversal.
+ * points outside the workspace.
+ *
+ * Any other failure is propagated rather than recovered from, so a caller can
+ * always distinguish a resolved location from one that could not be resolved.
  */
 export async function resolveSymlinkAwarePath(inputPath: string): Promise<string> {
     let current = path.resolve(inputPath)
@@ -84,7 +90,11 @@ export async function resolveSymlinkAwarePath(inputPath: string): Promise<string
         let stats: fs.Stats
         try {
             stats = await fs.promises.lstat(current)
-        } catch {
+        } catch (error) {
+            // Only ENOENT means "not created yet"; other errors are propagated.
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw error
+            }
             // `current` does not exist even as a symlink: resolve its existing
             // ancestor chain (which may traverse symlinked directories) and
             // re-append the final, not-yet-created segment.
@@ -98,8 +108,7 @@ export async function resolveSymlinkAwarePath(inputPath: string): Promise<string
 
         if (stats.isSymbolicLink()) {
             if (visited.has(current)) {
-                // Cyclic symlink: stop resolving and return what we have.
-                return current
+                throw errnoError('ELOOP', `Too many levels of symbolic links: ${inputPath}`)
             }
             visited.add(current)
             const linkTarget = await fs.promises.readlink(current)
@@ -109,11 +118,7 @@ export async function resolveSymlinkAwarePath(inputPath: string): Promise<string
 
         // `current` exists and is not a symlink: canonicalize it, which also
         // resolves any symlinked ancestor directories.
-        try {
-            return await fs.promises.realpath(current)
-        } catch {
-            return current
-        }
+        return await fs.promises.realpath(current)
     }
 }
 

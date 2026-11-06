@@ -101,6 +101,10 @@ describe('OAuthClient helpers', () => {
             'http://localhost:8080/token',
             'http://127.0.0.1/token',
             'http://127.0.0.2/token',
+            'http://127.255.255.254/token',
+            'http://127.1/token',
+            'http://2130706433/token',
+            'http://0x7f000001/token',
             'http://[::1]/token',
         ]) {
             it(`allows ${endpoint}`, () => {
@@ -111,6 +115,12 @@ describe('OAuthClient helpers', () => {
         for (const endpoint of [
             'http://auth.example.com/token',
             'http://localhost.example.com/token',
+            'http://127.example.com/token',
+            'http://127.0.0.1.example.com/token',
+            'http://128.0.0.1/token',
+            'http://0.0.0.0/token',
+            'http://[::]/token',
+            'http://127.0.0.1@auth.example.com/token',
             'ftp://auth.example.com/token',
             'not a url',
         ]) {

@@ -1,7 +1,8 @@
 import * as assert from 'assert'
+import * as fs from 'fs'
 import * as path from 'path'
 import sinon from 'ts-sinon'
-import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance } from './toolShared'
+import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance, resolveSymlinkAwarePath } from './toolShared'
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
@@ -1115,6 +1116,107 @@ describe('toolShared', () => {
                         '(see agenticChatController), not every path a tool has touched.'
                 )
             })
+        })
+    })
+
+    describe('resolveSymlinkAwarePath error handling', () => {
+        // Resolution errors are propagated rather than recovered from. The
+        // filesystem is stubbed so each error code is exercised deterministically;
+        // canonicalizationFailure.test.ts covers the real-filesystem case.
+        const errno = (code: string) => Object.assign(new Error(code), { code })
+        const file = (): fs.Stats => ({ isSymbolicLink: () => false }) as unknown as fs.Stats
+        const link = (): fs.Stats => ({ isSymbolicLink: () => true }) as unknown as fs.Stats
+        const input = path.resolve(path.sep, 'ws', 'dir', 'file.txt')
+
+        afterEach(() => {
+            sinon.restore()
+        })
+
+        it('returns the realpath of an existing non-symlink path', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').resolves(path.resolve(path.sep, 'real', 'file.txt'))
+
+            assert.strictEqual(await resolveSymlinkAwarePath(input), path.resolve(path.sep, 'real', 'file.txt'))
+        })
+
+        it('rejects when realpath fails', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').rejects(errno('ENAMETOOLONG'))
+
+            await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ENAMETOOLONG')
+                return true
+            })
+        })
+
+        it('rejects when lstat fails for a reason other than ENOENT', async () => {
+            for (const code of ['EACCES', 'ENAMETOOLONG', 'ENOTDIR', 'ELOOP']) {
+                sinon.restore()
+                sinon.stub(fs.promises, 'lstat').rejects(errno(code))
+                const realpath = sinon.stub(fs.promises, 'realpath')
+
+                await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                    assert.strictEqual(error.code, code, `lstat ${code} must propagate`)
+                    return true
+                })
+                assert.strictEqual(realpath.called, false, `must not fall through to the parent on ${code}`)
+            }
+        })
+
+        it('still resolves a not-yet-created leaf under an existing parent', async () => {
+            const parent = path.dirname(input)
+            const realParent = path.resolve(path.sep, 'real', 'dir')
+            const lstat = sinon.stub(fs.promises, 'lstat')
+            lstat.withArgs(input).rejects(errno('ENOENT'))
+            lstat.withArgs(parent).resolves(file())
+            sinon.stub(fs.promises, 'realpath').withArgs(parent).resolves(realParent)
+
+            assert.strictEqual(await resolveSymlinkAwarePath(input), path.join(realParent, 'file.txt'))
+        })
+
+        it('rejects a not-yet-created leaf when its parent cannot be canonicalized', async () => {
+            const parent = path.dirname(input)
+            const lstat = sinon.stub(fs.promises, 'lstat')
+            lstat.withArgs(input).rejects(errno('ENOENT'))
+            lstat.withArgs(parent).resolves(file())
+            sinon.stub(fs.promises, 'realpath').withArgs(parent).rejects(errno('ENAMETOOLONG'))
+
+            await assert.rejects(resolveSymlinkAwarePath(input), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ENAMETOOLONG')
+                return true
+            })
+        })
+
+        it('rejects a symlink cycle with ELOOP', async () => {
+            const a = path.resolve(path.sep, 'ws', 'a')
+            const b = path.resolve(path.sep, 'ws', 'b')
+            sinon.stub(fs.promises, 'lstat').resolves(link())
+            const readlink = sinon.stub(fs.promises, 'readlink')
+            readlink.withArgs(a).resolves('b')
+            readlink.withArgs(b).resolves('a')
+            const realpath = sinon.stub(fs.promises, 'realpath')
+
+            await assert.rejects(resolveSymlinkAwarePath(a), (error: NodeJS.ErrnoException) => {
+                assert.strictEqual(error.code, 'ELOOP')
+                return true
+            })
+            assert.strictEqual(realpath.called, false)
+        })
+
+        it('is reported by requiresPathAcceptance as a validation error with no checked target', async () => {
+            sinon.stub(fs.promises, 'lstat').resolves(file())
+            sinon.stub(fs.promises, 'realpath').rejects(errno('ENAMETOOLONG'))
+            const workspace = {
+                getAllWorkspaceFolders: () => [{ uri: 'file:///ws', name: 'ws' }],
+            } as unknown as Features['workspace']
+            const logging = { error: sinon.stub(), debug: sinon.stub() } as unknown as Features['logging']
+
+            const result = await requiresPathAcceptance(input, 'fsRead', workspace, logging)
+
+            assert.strictEqual(result.requiresAcceptance, true)
+            assert.strictEqual((result.validationError as NodeJS.ErrnoException)?.code, 'ENAMETOOLONG')
+            assert.strictEqual(result.canonicalPaths, undefined)
+            assert.strictEqual(result.checkedTargets, undefined)
         })
     })
 })
