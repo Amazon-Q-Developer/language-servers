@@ -416,8 +416,9 @@ export type AtxTestRunStatus = 'COMPLETED' | 'TEST_BUILD_FAILED' | 'TIMED_OUT'
 /**
  * Request from the Transform agent to run one test project (request.json of an integ-test-run HITL)
  * against the app the IDE started for the preceding integ-app-launch. Only what the IDE can't work
- * out itself is sent: the IDE sets ATX_TEST_RUN_BASE_URL_ENV, AB_SIDE and AB_RUN_ID for the test
- * process, and the language server picks the download folder.
+ * out itself is sent: the IDE sets ATX_TEST_RUN_BASE_URL_ENV, AB_SIDE, AB_RUN_ID,
+ * AB_SCREENSHOTS_DIR and AB_TEST_ORDER for the test process, and the language server picks the
+ * download folder.
  * Matches C# AtxTestRunRequest class.
  */
 export interface AtxTestRunRequest {
@@ -438,6 +439,9 @@ export interface AtxTestRunRequest {
     limits: {
         projectTimeoutSeconds: number
     }
+    // 1.1, optional: the order to run the tests in, set in AB_TEST_ORDER. 'default' (by name),
+    // 'reverse' or 'shuffle:<seed>'. The agent asks for a second order before it freezes a suite
+    testOrder?: string
 }
 
 /**
@@ -505,6 +509,8 @@ export interface AtxTestRunSummary {
     side: AtxTestRunSide
     project: string
     status: AtxTestRunStatus
+    // The request's testOrder, when it asked for one: EVALUATE_PRE_RUN tells the two orders apart by it
+    testOrder?: string
     appUrl?: string
     startedAt?: string
     finishedAt?: string
