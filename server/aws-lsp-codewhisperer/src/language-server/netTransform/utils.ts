@@ -6,8 +6,29 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import AdmZip = require('adm-zip')
 import { v4 as uuidv4 } from 'uuid'
+import { Worker } from 'worker_threads'
 
 export const workspaceFolderName = 'artifactWorkspace'
+
+// Plain JS run via `new Worker(..., { eval: true })`; only Node built-ins are available here.
+const UPLOAD_WORKER_SOURCE = `
+const { parentPort, workerData } = require('worker_threads')
+const fs = require('fs')
+const { url, filePath, headers } = workerData
+const transport = new URL(url).protocol === 'http:' ? require('http') : require('https')
+const reqHeaders = { ...headers }
+if (!Object.keys(reqHeaders).some(k => k.toLowerCase() === 'content-length')) {
+    reqHeaders['Content-Length'] = fs.statSync(filePath).size
+}
+let done = false
+const finish = msg => { if (!done) { done = true; parentPort.postMessage(msg) } }
+const req = transport.request(url, { method: 'PUT', headers: reqHeaders }, res => {
+    res.resume()
+    res.on('end', () => finish({ statusCode: res.statusCode }))
+})
+req.on('error', e => finish({ error: String(e) }))
+fs.createReadStream(filePath).on('error', e => req.destroy(e)).pipe(req)
+`
 
 export class Utils {
     /**
@@ -42,6 +63,29 @@ export class Utils {
     }
 
     /**
+     * PUT a file from a worker thread. The worker has its own event loop, so long synchronous work on the
+     * main thread (e.g. the 30-minute workspace index refresh) can't stall the upload past S3's idle timeout.
+     */
+    static async putFileFromWorker(
+        url: string,
+        filePath: string,
+        headers: Record<string, string>
+    ): Promise<{ statusCode?: number }> {
+        return new Promise((resolve, reject) => {
+            const worker = new Worker(UPLOAD_WORKER_SOURCE, { eval: true, workerData: { url, filePath, headers } })
+            worker.once('message', (result: { statusCode?: number; error?: string }) => {
+                if (result.error) {
+                    reject(new Error(result.error))
+                } else {
+                    resolve(result)
+                }
+            })
+            worker.once('error', reject)
+            worker.once('exit', code => reject(new Error(`Upload worker exited with code ${code} before responding`)))
+        })
+    }
+
+    /**
      * Upload artifact to S3 using presigned URL and headers
      */
     static async uploadArtifact(
@@ -59,17 +103,15 @@ export class Utils {
                     headers[key] = Array.isArray(value) ? value[0] : value
                 })
             }
-            const fileStream = fs.createReadStream(filePath)
             logger?.info(`Artifact upload size: ${fs.statSync(filePath).size} bytes`)
-            const response = await got.put(s3PreSignedUrl, {
-                body: fileStream,
-                headers: headers,
-            })
+            const response = await Utils.putFileFromWorker(s3PreSignedUrl, filePath, headers)
             if (response.statusCode === 200) {
                 return true
-            } else {
-                return false
             }
+            logger?.error(
+                `Upload artifact error: Response code ${response.statusCode}, please see https://docs.aws.amazon.com/transform/latest/userguide/dotnet-ide-troubleshoot.html`
+            )
+            return false
         } catch (error) {
             logger?.error(
                 `Upload artifact error: ${String(error)}, please see https://docs.aws.amazon.com/transform/latest/userguide/dotnet-ide-troubleshoot.html`
@@ -232,9 +274,19 @@ export class Utils {
         zipEntries: AdmZip.IZipEntry[],
         logger: Logging
     ): Promise<void> {
+        // Resolve the extraction root once so every entry can be checked against it.
+        const extractRoot = path.resolve(pathContainingArchive)
         for (const entry of zipEntries) {
             try {
                 const entryPath = path.join(pathContainingArchive, entry.entryName)
+                // Zip-slip guard: reject any entry that resolves outside the extraction
+                // root (../ traversal or absolute paths). Archives can originate from a
+                // remote artifact, so a crafted entry must never write outside destDir.
+                const resolvedEntry = path.resolve(entryPath)
+                if (resolvedEntry !== extractRoot && !resolvedEntry.startsWith(extractRoot + path.sep)) {
+                    logger.error(`Blocked zip entry escaping extraction directory: ${entry.entryName}`)
+                    continue
+                }
                 if (entry.isDirectory) {
                     await fs.promises.mkdir(entryPath, { recursive: true })
                 } else {

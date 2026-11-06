@@ -9,7 +9,7 @@ import { getInitialContextInfo, getUserPromptsDirectory } from './contextUtils'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
 import { workspaceUtils } from '@aws/lsp-core'
 import { ChatDatabase } from '../tools/chatDb/chatDb'
-import { TriggerContext } from './agenticChatTriggerContext'
+import { TriggerContext, workspaceChunkMaxSize } from './agenticChatTriggerContext'
 import { expect } from 'chai'
 
 describe('AdditionalContextProvider', () => {
@@ -895,6 +895,53 @@ describe('AdditionalContextProvider', () => {
             assert.strictEqual(result.length, 1)
             // Should use content from the indexing library, not filesystem
             assert.strictEqual(result[0].innerContext, 'Content from indexing library')
+        })
+
+        it('should cap oversized context content and mark it as truncated', async () => {
+            const mockWorkspaceFolder = {
+                uri: URI.file('/workspace').toString(),
+                name: 'test',
+            }
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns(['/workspace'])
+            const triggerContext: TriggerContext = {
+                workspaceFolder: mockWorkspaceFolder,
+            }
+
+            fsExistsStub.callsFake((pathStr: string) => {
+                if (pathStr.includes(path.join('.amazonq', 'rules'))) {
+                    return Promise.resolve(true)
+                }
+                return Promise.resolve(false)
+            })
+            fsReadDirStub.resolves([{ name: 'rule1.md', isFile: () => true, isDirectory: () => false }])
+
+            const largeContent = 'line of text\n'.repeat(10_000)
+            assert.ok(largeContent.length > workspaceChunkMaxSize)
+
+            getContextCommandPromptStub
+                .onFirstCall()
+                .resolves([])
+                .onSecondCall()
+                .resolves([
+                    {
+                        name: 'Large Rule',
+                        description: 'Test Description',
+                        content: largeContent,
+                        filePath: '/workspace/.amazonq/rules/rule1.md',
+                        relativePath: '.amazonq/rules/rule1.md',
+                        startLine: 1,
+                        endLine: 10,
+                    },
+                ])
+
+            const result = await provider.getAdditionalContext(triggerContext, '')
+
+            assert.strictEqual(result.length, 1)
+            const innerContext = result[0].innerContext ?? ''
+            assert.strictEqual(innerContext.length, workspaceChunkMaxSize)
+            assert.ok(innerContext.startsWith('line of text\n'))
+            assert.ok(innerContext.includes('[Content truncated:'))
+            assert.ok(innerContext.includes(`${largeContent.length} characters`))
         })
 
         it('should handle filesystem read errors gracefully in fallback', async () => {
