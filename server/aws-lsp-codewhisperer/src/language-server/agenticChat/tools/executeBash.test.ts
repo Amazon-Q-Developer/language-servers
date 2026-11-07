@@ -9,6 +9,7 @@ import {
     CommandCategory,
     hasWindowsDrivePath,
     hasWindowsUncPath,
+    hasWindowsRootedPath,
 } from './executeBash'
 import { multiplyLinkedFileWarning } from './toolShared'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
@@ -1767,6 +1768,68 @@ describe('requiresAcceptance fails closed on Windows UNC and environment-variabl
         }
         const result = await new ExecuteBash(features).requiresAcceptance({
             command: 'type %USERPROFILE%\\secrets.txt',
+            cwd: 'C:\\workspace\\folder',
+        })
+        assert.equal(result.requiresAcceptance, true)
+    })
+})
+
+describe('hasWindowsRootedPath (Windows root-relative backslash detection)', () => {
+    // A path that begins with a backslash is corrupted by shlex (the leading backslash is deleted),
+    // so it must be detected in the raw command. These forms must be detected.
+    const rootedCommands = [
+        'type \\Users\\alice\\.aws\\credentials', // type \Users\alice\.aws\credentials
+        'dir \\Windows\\System32', // dir \Windows\System32
+        '\\server\\share\\file', // rooted path as the first token
+        'dir \\\\host\\share', // UNC is a superset of a leading backslash
+        'type "\\Users\\alice\\secrets.txt"', // quoted rooted path
+    ]
+    for (const command of rootedCommands) {
+        it(`detects the rooted path in ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsRootedPath(command), true)
+        })
+    }
+
+    // A backslash that is not at the start of a token is intentionally not matched here: an
+    // in-workspace relative path and a `..\` traversal are handled by other checks.
+    const nonRootedCommands = [
+        'ls -la',
+        'cat project/notes.txt',
+        'cat sub\\file.txt', // mid-token backslash, stays inside the workspace
+        'cat ..\\secret', // `..\` traversal is handled separately
+        'curl https://example.com',
+    ]
+    for (const command of nonRootedCommands) {
+        it(`does not flag ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsRootedPath(command), false)
+        })
+    }
+})
+
+describe('requiresAcceptance fails closed on Windows root-relative backslash paths', () => {
+    // Dropping the drive letter from a drive path leaves a `\...` path that cmd.exe still reads from
+    // the working directory's drive root. IS_WINDOWS_PLATFORM is fixed at module load, so this
+    // end-to-end case runs on a Windows host only; the detection logic is covered on every platform
+    // by the suite above.
+    let features: TestFeatures
+
+    before(function () {
+        features = new TestFeatures()
+        features.workspace.getAllWorkspaceFolders = sinon
+            .stub()
+            .returns([{ uri: URI.file('/workspace/folder').toString(), name: 'test' }]) as any
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    it('requires acceptance for a leading-backslash path that drops the drive letter', async function () {
+        if (process.platform !== 'win32') {
+            return this.skip()
+        }
+        const result = await new ExecuteBash(features).requiresAcceptance({
+            command: 'type \\Users\\alice\\.aws\\credentials',
             cwd: 'C:\\workspace\\folder',
         })
         assert.equal(result.requiresAcceptance, true)

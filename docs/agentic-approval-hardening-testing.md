@@ -160,3 +160,46 @@ From `server/aws-lsp-codewhisperer`:
 npx ts-mocha --timeout 0 --exit --grep "working directory" \
   src/language-server/agenticChat/agenticChatController.test.ts
 ```
+
+## 4. Windows root-relative backslash paths (dropping the drive letter)
+
+### What was wrong
+
+The drive-letter detection in section 1 is defeated by dropping the drive letter. A root-relative
+path `type \Users\alice\.aws\credentials` has no drive letter, no UNC prefix, and no `\..`
+sequence, and shlex deletes its single leading backslash, so it collapses to `Usersalice...`, which
+resolves inside the working directory and runs with no approval prompt, while `cmd.exe` reads the
+path from the root of the working directory's drive — the same unprompted credential read as a full
+drive path, two characters shorter.
+
+### How the fix works
+
+A third detector, `hasWindowsRootedPath`, matches a backslash at a token boundary and is folded into
+the same fail-closed requirement, so a path that begins with a backslash (including the UNC form, a
+superset) requires approval. It matches only a leading backslash. A backslash later in a token is
+left to other checks on purpose: an in-workspace relative path such as `sub\file` stays inside the
+workspace, and a `..\` traversal is a separate, separately-tracked concern that is out of scope for
+this change. The `\..` pre-check catches a multi-segment `..\..\` traversal, because its second
+segment contains a literal `\..`; a single-hop `..\name` is not yet caught and is left to that
+separate work.
+
+### Safe reproduction and expected results
+
+Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance` only.
+
+| Command | Before | After |
+| --- | --- | --- |
+| `type \Users\alice\.aws\credentials` | no prompt | requires approval |
+| `dir \Windows\System32` | no prompt | requires approval |
+| `cat sub\notes.txt` (in-workspace) | no prompt | no prompt |
+
+### Tests
+
+`executeBash.test.ts` adds a `hasWindowsRootedPath` suite that runs on every platform: it detects
+the leading-backslash and UNC forms and does not flag a mid-token backslash (`sub\file`), a `..\`
+traversal, or a forward-slash path. A Windows-gated end-to-end case asserts that a leading-backslash
+path requires approval; it skips on a non-Windows host.
+
+### How to test
+
+Same commands as section 1. The Windows-gated case requires the Windows CI job.
