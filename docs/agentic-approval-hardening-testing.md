@@ -2,7 +2,7 @@
 
 This document records security hardening to the agentic chat tool-approval checks in
 `@aws/lsp-codewhisperer`, with the safe reproduction and test steps for each change. Each
-top-level section corresponds to one commit in this change.
+numbered section describes one fix in this change.
 
 Use only temporary directories and synthetic data. Never use a real credential file or a
 command-execution payload. The regression tests create and remove their own fixtures.
@@ -177,11 +177,13 @@ drive path, two characters shorter.
 A third detector, `hasWindowsRootedPath`, matches a backslash at a token boundary and is folded into
 the same fail-closed requirement, so a path that begins with a backslash (including the UNC form, a
 superset) requires approval. It matches only a leading backslash. A backslash later in a token is
-left to other checks on purpose: an in-workspace relative path such as `sub\file` stays inside the
-workspace, and a `..\` traversal is a separate, separately-tracked concern that is out of scope for
-this change. The `\..` pre-check catches a multi-segment `..\..\` traversal, because its second
-segment contains a literal `\..`; a single-hop `..\name` is not yet caught and is left to that
-separate work.
+left to other checks on purpose. An in-workspace relative path such as `sub\file` stays inside the
+workspace. A `..\` traversal is left to the existing traversal checks. The `\..` pre-check catches a
+multi-segment `..\..\` traversal, because its second segment contains a literal `\..`. A single-hop
+`..\name` from the workspace root also requires approval, but only indirectly: shlex deletes the
+backslash, so the workspace check sees the token `..name`, and it counts that token as outside the
+workspace only because its relative path starts with `..`. An explicit Windows `..\` check would
+remove that dependency; it is not part of this change.
 
 ### Safe reproduction and expected results
 
@@ -191,6 +193,7 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 | --- | --- | --- |
 | `type \Users\alice\.aws\credentials` | no prompt | requires approval |
 | `dir \Windows\System32` | no prompt | requires approval |
+| `type ..\secret.txt` (from the workspace root) | requires approval | requires approval |
 | `cat sub\notes.txt` (in-workspace) | no prompt | no prompt |
 
 ### Tests

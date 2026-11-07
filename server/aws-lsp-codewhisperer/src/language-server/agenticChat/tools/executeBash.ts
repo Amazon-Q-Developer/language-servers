@@ -188,12 +188,12 @@ export function hasWindowsUncPath(command: string): boolean {
  * from the root of the working directory's drive. Without this, dropping the `C:` from a drive path
  * reproduces the drive-path bypass. Fail closed on any token that begins with a backslash.
  *
- * Only a leading backslash is matched. A backslash later in a token is intentionally left to other
- * checks: an in-workspace relative path (`sub\file`) stays inside the workspace, and a `..\`
- * traversal is a separate, separately-tracked concern, out of scope here. (The `\..` pre-check
- * catches a multi-segment `..\..\` traversal, because its second segment contains a literal `\..`;
- * a single-hop `..\name` is not yet caught and is left to that separate work.) The function is
- * platform-independent so it can be unit-tested on any host; the caller applies it only on Windows.
+ * Only a leading backslash is matched. A mid-token backslash (`sub\file`) stays inside the
+ * workspace. A `..\` traversal is left to the traversal checks: the `\..` pre-check catches
+ * `..\..\`, and a single-hop `..\name` reaches the workspace check as the token `..name` (shlex
+ * deletes the backslash). From the workspace root, that token counts as outside the workspace only
+ * because its relative path starts with `..`. The function is platform-independent so it can be
+ * unit-tested on any host; the caller applies it only on Windows.
  */
 export function hasWindowsRootedPath(command: string): boolean {
     return /(?:^|[\s"'=,;(){}<>|&])\\/.test(command)
