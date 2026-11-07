@@ -143,6 +143,27 @@ export interface ExecuteBashOutput {
  */
 const IS_WINDOWS_PLATFORM = process.platform === 'win32'
 
+/**
+ * On Windows the shell is `cmd.exe`, which runs the raw command string verbatim, but
+ * {@link ExecuteBash.requiresAcceptance} tokenizes the command with shlex, whose POSIX rules treat
+ * a backslash as an escape character and delete it. A Windows drive path such as
+ * `C:\Users\alice\.aws\credentials` therefore collapses into the single token
+ * `C:Usersalice.awscredentials`, which no longer looks absolute, resolves inside the working
+ * directory, and so slips past the workspace, credential, and traversal checks below while
+ * `cmd.exe` still opens the real file.
+ *
+ * This detects a drive-letter path in the raw command so such a command can fail closed (require
+ * approval). It matches a single drive letter followed by a colon at a token boundary, which also
+ * covers a forward-slash drive path (`C:/Users/...`) and a bare drive-relative path (`C:name`).
+ * Requiring a token boundary keeps a URI scheme such as `https:` from being read as a drive.
+ *
+ * The function is platform-independent so it can be unit-tested on any host; the caller applies it
+ * only on Windows.
+ */
+export function hasWindowsDrivePath(command: string): boolean {
+    return /(?:^|[\s"'=,;(){}<>|&])[a-zA-Z]:/.test(command)
+}
+
 export class ExecuteBash {
     private childProcess?: ChildProcess
     private readonly logging: Features['logging']
@@ -209,7 +230,13 @@ export class ExecuteBash {
             // Tokenization does not evaluate shell syntax. Retain the raw approval requirement,
             // including quoted or escaped markers, while collecting category and warning metadata.
             const expansionPattern = IS_WINDOWS_PLATFORM ? /[%!^*?[\]]/ : /[$`{}*?[\]]/
-            const requiresShellApproval = expansionPattern.test(params.command) || /[<>();&|\r\n]/.test(params.command)
+            const requiresShellApproval =
+                expansionPattern.test(params.command) ||
+                /[<>();&|\r\n]/.test(params.command) ||
+                // On Windows, shlex tokenization deletes the backslashes in a drive path, so a command
+                // such as `type C:\Users\alice\.aws\credentials` would otherwise slip past the path
+                // checks below while cmd.exe reads the real file. Fail closed on any drive-letter path.
+                (IS_WINDOWS_PLATFORM && hasWindowsDrivePath(params.command))
 
             const args = split(params.command)
             if (!args || args.length === 0) {
