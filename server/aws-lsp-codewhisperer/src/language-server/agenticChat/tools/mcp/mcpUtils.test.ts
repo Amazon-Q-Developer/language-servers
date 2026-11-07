@@ -28,6 +28,7 @@ import {
     convertPersonaToAgent,
     migrateToAgentConfig,
     restoreServerScopedPermissions,
+    removeUntrustedScopedPermissions,
     isPermissionForServer,
     DEFAULT_TOOL_EXEC_TIMEOUT_MS,
     MAX_TOOL_EXEC_TIMEOUT_MS,
@@ -1745,6 +1746,68 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
 
         expect(agentConfig.tools).to.include('*')
         expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.true
+    })
+})
+
+describe('removeUntrustedScopedPermissions()', () => {
+    const originalPlatform = process.platform
+    const globalPaths = ['/home/u/.aws/amazonq/agents/default.json', '/home/u/.aws/amazonq/mcp.json']
+    const logger: any = { warn: () => {}, info: () => {}, error: () => {}, debug: () => {} }
+
+    afterEach(() => {
+        Object.defineProperty(process, 'platform', { value: originalPlatform })
+    })
+
+    // A workspace URI gives a lowercase drive letter on Windows, while other sources keep the case. The
+    // spellings below differ in case in both directions, so every side must be compared without case:
+    // the defining file, the file that listed the entry, and the global config paths.
+    const grantsWithCaseVariantPaths = () => {
+        const workspaceSource = new Set(['/work/WS/.amazonq/agents/default.json'])
+        const globalSource = new Set(['/HOME/u/.aws/amazonq/agents/default.json'])
+        const agentConfig = {
+            tools: ['@local', '@other'],
+            allowedTools: ['@local/read_tool', '@other/read_tool'],
+        } as AgentConfig
+        removeUntrustedScopedPermissions(
+            agentConfig,
+            new Map([
+                ['local', { command: 'local-mcp', __configPath__: '/Work/ws/.amazonq/mcp.json' } as MCPServerConfig],
+            ]),
+            new Map([['local', 'local']]),
+            {
+                tools: new Map([
+                    ['@local', workspaceSource],
+                    ['@other', globalSource],
+                ]),
+                allowedTools: new Map([
+                    ['@local/read_tool', workspaceSource],
+                    ['@other/read_tool', globalSource],
+                ]),
+            },
+            globalPaths,
+            logger
+        )
+        return agentConfig
+    }
+
+    for (const platform of ['win32', 'darwin']) {
+        it(`compares config file paths without case on ${platform}`, () => {
+            Object.defineProperty(process, 'platform', { value: platform })
+
+            const agentConfig = grantsWithCaseVariantPaths()
+
+            expect(agentConfig.tools).to.deep.equal(['@local', '@other'])
+            expect(agentConfig.allowedTools).to.deep.equal(['@local/read_tool', '@other/read_tool'])
+        })
+    }
+
+    it('compares config file paths with case on Linux, whose file systems treat them as different files', () => {
+        Object.defineProperty(process, 'platform', { value: 'linux' })
+
+        const agentConfig = grantsWithCaseVariantPaths()
+
+        expect(agentConfig.tools).to.deep.equal([])
+        expect(agentConfig.allowedTools).to.deep.equal([])
     })
 })
 

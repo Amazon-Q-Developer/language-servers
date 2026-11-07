@@ -48,6 +48,10 @@ that file could grant:
   kept only when every server it names trusts the file that listed it. For the same reason, a
   workspace file cannot grant a glob entry such as `@repo/*`: it would also match the tools of a
   server named `repo/x`.
+- Config file paths are compared without case on Windows and macOS, whose file systems usually ignore
+  case.
+  On Windows a path from a workspace URI has a lowercase drive letter, while other paths can keep
+  the uppercase one.
 - Non-string entries are skipped. Exact bare names, such as built-in tool names, are unchanged.
 - Every ignored entry is logged as a warning.
 
@@ -98,6 +102,10 @@ config". It writes real config files to a temporary folder and runs the real `lo
 - a workspace server whose entry also names one of the user's servers, with the warning naming that
   server;
 - a wildcard in the global config, which still applies.
+
+A separate `removeUntrustedScopedPermissions()` suite sets `process.platform` to `win32`, `darwin`
+and `linux` and checks that config file paths that differ only in case are treated as one file on
+Windows and macOS, and as different files on Linux.
 
 Several cases also check the warning that an ignored entry produces.
 

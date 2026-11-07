@@ -1511,6 +1511,16 @@ function isWildcardPermission(entry: string): boolean {
 }
 
 /**
+ * A config file path in the form used to compare it with another. The file systems of Windows and
+ * macOS usually ignore case, and the same file can arrive with a different drive-letter case (a path
+ * from a workspace URI has a lowercase drive letter).
+ */
+function comparableConfigPath(configPath: string): string {
+    const normalized = path.normalize(configPath)
+    return process.platform === 'win32' || process.platform === 'darwin' ? normalized.toLowerCase() : normalized
+}
+
+/**
  * Remove server-scoped permission entries ('@server', '@server/tool') that only workspace agent
  * configs list for a server that the listing file does not define.
  *
@@ -1536,7 +1546,7 @@ export function removeUntrustedScopedPermissions(
             continue
         }
         // The agent config and the mcp.json of one .amazonq folder have the same author
-        const definingFile = path.normalize(cfg.__configPath__)
+        const definingFile = comparableConfigPath(cfg.__configPath__)
         const files = [definingFile]
         if (path.basename(definingFile) === 'mcp.json') {
             files.push(path.join(path.dirname(definingFile), 'agents', 'default.json'))
@@ -1546,10 +1556,10 @@ export function removeUntrustedScopedPermissions(
         grantingFiles.set(serverNameMapping.get(sanitizedName) ?? sanitizedName, files)
     }
 
-    const globalPaths = new Set(globalConfigPaths.map(configPath => path.normalize(configPath)))
+    const globalPaths = new Set(globalConfigPaths.map(comparableConfigPath))
     // Why the config file cannot grant the entry, or undefined when it can
     const refusal = (entry: string, configPath: string): string | undefined => {
-        const sourceFile = path.normalize(configPath)
+        const sourceFile = comparableConfigPath(configPath)
         if (globalPaths.has(sourceFile)) {
             return undefined
         }
