@@ -315,6 +315,10 @@ export async function loadAgentConfig(
     // declared there, so the entries are stashed here and drained once every server is known.
     const pendingServerTools = new Set<string>()
     const pendingServerAllowedTools = new Set<string>()
+    const pendingServerEntries = { tools: pendingServerTools, allowedTools: pendingServerAllowedTools }
+    // The config files that contributed each server-scoped entry, so that an entry from a workspace
+    // file can be limited to the servers that file defines (see removeUntrustedScopedPermissions).
+    const scopedPermissionSources: ScopedPermissionSources = { tools: new Map(), allowedTools: new Map() }
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -388,27 +392,31 @@ export async function loadAgentConfig(
             }
         }
 
-        // 4) Process permissions (tools and allowedTools)
-        if (Array.isArray(json.tools)) {
-            for (const tool of json.tools) {
-                if (!tool.startsWith('@')) {
-                    if (!agentConfig.tools.includes(tool)) {
-                        agentConfig.tools.push(tool)
-                    }
-                } else {
-                    pendingServerTools.add(tool)
-                }
+        // 4) Process permissions (tools and allowedTools). Anyone who can change the repository can
+        // write a workspace file, so a '*' in its tools enables only the servers that file defines
+        // (step 6), and its other wildcards are ignored.
+        const isWorkspaceFile = fsPath !== globalConfigPath
+        let enablesOwnServers = false
+        for (const key of PERMISSION_KEYS) {
+            if (!Array.isArray(json[key])) {
+                continue
             }
-        }
-
-        if (Array.isArray(json.allowedTools)) {
-            for (const tool of json.allowedTools) {
-                if (!tool.startsWith('@')) {
-                    if (!agentConfig.allowedTools.includes(tool)) {
-                        agentConfig.allowedTools.push(tool)
-                    }
-                } else {
-                    pendingServerAllowedTools.add(tool)
+            for (const tool of json[key]) {
+                if (typeof tool !== 'string') {
+                    logging.warn(`Ignoring a '${key}' entry that is not a string in agent config at ${fsPath}`)
+                } else if (tool.startsWith('@')) {
+                    pendingServerEntries[key].add(tool)
+                    addPermissionSource(scopedPermissionSources[key], tool, fsPath)
+                } else if (isWorkspaceFile && isWildcardPermission(tool)) {
+                    const appliesToOwnServers = key === 'tools' && tool === '*'
+                    enablesOwnServers ||= appliesToOwnServers
+                    logging.warn(
+                        appliesToOwnServers
+                            ? `Limiting wildcard permission '*' in workspace agent config at ${fsPath} to the MCP servers that file defines`
+                            : `Ignoring wildcard permission '${tool}' in '${key}' of workspace agent config at ${fsPath}`
+                    )
+                } else if (!agentConfig[key].includes(tool)) {
+                    agentConfig[key].push(tool)
                 }
             }
         }
@@ -612,24 +620,19 @@ export async function loadAgentConfig(
                 agentConfig.mcpServers[name] = agentEntry
 
                 // Add MCP server-specific tools and allowedTools after server is successfully added
-                if (Array.isArray(json.tools)) {
-                    for (const tool of json.tools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.tools.includes(tool)
-                        ) {
-                            agentConfig.tools.push(tool)
-                        }
+                for (const key of PERMISSION_KEYS) {
+                    const entries: unknown[] = Array.isArray(json[key]) ? json[key] : []
+                    const serverEntries = entries.filter(
+                        (tool): tool is string => typeof tool === 'string' && isPermissionForServer(tool, name)
+                    )
+                    // A name with a glob character would turn '@name' into a pattern for other servers
+                    if (key === 'tools' && enablesOwnServers && !isWildcardPermission(name)) {
+                        serverEntries.push(`@${name}`)
+                        addPermissionSource(scopedPermissionSources[key], `@${name}`, fsPath)
                     }
-                }
-
-                if (Array.isArray(json.allowedTools)) {
-                    for (const tool of json.allowedTools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.allowedTools.includes(tool)
-                        ) {
-                            agentConfig.allowedTools.push(tool)
+                    for (const tool of serverEntries) {
+                        if (!agentConfig[key].includes(tool)) {
+                            agentConfig[key].push(tool)
                         }
                     }
                 }
@@ -665,6 +668,10 @@ export async function loadAgentConfig(
                 if (!agentConfig.tools.includes(serverPrefix)) {
                     agentConfig.tools.push(serverPrefix)
                 }
+                // The file that defines the server enables it
+                if (mcpConfig.__configPath__) {
+                    addPermissionSource(scopedPermissionSources.tools, serverPrefix, mcpConfig.__configPath__)
+                }
 
                 logging.info(`Loaded MCP server '${originalName}' from legacy MCP config`)
             }
@@ -684,6 +691,14 @@ export async function loadAgentConfig(
     // before the per-server permission pass, so without this their '@server' / '@server/tool'
     // entries were dropped on every load and "Always Allow" reverted to "Ask".
     restoreServerScopedPermissions(agentConfig, serverNameMapping, pendingServerTools, pendingServerAllowedTools)
+    removeUntrustedScopedPermissions(
+        agentConfig,
+        servers,
+        serverNameMapping,
+        scopedPermissionSources,
+        [globalConfigPath, getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())],
+        logging
+    )
 
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
@@ -1475,6 +1490,96 @@ export function restoreServerScopedPermissions(
         if (belongsToLoadedServer(entry) && !agentConfig.allowedTools.includes(entry)) {
             agentConfig.allowedTools.push(entry)
         }
+    }
+}
+
+/** The permission lists of an agent config */
+const PERMISSION_KEYS = ['tools', 'allowedTools'] as const
+
+/** For each server-scoped permission entry ('@server', '@server/tool'), the config files that list it */
+type ScopedPermissionSources = Record<(typeof PERMISSION_KEYS)[number], Map<string, Set<string>>>
+
+function addPermissionSource(sources: Map<string, Set<string>>, entry: string, configPath: string): void {
+    const configPaths = sources.get(entry) ?? new Set<string>()
+    configPaths.add(configPath)
+    sources.set(entry, configPaths)
+}
+
+/** True for a permission entry or server name with a glob character, which can match other names */
+function isWildcardPermission(entry: string): boolean {
+    return entry.includes('*') || entry.includes('?')
+}
+
+/**
+ * Remove server-scoped permission entries ('@server', '@server/tool') that only workspace agent
+ * configs list for a server that the listing file does not define.
+ *
+ * Anyone who can change a repository can write its workspace config, so a workspace file may grant
+ * permissions only for the servers it defines, which the user must approve before they start. It must
+ * not enable or auto-approve a tool on one of the user's own servers. The agent config next to a
+ * legacy `mcp.json` holds the permissions for that file's servers (see McpManager's permission update).
+ * A glob entry, or a server name with a glob character, can also match other servers, so a workspace
+ * file cannot grant either. Entries from the global config files, which only the user writes, are kept.
+ */
+export function removeUntrustedScopedPermissions(
+    agentConfig: AgentConfig,
+    servers: Map<string, MCPServerConfig>,
+    serverNameMapping: Map<string, string>,
+    sources: ScopedPermissionSources,
+    globalConfigPaths: string[],
+    logging: Logger
+): void {
+    // The config files that can grant permissions for each loaded server, by its original name
+    const grantingFiles = new Map<string, string[]>()
+    for (const [sanitizedName, cfg] of servers) {
+        if (!cfg.__configPath__) {
+            continue
+        }
+        // The agent config and the mcp.json of one .amazonq folder have the same author
+        const definingFile = path.normalize(cfg.__configPath__)
+        const files = [definingFile]
+        if (path.basename(definingFile) === 'mcp.json') {
+            files.push(path.join(path.dirname(definingFile), 'agents', 'default.json'))
+        } else if (path.basename(path.dirname(definingFile)) === 'agents') {
+            files.push(path.join(path.dirname(path.dirname(definingFile)), 'mcp.json'))
+        }
+        grantingFiles.set(serverNameMapping.get(sanitizedName) ?? sanitizedName, files)
+    }
+
+    const globalPaths = new Set(globalConfigPaths.map(configPath => path.normalize(configPath)))
+    // Why the config file cannot grant the entry, or undefined when it can
+    const refusal = (entry: string, configPath: string): string | undefined => {
+        const sourceFile = path.normalize(configPath)
+        if (globalPaths.has(sourceFile)) {
+            return undefined
+        }
+        // A server name can contain '/', so a glob such as '@repo/*' also matches the tools of a server
+        // named 'repo/x', and an exact entry can name more than one server; every one must trust it
+        if (isWildcardPermission(entry)) {
+            return 'a workspace config cannot grant a wildcard permission'
+        }
+        const matches = [...grantingFiles].filter(([serverName]) => isPermissionForServer(entry, serverName))
+        if (matches.length === 0) {
+            return 'it names no MCP server loaded from a config file'
+        }
+        const untrusted = matches
+            .filter(([serverName, files]) => isWildcardPermission(serverName) || !files.includes(sourceFile))
+            .map(([serverName]) => serverName)
+        return untrusted.length > 0
+            ? `it applies to MCP servers that the config does not define: ${untrusted.join(', ')}`
+            : undefined
+    }
+
+    for (const key of PERMISSION_KEYS) {
+        agentConfig[key] = agentConfig[key].filter(entry => {
+            const configPaths = [...(sources[key].get(entry) ?? [])]
+            const refusals = configPaths.map(configPath => refusal(entry, configPath))
+            if (configPaths.length === 0 || refusals.includes(undefined)) {
+                return true
+            }
+            logging.warn(`Ignoring permission '${entry}' in ${configPaths.join(', ')}: ${refusals[0]}`)
+            return false
+        })
     }
 }
 
