@@ -2227,6 +2227,33 @@ describe('AgenticChatController', () => {
 
             sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
         })
+
+        it('creates a saved prompt file when a rule is requested with no workspace folder open', async () => {
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([])
+            const expectedPath = path.join(getUserPromptsDirectory(), `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+        })
+
+        it('creates a rule file in the rules folder of the first workspace folder', async () => {
+            const workspaceFolder = path.join(os.tmpdir(), 'create-rule-workspace')
+            const secondWorkspaceFolder = path.join(os.tmpdir(), 'create-rule-second-workspace')
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([workspaceFolder, secondWorkspaceFolder])
+            const rulesDirectory = path.join(workspaceFolder, '.amazonq', 'rules')
+            const expectedPath = path.join(rulesDirectory, `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledWithExactly(testFeatures.workspace.fs.mkdir as sinon.SinonStub, rulesDirectory, {
+                recursive: true,
+            })
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+            sinon.assert.calledWithMatch(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                uri: URI.file(expectedPath).toString(),
+            })
+        })
     })
 
     describe('onInlineChatPrompt', () => {

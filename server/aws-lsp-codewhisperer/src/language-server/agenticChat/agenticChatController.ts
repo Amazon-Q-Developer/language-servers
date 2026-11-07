@@ -751,8 +751,9 @@ export class AgenticChatController implements ChatHandlers {
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
             let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            let workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            // Rules live in a workspace folder. With no folder open, the request creates a saved prompt below.
             if (workspaceFolders.length > 0) {
+                const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
                 const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
                 const newFileContent = ''
                 try {
