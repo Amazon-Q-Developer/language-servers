@@ -200,6 +200,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         let releaseBeamMap: () => void
         let beamMapRead: Promise<void>
 
+        const manifestWritten = () => Promise.all([...(handler as any).beamManifestWrites.values()])
         const beamPoll = (scope = SCOPE) =>
             handler.getTransformInfo({
                 TransformationJobId: JOB_ID,
@@ -338,6 +339,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
 
             await beamPoll()
+            await manifestWritten()
 
             const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
             expect(manifest.sourceFiles).to.include(path.join(tmpRoot, 'Web', 'Program.cs'))
@@ -347,7 +349,43 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, sourceFiles: ['kept'] }))
             await beamPoll()
+            await manifestWritten()
             expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles).to.deep.equal(['kept'])
+        })
+
+        it("sends a file the customer edited after Load with the transformed side's results", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            const edited = path.join(tmpRoot, 'Web', 'appsettings.json')
+            fs.writeFileSync(edited, '{}')
+            await beamPoll()
+            await manifestWritten()
+            fs.writeFileSync(edited, '{ "edited": true }')
+            const later = new Date(Date.now() + 60_000)
+            fs.utimesSync(edited, later, later)
+            const uploadStub = sinon.stub(Utils, 'uploadArtifact').resolves(true)
+            sinon
+                .stub(handler, 'createArtifactUploadUrl')
+                .resolves({ uploadUrl: 'u', uploadId: 'up-1', requestHeaders: {} } as any)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true })
+            sinon.stub(handler, 'submitHitl').resolves({ status: 'SUBMITTED' } as any)
+            const zipPath = path.join(tmpRoot, 'launch.zip')
+            const zip = new AdmZip()
+            zip.addFile(
+                'launch-result.json',
+                Buffer.from(
+                    JSON.stringify({ schemaVersion: '1.1', side: 'transformed', status: 'APP_NOT_STARTED', attempt: 2 })
+                )
+            )
+            zip.writeZip(zipPath)
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', zipPath, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            const uploaded = new AdmZip(uploadStub.firstCall.args[1])
+            expect(
+                JSON.parse(uploaded.getEntry('workspace/metadata.json')!.getData().toString()).filesUpdated
+            ).to.deep.equal([path.join('Web', 'appsettings.json')])
         })
 
         it("writes no manifest for a beamed repo that doesn't opt in", async () => {
@@ -356,6 +394,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             await beamPoll()
             await beamMapRead
             await beamPoll()
+            await manifestWritten()
 
             expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
                 .to.be.false

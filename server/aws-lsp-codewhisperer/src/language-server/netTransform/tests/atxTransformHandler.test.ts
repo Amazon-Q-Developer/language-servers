@@ -1280,6 +1280,21 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
                 ).to.be.empty
             })
 
+            it("marks only a failed step's apply as failed; the others still land and the plan comes back", async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+                applyStub.callsFake(async (checkpoint: string) =>
+                    path.basename(checkpoint) === 'fix-1' ? { success: false, error: 'conflict' } : { success: true }
+                )
+                ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+                const plan = await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(plan.Root.Children).to.have.length(2)
+                expect(appliedOrder()).to.deep.equal(['ut', 'fix-1', 'add'])
+                expect((handler as any)._currentDiffContext).to.deep.equal({ failed: true, failedStepIds: ['fix-1'] })
+                ;(handler as any)._currentDiffContext = null
+            })
+
             for (const scope of ['', undefined]) {
                 it(`applies nothing without the loaded repo's scope (${JSON.stringify(scope)})`, async () => {
                     sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())

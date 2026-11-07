@@ -71,6 +71,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
 
 import { Utils, workspaceFolderName } from './utils'
+import { beamApplyStepIds, listBeamRepoFiles } from './beamRepoFiles'
 import { BrowserInfo } from './models'
 import { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, ItGenJobGate } from './itgenJobGate'
 
@@ -240,21 +241,6 @@ const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 // size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
 const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 
-// The name of the Local Build Verification plan step; its rounds reach a beamed repo through the step-HITL diff path.
-const LOCAL_BUILD_VERIFICATION_STEP_NAME = 'Local Build Verification'
-
-// A beamed repo's customer-changes manifest: the folders left out, and a bound on the number of files it lists.
-const BEAM_MANIFEST_SKIPPED_FOLDERS = new Set([
-    'bin',
-    'obj',
-    '.git',
-    '.vs',
-    'node_modules',
-    'packages',
-    workspaceFolderName.toLowerCase(),
-])
-const BEAM_MANIFEST_MAX_FILES = 50_000
-
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
@@ -286,6 +272,8 @@ export class ATXTransformHandler {
         message => this.logging.log(message),
         (workspaceId, jobId) => this.readBeamOptIn(workspaceId, jobId)
     )
+    // Beam-to-IDE: customer-changes manifest writes in progress, by manifest path.
+    private readonly beamManifestWrites = new Map<string, Promise<void>>()
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -2761,7 +2749,8 @@ export class ATXTransformHandler {
             // the job's objective otherwise. A beam-map read it needs runs in the background, so it never delays a poll.
             if (request.IsBeam === true) {
                 if (await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)) {
-                    await this.ensureBeamSourceFilesManifest(request.SolutionRootPath, request.TransformationJobId)
+                    // In the background: the walk can take a while on a large repo, and nothing in this poll needs it
+                    void this.ensureBeamSourceFilesManifest(request.SolutionRootPath, request.TransformationJobId) // never rejects
                 }
             }
             const result = await this._getTransformInfoInternal(request, diffContext)
@@ -4498,9 +4487,9 @@ export class ATXTransformHandler {
             // steps before the beam are baked in and not in the beam bundle; applying them logs
             // "Checkpoint folder not available for step" and stalls the LBV loop. Only steps under the
             // loaded repo's card (beamScopeStepIds) are applied: the card is created at beam time, so
-            // they all came after it (unit tests, ITGen code fixes, adding the tests). LBV steps are
-            // left out: their rounds come through the separate diff-artifact path. Without a scope
-            // (not resolved yet, or beam discovery) nothing is applied.
+            // they all came after it (unit tests, ITGen code fixes, adding the tests). The card's own
+            // step and LBV steps are left out (beamApplyStepIds). Without a scope (not resolved yet,
+            // or beam discovery) nothing is applied.
             let beamScope: Set<string> | undefined
             if (isBeam) {
                 const scope = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
@@ -4511,10 +4500,7 @@ export class ATXTransformHandler {
                     this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
                     return plan
                 }
-                beamScope = new Set(scope)
-                for (const lbvStepId of this.lbvSubtreeStepIds(plan.Root)) {
-                    beamScope.delete(lbvStepId)
-                }
+                beamScope = beamApplyStepIds(plan.Root, new Set(scope))
             }
 
             const anyFailed = await this.downloadCompletedStepArtifacts(
@@ -4772,37 +4758,36 @@ export class ATXTransformHandler {
         return pending.filter(step => isDownloaded(step) || stepIdsWithArtifact.has(step.StepId))
     }
 
-    /** Beam-to-IDE: the Local Build Verification steps and every step under them (their error-fix rounds). */
-    private lbvSubtreeStepIds(root: AtxPlanStep): string[] {
-        const ids: string[] = []
-        const collect = (step: AtxPlanStep, inLbv: boolean) => {
-            const lbv = inLbv || step.StepName === LOCAL_BUILD_VERIFICATION_STEP_NAME
-            if (lbv && step.StepId) {
-                ids.push(step.StepId)
-            }
-            for (const child of step.Children || []) {
-                collect(child, lbv)
-            }
-        }
-        for (const child of root.Children || []) {
-            collect(child, false)
-        }
-        return ids
-    }
-
     /**
      * ITGen for a beamed repo: the customer-changes manifest that addCustomerChangesToResultZip and the user-edit
      * protection in applyChanges read. startTransform writes it for a standalone job; a beamed repo never runs
      * startTransform, so it's written on the first beamed poll, once the solution is open and its root is known.
      * It lists the files under the root, without build output and the IDE's own folders, and its baseline is now:
-     * edits after Load count as the customer's.
+     * edits after Load count as the customer's. Overlapping polls share one write; it never throws.
      */
-    private async ensureBeamSourceFilesManifest(solutionRootPath: string, jobId: string): Promise<void> {
+    private ensureBeamSourceFilesManifest(solutionRootPath: string, jobId: string): Promise<void> {
         if (!solutionRootPath || !isSafeAbsolutePath(solutionRootPath)) {
-            return
+            return Promise.resolve()
         }
-        const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
-        const manifestPath = path.join(checkpointsDir, 'source-files.json')
+        const manifestPath = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+        const key = path.resolve(manifestPath).toLowerCase()
+        const running = this.beamManifestWrites.get(key)
+        if (running) {
+            return running
+        }
+        const write = this.writeBeamSourceFilesManifest(solutionRootPath, jobId, manifestPath).finally(() =>
+            this.beamManifestWrites.delete(key)
+        )
+        this.beamManifestWrites.set(key, write)
+        return write
+    }
+
+    private async writeBeamSourceFilesManifest(
+        solutionRootPath: string,
+        jobId: string,
+        manifestPath: string
+    ): Promise<void> {
+        const checkpointsDir = path.dirname(manifestPath)
         try {
             await fs.promises.access(manifestPath)
             return
@@ -4810,7 +4795,7 @@ export class ATXTransformHandler {
             // not written yet
         }
         try {
-            const sourceFiles = await this.listBeamSourceFiles(solutionRootPath)
+            const sourceFiles = await listBeamRepoFiles(solutionRootPath, workspaceFolderName)
             const now = Date.now()
             const manifest = {
                 jobId: jobId,
@@ -4827,28 +4812,6 @@ export class ATXTransformHandler {
         } catch (error) {
             this.logging.error(`ATX: [BEAM] could not write the source files manifest: ${String(error)}`)
         }
-    }
-
-    // Files under a beamed solution's root, without build output, VCS and IDE folders, and artifactWorkspace.
-    private async listBeamSourceFiles(solutionRootPath: string): Promise<string[]> {
-        const files: string[] = []
-        const walk = async (dir: string): Promise<void> => {
-            for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
-                if (files.length >= BEAM_MANIFEST_MAX_FILES) {
-                    return
-                }
-                const full = path.join(dir, entry.name)
-                if (entry.isDirectory()) {
-                    if (!BEAM_MANIFEST_SKIPPED_FOLDERS.has(entry.name.toLowerCase())) {
-                        await walk(full)
-                    }
-                } else if (entry.isFile()) {
-                    files.push(full)
-                }
-            }
-        }
-        await walk(solutionRootPath)
-        return files
     }
 
     /**
