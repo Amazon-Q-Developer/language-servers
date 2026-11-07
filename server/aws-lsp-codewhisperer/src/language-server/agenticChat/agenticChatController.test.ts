@@ -5081,6 +5081,20 @@ ${' '.repeat(8)}}
 
                     sinon.assert.calledWith(mockSession.addApprovedPath, tmpDir, 'executeBash')
                 })
+
+                it('does not record the working directory when a read-only command needs no approval', async () => {
+                    // A path is recorded only after the user is actually asked and approves it. A
+                    // read-only command that needs no approval must leave the approved-path set empty,
+                    // so a later call on the same path is still checked.
+                    requiresAcceptanceStub.resolves({ requiresAcceptance: false })
+                    runToolStub.resolves('')
+
+                    await processExecuteBash(tmpDir)
+
+                    sinon.assert.calledOnce(runToolStub)
+                    sinon.assert.notCalled(mockSession.addApprovedPath)
+                    assert.strictEqual(mockSession.approvedPaths.size, 0)
+                })
             })
         })
 

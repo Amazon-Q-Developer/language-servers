@@ -117,3 +117,46 @@ that a UNC path and a `%VAR%` argument each require approval; they skip on a non
 ### How to test
 
 Same commands as the previous section. The Windows-gated cases require the Windows CI job.
+
+## 3. Approved paths recorded only after approval
+
+### What was wrong
+
+At the original review snapshot, the chat controller recorded an approved path for every tool call
+that carried a `path` or `cwd`, outside the approval branches. A read-only command that needed no
+prompt (for example because its `cwd` was the workspace root) still recorded that path. A recorded
+path then short-circuits the credential, binary, and workspace checks for the rest of the session,
+so a path that was harmless on first use could later skip the checks after it became something the
+user should be asked about.
+
+### How the fix works
+
+This change does not reach the vulnerable snapshot: the controller on this branch already records a
+path only when the user was actually asked and approved it (`toolApprovalGranted`) and the tool then
+succeeded. A rejected tool use, a failed tool use, and a command that exits with an error all record
+nothing. This commit adds the regression test that pins that behavior.
+
+### Safe reproduction and expected results
+
+With a controller test, stub the acceptance check so a read-only `executeBash` call returns
+`requiresAcceptance: false`, run it to success, and inspect the session.
+
+- At the original snapshot: the working directory is recorded in `approvedPaths`.
+- On this branch: `addApprovedPath` is not called and `approvedPaths` stays empty.
+
+### Tests
+
+`agenticChatController.test.ts` adds a case to the executeBash approval-recording suite: a read-only
+command that needs no approval records nothing, asserted by both `addApprovedPath` not being called
+and `approvedPaths.size` remaining zero. It sits beside the existing cases that already cover record
+after approval, no record on rejection, no record on failure, and no record on a non-zero exit. This
+case is platform-independent and runs on every host.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit --grep "working directory" \
+  src/language-server/agenticChat/agenticChatController.test.ts
+```
