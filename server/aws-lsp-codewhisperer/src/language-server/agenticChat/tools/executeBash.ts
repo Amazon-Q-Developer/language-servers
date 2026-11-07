@@ -143,6 +143,62 @@ export interface ExecuteBashOutput {
  */
 const IS_WINDOWS_PLATFORM = process.platform === 'win32'
 
+/**
+ * On Windows the shell is `cmd.exe`, which runs the raw command string verbatim, but
+ * {@link ExecuteBash.requiresAcceptance} tokenizes the command with shlex, whose POSIX rules treat
+ * a backslash as an escape character and delete it. A Windows drive path such as
+ * `C:\Users\alice\.aws\credentials` therefore collapses into the single token
+ * `C:Usersalice.awscredentials`, which no longer looks absolute, resolves inside the working
+ * directory, and so slips past the workspace, credential, and traversal checks below while
+ * `cmd.exe` still opens the real file.
+ *
+ * This detects a drive-letter path in the raw command so such a command can fail closed (require
+ * approval). It matches a single drive letter followed by a colon at a token boundary, which also
+ * covers a forward-slash drive path (`C:/Users/...`) and a bare drive-relative path (`C:name`).
+ * Requiring a token boundary keeps a URI scheme such as `https:` from being read as a drive.
+ *
+ * The function is platform-independent so it can be unit-tested on any host; the caller applies it
+ * only on Windows.
+ */
+export function hasWindowsDrivePath(command: string): boolean {
+    return /(?:^|[\s"'=,;(){}<>|&])[a-zA-Z]:/.test(command)
+}
+
+/**
+ * Detects a Windows UNC path (`\\host\share`) or its forward-slash form (`//host/share`) in a raw
+ * command. Like a drive path, a UNC path is corrupted by shlex tokenization (`\\host\share` becomes
+ * `\hostshare`), so the token-based checks cannot recognize it, while `cmd.exe` still opens the
+ * share, which on Windows can trigger outbound SMB authentication to an attacker-named host. This
+ * branch already blocks these forms incidentally, through an unrelated tokenizer side effect; this
+ * makes the control explicit at the raw-command layer and independent of that side effect.
+ *
+ * Matches a `\\` or `//` prefix at a token boundary. Requiring a token boundary keeps a URI
+ * authority such as `https://` from being read as a UNC path. The function is platform-independent
+ * so it can be unit-tested on any host; the caller applies it only on Windows.
+ */
+export function hasWindowsUncPath(command: string): boolean {
+    return /(?:^|[\s"'=,;(){}<>|&])(?:\\\\|\/\/)/.test(command)
+}
+
+/**
+ * Detects a Windows root-relative path that begins with a backslash, such as
+ * `\Users\alice\.aws\credentials` (and, as a superset, the UNC form `\\host\share`). shlex deletes a
+ * single leading backslash, so `\Users\alice\x` collapses to the token `Usersalicex`, which looks
+ * like an ordinary in-workspace name and passes the boundary check, while `cmd.exe` reads the path
+ * from the root of the working directory's drive. Without this, dropping the `C:` from a drive path
+ * reproduces the drive-path bypass. Fail closed on any token that begins with a backslash.
+ *
+ * Only a leading backslash is matched. A mid-token backslash (`sub\file`) stays inside the
+ * workspace. A `..\` traversal is left to the traversal checks: the `\..` pre-check catches
+ * `..\..\`, and a single-hop `..\name` reaches the workspace check as the token `..name` (shlex
+ * deletes the backslash). From the workspace root, that token counts as outside the workspace only
+ * because its relative path starts with `..`. The function is platform-independent so it can be
+ * unit-tested on any host; the caller applies it only on Windows.
+ */
+export function hasWindowsRootedPath(command: string): boolean {
+    return /(?:^|[\s"'=,;(){}<>|&])\\/.test(command)
+}
+
 export class ExecuteBash {
     private childProcess?: ChildProcess
     private readonly logging: Features['logging']
@@ -209,7 +265,18 @@ export class ExecuteBash {
             // Tokenization does not evaluate shell syntax. Retain the raw approval requirement,
             // including quoted or escaped markers, while collecting category and warning metadata.
             const expansionPattern = IS_WINDOWS_PLATFORM ? /[%!^*?[\]]/ : /[$`{}*?[\]]/
-            const requiresShellApproval = expansionPattern.test(params.command) || /[<>();&|\r\n]/.test(params.command)
+            const requiresShellApproval =
+                expansionPattern.test(params.command) ||
+                /[<>();&|\r\n]/.test(params.command) ||
+                // On Windows, shlex tokenization deletes the backslashes in a drive path, a UNC
+                // path, or a root-relative `\...` path, so a command such as
+                // `type C:\Users\alice\.aws\credentials`, `dir \\host\share`, or
+                // `type \Users\alice\.aws\credentials` would otherwise slip past the path checks
+                // below while cmd.exe reads the real location. Fail closed on any of those raw forms.
+                (IS_WINDOWS_PLATFORM &&
+                    (hasWindowsDrivePath(params.command) ||
+                        hasWindowsUncPath(params.command) ||
+                        hasWindowsRootedPath(params.command)))
 
             const args = split(params.command)
             if (!args || args.length === 0) {
