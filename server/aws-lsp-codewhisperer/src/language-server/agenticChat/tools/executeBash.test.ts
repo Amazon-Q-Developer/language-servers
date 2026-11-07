@@ -8,6 +8,7 @@ import {
     binaryFileWarningMessage,
     CommandCategory,
     hasWindowsDrivePath,
+    hasWindowsUncPath,
 } from './executeBash'
 import { multiplyLinkedFileWarning } from './toolShared'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
@@ -1697,6 +1698,75 @@ describe('requiresAcceptance fails closed on Windows drive-letter paths', () => 
         }
         const result = await new ExecuteBash(features).requiresAcceptance({
             command: 'type C:\\Users\\alice\\.aws\\credentials',
+            cwd: 'C:\\workspace\\folder',
+        })
+        assert.equal(result.requiresAcceptance, true)
+    })
+})
+
+describe('hasWindowsUncPath (Windows UNC detection)', () => {
+    // A UNC path is also corrupted by shlex tokenization, so it must be detected in the raw command.
+    const uncCommands = [
+        'dir \\\\host\\share', // dir \\host\share
+        'type \\\\fileserver\\share\\data.txt', // type \\fileserver\share\data.txt
+        '\\\\host\\share\\file', // UNC path as the first token
+        'dir "\\\\host\\share"', // quoted UNC path
+        'type //host/share', // forward-slash UNC form
+    ]
+    for (const command of uncCommands) {
+        it(`detects the UNC path in ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsUncPath(command), true)
+        })
+    }
+
+    const nonUncCommands = [
+        'ls -la',
+        'cat project/notes.txt',
+        'cat ./report.txt',
+        'curl https://example.com', // a URI authority is not a UNC path
+        'cat a//b', // a double slash inside a token is not a UNC prefix
+    ]
+    for (const command of nonUncCommands) {
+        it(`does not flag ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsUncPath(command), false)
+        })
+    }
+})
+
+describe('requiresAcceptance fails closed on Windows UNC and environment-variable arguments', () => {
+    // These forms only change the approval decision on Windows, where cmd.exe runs the raw command.
+    // IS_WINDOWS_PLATFORM is fixed at module load, so these end-to-end cases run on a Windows host
+    // only; the UNC detection logic itself is covered on every platform by the suite above.
+    let features: TestFeatures
+
+    before(function () {
+        features = new TestFeatures()
+        features.workspace.getAllWorkspaceFolders = sinon
+            .stub()
+            .returns([{ uri: URI.file('/workspace/folder').toString(), name: 'test' }]) as any
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    it('requires acceptance for a UNC path that cmd.exe would open as a share', async function () {
+        if (process.platform !== 'win32') {
+            return this.skip()
+        }
+        const result = await new ExecuteBash(features).requiresAcceptance({
+            command: 'dir \\\\host\\share',
+            cwd: 'C:\\workspace\\folder',
+        })
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for an environment-variable argument cmd.exe would expand', async function () {
+        if (process.platform !== 'win32') {
+            return this.skip()
+        }
+        const result = await new ExecuteBash(features).requiresAcceptance({
+            command: 'type %USERPROFILE%\\secrets.txt',
             cwd: 'C:\\workspace\\folder',
         })
         assert.equal(result.requiresAcceptance, true)

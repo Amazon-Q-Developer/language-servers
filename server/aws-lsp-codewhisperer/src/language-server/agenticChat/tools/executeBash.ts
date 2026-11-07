@@ -164,6 +164,22 @@ export function hasWindowsDrivePath(command: string): boolean {
     return /(?:^|[\s"'=,;(){}<>|&])[a-zA-Z]:/.test(command)
 }
 
+/**
+ * Detects a Windows UNC path (`\\host\share`) or its forward-slash form (`//host/share`) in a raw
+ * command. Like a drive path, a UNC path is corrupted by shlex tokenization (`\\host\share` becomes
+ * `\hostshare`), so the token-based checks cannot recognize it, while `cmd.exe` still opens the
+ * share, which on Windows can trigger outbound SMB authentication to an attacker-named host. This
+ * branch already blocks these forms incidentally, through an unrelated tokenizer side effect; this
+ * makes the control explicit at the raw-command layer and independent of that side effect.
+ *
+ * Matches a `\\` or `//` prefix at a token boundary. Requiring a token boundary keeps a URI
+ * authority such as `https://` from being read as a UNC path. The function is platform-independent
+ * so it can be unit-tested on any host; the caller applies it only on Windows.
+ */
+export function hasWindowsUncPath(command: string): boolean {
+    return /(?:^|[\s"'=,;(){}<>|&])(?:\\\\|\/\/)/.test(command)
+}
+
 export class ExecuteBash {
     private childProcess?: ChildProcess
     private readonly logging: Features['logging']
@@ -233,10 +249,11 @@ export class ExecuteBash {
             const requiresShellApproval =
                 expansionPattern.test(params.command) ||
                 /[<>();&|\r\n]/.test(params.command) ||
-                // On Windows, shlex tokenization deletes the backslashes in a drive path, so a command
-                // such as `type C:\Users\alice\.aws\credentials` would otherwise slip past the path
-                // checks below while cmd.exe reads the real file. Fail closed on any drive-letter path.
-                (IS_WINDOWS_PLATFORM && hasWindowsDrivePath(params.command))
+                // On Windows, shlex tokenization deletes the backslashes in a drive path or a UNC
+                // path, so a command such as `type C:\Users\alice\.aws\credentials` or
+                // `dir \\host\share` would otherwise slip past the path checks below while cmd.exe
+                // reads the real location. Fail closed on either raw form.
+                (IS_WINDOWS_PLATFORM && (hasWindowsDrivePath(params.command) || hasWindowsUncPath(params.command)))
 
             const args = split(params.command)
             if (!args || args.length === 0) {
