@@ -240,6 +240,21 @@ const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
 // size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
 const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 
+// The name of the Local Build Verification plan step; its rounds reach a beamed repo through the step-HITL diff path.
+const LOCAL_BUILD_VERIFICATION_STEP_NAME = 'Local Build Verification'
+
+// A beamed repo's customer-changes manifest: the folders left out, and a bound on the number of files it lists.
+const BEAM_MANIFEST_SKIPPED_FOLDERS = new Set([
+    'bin',
+    'obj',
+    '.git',
+    '.vs',
+    'node_modules',
+    'packages',
+    workspaceFolderName.toLowerCase(),
+])
+const BEAM_MANIFEST_MAX_FILES = 50_000
+
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
  * Parallel to RTS TransformHandler but uses AtxTokenServiceManager and ATX FES APIs
@@ -1149,13 +1164,18 @@ export class ATXTransformHandler {
 
     /**
      * Beam-to-IDE, ITGen: drops the integ-* HITLs outside the loaded repo's subtree (a sibling beamed repo's) and
-     * the ones with no step id, which can't be shown to belong to it. Unchanged when no scope is set (non-beam).
+     * the ones with no step id, which can't be shown to belong to it. While the job isn't known to be an ITGen job
+     * (e.g. right after an LS restart, before the background beam-map read finishes) it drops all of them, so none
+     * goes down the generic artifact path as an unknown tag. Unchanged when no scope is set (non-beam).
      */
-    private withoutSiblingItGenHitls(hitls: any[], scopeStepIds: string[]): any[] {
+    private withoutSiblingItGenHitls(hitls: any[], scopeStepIds: string[], jobId: string): any[] {
         if (scopeStepIds.length === 0) {
             return hitls
         }
-        return hitls.filter(h => !isItGenHitlTag(h.tag) || scopeStepIds.includes(String(this.getStepId(h) ?? '')))
+        const itGen = this.itGenJobs.isKnownItGenJob(jobId)
+        return hitls.filter(
+            h => !isItGenHitlTag(h.tag) || (itGen && scopeStepIds.includes(String(this.getStepId(h) ?? '')))
+        )
     }
 
     private static parseScopeStepIds(beamScopeStepIds: string | undefined): string[] {
@@ -2108,7 +2128,9 @@ export class ATXTransformHandler {
         solutionRootPath: string
     ): Promise<{ Success: boolean; Error?: string }> {
         try {
-            if (!(await this.isItGenJob(workspaceId, jobId))) {
+            // Beam-aware: after an LS restart, a beamed repo's parent job is known to be an ITGen job only once its
+            // beam-map is read, which may not have happened yet.
+            if (!(await this.itGenJobs.isBeamItGenJob(workspaceId, jobId))) {
                 return {
                     Success: false,
                     Error: 'completeHitlWithTestResults requires a job with generate_integration_tests',
@@ -2557,7 +2579,7 @@ export class ATXTransformHandler {
                 return null
             }
             const scopeStepIds = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
-            const hitls = this.withoutSiblingItGenHitls(listedHitls, scopeStepIds)
+            const hitls = this.withoutSiblingItGenHitls(listedHitls, scopeStepIds, jobId)
 
             if (hitls.length === 0) {
                 this.logging.log(`ATX: No hitls available`)
@@ -2738,7 +2760,9 @@ export class ATXTransformHandler {
             // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never reads
             // the job's objective otherwise. A beam-map read it needs runs in the background, so it never delays a poll.
             if (request.IsBeam === true) {
-                await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
+                if (await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)) {
+                    await this.ensureBeamSourceFilesManifest(request.SolutionRootPath, request.TransformationJobId)
+                }
             }
             const result = await this._getTransformInfoInternal(request, diffContext)
             if (result && diffContext.failed) {
@@ -2765,7 +2789,8 @@ export class ATXTransformHandler {
                     request.SolutionRootPath,
                     this.withoutSiblingItGenHitls(
                         this._currentPollHitls,
-                        ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                        ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds),
+                        request.TransformationJobId
                     )
                 )
             }
@@ -2853,7 +2878,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 return {
@@ -2896,7 +2922,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 // If GetCheckpoints is requested, populate HasCheckpoint field on steps
@@ -2938,7 +2965,11 @@ export class ATXTransformHandler {
                     // path too since a beam job surfaces its LBV HITL here.
                     const execScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
                     // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
-                    const scopedBlockingHitls = this.withoutSiblingItGenHitls(blockingHitls, execScopeStepIds)
+                    const scopedBlockingHitls = this.withoutSiblingItGenHitls(
+                        blockingHitls,
+                        execScopeStepIds,
+                        request.TransformationJobId
+                    )
                     const { scopedLbv: scopedExecLbv, allOutOfScopeLbv: execAllOutOfScope } = this.selectScopedLbvHitl(
                         scopedBlockingHitls,
                         execScopeStepIds
@@ -3040,7 +3071,8 @@ export class ATXTransformHandler {
                         request.WorkspaceId,
                         request.TransformationJobId,
                         request.SolutionRootPath,
-                        request.IsBeam === true
+                        request.IsBeam === true,
+                        request.beamScopeStepIds
                     )
                 } catch (e) {
                     // Plan not available yet
@@ -3053,7 +3085,11 @@ export class ATXTransformHandler {
                 if (hitls && hitls.length > 0) {
                     const planScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
                     // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
-                    const scopedPlanHitls = this.withoutSiblingItGenHitls(hitls, planScopeStepIds)
+                    const scopedPlanHitls = this.withoutSiblingItGenHitls(
+                        hitls,
+                        planScopeStepIds,
+                        request.TransformationJobId
+                    )
                     const { scopedLbv: scopedPlanLbv, allOutOfScopeLbv: planAllOutOfScopeLbv } =
                         this.selectScopedLbvHitl(scopedPlanHitls, planScopeStepIds)
                     // Beam multi-repo parity with EXECUTING / getHitlAgentArtifact: if scope is set and every
@@ -3061,7 +3097,7 @@ export class ATXTransformHandler {
                     // sibling's HITL — return plan-only. Prevents handing the IDE another repo's HITL.
                     if (planScopeStepIds.length > 0 && (planAllOutOfScopeLbv || scopedPlanHitls.length === 0)) {
                         this.logging.log(
-                            'ATX: PLANNING job — all pending HITLs are sibling-repo LBV (none in loaded scope); not surfacing'
+                            'ATX: PLANNING job — all pending HITLs belong to sibling repos (LBV or integ-*, none in loaded scope); not surfacing'
                         )
                         return {
                             TransformationJob: {
@@ -3232,7 +3268,8 @@ export class ATXTransformHandler {
                 request.WorkspaceId,
                 request.TransformationJobId,
                 request.SolutionRootPath,
-                request.IsBeam === true
+                request.IsBeam === true,
+                request.beamScopeStepIds
             )
             return {
                 TransformationJob: {
@@ -3256,7 +3293,8 @@ export class ATXTransformHandler {
                 request.WorkspaceId,
                 request.TransformationJobId,
                 request.SolutionRootPath,
-                request.IsBeam === true
+                request.IsBeam === true,
+                request.beamScopeStepIds
             )
             return {
                 TransformationJob: {
@@ -3276,7 +3314,8 @@ export class ATXTransformHandler {
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.IsBeam === true
+            request.IsBeam === true,
+            request.beamScopeStepIds
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
@@ -4439,34 +4478,52 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        isBeam: boolean = false
+        isBeam: boolean = false,
+        beamScopeStepIds?: string
     ): Promise<AtxTransformationPlan> {
         try {
             const plan = await this.fetchPlanTree(workspaceId, jobId)
 
-            // Fetch worklogs in parallel (fire and forget, don't block plan return)
-            this.fetchWorklogs(workspaceId, jobId, solutionRootPath).catch(e => {
-                this.logging.log(`ATX: Could not get worklogs for workspace: ${workspaceId}, job: ${jobId}`)
-            })
+            // Fetch worklogs in parallel (fire and forget, don't block plan return). Not without a solution root
+            // (beam discovery): they'd be written relative to the LS's working directory.
+            if (solutionRootPath) {
+                this.fetchWorklogs(workspaceId, jobId, solutionRootPath).catch(e => {
+                    this.logging.log(`ATX: Could not get worklogs for workspace: ${workspaceId}, job: ${jobId}`)
+                })
+            }
 
             // Download completed step artifacts if not already present.
             //
-            // Beam-to-IDE (transformed): SKIP this pass. The beamed source is already
-            // the transformed output, so the prior transform job's completed-step
-            // checkpoint diffs are (a) already baked in and (b) not present in the beam
-            // bundle. Attempting to apply them logs "Checkpoint folder not available for
-            // step" and sets DiffApplyFailed on every poll, stalling the LBV loop. New
-            // LBV-round diffs are surfaced via the separate diff-artifact path, which is
-            // not gated here.
+            // Beam-to-IDE (transformed): the beamed source is already the transformed output, so the
+            // steps before the beam are baked in and not in the beam bundle; applying them logs
+            // "Checkpoint folder not available for step" and stalls the LBV loop. Only steps under the
+            // loaded repo's card (beamScopeStepIds) are applied: the card is created at beam time, so
+            // they all came after it (unit tests, ITGen code fixes, adding the tests). LBV steps are
+            // left out: their rounds come through the separate diff-artifact path. Without a scope
+            // (not resolved yet, or beam discovery) nothing is applied.
+            let beamScope: Set<string> | undefined
             if (isBeam) {
-                this.logging.log(
-                    `ATX: [BEAM] skipping completed-step artifact apply for beamed job ${jobId} — source is already transformed`
-                )
-                this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
-                return plan
+                const scope = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
+                if (scope.length === 0 || !solutionRootPath) {
+                    this.logging.log(
+                        `ATX: [BEAM] no loaded-repo scope for beamed job ${jobId} — not applying completed-step artifacts`
+                    )
+                    this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
+                    return plan
+                }
+                beamScope = new Set(scope)
+                for (const lbvStepId of this.lbvSubtreeStepIds(plan.Root)) {
+                    beamScope.delete(lbvStepId)
+                }
             }
 
-            const anyFailed = await this.downloadCompletedStepArtifacts(workspaceId, jobId, solutionRootPath, plan)
+            const anyFailed = await this.downloadCompletedStepArtifacts(
+                workspaceId,
+                jobId,
+                solutionRootPath,
+                plan,
+                beamScope
+            )
             if (anyFailed && this._currentDiffContext) {
                 this._currentDiffContext.failed = true
             }
@@ -4487,7 +4544,8 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        plan: AtxTransformationPlan
+        plan: AtxTransformationPlan,
+        beamScope?: Set<string>
     ): Promise<boolean> {
         let anyFailed = false
         // Prevent concurrent execution
@@ -4499,7 +4557,16 @@ export class ATXTransformHandler {
 
         try {
             let completedSteps: (AtxPlanStep & { score?: number })[]
-            if (await this.isItGenJob(workspaceId, jobId)) {
+            if (beamScope) {
+                // A beamed repo's steps are nested under its card; only the ones in scope, in application order.
+                completedSteps = await this.findCompletedStepsAnyDepth(
+                    workspaceId,
+                    jobId,
+                    solutionRootPath,
+                    plan.Root,
+                    step => beamScope.has(step.StepId)
+                )
+            } else if (await this.isItGenJob(workspaceId, jobId)) {
                 // Already in application order (tree post-order).
                 completedSteps = await this.findCompletedStepsAnyDepth(workspaceId, jobId, solutionRootPath, plan.Root)
             } else {
@@ -4682,10 +4749,13 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        root: AtxPlanStep
+        root: AtxPlanStep,
+        include: (step: AtxPlanStep) => boolean = () => true
     ): Promise<AtxPlanStep[]> {
         const applied = new Set(this.loadAppliedCheckpoints(solutionRootPath, jobId))
-        const pending = this.findSucceededStepsPostOrder(root).filter(step => !applied.has(step.StepId))
+        const pending = this.findSucceededStepsPostOrder(root).filter(
+            step => include(step) && !applied.has(step.StepId)
+        )
         const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
         const isDownloaded = (step: AtxPlanStep) => fs.existsSync(path.join(checkpointsDir, step.StepId))
 
@@ -4700,6 +4770,85 @@ export class ATXTransformHandler {
             return pending.filter(isDownloaded)
         }
         return pending.filter(step => isDownloaded(step) || stepIdsWithArtifact.has(step.StepId))
+    }
+
+    /** Beam-to-IDE: the Local Build Verification steps and every step under them (their error-fix rounds). */
+    private lbvSubtreeStepIds(root: AtxPlanStep): string[] {
+        const ids: string[] = []
+        const collect = (step: AtxPlanStep, inLbv: boolean) => {
+            const lbv = inLbv || step.StepName === LOCAL_BUILD_VERIFICATION_STEP_NAME
+            if (lbv && step.StepId) {
+                ids.push(step.StepId)
+            }
+            for (const child of step.Children || []) {
+                collect(child, lbv)
+            }
+        }
+        for (const child of root.Children || []) {
+            collect(child, false)
+        }
+        return ids
+    }
+
+    /**
+     * ITGen for a beamed repo: the customer-changes manifest that addCustomerChangesToResultZip and the user-edit
+     * protection in applyChanges read. startTransform writes it for a standalone job; a beamed repo never runs
+     * startTransform, so it's written on the first beamed poll, once the solution is open and its root is known.
+     * It lists the files under the root, without build output and the IDE's own folders, and its baseline is now:
+     * edits after Load count as the customer's.
+     */
+    private async ensureBeamSourceFilesManifest(solutionRootPath: string, jobId: string): Promise<void> {
+        if (!solutionRootPath || !isSafeAbsolutePath(solutionRootPath)) {
+            return
+        }
+        const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
+        const manifestPath = path.join(checkpointsDir, 'source-files.json')
+        try {
+            await fs.promises.access(manifestPath)
+            return
+        } catch {
+            // not written yet
+        }
+        try {
+            const sourceFiles = await this.listBeamSourceFiles(solutionRootPath)
+            const now = Date.now()
+            const manifest = {
+                jobId: jobId,
+                solutionRootPath: solutionRootPath,
+                createdAt: new Date(now).toISOString(),
+                lastAppliedTimestamp: now,
+                sourceFiles: sourceFiles,
+            }
+            await fs.promises.mkdir(checkpointsDir, { recursive: true })
+            await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+            this.logging.log(
+                `ATX: [BEAM] source files manifest written to ${manifestPath} with ${sourceFiles.length} files`
+            )
+        } catch (error) {
+            this.logging.error(`ATX: [BEAM] could not write the source files manifest: ${String(error)}`)
+        }
+    }
+
+    // Files under a beamed solution's root, without build output, VCS and IDE folders, and artifactWorkspace.
+    private async listBeamSourceFiles(solutionRootPath: string): Promise<string[]> {
+        const files: string[] = []
+        const walk = async (dir: string): Promise<void> => {
+            for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+                if (files.length >= BEAM_MANIFEST_MAX_FILES) {
+                    return
+                }
+                const full = path.join(dir, entry.name)
+                if (entry.isDirectory()) {
+                    if (!BEAM_MANIFEST_SKIPPED_FOLDERS.has(entry.name.toLowerCase())) {
+                        await walk(full)
+                    }
+                } else if (entry.isFile()) {
+                    files.push(full)
+                }
+            }
+        }
+        await walk(solutionRootPath)
+        return files
     }
 
     /**

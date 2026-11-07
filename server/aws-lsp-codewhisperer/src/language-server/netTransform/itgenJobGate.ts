@@ -31,8 +31,6 @@ export type ReadBeamOptIn = (workspaceId: string, jobId: string) => Promise<bool
  */
 export class ItGenJobGate {
     static readonly maxJobs = 200
-    /** How long a beamed job whose beam-map has no opt-in goes before its beam-map is read again. */
-    static readonly beamRecheckMs = 5 * 60_000
     /** How long after a beam-map read that couldn't tell (or is still running) the next read may start. */
     static readonly beamRetryMs = 60_000
 
@@ -92,8 +90,10 @@ export class ItGenJobGate {
 
     /**
      * For a beamed repo, whose job is the parent web job: its objective never opts in, its beam-map entries do. When
-     * neither the objective nor an earlier read says yes, reads the beam-map (at most once per beamRecheckMs, or
-     * beamRetryMs when the last read couldn't tell). With `waitForBeamMap` false (a poll) the read runs in the
+     * neither the objective nor an earlier read says yes, reads the beam-map. A beam-map without an opt-in isn't read
+     * again until the job is forgotten: the beam-map is written when a repo is beamed, before the IDE loads it, and a
+     * repo beamed later is picked up by the dashboard's discovery (listBeamedRepos calls rememberBeamOptIn). A read
+     * that couldn't tell is retried after beamRetryMs. With `waitForBeamMap` false (a poll) the read runs in the
      * background and the gate turns on from the next call.
      */
     async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
@@ -115,7 +115,7 @@ export class ItGenJobGate {
                 if (optIn === true) {
                     this.rememberBeamOptIn(jobId)
                 } else if (optIn === false) {
-                    ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRecheckMs)
+                    ItGenJobGate.setCapped(this.beamChecks, jobId, Number.POSITIVE_INFINITY)
                 }
             },
             error => this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)

@@ -318,6 +318,49 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(beamMapStub.calledOnce).to.be.true
         })
 
+        it('surfaces no integ-* HITL while the gate is still unknown, e.g. right after an LS restart', async () => {
+            hitls = [appLaunchHitl]
+
+            // The beam-map read is still running (not released)
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl-artifact-integ-app-launch'))).to
+                .be.false
+        })
+
+        it("writes the customer-changes manifest once the repo is known to opt in, and doesn't rewrite it", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            fs.mkdirSync(path.join(tmpRoot, 'Web', 'bin'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'), 'bin')
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+
+            await beamPoll()
+
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+            expect(manifest.sourceFiles).to.include(path.join(tmpRoot, 'Web', 'Program.cs'))
+            expect(manifest.sourceFiles).to.not.include(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'))
+            expect(manifest.sourceFiles.some((f: string) => f.includes(workspaceFolderName))).to.be.false
+            expect(manifest.lastAppliedTimestamp).to.be.a('number')
+
+            fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, sourceFiles: ['kept'] }))
+            await beamPoll()
+            expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles).to.deep.equal(['kept'])
+        })
+
+        it("writes no manifest for a beamed repo that doesn't opt in", async () => {
+            beamOptIn = false
+            releaseBeamMap()
+            await beamPoll()
+            await beamMapRead
+            await beamPoll()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.false
+        })
+
         it('never reads the beam-map for a job that is not beamed', async () => {
             hitls = [appLaunchHitl]
 
@@ -753,8 +796,20 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(submitStub.firstCall.args).to.deep.equal([WS_ID, JOB_ID, 'task-run', 'upload-1'])
         })
 
+        it("accepts a beamed repo's results right after an LS restart, from its beam-map opt-in", async () => {
+            setItGen(false)
+            const readBeamOptIn = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
+            const full = writeZip('results.zip', { 'summary.json': summary() })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            expect(readBeamOptIn.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+        })
+
         it('refuses for a job without generate_integration_tests', async () => {
             setItGen(false)
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
             const full = writeZip('results.zip', { 'summary.json': summary() })
 
             const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)

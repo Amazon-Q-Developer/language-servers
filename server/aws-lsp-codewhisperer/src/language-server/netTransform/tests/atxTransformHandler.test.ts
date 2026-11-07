@@ -1193,6 +1193,114 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(downloadStub.callCount).to.equal(4)
         })
 
+        // Beam-to-IDE: the parent web job's plan. A pre-beam transform step, then the beamed repo's card with its
+        // unit tests, and Local Verification with LBV (and an error-fix round), an ITGen code fix and adding the tests.
+        const beamPlan = () => ({
+            Root: {
+                StepId: 'root',
+                Status: 'IN_PROGRESS',
+                Children: [
+                    { StepId: 'pre', StepName: 'Transform App', Status: 'SUCCEEDED', Children: [] },
+                    {
+                        StepId: 'repo',
+                        StepName: 'App (beamed)',
+                        Status: 'IN_PROGRESS',
+                        Children: [
+                            { StepId: 'ut', StepName: 'Generate unit tests', Status: 'SUCCEEDED', Children: [] },
+                            {
+                                StepId: 'lv',
+                                StepName: 'Local Verification',
+                                Status: 'IN_PROGRESS',
+                                Children: [
+                                    {
+                                        StepId: 'lbv',
+                                        StepName: 'Local Build Verification',
+                                        Status: 'SUCCEEDED',
+                                        Children: [
+                                            {
+                                                StepId: 'round-1',
+                                                StepName: 'Round 1',
+                                                Status: 'SUCCEEDED',
+                                                Children: [],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        StepId: 'fix-1',
+                                        StepName: 'Fixing code · iteration 1',
+                                        Status: 'SUCCEEDED',
+                                        Children: [],
+                                    },
+                                    {
+                                        StepId: 'add',
+                                        StepName: 'Adding tests to your solution',
+                                        Status: 'SUCCEEDED',
+                                        Children: [],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        })
+        const beamArtifacts = () => ({
+            artifacts: ['pre', 'ut', 'round-1', 'fix-1', 'add', 'lbv'].map(id => ({
+                artifactId: `a-${id}`,
+                planStepId: id,
+            })),
+        })
+        const BEAM_SCOPE = 'repo,ut,lv,lbv,round-1,fix-1,add'
+
+        describe('beamed job (getTransformationPlan with IsBeam)', () => {
+            beforeEach(() => {
+                sinon.stub(handler as any, 'fetchWorklogs').resolves()
+                sendStub.resolves(beamArtifacts())
+            })
+
+            it("applies the loaded repo's post-beam step diffs: unit tests, code fixes, adding the tests", async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(appliedOrder()).to.deep.equal(['ut', 'fix-1', 'add'])
+            })
+
+            it('never applies pre-beam steps or LBV steps and their rounds (those come through the step HITL)', async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(appliedOrder().filter(id => ['pre', 'lbv', 'round-1'].includes(id))).to.be.empty
+                expect(
+                    downloadStub
+                        .getCalls()
+                        .map(c => c.args[2])
+                        .filter(id => ['pre', 'lbv', 'round-1'].includes(id))
+                ).to.be.empty
+            })
+
+            for (const scope of ['', undefined]) {
+                it(`applies nothing without the loaded repo's scope (${JSON.stringify(scope)})`, async () => {
+                    sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                    await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, scope)
+
+                    expect(applyStub.called).to.be.false
+                    expect(downloadStub.called).to.be.false
+                })
+            }
+
+            it('applies nothing and fetches no worklogs without a solution root (beam discovery)', async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, '', true, BEAM_SCOPE)
+
+                expect(applyStub.called).to.be.false
+                expect((handler as any).fetchWorklogs.called).to.be.false
+            })
+        })
+
         it('skips SUCCEEDED steps with no artifact instead of reporting a failed apply', async () => {
             sendStub.resolves(listedArtifacts())
             ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
