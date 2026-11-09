@@ -293,3 +293,41 @@ npm run test:unit
   checks that the links of earlier events are kept.
 - The suite "source link clicks" checks that `http` and `https` links go to the IDE with telemetry,
   and that other links and local paths do not go to the IDE and show the notification.
+
+## 8. Memory bank folder cleanup
+
+### Behavior
+
+Before the agentic chat server generates a memory bank, `cleanMemoryBankDirectory` in
+`agenticChat/context/memorybank/memoryBankController.ts` removes the four memory bank files
+(`product.md`, `structure.md`, `tech.md` and `guidelines.md`) from `.amazonq/rules/memory-bank` in
+the workspace folder. It then creates that folder if it does not exist.
+
+- The server now does this only when the memory bank folder, after every symbolic link in its path is
+  followed, is inside the workspace folder. It resolves the path with `resolveCanonicalPath`, as the
+  file tools do, and compares it with the resolved workspace folder.
+- Otherwise, the server removes and creates nothing there, and logs a warning. Memory bank generation
+  continues. The files that the agent writes next go through the approval check for files outside the
+  workspace, like any other file write.
+- A symbolic link that stays inside the workspace folder, and a workspace folder that is opened
+  through a symbolic link, work as before.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "cleanMemoryBankDirectory" \
+  src/language-server/agenticChat/context/memorybank/memoryBankController.test.ts
+npm run lint
+```
+
+The suite "cleanMemoryBankDirectory" uses a temporary folder and directory links (junctions on
+Windows). It checks that:
+
+- the files are removed, and other files in the folder are kept, when the memory bank folder is in
+  the workspace folder, when a link inside the workspace folder leads to it, and when the workspace
+  folder is opened through a link;
+- the folder is created when it does not exist;
+- nothing is removed or created, and a warning is logged, when `.amazonq`, `.amazonq/rules` or
+  `.amazonq/rules/memory-bank` links to a folder outside the workspace folder.

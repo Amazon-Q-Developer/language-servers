@@ -4,6 +4,9 @@
  */
 
 import * as assert from 'assert'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import * as sinon from 'sinon'
 import { MemoryBankController } from './memoryBankController'
 import { MemoryBankPrompts } from './memoryBankPrompts'
@@ -400,6 +403,116 @@ describe('MemoryBankController', () => {
 
             assert.strictEqual(result, false)
             sinon.assert.calledOnce(mockLogging.error)
+        })
+    })
+
+    describe('cleanMemoryBankDirectory', () => {
+        const memoryBankFiles = ['product.md', 'structure.md', 'tech.md', 'guidelines.md']
+        let tempRoot: string
+        let workspacePath: string
+
+        // A directory link; on Windows a junction, which needs no extra privilege.
+        const linkDirectory = (target: string, linkPath: string) =>
+            fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+
+        const writeMemoryBankFiles = (folder: string) => {
+            fs.mkdirSync(folder, { recursive: true })
+            for (const name of memoryBankFiles) {
+                fs.writeFileSync(path.join(folder, name), 'old')
+            }
+        }
+
+        beforeEach(() => {
+            tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'memory-bank-')))
+            workspacePath = path.join(tempRoot, 'workspace')
+            fs.mkdirSync(workspacePath)
+
+            // The stubbed workspace file system acts on the real temporary folder.
+            mockFs.exists.callsFake(async (p: string) => fs.existsSync(p))
+            mockFs.rm = sinon.stub().callsFake((p: string) => fs.promises.rm(p, { recursive: true, force: true }))
+            mockFs.mkdir.callsFake(async (p: string, options?: fs.MakeDirectoryOptions) => {
+                await fs.promises.mkdir(p, options)
+            })
+        })
+
+        afterEach(() => {
+            fs.rmSync(tempRoot, { recursive: true, force: true })
+        })
+
+        it('removes the memory bank files in the workspace folder and keeps the folder', async () => {
+            const memoryBankPath = path.join(workspacePath, '.amazonq', 'rules', 'memory-bank')
+            writeMemoryBankFiles(memoryBankPath)
+            fs.writeFileSync(path.join(memoryBankPath, 'notes.md'), 'kept')
+
+            await controller.cleanMemoryBankDirectory(workspacePath)
+
+            assert.deepStrictEqual(fs.readdirSync(memoryBankPath), ['notes.md'])
+            sinon.assert.callCount(mockFs.rm, memoryBankFiles.length)
+            sinon.assert.notCalled(mockLogging.warn)
+        })
+
+        it('creates the memory bank folder when it does not exist yet', async () => {
+            await controller.cleanMemoryBankDirectory(workspacePath)
+
+            assert.ok(fs.statSync(path.join(workspacePath, '.amazonq', 'rules', 'memory-bank')).isDirectory())
+            sinon.assert.notCalled(mockFs.rm)
+        })
+
+        it('removes the files when a link inside the workspace folder leads to the memory bank folder', async () => {
+            const target = path.join(workspacePath, 'config', 'amazonq')
+            writeMemoryBankFiles(path.join(target, 'rules', 'memory-bank'))
+            linkDirectory(target, path.join(workspacePath, '.amazonq'))
+
+            await controller.cleanMemoryBankDirectory(workspacePath)
+
+            assert.deepStrictEqual(fs.readdirSync(path.join(target, 'rules', 'memory-bank')), [])
+            sinon.assert.notCalled(mockLogging.warn)
+        })
+
+        it('removes the files when the workspace folder itself is reached through a link', async () => {
+            const memoryBankPath = path.join(workspacePath, '.amazonq', 'rules', 'memory-bank')
+            writeMemoryBankFiles(memoryBankPath)
+            const workspaceAlias = path.join(tempRoot, 'workspace-alias')
+            linkDirectory(workspacePath, workspaceAlias)
+
+            await controller.cleanMemoryBankDirectory(workspaceAlias)
+
+            assert.deepStrictEqual(fs.readdirSync(memoryBankPath), [])
+        })
+
+        const outsideCases = [
+            { link: ['.amazonq'], below: ['rules', 'memory-bank'] },
+            { link: ['.amazonq', 'rules'], below: ['memory-bank'] },
+            { link: ['.amazonq', 'rules', 'memory-bank'], below: [] as string[] },
+        ]
+        for (const { link, below } of outsideCases) {
+            it(`leaves the files outside the workspace folder alone when ${link.join('/')} links there`, async () => {
+                const target = path.join(tempRoot, 'outside')
+                const outsideMemoryBankPath = path.join(target, ...below)
+                writeMemoryBankFiles(outsideMemoryBankPath)
+                fs.mkdirSync(path.join(workspacePath, ...link.slice(0, -1)), { recursive: true })
+                linkDirectory(target, path.join(workspacePath, ...link))
+
+                await controller.cleanMemoryBankDirectory(workspacePath)
+
+                for (const name of memoryBankFiles) {
+                    assert.strictEqual(fs.readFileSync(path.join(outsideMemoryBankPath, name), 'utf8'), 'old')
+                }
+                sinon.assert.notCalled(mockFs.rm)
+                sinon.assert.notCalled(mockFs.mkdir)
+                sinon.assert.calledOnceWithMatch(mockLogging.warn, /outside the workspace folder/)
+            })
+        }
+
+        it('does not create a memory bank folder through a link that leaves the workspace folder', async () => {
+            const target = path.join(tempRoot, 'outside')
+            fs.mkdirSync(target)
+            linkDirectory(target, path.join(workspacePath, '.amazonq'))
+
+            await controller.cleanMemoryBankDirectory(workspacePath)
+
+            assert.deepStrictEqual(fs.readdirSync(target), [])
+            sinon.assert.notCalled(mockFs.mkdir)
         })
     })
 })
