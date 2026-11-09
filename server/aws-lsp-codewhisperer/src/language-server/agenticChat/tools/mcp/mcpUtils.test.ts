@@ -1537,8 +1537,28 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
         expect(agentConfig.tools).to.include('@demo/allowed_tool')
         sinon.assert.calledWithMatch(
             logger.warn,
-            /Ignoring permission '@demo\/denied_tool' .*MCP servers that the config does not define: demo$/
+            /Ignoring permission "@demo\/denied_tool" .*MCP servers that the config does not define: "demo"$/
         )
+    })
+
+    it('logs each ignored permission entry and server name quoted, on a single line', async () => {
+        const serverName = 'demo\nsecond line'
+        const entry = `@${serverName}/tool`
+        const wildcard = 'fs*\nsecond line'
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { [serverName]: { command: 'x-mcp', args: [] } },
+        })
+        await writeJson(wsAgentPath, { tools: [entry, wildcard], allowedTools: [entry] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.allowedTools).to.not.include(entry)
+        const lines: string[] = logger.warn.args.map((args: unknown[]) => String(args[0]))
+        expect(lines.some(line => line.includes(`Ignoring permission ${JSON.stringify(entry)} in `))).to.be.true
+        expect(lines.some(line => line.endsWith(`does not define: ${JSON.stringify(serverName)}`))).to.be.true
+        expect(lines.some(line => line.includes(`Ignoring wildcard permission ${JSON.stringify(wildcard)} in `))).to.be
+            .true
+        expect(lines.filter(line => line.includes('\n'))).to.deep.equal([])
     })
 
     it('keeps the enablement of a global mcp.json server whose name extends a workspace server', async () => {
@@ -1567,14 +1587,14 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
 
         // '@repo/x' is ambiguous: it is also the tool 'x' of the user's server 'repo'
         expect(agentConfig.tools).to.not.include('@repo/x')
-        sinon.assert.calledWithMatch(logger.warn, /MCP servers that the config does not define: repo$/)
+        sinon.assert.calledWithMatch(logger.warn, /MCP servers that the config does not define: "repo"$/)
     })
 
-    it('does not let a decoy server of the same name carry a grant to a legacy global server', async () => {
+    it('does not apply a workspace grant to a legacy global server that has the same name', async () => {
         await writeJson(globalAgentPath, { mcpServers: {}, tools: [], allowedTools: [] })
         await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { demo: { command: 'demo-mcp', args: [] } } })
         await writeJson(wsAgentPath, {
-            mcpServers: { demo: { command: 'decoy-mcp', args: [] } },
+            mcpServers: { demo: { command: 'workspace-mcp', args: [] } },
             allowedTools: ['@demo/anytool'],
         })
 

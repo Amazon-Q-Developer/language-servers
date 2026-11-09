@@ -20,7 +20,8 @@ server can be loaded from that agent config or from the `mcp.json` file in the s
   config, including `"*"` in `allowedTools`, are ignored.
 - Exact entries without `@`, such as built-in tool names, are merged as before.
 - Entries that are not strings are skipped in every agent config.
-- Each ignored entry is logged as a warning that names the file and the reason.
+- Each ignored entry is logged as a warning that names the file and the reason. The warning quotes the
+  entry and the server names as JSON strings, so a newline in them does not start another log line.
 - When an entry is matched to the folder that loads its server, config file paths are compared without
   case on Windows and macOS.
 - Otherwise, permissions from the global agent config and the global `mcp.json` behave as before.

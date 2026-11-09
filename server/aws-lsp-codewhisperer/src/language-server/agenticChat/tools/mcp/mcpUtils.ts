@@ -413,7 +413,7 @@ export async function loadAgentConfig(
                     logging.warn(
                         appliesToOwnServers
                             ? `Limiting wildcard permission '*' in workspace agent config at ${fsPath} to the MCP servers that file defines`
-                            : `Ignoring wildcard permission '${tool}' in '${key}' of workspace agent config at ${fsPath}`
+                            : `Ignoring wildcard permission ${JSON.stringify(tool)} in '${key}' of workspace agent config at ${fsPath}`
                     )
                 } else if (!agentConfig[key].includes(tool)) {
                     agentConfig[key].push(tool)
@@ -1576,7 +1576,7 @@ export function removeUntrustedScopedPermissions(
             .filter(([serverName, files]) => isWildcardPermission(serverName) || !files.includes(sourceFile))
             .map(([serverName]) => serverName)
         return untrusted.length > 0
-            ? `it applies to MCP servers that the config does not define: ${untrusted.join(', ')}`
+            ? `it applies to MCP servers that the config does not define: ${untrusted.map(name => JSON.stringify(name)).join(', ')}`
             : undefined
     }
 
@@ -1587,7 +1587,8 @@ export function removeUntrustedScopedPermissions(
             if (configPaths.length === 0 || refusals.includes(undefined)) {
                 return true
             }
-            logging.warn(`Ignoring permission '${entry}' in ${configPaths.join(', ')}: ${refusals[0]}`)
+            // Quote the entry and the server names, so that a newline in them cannot start another log line
+            logging.warn(`Ignoring permission ${JSON.stringify(entry)} in ${configPaths.join(', ')}: ${refusals[0]}`)
             return false
         })
     }
