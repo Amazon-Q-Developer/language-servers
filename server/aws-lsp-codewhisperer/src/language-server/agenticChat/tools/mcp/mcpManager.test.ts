@@ -3065,6 +3065,72 @@ describe('workspace trust for stdio MCP servers', () => {
             expect(mgr.getServerState('svc')?.lastError).to.equal('connect failed')
         })
 
+        it('stops a server started in a trusted folder when the folder is no longer trusted, and starts it again once trusted', async () => {
+            const mgr = await buildMgr('trusted')
+            await start(mgr)
+            expect(startedCwds()).to.deep.equal([folderPath])
+            const close = sinon.stub().resolves()
+            mgr.clients.set('svc', { close })
+            mgr.mcpTools.push({ serverName: 'svc', toolName: 't', description: '', inputSchema: {} })
+
+            await mgr.setWorkspaceTrust('restricted')
+
+            expect(close.calledOnce).to.be.true
+            expect(mgr.clients.has('svc')).to.be.false
+            expect(mgr.getAllTools().some((t: any) => t.serverName === 'svc')).to.be.false
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.setWorkspaceTrust('trusted')
+
+            expect(startedCwds()).to.deep.equal([folderPath, folderPath])
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
+        it('reports why a server is held, and stops reporting it once the server starts', async () => {
+            const mgr = await buildMgr('restricted')
+            await start(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.setWorkspaceTrust('trusted')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
+        it('reports a declined folder, and a waiting folder again after declines are cleared', async () => {
+            const mgr = await buildMgr('prompt')
+            showMessageStub.onFirstCall().resolves({ title: "Don't allow" })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr)
+            await settlePrompts(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('declined')
+
+            mgr.clearDeclinedFolders()
+            await start(mgr)
+
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+        })
+
+        it('does not report a hold for a server that is restarting', async () => {
+            const mgr = await buildMgr('restricted')
+            await start(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.holdServerUntilTrusted('svc', 'restarting')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+            expect(mgr.serversAwaitingTrust.has('svc')).to.be.true
+        })
+
+        it('does not report a hold for a removed server', async () => {
+            const mgr = await buildMgr('restricted')
+            sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+            await start(mgr)
+
+            await mgr.removeServer('svc')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
         it('starts a held server with the config as it is when it starts, not as it was when it was held', async () => {
             const mgr = await buildMgr('restricted')
             await start(mgr)

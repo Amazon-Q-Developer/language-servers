@@ -158,6 +158,7 @@ export class McpEventHandler {
         // Transform server configs into DetailedListItem objects
         const activeItems: DetailedListItem[] = []
         const consentDeniedItems: DetailedListItem[] = []
+        const awaitingTrustItems: DetailedListItem[] = []
         const disabledItems: DetailedListItem[] = []
         const builtInItems: DetailedListItem[] = []
 
@@ -230,8 +231,12 @@ export class McpEventHandler {
                 ],
             }
 
+            // Held back by the workspace trust check, which a user-disabled server never reaches
+            const trustHold = mcpManager.isServerDisabled(serverName) ? undefined : this.#getTrustHoldReason(serverName)
             if (consentDenied) {
                 consentDeniedItems.push({ ...item, description: 'consent not granted' })
+            } else if (trustHold) {
+                awaitingTrustItems.push({ ...item, description: trustHold })
             } else if (mcpManager.isServerDisabled(serverName) || serverState?.status === McpServerStatus.DISABLED) {
                 disabledItems.push(item)
             } else {
@@ -255,6 +260,13 @@ export class McpEventHandler {
                         text: `${activeItems.length} servers with tools`,
                     },
                 ],
+            })
+        }
+
+        if (awaitingTrustItems.length > 0) {
+            groups.push({
+                groupName: 'Waiting for trust',
+                children: awaitingTrustItems,
             })
         }
 
@@ -954,6 +966,8 @@ export class McpEventHandler {
 
         // need to check server state now, as there is possibility of error during server initialization
         const serverStatusError = this.#getServerStatusError(serverName)
+        // A server held by the workspace trust check was saved correctly; it starts once the folder is trusted
+        const heldForTrust = !!this.#getTrustHoldReason(sanitizedServerName)
 
         let numTools = 0
         try {
@@ -972,7 +986,7 @@ export class McpEventHandler {
             languageServerVersion: this.#features.runtime.serverInfo.version,
         })
 
-        if (serverStatusError) {
+        if (serverStatusError && !heldForTrust) {
             try {
                 await McpManager.instance.removeServerFromConfigFile(serverName)
             } catch (error) {
@@ -1476,7 +1490,9 @@ export class McpEventHandler {
         const serverStatusError = error
             ? { title: error, icon: 'cancel-circle', status: 'error' as Status }
             : this.#getServerStatusError(serverName) || {}
-        const hasError = !!serverStatusError.status
+        const hasStatus = !!serverStatusError.status
+        // A server waiting for workspace trust has a warning, not an error
+        const hasError = serverStatusError.status === 'error'
 
         return {
             id: params.id,
@@ -1484,7 +1500,7 @@ export class McpEventHandler {
             header: {
                 title: 'Edit MCP Server',
                 status: serverStatusError,
-                actions: hasError
+                actions: hasStatus
                     ? [
                           {
                               id: 'mcp-details-menu',
@@ -1990,6 +2006,32 @@ export class McpEventHandler {
     }
 
     /**
+     * What a server held back by the workspace trust check is waiting for, and how the user can start it.
+     * Undefined when the server is not held.
+     */
+    #getTrustHoldReason(serverName: string | undefined): string | undefined {
+        if (!serverName || !McpManager.isInitialized()) {
+            return undefined
+        }
+        const mcpManager = McpManager.instance
+        const hold = mcpManager.getTrustHold(serverName)
+        if (hold === 'declined') {
+            return 'Not allowed in this folder. Refresh the server list to choose again.'
+        }
+        if (hold === 'waiting') {
+            switch (mcpManager.getWorkspaceTrust()) {
+                case 'restricted':
+                    return 'Waiting for workspace trust. Trust this project in your IDE to start it.'
+                case 'prompt':
+                    return 'Waiting for you to allow this folder.'
+                default:
+                    return 'Waiting for workspace trust.'
+            }
+        }
+        return undefined
+    }
+
+    /**
      * Gets the UI status object for a specific MCP server
      */
     #getServerStatusError(serverName: string): { title: string; icon: string; status: Status } | undefined {
@@ -2005,6 +2047,11 @@ export class McpEventHandler {
 
         if (!serverState) {
             return undefined
+        }
+
+        const trustHold = this.#getTrustHoldReason(key)
+        if (trustHold) {
+            return { title: trustHold, icon: 'warning', status: 'warning' }
         }
 
         // Only return status if there's an error
