@@ -1,7 +1,7 @@
 # Agentic chat hardening — testing
 
-This document describes behavior changes in the chat servers of `@aws/lsp-codewhisperer` and how to
-test them. Each numbered section describes one change.
+This document describes behavior changes in the language servers and the chat client, and how to test
+them. Each numbered section describes one change.
 
 The tests use only temporary folders and synthetic data. They create and remove their own fixtures.
 
@@ -247,3 +247,49 @@ npm run lint
   rejected URL and for a missing URL, and that no log line contains the activation token.
 - The test "logs the subscription status without the subscription URL" checks the log line that the
   server writes when a chat tab opens.
+
+## 7. Source links in chat responses
+
+### Behavior
+
+A chat response can include source links, which the service sends as the supplementary web links of
+the response. The chat UI shows them under the answer, and a click on one asks the IDE to open it.
+
+- The agentic chat server (`agenticChat/agenticChatEventParser.ts`) and the chat server in
+  `chat/qChatServer.ts` (`chat/chatEventParser.ts`) keep a source link only when its URL is an
+  absolute `http` or `https` URL with a host name. `isWebUrl` in `shared/utils.ts` checks the URL.
+  The servers drop every other source link, for example a link with another scheme, a relative link
+  or a link with no URL. A kept link is sent unchanged, in the order of the response.
+- When none of the links of a response event is kept, the server adds no related content for that
+  event. The telemetry count of source link events still counts the event.
+- The chat client sends a source link click to the IDE (`aws/chat/sourceLinkClick`) only when
+  `classifyChatLink` classifies the link as a web link. Clicks on links in answers and on info links
+  already used this check. For any other source link, the client records the `sourceLinkClick`
+  telemetry event, does not send the click to the IDE, and shows the "Link not opened" notification.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "source links|isWebUrl" \
+  src/language-server/agenticChat/agenticChatEventParser.test.ts \
+  src/language-server/chat/chatEventParser.test.ts \
+  src/shared/utils.test.ts
+npm run lint
+```
+
+From `chat-client`, run the whole suite. A run filtered with `-g` skips setup in `chat.test.ts` that the
+tests in `mynahUi.test.ts` need.
+
+```sh
+npm run test:unit
+```
+
+- The suite "isWebUrl" checks URLs that are accepted, and URLs that are rejected: other schemes in
+  several spellings, a URL with no host, a URL with no scheme, and relative and absolute paths.
+- The two "source links" suites check that only `http` and `https` links are kept, in order and
+  unchanged, and that an event with no such link adds no related content. The agentic suite also
+  checks that the links of earlier events are kept.
+- The suite "source link clicks" checks that `http` and `https` links go to the IDE with telemetry,
+  and that other links and local paths do not go to the IDE and show the notification.

@@ -224,6 +224,11 @@ export class Messager {
 
     onSourceLinkClick = (params: SourceLinkClickParams): void => {
         this.chatApi.sourceLinkClick(params)
+        this.onSourceLinkClickTelemetry(params)
+    }
+
+    /** Records a source-link click that chat did not send to the IDE (a link that is not http or https). */
+    onSourceLinkClickTelemetry = (params: SourceLinkClickParams): void => {
         this.chatApi.telemetry({ ...params, name: SOURCE_LINK_CLICK_TELEMETRY_EVENT })
     }
 

@@ -394,4 +394,74 @@ describe('AgenticChatEventParser', () => {
         assert.strictEqual(result.success, true)
         assert.strictEqual(result.data?.toolUses['tool-1'].stop, false)
     })
+
+    describe('source links', () => {
+        const webLink = (url: string | undefined, title = 'title') => ({ title, snippet: 'snippet', url })
+
+        it('keeps only http and https source links, in order and unchanged', () => {
+            const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [
+                        webLink('https://docs.example.com/guide?a=1#part', 'https link'),
+                        webLink('javascript:alert(1)'),
+                        webLink('HTTP://Example.com/Page', 'http link'),
+                        webLink('data:text/html,hello'),
+                        webLink('file:///etc/hosts'),
+                        webLink('vscode://settings/x'),
+                        webLink('command:workbench.action.reloadWindow'),
+                        webLink('mailto:someone@example.com'),
+                        webLink('//example.com/no-scheme'),
+                        webLink('docs/relative.md'),
+                        webLink('https://'),
+                        webLink(''),
+                        webLink(undefined),
+                    ],
+                },
+            })
+
+            const result = chatEventParser.getResult()
+            assert.deepStrictEqual(result.data?.chatResult.relatedContent, {
+                content: [
+                    { title: 'https link', url: 'https://docs.example.com/guide?a=1#part', body: 'snippet' },
+                    { title: 'http link', url: 'HTTP://Example.com/Page', body: 'snippet' },
+                ],
+            })
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+        })
+
+        it('adds no related content when an event has no http or https link', () => {
+            const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [webLink('javascript:alert(1)'), webLink('file:///etc/hosts')],
+                },
+            })
+
+            assert.strictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, undefined)
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+        })
+
+        it('keeps the links of earlier events when a later event has no web link', () => {
+            const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: { supplementaryWebLinks: [webLink('https://a.example.com/')] },
+            })
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: { supplementaryWebLinks: [webLink('vbscript:msgbox(1)')] },
+            })
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: { supplementaryWebLinks: [webLink('http://b.example.com/x')] },
+            })
+
+            assert.deepStrictEqual(
+                chatEventParser.getResult().data?.chatResult.relatedContent?.content.map(link => link.url),
+                ['https://a.example.com/', 'http://b.example.com/x']
+            )
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 3)
+        })
+    })
 })

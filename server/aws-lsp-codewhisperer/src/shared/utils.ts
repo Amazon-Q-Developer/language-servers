@@ -740,3 +740,20 @@ export function sanitizeRequestInput(input: any): any {
     }
     return input
 }
+
+/**
+ * Whether `url` is an absolute http or https URL with a host name. The chat UI shows the source links of a
+ * response and the IDE opens them, so a source link with any other URL is dropped.
+ */
+export function isWebUrl(url: string | undefined): boolean {
+    if (!url) {
+        return false
+    }
+    try {
+        // `URL` rejects an http or https URL without a host.
+        const { protocol } = new URL(url)
+        return protocol === 'http:' || protocol === 'https:'
+    } catch {
+        return false
+    }
+}

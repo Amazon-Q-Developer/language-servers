@@ -31,6 +31,7 @@ import {
     isUsingIAMAuth,
     getBearerTokenFromProviderWithType,
     sanitizeLogInput,
+    isWebUrl,
 } from './utils'
 import { promises as fsPromises } from 'fs'
 
@@ -1235,4 +1236,51 @@ describe('sanitizeRequestInput', () => {
             assert.strictEqual(result, input)
         })
     })
+})
+
+describe('isWebUrl', () => {
+    for (const url of [
+        'https://example.com',
+        'https://docs.example.com/guide?a=1#part',
+        'http://example.com:8080/x',
+        'HTTPS://EXAMPLE.COM/',
+        'https://user:pass@example.com/',
+        'https://127.0.0.1/',
+        'https://[::1]/',
+        ' https://example.com/ ',
+    ]) {
+        it(`accepts ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), true)
+        })
+    }
+
+    for (const url of [
+        undefined,
+        '',
+        'javascript:alert(1)',
+        'JavaScript:alert(1)',
+        ' javascript:alert(1)',
+        '\u0000javascript:alert(1)',
+        'java\nscript:alert(1)',
+        'data:text/html,hello',
+        'vbscript:msgbox(1)',
+        'file:///etc/hosts',
+        'file://server/share/x',
+        'vscode://settings/x',
+        'command:workbench.action.reloadWindow',
+        'mailto:someone@example.com',
+        'ftp://example.com/x',
+        'ws://example.com/',
+        'about:blank',
+        'blob:https://example.com/id',
+        'https://',
+        '//example.com/x',
+        '/etc/hosts',
+        'docs/relative.md',
+        'not a url',
+    ]) {
+        it(`rejects ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), false)
+        })
+    }
 })

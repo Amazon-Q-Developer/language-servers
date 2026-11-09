@@ -270,4 +270,47 @@ describe('ChatEventParser', () => {
 
         assert.deepStrictEqual(chatEventParser.getResult(), { success: true, data: expectedData })
     })
+
+    describe('source links', () => {
+        const webLink = (url: string | undefined, title = 'title') => ({ title, snippet: 'snippet', url })
+
+        it('keeps only http and https source links, in order and unchanged', () => {
+            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [
+                        webLink('javascript:alert(1)'),
+                        webLink('https://docs.example.com/guide', 'https link'),
+                        webLink('file:///etc/hosts'),
+                        webLink('http://example.com/page', 'http link'),
+                        webLink('vscode://settings/x'),
+                        webLink('https://'),
+                        webLink(undefined),
+                    ],
+                },
+            })
+
+            assert.deepStrictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, {
+                content: [
+                    { title: 'https link', url: 'https://docs.example.com/guide', body: 'snippet' },
+                    { title: 'http link', url: 'http://example.com/page', body: 'snippet' },
+                ],
+            })
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+        })
+
+        it('adds no related content when an event has no http or https link', () => {
+            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [webLink('data:text/html,hello'), webLink('command:x')],
+                },
+            })
+
+            assert.strictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, undefined)
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+        })
+    })
 })

@@ -892,6 +892,55 @@ describe('MynahUI', () => {
         })
     })
 
+    describe('source link clicks', () => {
+        const props = () => (mynahUi as any).props
+        const sourceLinkTelemetry = () =>
+            (outboundChatApi.telemetry as sinon.SinonStub).getCalls().filter(c => c.args[0].name === 'sourceLinkClick')
+
+        it('sends an https or http source link to the IDE and records telemetry', () => {
+            props().onSourceLinkClick('tab-1', 'answer-1', 'https://example.com/doc', undefined, 'event-1')
+            props().onSourceLinkClick('tab-1', 'answer-1', 'http://example.com/page', undefined, 'event-2')
+
+            const sourceLinkClick = outboundChatApi.sourceLinkClick as sinon.SinonStub
+            sinon.assert.calledTwice(sourceLinkClick)
+            deepStrictEqual(sourceLinkClick.firstCall.args[0], {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/doc',
+                eventId: 'event-1',
+            })
+            strictEqual(sourceLinkClick.secondCall.args[0].link, 'http://example.com/page')
+            strictEqual(sourceLinkTelemetry().length, 2)
+            sinon.assert.notCalled(notifySpy)
+        })
+
+        it('does not send a source link with another scheme or a local path, and tells the user', () => {
+            const links = [
+                'javascript:alert(1)',
+                'file:///etc/hosts',
+                'vscode://settings/x',
+                'command:workbench.action.reloadWindow',
+                'src/foo.ts',
+                '\\\\host\\share\\x',
+                '',
+            ]
+            for (const link of links) {
+                props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
+            }
+
+            sinon.assert.notCalled(outboundChatApi.sourceLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            strictEqual(notifySpy.callCount, links.length)
+            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
+            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
+            deepStrictEqual(
+                sourceLinkTelemetry().map(c => c.args[0].link),
+                links
+            )
+        })
+    })
+
     describe('onMessageDismiss', () => {
         it('acknowledges the deprecation card and removes it from every open and future new chat', () => {
             const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
