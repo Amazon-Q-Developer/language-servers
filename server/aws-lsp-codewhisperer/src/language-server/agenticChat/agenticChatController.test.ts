@@ -486,6 +486,115 @@ describe('AgenticChatController', () => {
 
             sinon.assert.calledOnce(getSubscriptionStatusStub)
         })
+
+        it('logs the subscription status without the subscription URL', async () => {
+            getSubscriptionStatusStub.resolves({
+                status: 'none',
+                encodedVerificationUrl: 'https://signin.aws.amazon.com/oauth?activationToken=TOKEN-1234',
+            })
+
+            chatController.onTabAdd({ tabId: mockTabId })
+            await new Promise(resolve => setTimeout(resolve, 0))
+
+            sinon.assert.calledWith(
+                testFeatures.logging.log as sinon.SinonStub,
+                'setPaidTierMode: getSubscriptionStatus: none'
+            )
+            sinon.assert.neverCalledWithMatch(testFeatures.logging.log as sinon.SinonStub, sinon.match('TOKEN-1234'))
+        })
+    })
+
+    describe('onManageSubscription', () => {
+        // The form of the URL that the service returns. The activation token must not reach the log.
+        const activationToken = 'TOKEN-1234'
+        const signInUrl = `https://signin.aws.amazon.com/oauth?redirect_uri=https://us-east-1.console.aws.amazon.com/amazonq/developer/home?hashArgs=%23%2Fsubscriptions%2FbuilderId%3FactivationToken%3D${activationToken}&isauthcode=true&region=us-east-1&response_type=code`
+        let getCodewhispererServiceStub: sinon.SinonStub
+        let getSubscriptionStatusStub: sinon.SinonStub
+        let waitUntilSubscriptionActiveStub: sinon.SinonStub
+
+        const loggedText = () =>
+            (['log', 'info', 'warn', 'error', 'debug'] as const)
+                .flatMap(level => (testFeatures.logging[level] as sinon.SinonStub).args)
+                .map(args => args.join(' '))
+                .join('\n')
+
+        // Runs the "Upgrade Q" flow of a free-tier user whose subscription status response has this URL
+        const manageSubscription = async (encodedVerificationUrl: string | undefined) => {
+            getSubscriptionStatusStub.resolves({ status: 'none', encodedVerificationUrl })
+            await chatController.onManageSubscription(mockTabId)
+            // onManageSubscription handles the status response asynchronously
+            await new Promise(resolve => setTimeout(resolve, 0))
+        }
+
+        const upgradePendingUpdate = sinon.match({ paidTierMode: 'upgrade-pending' })
+
+        const assertRequestFailedMessage = () => {
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.notCalled(waitUntilSubscriptionActiveStub)
+            sinon.assert.neverCalledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showMessage as sinon.SinonStub, {
+                message: 'Subscription request failed.',
+                type: MessageType.Error,
+            })
+        }
+
+        beforeEach(() => {
+            getSubscriptionStatusStub = sinon.stub()
+            waitUntilSubscriptionActiveStub = sinon.stub().resolves(true)
+            getCodewhispererServiceStub = sinon
+                .stub(AmazonQTokenServiceManager.prototype, 'getCodewhispererService')
+                .returns({
+                    getSubscriptionStatus: getSubscriptionStatusStub,
+                    waitUntilSubscriptionActive: waitUntilSubscriptionActiveStub,
+                } as any)
+            ;(testFeatures.lsp.window.showDocument as sinon.SinonStub).resolves({ success: true })
+            testFeatures.lsp.window.showMessage = sinon.stub().resolves()
+        })
+
+        afterEach(() => {
+            getCodewhispererServiceStub.restore()
+        })
+
+        it('opens an https URL on the AWS sign-in host in the external browser without logging it', async () => {
+            await manageSubscription(signInUrl)
+
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                external: true,
+                uri: signInUrl,
+            })
+            sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.calledOnce(waitUntilSubscriptionActiveStub)
+            assert.ok(!loggedText().includes(activationToken))
+        })
+
+        it('opens the URL in its normalized form', async () => {
+            await manageSubscription('HTTPS://SIGNIN.AWS.AMAZON.COM:443/oauth?state=1')
+
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                external: true,
+                uri: 'https://signin.aws.amazon.com/oauth?state=1',
+            })
+        })
+
+        for (const uri of [
+            `vscode://publisher.extension/path?activationToken=${activationToken}`,
+            `file:///tmp/file.txt?activationToken=${activationToken}`,
+            `http://signin.aws.amazon.com/oauth?activationToken=${activationToken}`,
+            `https://example.com/oauth?activationToken=${activationToken}`,
+        ]) {
+            it(`does not open ${uri.split('?')[0]} and shows an error without logging the URL`, async () => {
+                await manageSubscription(uri)
+
+                assertRequestFailedMessage()
+                assert.ok(!loggedText().includes(activationToken))
+            })
+        }
+
+        it('shows an error when the response has no URL', async () => {
+            await manageSubscription(undefined)
+
+            assertRequestFailedMessage()
+        })
     })
 
     it('onTabRemove unsets tab id if current tab is removed and emits metrics', () => {

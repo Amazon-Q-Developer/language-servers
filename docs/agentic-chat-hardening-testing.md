@@ -206,3 +206,44 @@ npm run lint
   checks the request that is sent.
 - In `agenticChatController.test.ts`, the test "removes invisible characters from the file ranking
   request without escaping HTML" checks the ranking request of memory bank generation.
+
+## 6. Subscription upgrade URL
+
+### Behavior
+
+When a Builder ID user on the free tier chooses to upgrade (the upgrade button in chat, the upgrade
+action of the free-tier limit message, or the `aws/chat/manageSubscription` command with no AWS
+account ID), the agentic chat server requests a subscription token. It then asks the client to open
+the `encodedVerificationUrl` of the response in the external browser.
+
+- The server asks the client to open the URL only when it is an https URL on the AWS sign-in host
+  (`signin.aws.amazon.com`), with no user name, no password and the default port. The service builds
+  the URL on `https://signin.aws.amazon.com/oauth`. Subdomains of the sign-in host are not accepted,
+  because AWS accounts can choose subdomains of it for their own sign-in pages.
+- `parseSubscriptionUpgradeUrl` in `paidTier/paidTier.ts` checks the URL. The server sends the URL in
+  the normalized form that `URL` returns.
+- For any other URL, the server does not ask the client to open it, does not set the "upgrade pending"
+  state, and shows the error "Subscription request failed.", as it already did for a response with no
+  URL.
+- The server logs the subscription status, but not the URL, because the URL contains an activation
+  token.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit src/language-server/paidTier/paidTier.test.ts
+npx ts-mocha --timeout 0 --exit -g "onManageSubscription|setPaidTierMode caching" \
+  src/language-server/agenticChat/agenticChatController.test.ts
+npm run lint
+```
+
+- The suite "parseSubscriptionUpgradeUrl" checks URLs that are accepted and their normalized form,
+  and URLs that are rejected: other schemes, http, other hosts, subdomains of the sign-in host, a host
+  that only ends with the sign-in host name, a user name or password, and a non-default port.
+- The suite "onManageSubscription" checks that the server asks the client to open the sign-in URL in
+  the external browser, in normalized form. It also checks that the server shows the error for each
+  rejected URL and for a missing URL, and that no log line contains the activation token.
+- The test "logs the subscription status without the subscription URL" checks the log line that the
+  server writes when a chat tab opens.
