@@ -617,6 +617,27 @@ describe('AgenticChatController', () => {
 
                 assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), false)
             })
+
+            it('removes invisible characters from the file ranking request without escaping HTML', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .callsFake(async (_workspaceFolderUri, rankFiles) => {
+                        await rankFiles('Rank src/a&b\u00AD.ts \u{1F600}\u{E0100}\u{E0158} src/<c>.ts\u{E0041}')
+                        return 'Write the memory bank files'
+                    })
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Create a memory bank' } },
+                    mockCancellationToken
+                )
+
+                sinon.assert.calledOnce(sendMessageStub)
+                const rankingRequest: SendMessageCommandInput = sendMessageStub.firstCall.firstArg
+                assert.strictEqual(
+                    rankingRequest.conversationState?.currentMessage?.userInputMessage?.content,
+                    'Rank src/a&b.ts \u{1F600} src/<c>.ts'
+                )
+            })
         })
 
         it('read all the response streams and return compiled results', async () => {

@@ -1049,7 +1049,9 @@ export class AgenticChatController implements ChatHandlers {
                                 },
                             }
 
-                            const response = await client.sendMessage(requestInput)
+                            // The prompt lists workspace file paths. Remove invisible characters, as for the
+                            // other chat requests.
+                            const response = await client.sendMessage(sanitizeRequestInput(requestInput))
 
                             let responseContent = ''
                             const maxResponseSize = 50000 // 50KB limit

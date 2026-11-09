@@ -176,3 +176,33 @@ npm run lint
 
 The test "removes invisible characters from the prompt and the document text without escaping HTML"
 opens a document, sends an inline chat prompt for it, and checks the request that is sent.
+
+## 5. Invisible characters in other chat requests
+
+### Behavior
+
+- The agentic chat server applies `sanitizeRequestInput` to the file ranking request of memory bank
+  generation. That request lists workspace file paths. As in section 3, a path that contains a removed
+  character reaches the model without that character.
+- In the chat server in `chat/qChatServer.ts`, `chat/chatController.ts` applies `sanitizeRequestInput`
+  to each chat request and each inline chat request. Before this change, this server removed no
+  characters from requests. Now the characters that section 3 says `sanitizeInput` removes are removed
+  from the prompt, the document text and the rest of the request. The prompt is not HTML-escaped, as
+  before. Code that inline chat rewrites loses the removed characters that it contained.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit src/language-server/chat/chatController.test.ts
+npx ts-mocha --timeout 0 --exit -g "memory bank generation" \
+  src/language-server/agenticChat/agenticChatController.test.ts
+npm run lint
+```
+
+- In `chatController.test.ts`, the suites "onChatPrompt" and "onInlineChatPrompt" each have the test
+  "removes invisible characters from the prompt and the document text without escaping HTML". It
+  checks the request that is sent.
+- In `agenticChatController.test.ts`, the test "removes invisible characters from the file ranking
+  request without escaping HTML" checks the ranking request of memory bank generation.
