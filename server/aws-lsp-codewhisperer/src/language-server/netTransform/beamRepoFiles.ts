@@ -3,8 +3,13 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-/** The Local Build Verification plan step. Its rounds reach a beamed repo through the step-HITL diff path. */
-export const LOCAL_BUILD_VERIFICATION_STEP_NAME = 'Local Build Verification'
+/**
+ * Whether a plan step is Local Build Verification, whose rounds reach a beamed repo through the step-HITL diff path.
+ * Matched on the name, case-insensitively and anywhere in it, so a renamed or numbered LBV node still counts.
+ */
+export function isLocalBuildVerificationStep(stepName: string | undefined): boolean {
+    return (stepName || '').toLowerCase().includes('local build verification')
+}
 
 /** The most files a beamed repo's manifest lists. */
 export const BEAM_MANIFEST_MAX_FILES = 50_000
@@ -27,7 +32,7 @@ export function beamApplyStepIds(root: PlanNode, scope: ReadonlySet<string>): Se
     const ids = new Set<string>()
     const walk = (step: PlanNode, parentInScope: boolean, inLbv: boolean) => {
         const inScope = !!step.StepId && scope.has(step.StepId)
-        const lbv = inLbv || step.StepName === LOCAL_BUILD_VERIFICATION_STEP_NAME
+        const lbv = inLbv || isLocalBuildVerificationStep(step.StepName)
         if (inScope && parentInScope && !lbv) {
             ids.add(step.StepId!)
         }
@@ -41,21 +46,42 @@ export function beamApplyStepIds(root: PlanNode, scope: ReadonlySet<string>): Se
     return ids
 }
 
+export interface BeamRepoFiles {
+    files: string[]
+    /** True when the walk stopped at `maxFiles`. */
+    truncated: boolean
+    /** Subfolders that couldn't be read (locked, access denied, deleted mid-walk), relative to the root. */
+    unreadableFolders: string[]
+}
+
 /**
  * The files under a beamed solution's root, for its customer-changes manifest: without build output, VCS and IDE
  * folders, `workspaceFolder` (artifactWorkspace) and a NuGet packages folder, and at most `maxFiles`. Symbolic links
- * aren't followed.
+ * aren't followed. A subfolder that can't be read is left out; only an unreadable root fails the walk.
  */
 export async function listBeamRepoFiles(
     solutionRootPath: string,
     workspaceFolder: string,
     maxFiles: number = BEAM_MANIFEST_MAX_FILES
-): Promise<string[]> {
+): Promise<BeamRepoFiles> {
     const files: string[] = []
+    const unreadableFolders: string[] = []
+    let truncated = false
     const skipped = new Set([...SKIPPED_FOLDERS, workspaceFolder.toLowerCase()])
     const walk = async (dir: string): Promise<void> => {
-        for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+        let entries: fs.Dirent[]
+        try {
+            entries = await fs.promises.readdir(dir, { withFileTypes: true })
+        } catch (error) {
+            if (dir === solutionRootPath) {
+                throw error
+            }
+            unreadableFolders.push(path.relative(solutionRootPath, dir))
+            return
+        }
+        for (const entry of entries) {
             if (files.length >= maxFiles) {
+                truncated = true
                 return
             }
             const full = path.join(dir, entry.name)
@@ -70,7 +96,7 @@ export async function listBeamRepoFiles(
         }
     }
     await walk(solutionRootPath)
-    return files
+    return { files, truncated, unreadableFolders }
 }
 
 // packages.config restores to packages/<Id>.<Version>/<Id>.<Version>.nupkg; a source folder named packages has none.

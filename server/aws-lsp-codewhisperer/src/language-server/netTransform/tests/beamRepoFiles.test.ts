@@ -3,7 +3,7 @@ import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { beamApplyStepIds, listBeamRepoFiles, PlanNode } from '../beamRepoFiles'
+import { beamApplyStepIds, isLocalBuildVerificationStep, listBeamRepoFiles, PlanNode } from '../beamRepoFiles'
 
 describe('beamRepoFiles', () => {
     afterEach(() => {
@@ -56,6 +56,43 @@ describe('beamRepoFiles', () => {
         it('keeps nothing for an empty scope', () => {
             expect(beamApplyStepIds(plan, new Set()).size).to.equal(0)
         })
+
+        // The handler finds LBV nodes the same way (findAllLbvNodes), so a re-beamed or renamed LBV is still left out.
+        it('leaves out an LBV step whatever its casing or suffix, with its rounds', () => {
+            const renamed: PlanNode = {
+                StepId: 'root',
+                Children: [
+                    {
+                        StepId: 'repo',
+                        Children: [
+                            {
+                                StepId: 'lbv-2',
+                                StepName: 'local build verification (attempt 2)',
+                                Children: [{ StepId: 'round-1' }],
+                            },
+                            { StepId: 'fix-1', StepName: 'Fixing code · iteration 1' },
+                        ],
+                    },
+                ],
+            }
+
+            expect([...beamApplyStepIds(renamed, new Set(['repo', 'lbv-2', 'round-1', 'fix-1']))]).to.deep.equal([
+                'fix-1',
+            ])
+        })
+    })
+
+    describe('isLocalBuildVerificationStep', () => {
+        for (const name of ['Local Build Verification', 'LOCAL BUILD VERIFICATION', 'Local Build Verification 2']) {
+            it(`is true for ${JSON.stringify(name)}`, () => {
+                expect(isLocalBuildVerificationStep(name)).to.be.true
+            })
+        }
+        for (const name of ['Local Verification', 'Build', '', undefined]) {
+            it(`is false for ${JSON.stringify(name)}`, () => {
+                expect(isLocalBuildVerificationStep(name)).to.be.false
+            })
+        }
     })
 
     describe('listBeamRepoFiles', () => {
@@ -65,7 +102,7 @@ describe('beamRepoFiles', () => {
             fs.writeFileSync(path.join(root, rel), content)
         }
         const listed = async (max?: number) =>
-            (await listBeamRepoFiles(root, 'artifactWorkspace', max)).map(f =>
+            (await listBeamRepoFiles(root, 'artifactWorkspace', max)).files.map(f =>
                 path.relative(root, f).split(path.sep).join('/')
             )
 
@@ -96,12 +133,49 @@ describe('beamRepoFiles', () => {
             expect(await listed()).to.deep.equal(['src/packages/Shared/Shared.cs'])
         })
 
-        it('stops at the file cap', async () => {
+        it('stops at the file cap, and says so', async () => {
             for (let i = 0; i < 5; i++) {
                 write(`f${i}.cs`)
             }
 
-            expect(await listed(3)).to.have.length(3)
+            const result = await listBeamRepoFiles(root, 'artifactWorkspace', 3)
+
+            expect(result.files).to.have.length(3)
+            expect(result.truncated).to.be.true
+            expect((await listBeamRepoFiles(root, 'artifactWorkspace', 5)).truncated).to.be.false
+        })
+
+        it('leaves out a folder it cannot read, and lists the rest', async () => {
+            write('Web/Program.cs')
+            write('Locked/Secret.cs')
+            write('Api/Api.cs')
+            const readdir = fs.promises.readdir
+            sinon
+                .stub(fs.promises, 'readdir')
+                .callsFake(((dir: fs.PathLike, options: any) =>
+                    path.basename(String(dir)) === 'Locked'
+                        ? Promise.reject(Object.assign(new Error('EPERM'), { code: 'EPERM' }))
+                        : readdir(dir, options)) as any)
+
+            const result = await listBeamRepoFiles(root, 'artifactWorkspace')
+
+            expect(result.files.map(f => path.relative(root, f).split(path.sep).join('/')).sort()).to.deep.equal([
+                'Api/Api.cs',
+                'Web/Program.cs',
+            ])
+            expect(result.unreadableFolders).to.deep.equal(['Locked'])
+        })
+
+        it('fails when the root itself cannot be read', async () => {
+            const missing = path.join(root, 'missing')
+
+            let error: unknown
+            try {
+                await listBeamRepoFiles(missing, 'artifactWorkspace')
+            } catch (e) {
+                error = e
+            }
+            expect(error).to.be.an('error')
         })
     })
 })

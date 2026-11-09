@@ -13,6 +13,7 @@ import {
     itGenProjectFolderName,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
+import * as beamRepoFiles from '../beamRepoFiles'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 
@@ -331,8 +332,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
                 .be.false
         })
 
-        it("writes the customer-changes manifest once the repo is known to opt in, and doesn't rewrite it", async () => {
-            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+        it("writes the customer-changes manifest for a loaded beamed repo, and doesn't rewrite it", async () => {
             fs.mkdirSync(path.join(tmpRoot, 'Web', 'bin'), { recursive: true })
             fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
             fs.writeFileSync(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'), 'bin')
@@ -388,16 +388,64 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             ).to.deep.equal([path.join('Web', 'appsettings.json')])
         })
 
-        it("writes no manifest for a beamed repo that doesn't opt in", async () => {
+        // The downlink applies a beamed repo's post-beam steps whether or not it opts in to ITGen, so every loaded
+        // repo gets the baseline its user-edit protection needs. In a multi-repo beam the gate is job-wide.
+        it("writes the manifest for a beamed repo that doesn't opt in too", async () => {
             beamOptIn = false
             releaseBeamMap()
             await beamPoll()
             await beamMapRead
-            await beamPoll()
+            await manifestWritten()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.true
+        })
+
+        it('writes no manifest without the loaded repo (beam discovery has no scope)', async () => {
+            await beamPoll('')
             await manifestWritten()
 
             expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
                 .to.be.false
+        })
+
+        // The walk runs in the background, but an apply in the same poll waits for it: otherwise a folder the apply
+        // adds (the generated unit-test project) can land after the walk passed it and before the manifest exists, and
+        // updateSourceFilesManifest, finding no manifest, never tracks it.
+        it('tracks the files an apply adds while the manifest is still being written', async () => {
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            let releaseWalk!: () => void
+            const walkHeld = new Promise<void>(resolve => (releaseWalk = resolve))
+            const list = beamRepoFiles.listBeamRepoFiles
+            sinon.stub(beamRepoFiles, 'listBeamRepoFiles').callsFake(async (...args) => {
+                const listed = await list(...args)
+                await walkHeld
+                return listed
+            })
+            const checkpoint = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'ut')
+            fs.mkdirSync(path.join(checkpoint, 'after', 'Web.Tests'), { recursive: true })
+            fs.writeFileSync(path.join(checkpoint, 'after', 'Web.Tests', 'T.cs'), 'class T {}')
+            fs.writeFileSync(
+                path.join(checkpoint, 'metadata.json'),
+                JSON.stringify({ filesAdded: [path.join('Web.Tests', 'T.cs')] })
+            )
+            await beamPoll()
+
+            const applying = (handler as any).applyChanges(checkpoint, tmpRoot, JOB_ID)
+            await new Promise(resolve => setTimeout(resolve, 50))
+            expect(fs.existsSync(path.join(tmpRoot, 'Web.Tests', 'T.cs')), 'the apply waits for the baseline').to.be
+                .false
+            releaseWalk()
+            const applied = await applying
+            ;(handler as any).updateSourceFilesManifest(tmpRoot, JOB_ID, applied.addedFiles)
+
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+            const sourceFiles: string[] = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles
+            expect(sourceFiles.map(f => path.resolve(tmpRoot, f))).to.include.members([
+                path.join(tmpRoot, 'Web', 'Program.cs'),
+                path.join(tmpRoot, 'Web.Tests', 'T.cs'),
+            ])
         })
 
         it('never reads the beam-map for a job that is not beamed', async () => {

@@ -71,7 +71,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
 
 import { Utils, workspaceFolderName } from './utils'
-import { beamApplyStepIds, listBeamRepoFiles } from './beamRepoFiles'
+import { beamApplyStepIds, isLocalBuildVerificationStep, listBeamRepoFiles } from './beamRepoFiles'
 import { BrowserInfo } from './models'
 import { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, ItGenJobGate } from './itgenJobGate'
 
@@ -2745,11 +2745,15 @@ export class ATXTransformHandler {
         const diffContext: DiffApplyContext = { failed: false, failedStepIds: [] }
         this._currentDiffContext = diffContext
         try {
-            // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never reads
-            // the job's objective otherwise. A beam-map read it needs runs in the background, so it never delays a poll.
             if (request.IsBeam === true) {
-                if (await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)) {
-                    // In the background: the walk can take a while on a large repo, and nothing in this poll needs it
+                // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never
+                // reads the job's objective otherwise. A beam-map read it needs runs in the background, so it never
+                // delays a poll.
+                await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
+                // The customer-changes baseline, for every loaded beamed repo (the downlink applies post-beam steps
+                // to each of them, opted in or not). In the background: the walk can take a while on a large repo.
+                // Only an apply waits for it (applyChanges), so the files the apply adds are tracked.
+                if (ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds).length > 0) {
                     void this.ensureBeamSourceFilesManifest(request.SolutionRootPath, request.TransformationJobId) // never rejects
                 }
             }
@@ -3631,7 +3635,7 @@ export class ATXTransformHandler {
 
     private findAllLbvNodes(step: AtxPlanStep): AtxPlanStep[] {
         const found: AtxPlanStep[] = []
-        if ((step.StepName || '').toLowerCase().includes('local build verification')) {
+        if (isLocalBuildVerificationStep(step.StepName)) {
             found.push(step)
             return found
         }
@@ -4770,7 +4774,7 @@ export class ATXTransformHandler {
             return Promise.resolve()
         }
         const manifestPath = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
-        const key = path.resolve(manifestPath).toLowerCase()
+        const key = ATXTransformHandler.beamManifestKey(solutionRootPath, jobId)
         const running = this.beamManifestWrites.get(key)
         if (running) {
             return running
@@ -4780,6 +4784,12 @@ export class ATXTransformHandler {
         )
         this.beamManifestWrites.set(key, write)
         return write
+    }
+
+    private static beamManifestKey(solutionRootPath: string, jobId: string): string {
+        return path
+            .resolve(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+            .toLowerCase()
     }
 
     private async writeBeamSourceFilesManifest(
@@ -4795,7 +4805,21 @@ export class ATXTransformHandler {
             // not written yet
         }
         try {
-            const sourceFiles = await listBeamRepoFiles(solutionRootPath, workspaceFolderName)
+            const {
+                files: sourceFiles,
+                truncated,
+                unreadableFolders,
+            } = await listBeamRepoFiles(solutionRootPath, workspaceFolderName)
+            if (truncated) {
+                this.logging.warn(
+                    `ATX: [BEAM] source files manifest stopped at ${sourceFiles.length} files; later files aren't tracked`
+                )
+            }
+            if (unreadableFolders.length > 0) {
+                this.logging.debug(
+                    `ATX: [BEAM] source files manifest left out unreadable folders: ${unreadableFolders.join(', ')}`
+                )
+            }
             const now = Date.now()
             const manifest = {
                 jobId: jobId,
@@ -5718,6 +5742,11 @@ export class ATXTransformHandler {
         conflictedFiles?: string[]
     }> {
         try {
+            // Beam to IDE: a beamed repo's customer-changes baseline is written before its first apply, so the files
+            // the apply adds are tracked (updateSourceFilesManifest needs the manifest).
+            if (jobId) {
+                await this.beamManifestWrites.get(ATXTransformHandler.beamManifestKey(solutionRootPath, jobId))
+            }
             this.logging.log(`ATX: Starting applyChanges from ${checkpointFolderPath} to ${solutionRootPath}`)
 
             // Read metadata.json from checkpoint folder
