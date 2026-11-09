@@ -331,6 +331,171 @@ describe('McpEventHandler error handling', () => {
             expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
         })
 
+        describe('servers held back by the workspace trust check', () => {
+            const trustHoldCases = [
+                {
+                    trust: 'restricted',
+                    hold: 'waiting',
+                    reason: 'Waiting for workspace trust. Trust this project in your IDE to start it.',
+                },
+                { trust: 'prompt', hold: 'waiting', reason: 'Waiting for you to allow this folder.' },
+                {
+                    trust: 'prompt',
+                    hold: 'declined',
+                    reason: 'Not allowed in this folder. Refresh the server list to choose again.',
+                },
+                { trust: 'trusted', hold: 'waiting', reason: 'Waiting for workspace trust.' },
+            ] as const
+
+            for (const { trust, hold, reason } of trustHoldCases) {
+                it(`lists a ${hold} server in ${trust} mode with what starts it`, async () => {
+                    await setupServers(new Map([['held', { command: 'npx', disabled: false }]]), {
+                        held: McpServerStatus.DISABLED,
+                    })
+                    sinon.stub(McpManager.instance, 'getTrustHold').returns(hold)
+                    sinon.stub(McpManager.instance, 'getWorkspaceTrust').returns(trust)
+
+                    const result = await eventHandler.onListMcpServers({})
+
+                    expect(result.list.map(group => group.groupName)).to.deep.equal(['Waiting for trust'])
+                    expect(result.list[0].children?.[0].description).to.equal(reason)
+                })
+            }
+
+            it('shows the reason as a warning when opening a held server', async () => {
+                await setupServers(
+                    new Map([['held', { command: 'npx', disabled: false }]]),
+                    { held: McpServerStatus.DISABLED },
+                    { held: 'Waiting for workspace trust' }
+                )
+                sinon.stub(McpManager.instance, 'getTrustHold').returns('waiting')
+                sinon.stub(McpManager.instance, 'getWorkspaceTrust').returns('restricted')
+
+                const result = await eventHandler.onMcpServerClick({ id: 'open-mcp-server', title: 'held' })
+
+                expect(result.header.status).to.deep.equal({
+                    title: 'Waiting for workspace trust. Trust this project in your IDE to start it.',
+                    icon: 'warning',
+                    status: 'warning',
+                })
+            })
+
+            describe('saving a server that the trust check holds back', () => {
+                const saveParams = {
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'held',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'global',
+                    },
+                } as any
+
+                async function save(hold: 'waiting' | undefined, lastError: string) {
+                    await setupServers(
+                        new Map([['held', { command: 'npx', disabled: false }]]),
+                        { held: McpServerStatus.DISABLED },
+                        { held: lastError }
+                    )
+                    const mgr = McpManager.instance
+                    sinon.stub(mgr, 'getTrustHold').returns(hold)
+                    sinon.stub(mgr, 'getWorkspaceTrust').returns('restricted')
+                    sinon.stub(mgr, 'addServer').resolves()
+                    const removeFromFile = sinon.stub(mgr, 'removeServerFromConfigFile').resolves()
+                    const result = await eventHandler.onMcpServerClick(saveParams)
+                    return { result, removeFromFile }
+                }
+
+                it('keeps the saved server and shows why it is not running yet', async () => {
+                    const { result, removeFromFile } = await save('waiting', 'Waiting for workspace trust')
+
+                    sinon.assert.notCalled(removeFromFile)
+                    expect(result.header.status).to.deep.equal({
+                        title: 'Waiting for workspace trust. Trust this project in your IDE to start it.',
+                        icon: 'warning',
+                        status: 'warning',
+                    })
+                })
+
+                it('still removes a server that failed to start', async () => {
+                    const { removeFromFile } = await save(undefined, 'spawn npx ENOENT')
+
+                    sinon.assert.calledOnceWithExactly(removeFromFile, 'held')
+                })
+            })
+
+            for (const registry of [false, true]) {
+                it(`shows a held server as a warning with a normal Save when editing it${registry ? ' from a registry' : ''}`, async () => {
+                    await setupServers(
+                        new Map([['held', { command: 'npx', disabled: false }]]),
+                        { held: McpServerStatus.DISABLED },
+                        { held: 'Waiting for workspace trust' }
+                    )
+                    const mgr = McpManager.instance
+                    sinon.stub(mgr, 'getTrustHold').returns('waiting')
+                    sinon.stub(mgr, 'getWorkspaceTrust').returns('restricted')
+                    sinon.stub(mgr, 'getRegistryService').returns({ isRegistryActive: () => registry } as any)
+
+                    const result: any = await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'held' })
+
+                    expect(result.header.status.status).to.equal('warning')
+                    expect(result.filterActions.find((a: any) => a.id === 'save-mcp').status).to.equal('primary')
+                    if (registry) {
+                        // Disable and delete stay available from the details menu
+                        expect(result.header.actions.map((a: any) => a.id)).to.deep.equal(['mcp-details-menu'])
+                    }
+                })
+            }
+
+            it('keeps a server the user disabled in Disabled', async () => {
+                await setupServers(new Map([['held', { command: 'npx', disabled: true }]]), {
+                    held: McpServerStatus.DISABLED,
+                })
+                sinon.stub(McpManager.instance, 'getTrustHold').returns('waiting')
+
+                const result = await eventHandler.onListMcpServers({})
+
+                expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
+            })
+
+            it('lists held servers after active ones and before denied and disabled ones', async () => {
+                const configs = new Map([
+                    ['allowed', { command: 'node', disabled: false }],
+                    ['held', { command: 'npx', disabled: false }],
+                    ['denied', { command: 'node', disabled: false }],
+                    ['disabled', { command: 'node', disabled: true }],
+                ])
+                await setupServers(
+                    configs,
+                    {
+                        allowed: McpServerStatus.ENABLED,
+                        held: McpServerStatus.DISABLED,
+                        denied: McpServerStatus.DISABLED,
+                        disabled: McpServerStatus.DISABLED,
+                    },
+                    { denied: 'consent not granted' }
+                )
+                sinon
+                    .stub(McpManager.instance, 'getTrustHold')
+                    .callsFake(name => (name === 'held' ? 'waiting' : undefined))
+                sinon.stub(McpManager.instance, 'getWorkspaceTrust').returns('restricted')
+
+                const result = await eventHandler.onListMcpServers({})
+
+                expect(
+                    result.list.map(group => [group.groupName, group.children?.map(item => item.title)])
+                ).to.deep.equal([
+                    ['Active', ['allowed']],
+                    ['Waiting for trust', ['held']],
+                    ['Denied', ['denied']],
+                    ['Disabled', ['disabled']],
+                ])
+            })
+        })
+
         it('does not label other runtime-disabled states as consent denial', async () => {
             await setupServers(new Map([['disabled', { command: 'node', disabled: false }]]), {
                 disabled: McpServerStatus.DISABLED,

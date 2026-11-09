@@ -129,6 +129,8 @@ export class McpManager {
     private readonly pendingFolderPrompts = new Map<string, Promise<boolean>>()
     // Stdio servers held back until their launch folder is trusted
     private readonly serversAwaitingTrust = new Set<string>()
+    // Why each held server is waiting, so the server list can say what starts it
+    private readonly trustHolds = new Map<string, 'waiting' | 'declined'>()
     // Workspace folder each started stdio server runs in; undefined when it started with no folder open
     private readonly stdioLaunchFolders = new Map<string, string | undefined>()
     // Increases when trust, folder approvals or workspace folders change, so a start in progress checks again
@@ -212,6 +214,19 @@ export class McpManager {
     /** Trust state the client reported for the open workspace. */
     public getWorkspaceTrust(): WorkspaceTrustState {
         return this.workspaceTrust
+    }
+
+    /**
+     * Why a stdio server is held back by the workspace trust check: 'waiting' until the workspace or folder is
+     * trusted, or 'declined' after the user did not allow the folder. Undefined when it is not held.
+     */
+    public getTrustHold(serverName: string): 'waiting' | 'declined' | undefined {
+        return this.serversAwaitingTrust.has(serverName) ? this.trustHolds.get(serverName) : undefined
+    }
+
+    private releaseTrustHold(serverName: string): void {
+        this.serversAwaitingTrust.delete(serverName)
+        this.trustHolds.delete(serverName)
     }
 
     /**
@@ -359,7 +374,7 @@ export class McpManager {
                 // Read the config under the lock, so an edit made while this waited is the one that starts
                 const cfg = this.mcpServers.get(name)
                 if (!cfg || this.isServerDisabled(name)) {
-                    this.serversAwaitingTrust.delete(name)
+                    this.releaseTrustHold(name)
                     return
                 }
                 await this.initOneServerInternal(name, cfg, AuthIntent.Silent)
@@ -372,7 +387,7 @@ export class McpManager {
     /** Forget a server's launch folder and trust hold, after it is removed or disabled. */
     private forgetServerLaunch(serverName: string): void {
         this.stdioLaunchFolders.delete(serverName)
-        this.serversAwaitingTrust.delete(serverName)
+        this.releaseTrustHold(serverName)
     }
 
     /**
@@ -644,7 +659,7 @@ export class McpManager {
                 return
             }
         }
-        this.serversAwaitingTrust.delete(serverName)
+        this.releaseTrustHold(serverName)
 
         // Consent gate for workspace-scoped MCP configs (P417451767).
         // Workspace-scoped configs live in a folder the user opened and may be attacker-controlled.
@@ -1672,6 +1687,7 @@ export class McpManager {
         this.sessionDeniedConsent.clear()
         this.resourceSources = new Map()
         this.serversAwaitingTrust.clear()
+        this.trustHolds.clear()
         this.stdioLaunchFolders.clear()
         this.agentConfig = {
             name: 'q_ide_default',
@@ -2258,6 +2274,11 @@ export class McpManager {
     ): Promise<void> {
         this.features.logging.info(`MCP: [${serverName}] not started in the workspace folder (${reason})`)
         this.serversAwaitingTrust.add(serverName)
+        if (reason === 'restarting') {
+            this.trustHolds.delete(serverName)
+        } else {
+            this.trustHolds.set(serverName, reason)
+        }
         await this.cleanupExistingServer(serverName)
         this.stdioLaunchFolders.delete(serverName)
         this.mcpTools = this.mcpTools.filter(t => t.serverName !== serverName)
