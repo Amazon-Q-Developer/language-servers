@@ -1,6 +1,6 @@
 # Agentic chat hardening — testing
 
-This document describes behavior changes in the agentic chat of `@aws/lsp-codewhisperer` and how to
+This document describes behavior changes in the chat servers of `@aws/lsp-codewhisperer` and how to
 test them. Each numbered section describes one change.
 
 The tests use only temporary folders and synthetic data. They create and remove their own fixtures.
@@ -61,11 +61,16 @@ From the repository root, check formatting with `npm run check:formatting`.
 
 ### Behavior
 
-- When a chat notification handler throws, or returns a promise that rejects, the agentic chat server
-  logs the error and continues to run. The log line names the notification method, for example
-  `Chat notification aws/chat/createPrompt failed:`.
+- When a chat notification handler throws, or returns a promise that rejects, the chat server logs
+  the error and continues to run. The log line names the notification method, for example
+  `Chat notification aws/chat/createPrompt failed:`. This applies to the agentic chat server
+  (`agenticChat/qAgenticChatServer.ts`) and to the chat server in `chat/qChatServer.ts`. Both use
+  `logNotificationErrors` from `chat/notificationErrors.ts`.
 - A notification has no response, so the client receives no error. Request handlers are unchanged:
   the JSON-RPC layer already sends an error response when a request handler fails.
+- When the chat UI is ready, the agentic chat server starts a background update of the code symbols
+  for context commands. A failure of that update is logged as
+  `Error updating code symbols for context commands:`.
 - `aws/chat/createPrompt` with `isRule: true` creates the rule in the `.amazonq/rules` folder of the
   first workspace folder, as before. When no workspace folder is open, it creates a saved prompt in
   the user prompts folder (`~/.aws/amazonq/prompts`), the same as a request without `isRule`.
@@ -76,18 +81,23 @@ From `server/aws-lsp-codewhisperer`:
 
 ```sh
 npx ts-mocha --timeout 0 --exit \
+  src/language-server/chat/notificationErrors.test.ts \
+  src/language-server/chat/qChatServer.test.ts \
   src/language-server/agenticChat/qAgenticChatServer.test.ts \
   src/language-server/agenticChat/agenticChatController.test.ts
 npm run lint
 ```
 
-- The suite "notification handler failures" calls each notification handler that the server
-  registers while the controller method rejects. Each test checks that the error is logged with the
-  notification method and that no rejection is left unhandled. Another test checks a controller
-  method that throws, and another sends a rule request with no workspace folder open.
-- The suite "request handler results" checks that each request handler still returns the result of
-  its controller method.
-- The suite "logNotificationErrors()" checks the wrapper without the server, including an error that
+- In `qAgenticChatServer.test.ts` and `qChatServer.test.ts`, the suite "notification handler
+  failures" calls each notification handler that the server registers while the controller method
+  rejects. Each test checks that the error is logged with the notification method and that this
+  rejection is not left unhandled. Other tests check a controller method that throws, a rule request with
+  no workspace folder open (agentic chat server), and an insert notification whose `code` is not a
+  string (chat server).
+- The suite "request handler results" in each of those files checks that each request handler still
+  returns the result of its controller method.
+- The suite "logNotificationErrors()" checks the wrapper without a server, including an error that
   cannot be formatted and a logger that throws.
-- The `onCreatePrompt` tests in `agenticChatController.test.ts` check rule creation with and without
-  a workspace folder.
+- In `agenticChatController.test.ts`, the `onCreatePrompt` tests check rule creation with and without
+  a workspace folder. The `onReady` test checks that a failed code symbol update is logged and leaves
+  no unhandled rejection.

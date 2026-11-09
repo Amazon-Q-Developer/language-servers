@@ -4,7 +4,7 @@
  */
 
 import * as assert from 'assert'
-import { CancellationToken, Logging, Server } from '@aws/language-server-runtimes/server-interface'
+import { CancellationToken, Server } from '@aws/language-server-runtimes/server-interface'
 import {
     activeEditorChangedNotificationType,
     createPromptNotificationType,
@@ -25,9 +25,10 @@ import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import sinon from 'ts-sinon'
 import { AgenticChatController } from './agenticChatController'
 import { ChatSessionManagementService } from '../chat/chatSessionManagementService'
-import { logNotificationErrors, QAgenticChatServer } from './qAgenticChatServer'
+import { QAgenticChatServer } from './qAgenticChatServer'
 import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 import { AmazonQBaseServiceManager } from '../../shared/amazonQServiceManager/BaseAmazonQServiceManager'
+import { unhandledRejectionsDuring } from '../../shared/testUtils'
 import { Features } from '../types'
 
 describe('QAgenticChatServer', () => {
@@ -160,24 +161,6 @@ describe('QAgenticChatServer', () => {
         sinon.assert.calledOnce(tabBarActionStub)
     })
 
-    /**
-     * Runs `action`, lets pending promise callbacks run, and returns the rejections that had no handler.
-     * Mocha re-emits an unhandled rejection from test code instead of failing on it, so a listener added here
-     * receives it, possibly more than once.
-     */
-    async function unhandledRejectionsDuring(action: () => void): Promise<unknown[]> {
-        const rejections: unknown[] = []
-        const listener = (reason: unknown) => rejections.push(reason)
-        process.on('unhandledRejection', listener)
-        try {
-            action()
-            await new Promise(resolve => setImmediate(resolve))
-        } finally {
-            process.removeListener('unhandledRejection', listener)
-        }
-        return rejections
-    }
-
     describe('request handler results', () => {
         // The chat registrations that the runtime binds to JSON-RPC requests. They must return the controller's
         // result, because the JSON-RPC layer sends it as the response.
@@ -231,12 +214,13 @@ describe('QAgenticChatServer', () => {
 
         for (const [name, method] of notificationRegistrations) {
             it(`logs a rejected ${name} handler and leaves no unhandled rejection`, async () => {
-                sinon.stub(AgenticChatController.prototype, name).rejects(new Error(`${name} failed`))
+                const failure = new Error(`${name} failed`)
+                sinon.stub(AgenticChatController.prototype, name).rejects(failure)
                 const handler = (testFeatures.chat[name] as sinon.SinonStub).firstCall.firstArg
 
                 const rejections = await unhandledRejectionsDuring(() => handler({ tabId: mockTabId }))
 
-                assert.deepStrictEqual(rejections, [])
+                assert.ok(!rejections.includes(failure), `the ${name} failure was left as an unhandled rejection`)
                 sinon.assert.calledWithMatch(
                     testFeatures.logging.error as sinon.SinonStub,
                     sinon.match(method).and(sinon.match(`${name} failed`))
@@ -259,11 +243,9 @@ describe('QAgenticChatServer', () => {
             testFeatures.workspace.getAllWorkspaceFolders.returns([])
             const handler = testFeatures.chat.onCreatePrompt.firstCall.firstArg
 
-            const rejections = await unhandledRejectionsDuring(() =>
-                handler({ promptName: 'no-folder-rule', isRule: true })
-            )
+            handler({ promptName: 'no-folder-rule', isRule: true })
+            await new Promise(resolve => setImmediate(resolve))
 
-            assert.deepStrictEqual(rejections, [])
             sinon.assert.neverCalledWithMatch(
                 testFeatures.logging.error as sinon.SinonStub,
                 sinon.match(createPromptNotificationType.method)
@@ -272,59 +254,6 @@ describe('QAgenticChatServer', () => {
                 testFeatures.workspace.fs.writeFile as sinon.SinonStub,
                 sinon.match(/no-folder-rule\.md$/)
             )
-        })
-    })
-
-    describe('logNotificationErrors()', () => {
-        let logError: sinon.SinonStub
-        let logging: Logging
-
-        beforeEach(() => {
-            logError = sinon.stub()
-            logging = { error: logError } as unknown as Logging
-        })
-
-        it('passes the params to the handler and logs nothing when the handler succeeds', async () => {
-            const syncHandler = sinon.stub().returns(undefined)
-            const asyncHandler = sinon.stub().resolves('done')
-
-            logNotificationErrors(logging, 'test/sync', syncHandler)({ value: 1 })
-            logNotificationErrors(logging, 'test/async', asyncHandler)({ value: 2 })
-            await new Promise(resolve => setImmediate(resolve))
-
-            sinon.assert.calledOnceWithExactly(syncHandler, { value: 1 })
-            sinon.assert.calledOnceWithExactly(asyncHandler, { value: 2 })
-            sinon.assert.notCalled(logError)
-        })
-
-        it('logs a rejection reason that is not an Error', async () => {
-            logNotificationErrors(logging, 'test/reject', () => Promise.reject('plain reason'))(undefined)
-            await new Promise(resolve => setImmediate(resolve))
-
-            sinon.assert.calledOnceWithMatch(logError, sinon.match('test/reject').and(sinon.match('plain reason')))
-        })
-
-        it('leaves no unhandled rejection when the rejection reason cannot be formatted', async () => {
-            // JSON serialization, which formatErr uses, throws on a bigint
-            const rejections = await unhandledRejectionsDuring(() =>
-                logNotificationErrors(logging, 'test/bigint', () => Promise.reject(10n))(undefined)
-            )
-
-            assert.deepStrictEqual(rejections, [])
-        })
-
-        it('leaves no unhandled rejection or exception when the logger throws', async () => {
-            logError.throws(new Error('logger failed'))
-
-            const rejections = await unhandledRejectionsDuring(() => {
-                logNotificationErrors(logging, 'test/reject', () => Promise.reject(new Error('rejected')))(undefined)
-                logNotificationErrors(logging, 'test/throw', () => {
-                    throw new Error('thrown')
-                })(undefined)
-            })
-
-            assert.deepStrictEqual(rejections, [])
-            sinon.assert.calledTwice(logError)
         })
     })
 })

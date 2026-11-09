@@ -4496,7 +4496,10 @@ export class AgenticChatController implements ChatHandlers {
             const contextItems = await localProjectContextController.getContextCommandItems()
             this.#contextCommandsProvider.setFilesAndFoldersPending(false)
             await this.#contextCommandsProvider.processContextCommandUpdate(contextItems)
-            void this.#contextCommandsProvider.maybeUpdateCodeSymbols()
+            // This update runs in the background, so its failure must be handled here, not by the catch below
+            this.#contextCommandsProvider.maybeUpdateCodeSymbols().catch(error => {
+                this.#log('Error updating code symbols for context commands: ' + error)
+            })
         } catch (error) {
             this.#contextCommandsProvider.setFilesAndFoldersFailed(true)
             await this.#contextCommandsProvider.processContextCommandUpdate([])

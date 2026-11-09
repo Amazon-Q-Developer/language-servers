@@ -1,6 +1,15 @@
 import { InitializeParams, Server } from '@aws/language-server-runtimes/server-interface'
+import {
+    feedbackNotificationType,
+    inlineChatResultNotificationType,
+    insertToCursorPositionNotificationType,
+    tabAddNotificationType,
+    tabChangeNotificationType,
+    tabRemoveNotificationType,
+} from '@aws/language-server-runtimes/protocol'
 import { ChatController } from './chatController'
 import { ChatSessionManagementService } from './chatSessionManagementService'
+import { logNotificationErrors } from './notificationErrors'
 import { CLEAR_QUICK_ACTION, HELP_QUICK_ACTION } from './quickActions'
 import { TelemetryService } from '../../shared/telemetry/telemetryService'
 import { makeUserContextObject } from '../../shared/telemetryUtils'
@@ -73,23 +82,31 @@ export const QChatServerFactory =
             await amazonQServiceManager.addDidChangeConfigurationListener(updateConfigurationHandler)
         })
 
-        chat.onTabAdd(params => {
-            logging.log(`Adding tab: ${params.tabId}`)
+        // Wrap each chat notification handler in logNotificationErrors. Request handlers need no wrapper, because the
+        // JSON-RPC layer sends an error response when a request handler fails.
+        chat.onTabAdd(
+            logNotificationErrors(logging, tabAddNotificationType.method, params => {
+                logging.log(`Adding tab: ${params.tabId}`)
 
-            return chatController.onTabAdd(params)
-        })
+                return chatController.onTabAdd(params)
+            })
+        )
 
-        chat.onTabChange(params => {
-            logging.log(`Changing to tab: ${params.tabId}`)
+        chat.onTabChange(
+            logNotificationErrors(logging, tabChangeNotificationType.method, params => {
+                logging.log(`Changing to tab: ${params.tabId}`)
 
-            return chatController.onTabChange(params)
-        })
+                return chatController.onTabChange(params)
+            })
+        )
 
-        chat.onTabRemove(params => {
-            logging.log(`Removing tab: ${params.tabId}`)
+        chat.onTabRemove(
+            logNotificationErrors(logging, tabRemoveNotificationType.method, params => {
+                logging.log(`Removing tab: ${params.tabId}`)
 
-            return chatController.onTabRemove(params)
-        })
+                return chatController.onTabRemove(params)
+            })
+        )
 
         chat.onEndChat((...params) => {
             logging.log('Received end chat request')
@@ -110,17 +127,23 @@ export const QChatServerFactory =
             return chatController.onQuickAction(...params)
         })
 
-        chat.onSendFeedback(params => {
-            return chatController.onSendFeedback(params)
-        })
+        chat.onSendFeedback(
+            logNotificationErrors(logging, feedbackNotificationType.method, params => {
+                return chatController.onSendFeedback(params)
+            })
+        )
 
-        chat.onCodeInsertToCursorPosition(params => {
-            return chatController.onCodeInsertToCursorPosition(params)
-        })
+        chat.onCodeInsertToCursorPosition(
+            logNotificationErrors(logging, insertToCursorPositionNotificationType.method, params => {
+                return chatController.onCodeInsertToCursorPosition(params)
+            })
+        )
 
-        chat.onInlineChatResult(params => {
-            return chatController.onInlineChatResult(params)
-        })
+        chat.onInlineChatResult(
+            logNotificationErrors(logging, inlineChatResultNotificationType.method, params => {
+                return chatController.onInlineChatResult(params)
+            })
+        )
 
         logging.log('Q Chat server has been initialized')
 
