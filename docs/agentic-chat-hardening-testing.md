@@ -364,3 +364,32 @@ npm run lint
   literal, and four lines with no `;` that must each be read in well under 500 ms: a long name, a
   long aliased name, a long dotted name and a long run of whitespace.
 - The test "should treat the dot between namespace names as a literal dot" checks the namespace map.
+
+## 10. Nested .gitignore files in the security scan
+
+### Behavior
+
+Before the security scan builds its dependency graph, it removes the files that the project's
+`.gitignore` files ignore. `GitIgnoreFilter` in `@aws/lsp-core`
+(`core/aws-lsp-core/src/util/gitIgnoreFilter.ts`) does this.
+
+- `GitIgnoreFilter` now applies the patterns of each `.gitignore` file relative to the folder that
+  contains the file, and only to the files in that folder and its subfolders, as Git does. Before this
+  change, it applied the patterns of every `.gitignore` file relative to the root folder of the scan.
+- For example, `/x.cs` in `sub/.gitignore` now ignores `sub/x.cs` and not `x.cs`, and `*.tmp` in
+  `sub/.gitignore` no longer ignores `.tmp` files outside `sub`.
+- A file is kept only when every `.gitignore` file that applies to it accepts it, as before.
+- `GitIgnoreFilter.build` keeps its `rootPath` parameter so that existing callers keep working. It no
+  longer uses it.
+
+### How to test
+
+From `core/aws-lsp-core`:
+
+```sh
+npx ts-mocha --timeout 0 --exit src/util/gitIgnoreFilter.test.ts
+```
+
+The suite "GitIgnoreFilter" checks root and nested `.gitignore` files: anchored patterns, patterns
+without a slash, folder patterns, a sibling folder whose name starts with the same text, and a file
+that two `.gitignore` files apply to.
