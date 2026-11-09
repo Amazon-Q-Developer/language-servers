@@ -331,3 +331,36 @@ Windows). It checks that:
 - the folder is created when it does not exist;
 - nothing is removed or created, and a warning is logged, when `.amazonq`, `.amazonq/rules` or
   `.amazonq/rules/memory-bank` links to a folder outside the workspace folder.
+
+## 9. C# imports in the security scan
+
+### Behavior
+
+The C# dependency graph of the security scan (`securityScan/dependencyGraph/csharpDependencyGraph.ts`)
+reads the `using` directives and `namespace` declarations of the C# files in the project.
+
+- The patterns for `using` directives and `namespace` declarations now match the `.` between two
+  names as a literal dot. Before this change, `.` matched any character, so a long `using` line with
+  no `;` could take seconds or more to fail to match. It now fails in linear time.
+- `readImports` now uses the exported `importRegex`. The pattern that it used before was the same
+  except for a leading `\s*`. That `\s*` did not change the imports that it read, but it made a long
+  run of whitespace take time that grew with the square of its length. That now takes linear time.
+- For names made of ASCII letters, digits and `_`, the imports and namespaces that are read do not
+  change. Other text can be read differently than before, because `.` no longer matches another
+  character: `using Foo Bar;` and `namespace Foo Bar` are no longer read as the name `Foo Bar`, and
+  `using MaßEinheit;` is no longer read as an import.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "readImports|createNamespaceFilenameMapper" \
+  src/language-server/securityScan/dependencyGraph/csharpDependencyGraph.test.ts
+npm run lint
+```
+
+- The suite "Test readImports" checks indented, aliased and static imports, a dot that must be
+  literal, and four lines with no `;` that must each be read in well under 500 ms: a long name, a
+  long aliased name, a long dotted name and a long run of whitespace.
+- The test "should treat the dot between namespace names as a literal dot" checks the namespace map.

@@ -175,6 +175,25 @@ describe('Test CsharpDependencyGraph', () => {
             await csharpDependencyGraph.createNamespaceFilenameMapper(projectPathUri)
             assert.deepStrictEqual(csharpDependencyGraph.namespaceToFilepathDirectory, new Map([]))
         })
+        it('should treat the dot between namespace names as a literal dot', async () => {
+            csharpDependencyGraph.namespaceToFilepathDirectory = new Map<string, Set<string>>()
+            mockedFs.readFile.callsFake(async filePath => {
+                if (filePath === path.join(projectPathUri, 'src', 'sample.cs')) {
+                    return `namespace Foo.Bar {}`
+                }
+                if (filePath === path.join(projectPathUri, 'src', 'model.cs')) {
+                    return `namespace Foo Bar {}`
+                }
+            })
+            await csharpDependencyGraph.createNamespaceFilenameMapper(projectPathUri)
+            assert.deepStrictEqual(
+                csharpDependencyGraph.namespaceToFilepathDirectory,
+                new Map([
+                    ['Foo.Bar', new Set([path.join(projectPathUri, 'src', 'sample.cs')])],
+                    ['Foo', new Set([path.join(projectPathUri, 'src', 'model.cs')])],
+                ])
+            )
+        })
     })
     describe('Test searchDependency', () => {
         beforeEach(() => {
@@ -382,6 +401,44 @@ namespace Amazon.Toolkit.Demo {
             const response = csharpDependencyGraph.readImports(content)
             assert.deepStrictEqual(response, [])
         })
+        it('should read indented, aliased and static imports', () => {
+            const content = [
+                '    using System.Collections.Generic;',
+                '\tglobal using static System.Math;',
+                'using   Alias   =   Foo.Bar.Baz;',
+                'using X;',
+            ].join('\r\n')
+            assert.deepStrictEqual(csharpDependencyGraph.readImports(content), [
+                'System.Collections.Generic',
+                'System.Math',
+                'Foo.Bar.Baz',
+                'X',
+            ])
+        })
+        it('should treat the dot between names as a literal dot', () => {
+            const content = ['using Foo Bar;', 'using Foo,Bar;', 'using Foo-Bar;', 'using Foo.Bar;'].join('\n')
+            assert.deepStrictEqual(csharpDependencyGraph.readImports(content), ['Foo.Bar'])
+        })
+
+        // None of these lines has a ';', so the pattern must fail on each of them in linear time. The two names
+        // without dots and the run of whitespace took the old pattern seconds or more. Each line now takes well under
+        // a millisecond, so the limit only has to catch a regression, not measure speed.
+        const slowInputs: { name: string; content: string }[] = [
+            { name: 'a long name without a semicolon', content: `using ${'A'.repeat(40)}` },
+            { name: 'a long aliased name without a semicolon', content: `using Alias = ${'A'.repeat(40)}` },
+            { name: 'a long dotted name without a semicolon', content: `using ${Array(5000).fill('Ab').join('.')}` },
+            { name: 'a long run of whitespace', content: `${' '.repeat(100000)}x` },
+        ]
+        for (const { name, content } of slowInputs) {
+            it(`should read ${name} in linear time`, () => {
+                const start = process.hrtime.bigint()
+                const response = csharpDependencyGraph.readImports(content)
+                const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
+
+                assert.deepStrictEqual(response, [])
+                assert.ok(elapsedMs < 500, `readImports took ${elapsedMs.toFixed(1)} ms`)
+            })
+        }
     })
     describe('Test generateTruncation', () => {
         before(() => {
