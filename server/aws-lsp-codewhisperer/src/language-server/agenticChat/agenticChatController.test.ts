@@ -667,6 +667,69 @@ describe('AgenticChatController', () => {
             assert.strictEqual(requestInput.conversationState?.conversationId, session.conversationId)
         })
 
+        it('removes variation selectors from the prompt and keeps emoji', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+
+            await chatController.onChatPrompt(
+                {
+                    tabId: mockTabId,
+                    prompt: { prompt: 'Fix the \u26A0\uFE0F warning \u{1F600}\u{E0100}\u{E0158}\u{E01EF}\uFE01' },
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                'Fix the \u26A0\uFE0F warning \u{1F600}'
+            )
+        })
+
+        it('removes variation selectors from the chat history in the request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt: 'Hello' } }, mockCancellationToken)
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
+        })
+
+        it('removes variation selectors from the chat history in the compaction request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt(
+                { tabId: mockTabId, prompt: { prompt: '', command: '/compact' } },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                constants.COMPACTION_PROMPT
+            )
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
+        })
+
         it('invokes IdleWorkspaceManager recordActivityTimestamp', async () => {
             const recordActivityTimestampStub = sinon.stub(IdleWorkspaceManager, 'recordActivityTimestamp')
 

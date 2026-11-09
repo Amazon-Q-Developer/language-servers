@@ -101,3 +101,54 @@ npm run lint
 - In `agenticChatController.test.ts`, the `onCreatePrompt` tests check rule creation with and without
   a workspace folder. The `onReady` test checks that a failed code symbol update is logged and leaves
   no unhandled rejection.
+
+## 3. Invisible characters in chat requests
+
+### Behavior
+
+`sanitizeInput` in `shared/utils.ts` removes characters that can hide content. Most of them are not
+visible in rendered text. The agentic chat server applies it to the chat prompt, to each request of
+the agent loop and of history compaction (with their history, context, tool results and tool
+descriptions), and to the descriptions of MCP tools.
+
+- It removes every character with the Unicode property `Default_Ignorable_Code_Point`, except the
+  presentation selectors described below, in addition to the ranges that it removed before. The new
+  characters include the variation selectors (U+FE00–U+FE0F and U+E0100–U+E01EF), the soft hyphen
+  (U+00AD), the combining grapheme joiner (U+034F), the Arabic letter mark (U+061C), the Hangul fillers
+  and U+FEFF.
+- A presentation selector that belongs to an emoji is kept: U+FE0E or U+FE0F directly after a
+  character with the Unicode property `Extended_Pictographic`, or the U+FE0F of a keycap sequence such
+  as `1️⃣` (1 U+FE0F U+20E3). So an emoji such as `⚠️` (U+26A0 U+FE0F) reaches the model unchanged. In
+  a run of variation selectors, at most the first one is kept.
+- Every character that it removed before is still removed. Control characters, including tab, newline
+  and carriage return, are kept, as before.
+- Other variation sequences, for example of CJK ideographs, Mongolian letters and mathematical
+  symbols, reach the model in their default form.
+- As with the characters that were removed before, the removal also applies to file and folder names in
+  the request. An edit does not match when the file text that it replaces contains a removed character,
+  and a file that the model rewrites in full no longer contains these characters.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit \
+  src/shared/utils.test.ts \
+  src/language-server/agenticChat/agenticChatController.test.ts \
+  src/language-server/agenticChat/tools/mcp/mcpManager.test.ts
+npm run lint
+```
+
+- The suite "sanitizeInput" checks characters from each newly removed range, a run of variation
+  selectors after an emoji, the presentation selectors that are kept and removed, and every character
+  in the earlier ranges. Other tests check HTML escaping, visible text in several scripts, and that a
+  second pass gives the same result.
+- The suite "sanitizeRequestInput" checks the message, context, history, tool results and tool
+  descriptions of one request.
+- In `agenticChatController.test.ts`, the tests "removes variation selectors from the prompt and keeps
+  emoji", "removes variation selectors from the chat history in the request" and "removes variation
+  selectors from the chat history in the compaction request" check the requests that a chat prompt and
+  `/compact` produce.
+- In `mcpManager.test.ts`, the suite "tool descriptions from an MCP server" checks the description of a
+  tool that a server lists.

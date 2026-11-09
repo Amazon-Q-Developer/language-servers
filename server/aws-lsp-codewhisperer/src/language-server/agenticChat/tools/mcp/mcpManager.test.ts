@@ -2258,6 +2258,52 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
     })
 })
 
+describe('tool descriptions from an MCP server', () => {
+    const fakeHome = '/home/testuser'
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('removes variation selectors and keeps emoji', async () => {
+        stubAgentConfig()
+        const mgr = await McpManager.init([], {
+            ...features,
+            workspace: { ...fakeWorkspace, fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome } },
+            lsp: {
+                window: { showMessageRequest: sinon.stub(), showDocument: sinon.stub().resolves({ success: true }) },
+            },
+        } as any)
+        // Loads the stubbed agent config, which has no servers, and sets up tool permissions
+        await mgr.discoverAllServers()
+        await mgr.setWorkspaceTrust('trusted')
+        // The client is not connected to a process, so the stubbed tool list is what the server returns
+        sinon.stub(Client.prototype, 'connect').resolves()
+        sinon.stub(Client.prototype, 'listTools').resolves({
+            tools: [
+                {
+                    name: 'read_notes',
+                    description: 'Reads notes \u26A0\uFE0F\u{E0100}\u{E0158}\u{E01EF}\uFE01',
+                    inputSchema: { type: 'object' },
+                },
+            ],
+        } as any)
+        const cfg: MCPServerConfig = {
+            command: 'node',
+            args: [],
+            __configPath__: mcpUtils.getGlobalMcpConfigPath(fakeHome),
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const tool = mgr.getAllTools().find(t => t.toolName === 'read_notes')
+        expect(tool?.description).to.equal('Reads notes \u26A0\uFE0F')
+    })
+})
+
 describe('workspace trust for stdio MCP servers', () => {
     const fakeHome = '/home/testuser'
     const globalMcp = mcpUtils.getGlobalMcpConfigPath(fakeHome)
