@@ -13,6 +13,7 @@ import {
     itGenProjectFolderName,
 } from '../atxTransformHandler'
 import { Utils, workspaceFolderName } from '../utils'
+import * as beamRepoFiles from '../beamRepoFiles'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 
@@ -200,6 +201,7 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
         let releaseBeamMap: () => void
         let beamMapRead: Promise<void>
 
+        const manifestWritten = () => Promise.all([...(handler as any).beamManifestWrites.values()])
         const beamPoll = (scope = SCOPE) =>
             handler.getTransformInfo({
                 TransformationJobId: JOB_ID,
@@ -316,6 +318,134 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
 
             expect(result).to.not.be.null
             expect(beamMapStub.calledOnce).to.be.true
+        })
+
+        it('surfaces no integ-* HITL while the gate is still unknown, e.g. right after an LS restart', async () => {
+            hitls = [appLaunchHitl]
+
+            // The beam-map read is still running (not released)
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl-artifact-integ-app-launch'))).to
+                .be.false
+        })
+
+        it("writes the customer-changes manifest for a loaded beamed repo, and doesn't rewrite it", async () => {
+            fs.mkdirSync(path.join(tmpRoot, 'Web', 'bin'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'), 'bin')
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+
+            await beamPoll()
+            await manifestWritten()
+
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+            expect(manifest.sourceFiles).to.include(path.join(tmpRoot, 'Web', 'Program.cs'))
+            expect(manifest.sourceFiles).to.not.include(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'))
+            expect(manifest.sourceFiles.some((f: string) => f.includes(workspaceFolderName))).to.be.false
+            expect(manifest.lastAppliedTimestamp).to.be.a('number')
+
+            fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, sourceFiles: ['kept'] }))
+            await beamPoll()
+            await manifestWritten()
+            expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles).to.deep.equal(['kept'])
+        })
+
+        it("sends a file the customer edited after Load with the transformed side's results", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            const edited = path.join(tmpRoot, 'Web', 'appsettings.json')
+            fs.writeFileSync(edited, '{}')
+            await beamPoll()
+            await manifestWritten()
+            fs.writeFileSync(edited, '{ "edited": true }')
+            const later = new Date(Date.now() + 60_000)
+            fs.utimesSync(edited, later, later)
+            const uploadStub = sinon.stub(Utils, 'uploadArtifact').resolves(true)
+            sinon
+                .stub(handler, 'createArtifactUploadUrl')
+                .resolves({ uploadUrl: 'u', uploadId: 'up-1', requestHeaders: {} } as any)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true })
+            sinon.stub(handler, 'submitHitl').resolves({ status: 'SUBMITTED' } as any)
+            const zipPath = path.join(tmpRoot, 'launch.zip')
+            const zip = new AdmZip()
+            zip.addFile(
+                'launch-result.json',
+                Buffer.from(
+                    JSON.stringify({ schemaVersion: '1.1', side: 'transformed', status: 'APP_NOT_STARTED', attempt: 2 })
+                )
+            )
+            zip.writeZip(zipPath)
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', zipPath, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            const uploaded = new AdmZip(uploadStub.firstCall.args[1])
+            expect(
+                JSON.parse(uploaded.getEntry('workspace/metadata.json')!.getData().toString()).filesUpdated
+            ).to.deep.equal([path.join('Web', 'appsettings.json')])
+        })
+
+        // The downlink applies a beamed repo's post-beam steps whether or not it opts in to ITGen, so every loaded
+        // repo gets the baseline its user-edit protection needs. In a multi-repo beam the gate is job-wide.
+        it("writes the manifest for a beamed repo that doesn't opt in too", async () => {
+            beamOptIn = false
+            releaseBeamMap()
+            await beamPoll()
+            await beamMapRead
+            await manifestWritten()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.true
+        })
+
+        it('writes no manifest without the loaded repo (beam discovery has no scope)', async () => {
+            await beamPoll('')
+            await manifestWritten()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.false
+        })
+
+        // The walk runs in the background, but an apply in the same poll waits for it: otherwise a folder the apply
+        // adds (the generated unit-test project) can land after the walk passed it and before the manifest exists, and
+        // updateSourceFilesManifest, finding no manifest, never tracks it.
+        it('tracks the files an apply adds while the manifest is still being written', async () => {
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            let releaseWalk!: () => void
+            const walkHeld = new Promise<void>(resolve => (releaseWalk = resolve))
+            const list = beamRepoFiles.listBeamRepoFiles
+            sinon.stub(beamRepoFiles, 'listBeamRepoFiles').callsFake(async (...args) => {
+                const listed = await list(...args)
+                await walkHeld
+                return listed
+            })
+            const checkpoint = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'ut')
+            fs.mkdirSync(path.join(checkpoint, 'after', 'Web.Tests'), { recursive: true })
+            fs.writeFileSync(path.join(checkpoint, 'after', 'Web.Tests', 'T.cs'), 'class T {}')
+            fs.writeFileSync(
+                path.join(checkpoint, 'metadata.json'),
+                JSON.stringify({ filesAdded: [path.join('Web.Tests', 'T.cs')] })
+            )
+            await beamPoll()
+
+            const applying = (handler as any).applyChanges(checkpoint, tmpRoot, JOB_ID)
+            await new Promise(resolve => setTimeout(resolve, 50))
+            expect(fs.existsSync(path.join(tmpRoot, 'Web.Tests', 'T.cs')), 'the apply waits for the baseline').to.be
+                .false
+            releaseWalk()
+            const applied = await applying
+            ;(handler as any).updateSourceFilesManifest(tmpRoot, JOB_ID, applied.addedFiles)
+
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+            const sourceFiles: string[] = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles
+            expect(sourceFiles.map(f => path.resolve(tmpRoot, f))).to.include.members([
+                path.join(tmpRoot, 'Web', 'Program.cs'),
+                path.join(tmpRoot, 'Web.Tests', 'T.cs'),
+            ])
         })
 
         it('never reads the beam-map for a job that is not beamed', async () => {
@@ -753,8 +883,20 @@ describe('ATXTransformHandler - ITGen test HITLs', () => {
             expect(submitStub.firstCall.args).to.deep.equal([WS_ID, JOB_ID, 'task-run', 'upload-1'])
         })
 
+        it("accepts a beamed repo's results right after an LS restart, from its beam-map opt-in", async () => {
+            setItGen(false)
+            const readBeamOptIn = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
+            const full = writeZip('results.zip', { 'summary.json': summary() })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            expect(readBeamOptIn.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+        })
+
         it('refuses for a job without generate_integration_tests', async () => {
             setItGen(false)
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
             const full = writeZip('results.zip', { 'summary.json': summary() })
 
             const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)

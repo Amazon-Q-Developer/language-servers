@@ -99,18 +99,18 @@ describe('ItGenJobGate', () => {
             expect(readBeamOptIn.called).to.be.false
         })
 
-        it(`reads a beam-map without an opt-in again only after ${ItGenJobGate.beamRecheckMs} ms`, async () => {
+        it("doesn't read a beam-map without an opt-in again this session; a later opt-in comes from discovery", async () => {
             readBeamOptIn.resolves(false)
 
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.false
-            clock += ItGenJobGate.beamRecheckMs - 1
+            clock += 24 * 60 * 60_000
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.false
             expect(readBeamOptIn.callCount).to.equal(1)
 
-            readBeamOptIn.resolves(true)
-            clock += 1
+            // listBeamedRepos (the dashboard's discovery) records a repo beamed later with the flag
+            beamGate.rememberBeamOptIn('web-1')
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
-            expect(readBeamOptIn.callCount).to.equal(2)
+            expect(readBeamOptIn.callCount).to.equal(1)
         })
 
         it(`tries again after ${ItGenJobGate.beamRetryMs} ms when the beam-map couldn't be read`, async () => {
