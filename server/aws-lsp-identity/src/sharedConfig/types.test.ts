@@ -53,4 +53,21 @@ describe('sharedConfig.Setting', () => {
         const actual = new Setting('setting-name', 'setting value').toIniSettingLine()
         assert.equal(actual, 'setting-name = setting value')
     })
+
+    for (const lineBreak of ['\n', '\r', '\r\n']) {
+        it(`refuses to serialize a line break ${JSON.stringify(lineBreak)}`, () => {
+            const multiline = `x${lineBreak}y = z`
+
+            assert.throws(() => new Setting('region', multiline).toIniSettingLine(), /cannot contain line breaks/)
+            assert.throws(() => new Setting(multiline, 'value').toIniSettingLine(), /cannot contain line breaks/)
+            assert.throws(
+                () => new Setting('name', 'value', { subsection: multiline }).toIniSubsectionHeaderLine(),
+                /cannot contain line breaks/
+            )
+            assert.throws(
+                () => new SectionHeader(multiline).toIniSectionName(IniFileType.config),
+                /cannot contain line breaks/
+            )
+        })
+    }
 })
