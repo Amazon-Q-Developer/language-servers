@@ -4201,6 +4201,8 @@ export class AgenticChatController implements ChatHandlers {
                 ChatTriggerType.INLINE_CHAT,
                 this.#customizationArn
             )
+            // Remove invisible characters from the whole request, as for the agent loop and compaction requests
+            requestInput = sanitizeRequestInput(requestInput)
 
             if (!this.#serviceManager) {
                 throw new Error('amazonQServiceManager is not initialized')

@@ -152,3 +152,26 @@ npm run lint
   `/compact` produce.
 - In `mcpManager.test.ts`, the suite "tool descriptions from an MCP server" checks the description of a
   tool that a server lists.
+
+## 4. Invisible characters in inline chat requests
+
+### Behavior
+
+- The agentic chat server applies `sanitizeRequestInput` to each inline chat request before it sends
+  it. The characters that section 3 says `sanitizeInput` removes are removed from the prompt, the
+  document text and the rest of the request.
+- The inline chat prompt is not HTML-escaped, as before.
+- Code that inline chat rewrites loses the removed characters that it contained.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "onInlineChatPrompt" \
+  src/language-server/agenticChat/agenticChatController.test.ts
+npm run lint
+```
+
+The test "removes invisible characters from the prompt and the document text without escaping HTML"
+opens a document, sends an inline chat prompt for it, and checks the request that is sent.

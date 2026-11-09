@@ -2481,6 +2481,26 @@ describe('AgenticChatController', () => {
             assert.deepStrictEqual(chatResult, new ResponseError(LSPErrorCodes.RequestFailed, 'invalid state'))
         })
 
+        it('removes invisible characters from the prompt and the document text without escaping HTML', async () => {
+            testFeatures.openDocument(
+                TextDocument.create('file:///inline.ts', 'typescript', 1, 'const a = 1\u{E0041}\u{E0100}\u{E0158}\n')
+            )
+
+            await chatController.onInlineChatPrompt(
+                {
+                    prompt: { prompt: 'Make a < b \u26A0\uFE0F\u{E0041}\u{E0100}\uFE01' },
+                    textDocument: { uri: 'file:///inline.ts' },
+                    cursorState: [{ position: { line: 0, character: 0 } }],
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const userInputMessage = requestInput.conversationState?.currentMessage?.userInputMessage
+            assert.strictEqual(userInputMessage?.content, 'Make a < b \u26A0\uFE0F')
+            assert.strictEqual(userInputMessage?.userInputMessageContext?.editorState?.document?.text, 'const a = 1\n')
+        })
+
         describe('#extractDocumentContext', () => {
             const typescriptDocument = TextDocument.create('file:///test.ts', 'typescript', 1, 'test')
             let extractDocumentContextStub: sinon.SinonStub
