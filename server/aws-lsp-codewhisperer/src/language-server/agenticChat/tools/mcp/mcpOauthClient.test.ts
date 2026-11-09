@@ -129,6 +129,42 @@ describe('OAuthClient helpers', () => {
             })
         }
     })
+
+    describe('validateAuthorizationEndpoint()', () => {
+        const validate = (endpoint: string) => (OAuthClient as any).validateAuthorizationEndpoint(endpoint)
+
+        for (const endpoint of [
+            'https://auth.example.com/authorize',
+            'http://localhost:8080/authorize',
+            'http://127.0.0.1/authorize',
+            'http://[::1]/authorize',
+        ]) {
+            it(`allows ${endpoint}`, () => {
+                expect(() => validate(endpoint)).not.to.throw()
+            })
+        }
+
+        it('returns the parsed URL for a valid endpoint', () => {
+            const url = validate('https://auth.example.com/authorize')
+            expect(url).to.be.instanceOf(URL)
+            expect(url.href).to.equal('https://auth.example.com/authorize')
+        })
+
+        // A hostile MCP server must not be able to push a non-web URI into the OS browser.
+        for (const endpoint of [
+            'javascript:alert(document.domain)',
+            'file:///etc/passwd',
+            'data:text/html,<script>alert(1)</script>',
+            'http://auth.example.com/authorize',
+            'ftp://auth.example.com/authorize',
+            'vscode://extension/evil',
+            'not a url',
+        ]) {
+            it(`rejects ${endpoint}`, () => {
+                expect(() => validate(endpoint)).to.throw()
+            })
+        }
+    })
 })
 
 describe('OAuthClient.refreshGrant()', () => {
@@ -159,6 +195,55 @@ describe('OAuthClient.refreshGrant()', () => {
         expect(fetchStub.called).to.be.false
     })
 })
+
+describe('OAuthClient.pkceGrant() authorization endpoint', () => {
+    // showDocument rejects loudly: if validation is ever skipped and the browser
+    // is launched, the grant rejects with this marker instead of the validation
+    // error, so the test fails fast rather than waiting on the real PKCE timeout.
+    let showDocument: sinon.SinonStub
+
+    beforeEach(() => {
+        sinon.restore()
+        showDocument = sinon.stub().rejects(new Error('BROWSER_LAUNCHED'))
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, { window: { showDocument } } as any)
+    })
+
+    afterEach(() => sinon.restore())
+
+    // The token endpoint is a valid loopback URL so the flow reaches the browser step;
+    // only the server-supplied authorization_endpoint is hostile.
+    for (const authorization_endpoint of [
+        'javascript:alert(document.domain)',
+        'file:///etc/passwd',
+        'data:text/html,<script>alert(1)</script>',
+        'http://evil.example.com/authorize',
+        'vscode://extension/evil',
+    ]) {
+        it(`refuses to open ${authorization_endpoint} and never calls showDocument`, async () => {
+            const meta = { authorization_endpoint, token_endpoint: 'http://127.0.0.1:12345/token' }
+            const reg = { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' }
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+
+            try {
+                await (OAuthClient as any).pkceGrant(
+                    meta,
+                    reg,
+                    new URL('https://mcp.example.com/mcp'),
+                    ['openid'],
+                    'http://localhost:12345/oauth/callback',
+                    new EventEmitter()
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('authorization endpoint')
+            }
+
+            expect(showDocument.called).to.be.false
+            expect(fetchStub.called).to.be.false
+        })
+    }
+})
+
 describe('OAuthClient.selectAuthMethod()', () => {
     const selectAuthMethod = (reg: any, meta?: any) => (OAuthClient as any).selectAuthMethod(reg, meta)
 
@@ -348,6 +433,99 @@ describe('OAuthClient.discoverAS()', () => {
         const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
         expect(result.scopes_supported).to.deep.equal(['custom:scope'])
     })
+
+    it('ignores a plaintext HTTP authorization server from PRM and never fetches it', async () => {
+        fetchStub.callsFake(async (url: string) => {
+            if (url.includes('.well-known/oauth-protected-resource')) {
+                return { ok: true, json: async () => ({ authorization_servers: ['http://evil.example.com'] }) }
+            }
+            return { ok: false, status: 404, text: async () => '', headers: { get: () => '' } }
+        })
+
+        const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
+
+        // Falls through to synthesized endpoints on the original https server, never the http AS.
+        expect(result.authorization_endpoint).to.equal('https://mcp.example.com/mcp/authorize')
+        const fetchedEvil = fetchStub
+            .getCalls()
+            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('evil.example.com'))
+        expect(fetchedEvil).to.be.false
+    })
+
+    it('ignores a plaintext resource_metadata URL from the WWW-Authenticate header', async () => {
+        fetchStub.callsFake(async (url: string, init?: any) => {
+            if (url.includes('.well-known/oauth-protected-resource')) {
+                return { ok: false, status: 404 } // step 1 (PRM) fails
+            }
+            if (init?.method === 'HEAD') {
+                return {
+                    ok: true,
+                    status: 401,
+                    headers: {
+                        get: (h: string) =>
+                            h.toLowerCase() === 'www-authenticate'
+                                ? 'Bearer resource_metadata="http://169.254.169.254/meta"'
+                                : '',
+                    },
+                }
+            }
+            return { ok: false, status: 404, text: async () => '' } // step 3 well-known fails
+        })
+
+        const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
+
+        // The insecure resource_metadata link is rejected; discovery falls through to synthesized endpoints,
+        // and the internal address is never fetched.
+        expect(result.authorization_endpoint).to.equal('https://mcp.example.com/mcp/authorize')
+        const fetchedMeta = fetchStub
+            .getCalls()
+            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('169.254.169.254'))
+        expect(fetchedMeta).to.be.false
+    })
+})
+
+describe('OAuthClient.fetchASFromResourceMeta()', () => {
+    beforeEach(() => {
+        sinon.restore()
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+    })
+
+    afterEach(() => sinon.restore())
+
+    for (const authServer of ['http://auth.example.com', 'ftp://auth.example.com', 'http://169.254.169.254']) {
+        it(`rejects a non-secure authorization server URL (${authServer}) before fetching`, async () => {
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            try {
+                await (OAuthClient as any).fetchASFromResourceMeta(
+                    { authorization_server: authServer },
+                    'https://mcp.example.com/.well-known/oauth-protected-resource'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('authorization server')
+            }
+            expect(fetchStub.called).to.be.false
+        })
+    }
+
+    it('allows an https authorization server URL', async () => {
+        const asMeta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://auth.example.com/token',
+        }
+        sinon.stub(OAuthClient as any, 'fetchCompat').callsFake(async (url: unknown) => {
+            if (String(url).includes('.well-known/oauth-authorization-server')) {
+                return { ok: true, json: async () => asMeta }
+            }
+            return { ok: false, status: 404, text: async () => '' }
+        })
+
+        const result = await (OAuthClient as any).fetchASFromResourceMeta(
+            { authorization_server: 'https://auth.example.com' },
+            'https://mcp.example.com/.well-known/oauth-protected-resource'
+        )
+        expect(result.token_endpoint).to.equal('https://auth.example.com/token')
+    })
 })
 
 describe('OAuthClient.obtainClient()', () => {
@@ -419,6 +597,30 @@ describe('OAuthClient.obtainClient()', () => {
             expect(e.message).to.include('does not support dynamic registration')
         }
     })
+
+    for (const registration_endpoint of ['http://evil.example.com/register', 'http://169.254.169.254/register']) {
+        it(`rejects a non-secure registration endpoint (${registration_endpoint}) before sending DCR`, async () => {
+            const meta = {
+                authorization_endpoint: 'https://auth.example.com/authorize',
+                token_endpoint: 'https://auth.example.com/token',
+                registration_endpoint,
+            }
+
+            try {
+                await (OAuthClient as any).obtainClient(
+                    meta,
+                    '/tmp/test.json',
+                    [],
+                    'http://localhost:12345/oauth/callback'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('registration endpoint')
+            }
+
+            expect(fetchStub.called).to.be.false
+        })
+    }
 })
 
 describe('OAuthClient.discoverProtectedResourceMetadata()', () => {
@@ -635,5 +837,200 @@ describe('OAuthClient getValidAccessToken()', () => {
 
         const scopesArg = pkceStub.firstCall.args[3]
         expect(scopesArg).to.deep.equal(['openid', 'offline_access'])
+    })
+
+    it('pins the discovered endpoints to disk after an interactive sign-in', async () => {
+        stubFileSystem()
+        const meta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://auth.example.com/token',
+            registration_endpoint: 'https://auth.example.com/register',
+        }
+        sinon.stub(OAuthClient as any, 'discoverAS').resolves(meta)
+        sinon.stub(OAuthClient as any, 'obtainClient').resolves({
+            client_id: 'cid',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        })
+        sinon.stub(OAuthClient as any, 'pkceGrant').resolves({
+            access_token: 'new_token',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: true,
+        })
+
+        expect(token).to.equal('new_token')
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'expected a .meta.json write').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(meta)
+    })
+
+    it('silent refresh reuses the pinned token endpoint and does not re-discover', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+        const pinnedMeta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://pinned.example.com/token',
+        }
+
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            if (String(file).endsWith('.meta.json')) return pinnedMeta
+            return undefined
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves({
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        })
+        const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.called).to.be.false
+        expect(refresh.calledOnce).to.be.true
+        // refreshGrant must receive the pinned endpoints, not freshly discovered ones.
+        expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+        // A valid pin is reused as-is, not rewritten.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'a valid pin must not be rewritten on silent refresh').to.be.undefined
+    })
+
+    it('silent refresh falls back to discovery when no endpoints were pinned', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        }
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            return undefined // legacy token: no pinned meta on disk
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+        sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.calledOnce).to.be.true
+        // A legacy token (no pin) is migrated: the endpoints that just worked get pinned.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'a legacy token should be migrated to a pinned meta').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(discovered)
+    })
+
+    it('silent refresh falls back to discovery and re-pins when the pinned token endpoint is insecure', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        }
+
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            if (String(file).endsWith('.meta.json')) return { token_endpoint: 'http://evil.example.com/token' }
+            return undefined
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+        const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.calledOnce).to.be.true
+        // The insecure pin must not be forwarded to refreshGrant; the discovered secure endpoints are used.
+        expect(refresh.firstCall.args[0]).to.deep.equal(discovered)
+        // The insecure pin is replaced with the freshly discovered secure endpoints.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'an insecure pin should be replaced').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(discovered)
+    })
+
+    it('pins the discovered endpoints after an interactive refresh-token sign-in', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = {
+            client_id: 'cid',
+            client_secret: 'csecret',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        }
+        stubFileSystem(expiredToken, cachedReg)
+        const meta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://auth.example.com/token',
+            registration_endpoint: 'https://auth.example.com/register',
+        }
+        sinon.stub(OAuthClient as any, 'discoverAS').resolves(meta)
+        sinon.stub(OAuthClient as any, 'obtainClient').resolves({
+            client_id: 'cid',
+            client_secret: 'csecret',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        })
+        sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const pkce = sinon.stub(OAuthClient as any, 'pkceGrant')
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: true,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(pkce.called).to.be.false
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'the interactive refresh path should pin the endpoints').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(meta)
     })
 })

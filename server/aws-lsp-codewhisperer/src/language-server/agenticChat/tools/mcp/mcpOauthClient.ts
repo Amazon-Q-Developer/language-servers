@@ -57,6 +57,7 @@ export class OAuthClient {
         const key = this.computeKey(mcpBase)
         const regPath = path.join(this.cacheDir, `${key}.registration.json`)
         const tokPath = path.join(this.cacheDir, `${key}.token.json`)
+        const metaPath = path.join(this.cacheDir, `${key}.meta.json`)
 
         // Silent branch: try cached token, then refresh, never opens a browser
         if (!interactive) {
@@ -73,10 +74,16 @@ export class OAuthClient {
             const savedReg = await this.read<Registration>(regPath)
             if (cachedTok?.refresh_token && savedReg) {
                 try {
-                    const meta = await this.discoverAS(mcpBase)
+                    const { meta, pinned } = await this.pinnedOrDiscoveredMeta(metaPath, mcpBase)
                     const refreshed = await this.refreshGrant(meta, savedReg, mcpBase, cachedTok.refresh_token)
                     if (refreshed) {
                         await this.write(tokPath, refreshed)
+                        if (!pinned) {
+                            // Migrate a legacy or invalidated pin: remember the endpoints that
+                            // just worked so later silent refreshes reuse them instead of
+                            // re-discovering, which would re-expose the refresh token.
+                            await this.write(metaPath, meta)
+                        }
                         this.logger.info('OAuth: refresh grant succeeded (silent)')
                         return refreshed.access_token
                     }
@@ -142,6 +149,7 @@ export class OAuthClient {
                 const refreshed = await this.refreshGrant(meta, reg, mcpBase, cached.refresh_token)
                 if (refreshed) {
                     await this.write(tokPath, refreshed)
+                    await this.write(metaPath, meta)
                     this.logger.info('OAuth: refresh grant succeeded')
                     return refreshed.access_token
                 }
@@ -150,6 +158,7 @@ export class OAuthClient {
             // PKCE interactive flow
             const fresh = await this.pkceGrant(meta, reg, mcpBase, scopes, redirectUri, server)
             await this.write(tokPath, fresh)
+            await this.write(metaPath, meta)
             return fresh.access_token
         } finally {
             if (server) {
@@ -167,6 +176,37 @@ export class OAuthClient {
     }
 
     /**
+     * Resolve the endpoints for a silent refresh. Prefer the endpoints pinned
+     * when the user first signed in; only fall back to live discovery for
+     * tokens cached before pinning existed or when the pin is no longer valid.
+     * Re-running discovery on every refresh would let a server that later turns
+     * malicious (or a network attacker on the discovery response) redirect the
+     * refresh token to a new token endpoint without the user ever being
+     * prompted again.
+     *
+     * Returns `pinned` so the caller can migrate a legacy token by pinning the
+     * endpoints that just worked. A legitimately rotated token endpoint is
+     * recovered on the next interactive sign-in, which re-pins.
+     */
+    private static async pinnedOrDiscoveredMeta(
+        metaPath: string,
+        mcpBase: URL
+    ): Promise<{ meta: Meta; pinned: boolean }> {
+        const pinned = await this.read<Meta>(metaPath)
+        if (pinned?.token_endpoint) {
+            try {
+                this.validateTokenEndpoint(pinned.token_endpoint)
+                return { meta: pinned, pinned: true }
+            } catch (e) {
+                this.logger.warn(
+                    `OAuth: ignoring invalid pinned token endpoint — ${e instanceof Error ? e.message : String(e)}`
+                )
+            }
+        }
+        return { meta: await this.discoverAS(mcpBase), pinned: false }
+    }
+
+    /**
      * Discover OAuth endpoints using the following chain (aligned with MCP SDK):
      * 1. RFC 9728 Protected Resource Metadata
      * 2. WWW-Authenticate header resource_metadata link
@@ -180,6 +220,7 @@ export class OAuthClient {
             if (prm) {
                 const asUrl = prm.authorization_servers?.[0]
                 if (asUrl) {
+                    this.assertSecureEndpoint(String(asUrl), 'authorization server')
                     const asMeta = await this.discoverAuthorizationServerMetadata(new URL(asUrl))
                     if (asMeta) {
                         if (!asMeta.scopes_supported && prm.scopes_supported) {
@@ -200,6 +241,8 @@ export class OAuthClient {
             const m = /resource_metadata=(?:"([^"]+)"|([^,\s]+))/i.exec(header)
             if (m) {
                 const metaUrl = new URL(m[1] || m[2], rs).toString()
+                // The resource_metadata link comes from a server-supplied header; require a secure transport.
+                this.assertSecureEndpoint(metaUrl, 'resource metadata')
                 const raw = await this.json<any>(metaUrl)
                 return await this.fetchASFromResourceMeta(raw, metaUrl)
             }
@@ -285,6 +328,7 @@ export class OAuthClient {
         if (!asBase) {
             throw new Error(`resource_metadata at ${metaUrl} lacked authorization_server(s)`)
         }
+        this.assertSecureEndpoint(String(asBase), 'authorization server')
 
         for (const p of ['.well-known/oauth-authorization-server', '.well-known/openid-configuration']) {
             try {
@@ -316,6 +360,8 @@ export class OAuthClient {
         if (!meta.registration_endpoint) {
             throw new Error('OAuth: AS does not support dynamic registration')
         }
+        // The registration endpoint is server-supplied via discovery; require a secure transport.
+        this.assertSecureEndpoint(meta.registration_endpoint, 'registration endpoint')
 
         // Let the server decide token_endpoint_auth_method and scope
         const body = {
@@ -390,7 +436,7 @@ export class OAuthClient {
         const challenge = this.b64url(crypto.createHash('sha256').update(verifier).digest())
         const state = this.b64url(crypto.randomBytes(16))
 
-        const authz = new URL(meta.authorization_endpoint)
+        const authz = this.validateAuthorizationEndpoint(meta.authorization_endpoint)
         authz.search = new URLSearchParams({
             client_id: reg.client_id,
             response_type: 'code',
@@ -550,15 +596,36 @@ export class OAuthClient {
      * Require HTTPS for remote endpoints while retaining the OAuth loopback exception for local development.
      */
     private static validateTokenEndpoint(endpoint: string): void {
+        this.assertSecureEndpoint(endpoint, 'token endpoint')
+    }
+
+    /**
+     * The authorization endpoint is handed to the OS browser via showDocument,
+     * and an MCP server supplies it through discovery. Restrict it to HTTPS (or
+     * a loopback HTTP address for local development) so a hostile server cannot
+     * launch a javascript:, file:, data: or other non-web URI, or send the user
+     * to a plaintext remote login page. Returns the parsed URL for the caller.
+     */
+    private static validateAuthorizationEndpoint(endpoint: string): URL {
+        return this.assertSecureEndpoint(endpoint, 'authorization endpoint')
+    }
+
+    /**
+     * Require HTTPS for a remote OAuth endpoint, keeping the loopback HTTP
+     * exception for local development. Rejects every other scheme (javascript:,
+     * file:, data:, ftp:, ...) and malformed URLs. Returns the parsed URL so
+     * callers can reuse it without parsing twice.
+     */
+    private static assertSecureEndpoint(endpoint: string, label: string): URL {
         let url: URL
         try {
             url = new URL(endpoint)
         } catch {
-            throw new Error('OAuth: token endpoint is not a valid URL')
+            throw new Error(`OAuth: ${label} is not a valid URL`)
         }
 
         if (url.protocol === 'https:') {
-            return
+            return url
         }
 
         const hostname = url.hostname.toLowerCase()
@@ -566,10 +633,10 @@ export class OAuthClient {
             url.protocol === 'http:' &&
             (hostname === 'localhost' || hostname === '[::1]' || (isIPv4(hostname) && hostname.startsWith('127.')))
         if (isLoopbackHttp) {
-            return
+            return url
         }
 
-        throw new Error('OAuth: token endpoint must use HTTPS unless it is a loopback address')
+        throw new Error(`OAuth: ${label} must use HTTPS unless it is a loopback address`)
     }
 
     /** Await server.listen() with error rejection for immediate handling. */
