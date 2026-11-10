@@ -926,6 +926,9 @@ export class ATXTransformHandler {
             }
             const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
             let scanCutShort = false
+            // Candidates that couldn't be downloaded (for example ResourceNotFound while the web side's
+            // copy to the user-facing bucket hasn't landed). Any of them could be the beam-map.
+            const unreadable: string[] = []
             this.logging.log(
                 `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
             )
@@ -939,7 +942,9 @@ export class ATXTransformHandler {
                     break
                 }
                 try {
-                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId)
+                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId, () =>
+                        unreadable.push(a.artifactId)
+                    )
                     // Validate shape before trusting it: the beam-map is uploaded by the web
                     // orchestrator, so a malformed, unexpectedly-shaped, or attacker-influenced
                     // payload must NOT flow into normalizeBeamRepo (which drives which artifacts
@@ -969,6 +974,17 @@ export class ATXTransformHandler {
                     // download hiccup). Keep scanning the rest.
                     this.logging.log(`[BEAM-PKG] beam-map scan: skipped artifact ${a.artifactId}: ${String(e)}`)
                 }
+            }
+
+            // Without a beam-map, an unreadable candidate means the opt-in can't be told: the gate
+            // retries later instead of caching "not opted in" for the session.
+            const beamMapUnreadable = !beamMapRepos && unreadable.length > 0
+            if (beamMapUnreadable) {
+                this.logging.warn(
+                    `[BEAM-PKG] beam-map scan: couldn't download ${unreadable.length} candidate artifact(s) ` +
+                        `(${unreadable.join(', ')}) for job=${parentJobId}; if one is the beam-map, its ITGen ` +
+                        `opt-in is unknown until a later scan reads it`
+                )
             }
 
             const beamed: BeamedRepoInfo[] = []
@@ -1107,7 +1123,7 @@ export class ATXTransformHandler {
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
             return {
                 repos: beamed,
-                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort,
+                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort && !beamMapUnreadable,
             }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
@@ -1217,7 +1233,16 @@ export class ATXTransformHandler {
         return Date.now() < this.beamThrottleCooldownUntilMs
     }
 
-    private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
+    /**
+     * `onUnreadable` is called when the artifact couldn't be downloaded (no download URL, or the
+     * download failed), as opposed to read and found not to be JSON: both return null.
+     */
+    private async downloadJsonArtifact(
+        workspaceId: string,
+        jobId: string,
+        artifactId: string,
+        onUnreadable?: () => void
+    ): Promise<any | null> {
         // Beam discovery re-scans the same candidate artifacts on every sweep, so without a cache
         // the same artifact is downloaded and re-parsed on every pass (measured: ~2000 download-URL
         // creations and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
@@ -1251,7 +1276,10 @@ export class ATXTransformHandler {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
             // No presigned URL is a transient condition (throttle/authz), so it is NOT
             // cached — the next sweep must be free to retry.
-            if (!dl?.s3PresignedUrl) return null
+            if (!dl?.s3PresignedUrl) {
+                onUnreadable?.()
+                return null
+            }
             const response = await got.get(dl.s3PresignedUrl, {
                 headers: dl.requestHeaders || {},
                 responseType: 'buffer',
@@ -1298,6 +1326,7 @@ export class ATXTransformHandler {
             // made AdmZip throw). Deliberately NOT cached — caching one of these would
             // permanently mark a readable artifact as unreadable.
             this.logging.log(`ATX: downloadJsonArtifact parse/download failed for ${artifactId}: ${String(error)}`)
+            onUnreadable?.()
             return null
         }
     }

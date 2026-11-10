@@ -78,6 +78,19 @@ describe('ATXTransformHandler - Chat APIs', () => {
             expect(urlStub.called).to.be.false
         })
 
+        it('says when an artifact could not be downloaded, and not when it was read and is not JSON', async () => {
+            const onUnreadable = sinon.spy()
+            urlStub.resolves(null)
+
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'gone', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce).to.be.true
+
+            onUnreadable.resetHistory()
+            ;(handler as any).beamJsonArtifactCache.set('not-json', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'not-json', onUnreadable)).to.equal(null)
+            expect(onUnreadable.called).to.be.false
+        })
+
         it('serves a fresh POSITIVE from cache without re-fetching', async () => {
             ;(handler as any).beamJsonArtifactCache.set('a2', {
                 value: { repos: ['alice'] },
@@ -5436,7 +5449,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
     beforeEach(() => {
         serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
         workspace = {} as Workspace
-        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
         runtime = {} as Runtime
         handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
         sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
@@ -5618,6 +5631,57 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             // Throttle cooldown: the beam-map scan is skipped, so "no opt-in" can't be told apart from "not read".
             ;(handler as any).beamThrottleCooldownUntilMs = Date.now() + 60_000
             expect(await readBeamOptIn('job-3')).to.equal(undefined)
+        })
+
+        // A beam-map that's listed but can't be downloaded yet (ResourceNotFound until the web side's copy to the
+        // user-facing bucket lands) must not turn ITGen off for the session: the gate retries a "can't tell".
+        it("can't tell whether a job opts in while a candidate can't be downloaded and no beam-map was read", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                _id: string,
+                onUnreadable?: () => void
+            ) => {
+                onUnreadable?.()
+                return null
+            }) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
+            expect(warn.calledWithMatch(/couldn't download 1 candidate artifact\(s\) \(beammap-1\)/)).to.be.true
+
+            // Once it downloads, the opt-in is read.
+            mapStub.callsFake(async () => ({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            }))
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+        })
+
+        it('reads a beam-map even when another candidate cannot be downloaded', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'other-1', fileMetadata: { path: '' } },
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                id: string,
+                onUnreadable?: () => void
+            ) => {
+                if (id === 'other-1') {
+                    onUnreadable?.()
+                    return null
+                }
+                return { repos: [{ repoName: 'alice', stepId: 's1' }] }
+            }) as any)
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(false)
         })
 
         it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
