@@ -12,6 +12,7 @@ import {
     effectiveHeaders,
     fingerprintServerConfig,
     fingerprintWorkspace,
+    formatServerConfigForReview,
     hasApproval,
     recordApproval,
     removeApproval,
@@ -140,6 +141,138 @@ describe('mcpConsentStore', () => {
         it('returns an empty object when nothing is set', () => {
             expect(effectiveEnv({})).to.deep.equal({})
             expect(effectiveHeaders({})).to.deep.equal({})
+        })
+    })
+
+    describe('formatServerConfigForReview', () => {
+        it('shows the command, arguments and merged environment of a stdio server as JSON', () => {
+            const cfg: MCPServerConfig = {
+                command: 'npx',
+                args: ['-y', '@example/server@1.0.0', '--flag=a b'],
+                env: { B_VAR: 'b', A_VAR: 'a' },
+                __additionalEnv__: { B_VAR: 'override' },
+                url: 'https://ignored.example.com',
+                timeout: 60000,
+            }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(JSON.parse(text)).to.deep.equal({
+                command: 'npx',
+                args: ['-y', '@example/server@1.0.0', '--flag=a b'],
+                env: { A_VAR: 'a', B_VAR: 'override' },
+            })
+            expect(text).to.equal(
+                '{\n "command": "npx",\n "args": [\n  "-y",\n  "@example/server@1.0.0",\n  "--flag=a b"\n ],\n "env": {\n  "A_VAR": "a",\n  "B_VAR": "override"\n }\n}'
+            )
+        })
+
+        it('shows the URL and merged headers of an HTTP server as JSON', () => {
+            const cfg: MCPServerConfig = {
+                url: 'https://mcp.example.com/path?x=1',
+                headers: { 'X-Team': 'docs' },
+                __additionalHeaders__: { Authorization: 'Bearer abc' },
+            }
+
+            expect(JSON.parse(formatServerConfigForReview(cfg))).to.deep.equal({
+                url: 'https://mcp.example.com/path?x=1',
+                headers: { Authorization: 'Bearer abc', 'X-Team': 'docs' },
+            })
+        })
+
+        it('leaves out empty arguments, environment variables and headers', () => {
+            expect(JSON.parse(formatServerConfigForReview({ command: 'uvx', args: [], env: {} }))).to.deep.equal({
+                command: 'uvx',
+            })
+            expect(
+                JSON.parse(formatServerConfigForReview({ url: 'https://mcp.example.com', headers: {} }))
+            ).to.deep.equal({
+                url: 'https://mcp.example.com',
+            })
+        })
+
+        it('writes characters that a reader would not see as escapes, and keeps the exact values', () => {
+            const hidden = [
+                '\u202E',
+                '\u2066',
+                '\u200B',
+                '\u200D',
+                '\u2028',
+                '\u2029',
+                '\u00AD',
+                '\uFEFF',
+                '\uFE0F',
+                '\u0085',
+                '\u001B',
+                '\u{E0041}',
+                // A format character that is not default ignorable
+                '\uFFF9',
+            ]
+            const cfg: MCPServerConfig = {
+                command: 'npx',
+                args: hidden.map(character => `a${character}b`),
+                env: { [`NAME\u202E`]: `x\ny\tz` },
+            }
+
+            const text = formatServerConfigForReview(cfg)
+
+            for (const character of hidden) {
+                expect(text).to.not.include(character)
+            }
+            expect(text).to.include('a\\u202eb')
+            expect(text).to.include('a\\udb40\\udc41b')
+            expect(text).to.include('"NAME\\u202e": "x\\ny\\tz"')
+            expect(JSON.parse(text)).to.deep.equal({
+                command: 'npx',
+                args: hidden.map(character => `a${character}b`),
+                env: { [`NAME\u202E`]: `x\ny\tz` },
+            })
+        })
+
+        it('writes <, > and & as escapes, and keeps the exact values', () => {
+            const values = ['<span hidden>', '--allow-write', '</span>', 'a&quot;, "b', '<b ', 'c&#x3A;d', '&lt;i&gt;']
+            const cfg: MCPServerConfig = { command: 'npx', args: values, env: { 'A<B': 'x&y' } }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(text).to.not.match(/[<>&]/)
+            expect(text).to.include('"\\u003cspan hidden\\u003e"')
+            expect(text).to.include('"a\\u0026quot;, \\"b"')
+            expect(text).to.include('"A\\u003cB": "x\\u0026y"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args: values, env: { 'A<B': 'x&y' } })
+        })
+
+        it('writes <, > and & in a URL and headers as escapes', () => {
+            const cfg: MCPServerConfig = { url: 'https://mcp.example.com/?a=1&b=<2>', headers: { 'X-A&B': '<c>' } }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(text).to.not.match(/[<>&]/)
+            expect(text).to.include('"https://mcp.example.com/?a=1\\u0026b=\\u003c2\\u003e"')
+            expect(JSON.parse(text)).to.deep.equal({ url: cfg.url, headers: cfg.headers })
+        })
+
+        it('writes spaces other than U+0020 as escapes', () => {
+            const spaces = ['\u00A0', '\u1680', '\u2003', '\u202F', '\u205F', '\u3000']
+            const args = [...spaces.map(space => `a${space}b`), 'a   b']
+
+            const text = formatServerConfigForReview({ command: 'npx', args })
+
+            for (const space of spaces) {
+                expect(text).to.not.include(space)
+            }
+            expect(text).to.include('"a\\u00a0b"')
+            expect(text).to.include('"a\\u3000b"')
+            expect(text).to.include('"a   b"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args })
+        })
+
+        it('keeps visible non-ASCII characters', () => {
+            const text = formatServerConfigForReview({ command: 'npx', args: ['Größe', 'データ', '✓'] })
+
+            expect(text).to.include('"Größe"')
+            expect(text).to.include('"データ"')
+            expect(text).to.include('"✓"')
         })
     })
 

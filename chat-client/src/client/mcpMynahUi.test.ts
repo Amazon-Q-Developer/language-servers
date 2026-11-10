@@ -649,4 +649,72 @@ describe('McpMynahUi', () => {
             assert.strictEqual(detailedList.list[0].children[0].icon, 'mocked-icon')
         })
     })
+
+    describe('registry server install', () => {
+        const openRegistryView = (params: Record<string, unknown>) => {
+            mcpMynahUi.mcpServerClick({ id: 'add-new-mcp', isMcpRegistry: true, list: [], ...params } as any)
+            return (mynahUi.openDetailedList as sinon.SinonStub).lastCall.args[0]
+        }
+
+        it('asks for the install preview when Install is clicked in the registry list', () => {
+            const { events } = openRegistryView({
+                header: { title: 'Add MCP Server' },
+                filterOptions: [],
+                list: [{ children: [{ title: 'docs-server 1.2.3', actions: [{ id: 'install-registry-server' }] }] }],
+            })
+
+            events.onActionClick(
+                { id: 'install-registry-server' } as ChatItemButton,
+                {
+                    title: 'docs-server 1.2.3',
+                } as DetailedListItem
+            )
+
+            sinon.assert.calledWith(mynahUi.toggleSplashLoader as sinon.SinonStub, true, '**Loading MCP Server**')
+            sinon.assert.calledOnceWithExactly(
+                messager.onMcpServerClick as sinon.SinonStub,
+                'install-registry-server',
+                'docs-server 1.2.3'
+            )
+        })
+
+        it('installs the previewed server when Install is clicked in the preview', () => {
+            const { detailedList, events } = openRegistryView({
+                header: { title: 'Install MCP Server', description: 'Review this server before you install it.' },
+                filterOptions: [{ type: 'textinput', id: 'name', title: 'Name', value: 'docs-server' }],
+                filterActions: [
+                    { id: 'cancel-mcp', text: 'Cancel' },
+                    { id: 'confirm-install-registry-server', text: 'Install' },
+                ],
+            })
+            assert.strictEqual(detailedList.header.title, 'Install MCP Server')
+            assert.deepStrictEqual(
+                detailedList.filterActions.map((action: any) => action.id),
+                ['cancel-mcp', 'confirm-install-registry-server']
+            )
+
+            // The server name comes from the preview that the server sent, not from the form values
+            events.onFilterActionClick({ id: 'confirm-install-registry-server' }, { name: 'other-server' })
+
+            sinon.assert.calledWith(mynahUi.toggleSplashLoader as sinon.SinonStub, true, '**Installing MCP Server**')
+            sinon.assert.calledOnceWithExactly(
+                messager.onMcpServerClick as sinon.SinonStub,
+                'confirm-install-registry-server',
+                'docs-server'
+            )
+            sinon.assert.notCalled(messager.onListMcpServers as sinon.SinonStub)
+        })
+
+        it('goes back to the server list when Cancel is clicked in the preview', () => {
+            const { events } = openRegistryView({
+                header: { title: 'Install MCP Server' },
+                filterOptions: [{ type: 'textinput', id: 'name', title: 'Name', value: 'docs-server' }],
+            })
+
+            events.onFilterActionClick({ id: 'cancel-mcp' }, { name: 'docs-server' })
+
+            sinon.assert.calledOnce(messager.onListMcpServers as sinon.SinonStub)
+            sinon.assert.notCalled(messager.onMcpServerClick as sinon.SinonStub)
+        })
+    })
 })

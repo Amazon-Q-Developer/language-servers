@@ -23,11 +23,14 @@ import {
 } from './mcpUtils'
 import {
     McpPermissionType,
+    McpRegistryServer,
     MCPServerConfig,
     MCPServerPermission,
     McpServerRuntimeState,
     McpServerStatus,
 } from './mcpTypes'
+import { fingerprintServerConfig, formatServerConfigForReview } from './mcpConsentStore'
+import { codeSpan } from '../../textFormatting'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import { McpRegistryService } from './mcpRegistryService'
@@ -48,6 +51,9 @@ enum TransportType {
     HTTP = 'http',
 }
 
+/** Button of the install preview of a registry server that installs the server */
+const CONFIRM_INSTALL_REGISTRY_SERVER = 'confirm-install-registry-server'
+
 export class McpEventHandler {
     private static readonly FILE_WATCH_DEBOUNCE_MS = 2000
     #features: Features
@@ -65,6 +71,8 @@ export class McpEventHandler {
     #lastProgrammaticState: boolean = false
     #serverNameBeforeUpdate: string | undefined
     #converter: McpServerConfigConverter = new McpServerConfigConverter()
+    /** The registry server configuration that the install preview showed. Install installs only this configuration. */
+    #previewedRegistryInstall: { serverName: string; version: string; fingerprint: string } | undefined
 
     #releaseProgrammaticAfterDebounce(padMs = 500) {
         setTimeout(() => {
@@ -403,7 +411,8 @@ export class McpEventHandler {
             'mcp-disable-server': () => this.#handleDisableMcpServer(params),
             'mcp-delete-server': () => this.#handleDeleteMcpServer(params),
             'mcp-fix-server': () => this.#handleEditMcpServer(params),
-            'install-registry-server': () => this.#handleInstallRegistryServer(params),
+            'install-registry-server': () => this.#handleShowRegistryInstallPreview(params),
+            [CONFIRM_INSTALL_REGISTRY_SERVER]: () => this.#handleInstallRegistryServer(params),
         }
 
         // Execute the appropriate handler or return default response
@@ -2234,20 +2243,179 @@ export class McpEventHandler {
     }
 
     /**
-     * Installs a server from the registry
+     * The registry entry named `serverName` and the configuration that the server starts with when it is installed.
+     * Undefined when the registry has no such entry or the entry cannot be converted.
+     */
+    #resolveRegistryServer(
+        serverName: string
+    ): { registryServer: McpRegistryServer; config: MCPServerConfig } | undefined {
+        const registryServer: McpRegistryServer | undefined = McpManager.instance
+            .getRegistryService()
+            ?.getServerByName(serverName)
+        if (!registryServer) {
+            this.#features.logging.error(`Registry server not found: ${serverName}`)
+            return undefined
+        }
+        try {
+            return { registryServer, config: this.#converter.convertRegistryServer(registryServer) }
+        } catch (error) {
+            this.#features.logging.error(`Invalid registry server '${serverName}': ${error}`)
+            return undefined
+        }
+    }
+
+    /**
+     * Shows what a registry server runs, or what it connects to, before the user installs it. The registry decides
+     * the command, arguments, environment variables, URL and headers, and the registry list shows only the name,
+     * version and description of each server.
+     */
+    async #handleShowRegistryInstallPreview(params: McpServerClickParams, changedInRegistry: boolean = false) {
+        const serverName = params.title?.split(' ')[0]
+        if (!serverName) return
+
+        const resolved = this.#resolveRegistryServer(serverName)
+        if (!resolved) {
+            return this.#handleShowRegistryServers(params)
+        }
+        const { registryServer, config } = resolved
+        this.#previewedRegistryInstall = {
+            serverName,
+            version: registryServer.version,
+            fingerprint: fingerprintServerConfig(config),
+        }
+
+        const isRemote = !!config.url
+        const readOnlyRows = <T>(values: T[]) => values.map(value => ({ persistent: true, value }))
+        const args = readOnlyRows((config.args ?? []).map(arg => ({ arg_key: arg })))
+        const envVariables = readOnlyRows(
+            Object.entries(config.env ?? {}).map(([name, value]) => ({ env_var_name: name, env_var_value: value }))
+        )
+        const headers = readOnlyRows(Object.entries(config.headers ?? {}).map(([key, value]) => ({ key, value })))
+
+        const definition = isRemote
+            ? [
+                  { type: 'textinput', id: 'url', title: 'URL', value: config.url, disabled: true },
+                  ...(headers.length > 0
+                      ? [
+                            {
+                                type: 'list',
+                                id: 'headers',
+                                title: 'Headers',
+                                items: [
+                                    { id: 'key', title: 'Key', type: 'textinput' },
+                                    { id: 'value', title: 'Value', type: 'textinput' },
+                                ],
+                                value: headers,
+                                disabled: true,
+                            },
+                        ]
+                      : []),
+              ]
+            : [
+                  { type: 'textinput', id: 'command', title: 'Command', value: config.command ?? '', disabled: true },
+                  ...(args.length > 0
+                      ? [
+                            {
+                                type: 'list',
+                                id: 'args',
+                                title: 'Arguments',
+                                items: [{ id: 'arg_key', type: 'textinput' }],
+                                value: args,
+                                disabled: true,
+                            },
+                        ]
+                      : []),
+                  ...(envVariables.length > 0
+                      ? [
+                            {
+                                type: 'list',
+                                id: 'env_variables',
+                                title: 'Environment variables',
+                                items: [
+                                    { id: 'env_var_name', title: 'Name', type: 'textinput' },
+                                    { id: 'env_var_value', title: 'Value', type: 'textinput' },
+                                ],
+                                value: envVariables,
+                                disabled: true,
+                            },
+                        ]
+                      : []),
+              ]
+
+        let statusTitle = 'Installing this server runs this command on your computer:'
+        if (changedInRegistry) {
+            statusTitle = 'This server changed in the registry. Review it again before you install it.'
+        } else if (isRemote) {
+            statusTitle = 'Installing this server connects Amazon Q to this URL:'
+        }
+
+        return {
+            id: 'add-new-mcp',
+            isMcpRegistry: true,
+            header: {
+                title: 'Install MCP Server',
+                description: 'Review this server before you install it.',
+                // The fields below cut off long values, so the status also shows the whole configuration. The chat
+                // client shows the status as markdown. In a code span, markdown is not applied and the text wraps,
+                // and formatServerConfigForReview escapes the characters that the chat client could read as HTML.
+                // A code block would not wrap, and its Copy and Insert buttons do nothing in this view.
+                status: {
+                    title: statusTitle,
+                    // On one line, so that a delimiter of three or more backticks cannot open a fenced code block.
+                    // In a code span, markdown turns line ends into spaces anyway.
+                    description: codeSpan(formatServerConfigForReview(config).replace(/\n */g, ' ')),
+                    icon: changedInRegistry ? 'warning' : 'info',
+                    status: (changedInRegistry ? 'warning' : 'info') as Status,
+                },
+            },
+            list: [],
+            filterOptions: [
+                { type: 'textinput', id: 'name', title: 'Name', value: serverName, disabled: true },
+                { type: 'textinput', id: 'version', title: 'Version', value: registryServer.version, disabled: true },
+                {
+                    type: 'textinput',
+                    id: 'transport',
+                    title: 'Transport',
+                    value: isRemote ? TransportType.HTTP : TransportType.STDIO,
+                    disabled: true,
+                },
+                ...definition,
+            ],
+            filterActions: [
+                { id: 'cancel-mcp', text: 'Cancel' },
+                { id: CONFIRM_INSTALL_REGISTRY_SERVER, text: 'Install', status: 'primary' },
+            ],
+        }
+    }
+
+    /**
+     * Installs a registry server after the user reviewed it in the install preview. If the registry changed the
+     * server's configuration after the preview, or there was no preview, shows the preview instead.
      */
     async #handleInstallRegistryServer(params: McpServerClickParams) {
         const serverName = params.title?.split(' ')[0]
         if (!serverName) return
 
-        const registryService = McpManager.instance.getRegistryService()
-        const registryServer = registryService?.getServerByName(serverName)
-        if (!registryServer) {
-            this.#features.logging.error(`Registry server not found: ${serverName}`)
+        const resolved = this.#resolveRegistryServer(serverName)
+        if (!resolved) {
             return this.#handleShowRegistryServers(params)
         }
-
-        const config = this.#converter.convertRegistryServer(registryServer)
+        const { registryServer, config } = resolved
+        const previewed = this.#previewedRegistryInstall
+        if (
+            previewed?.serverName !== serverName ||
+            previewed.version !== registryServer.version ||
+            previewed.fingerprint !== fingerprintServerConfig(config)
+        ) {
+            const changedInRegistry = previewed?.serverName === serverName
+            this.#features.logging.info(
+                `MCP Registry: showing the install preview of '${serverName}' again because ${
+                    changedInRegistry ? 'its registry entry changed' : 'it was not the server in the preview'
+                }`
+            )
+            return this.#handleShowRegistryInstallPreview(params, changedInRegistry)
+        }
+        this.#previewedRegistryInstall = undefined
         config.__cachedVersion__ = registryServer.version
 
         const agentPath = await this.#getAgentPath(true)

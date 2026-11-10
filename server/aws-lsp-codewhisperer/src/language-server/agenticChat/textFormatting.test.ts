@@ -1,5 +1,5 @@
 import * as assert from 'assert'
-import { codeBlockLines, codeFence, shellCommandBlock, shellCommandBlockStart } from './textFormatting'
+import { codeBlockLines, codeFence, codeSpan, shellCommandBlock, shellCommandBlockStart } from './textFormatting'
 
 describe('textFormatting', () => {
     describe('shell command blocks', () => {
@@ -19,6 +19,30 @@ describe('textFormatting', () => {
 
             assert.strictEqual(shellCommandBlockStart(command), '````shell\necho ```')
             assert.strictEqual(codeFence(command), '````')
+        })
+    })
+
+    describe('code spans', () => {
+        it('wrap text with no backticks in single backticks', () => {
+            assert.strictEqual(codeSpan('npx -y pkg@1'), '`npx -y pkg@1`')
+        })
+
+        it('use a delimiter longer than the longest run of backticks in the text', () => {
+            assert.strictEqual(codeSpan('a`b'), '``a`b``')
+            assert.strictEqual(codeSpan('a```b `c` d'), '````a```b `c` d````')
+        })
+
+        it('add a space between the delimiter and a backtick at the start or the end', () => {
+            assert.strictEqual(codeSpan('`x'), '`` `x ``')
+            assert.strictEqual(codeSpan('x`'), '`` x` ``')
+            assert.strictEqual(codeSpan('``'), '``` `` ```')
+        })
+
+        it('leave markdown and HTML in the text unchanged', () => {
+            assert.strictEqual(
+                codeSpan('[docs](https://example.com) <b>x</b> **y**'),
+                '`[docs](https://example.com) <b>x</b> **y**`'
+            )
         })
     })
 
