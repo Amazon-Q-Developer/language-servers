@@ -527,3 +527,28 @@ The suite "a workspace agent config path with symbolic links" uses a temporary f
   each other.
 
 The cases with a link to a file are skipped on Windows when the test cannot create one.
+
+## 13. MCP server form values in the log
+
+### Behavior
+
+Each click in the MCP server views of the chat, such as **Save** in the add or edit view, reaches the
+server as an `onMcpServerClick` request with the values of the form. The server wrote the whole
+request to the log, including the values of environment variables and headers, which often hold API
+tokens.
+
+- The server now logs the action id, the title and the names of the form fields, not their values.
+- Not covered: when the server starts a local MCP server, it still logs the command and its
+  arguments. It logs only the names of the environment variables.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "logs the names of the MCP server form fields" \
+  src/language-server/agenticChat/tools/mcp/mcpEventHandler.test.ts
+```
+
+The test sends a click with an environment variable value and a header value. It checks that the log
+line lists the field names and that no log line contains either value.

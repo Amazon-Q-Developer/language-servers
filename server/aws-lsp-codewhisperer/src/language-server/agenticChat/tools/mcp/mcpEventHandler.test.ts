@@ -814,6 +814,30 @@ describe('McpEventHandler error handling', () => {
         })
     })
 
+    it('logs the names of the MCP server form fields, not their values', async () => {
+        // The log line comes before the click is handled, so an id that no handler takes is enough here
+        await eventHandler.onMcpServerClick({
+            id: 'unhandled-action',
+            title: 'docs-server',
+            optionsValues: {
+                name: 'docs-server',
+                env_variables: JSON.stringify([{ env_var_name: 'API_TOKEN', env_var_value: 'lsfix-env-secret' }]),
+                headers: JSON.stringify([{ key: 'Authorization', value: 'Bearer lsfix-header-secret' }]),
+            },
+        })
+
+        const logged = (['log', 'info', 'warn', 'error', 'debug'] as const)
+            .flatMap(level =>
+                features.logging[level].getCalls().map((call: sinon.SinonSpyCall) => String(call.args[0]))
+            )
+            .join('\n')
+        expect(logged).to.include(
+            'onMcpServerClick event with params: {"id":"unhandled-action","title":"docs-server","fieldNames":["name","env_variables","headers"]}'
+        )
+        expect(logged).to.not.include('lsfix-env-secret')
+        expect(logged).to.not.include('lsfix-header-secret')
+    })
+
     it('handles server click events for fixing failed servers', async () => {
         // Make sure previous stubs are restored
         sinon.restore()

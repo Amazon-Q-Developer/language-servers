@@ -380,7 +380,16 @@ export class McpEventHandler {
      */
 
     async onMcpServerClick(params: McpServerClickParams) {
-        this.#features.logging.log(`onMcpServerClick event with params: ${JSON.stringify(params)}`)
+        // The form values can hold secrets, such as environment variable and header values, so only their names
+        // are logged
+        this.#features.logging.log(
+            `onMcpServerClick event with params: ${JSON.stringify({
+                id: params.id,
+                title: params.title,
+                isMcpRegistry: params.isMcpRegistry,
+                fieldNames: Object.keys(params.optionsValues ?? {}),
+            })}`
+        )
 
         // Use a map of handlers for different action types
         const handlers: Record<string, () => Promise<any>> = {
