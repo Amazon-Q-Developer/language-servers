@@ -924,6 +924,8 @@ export class ATXTransformHandler {
             // tab would go empty for the duration of the cooldown. Emptying skips only the optional
             // enrichment and lets the path that actually finds beamed repos run untouched.
             const beamThrottleCoolingDown = this.isBeamThrottleCooldownActive()
+            // A throttle during the scan moves this, and makes the scan unfinished (see scanFinished).
+            const throttleMarkBeforeScan = this.beamThrottleCooldownUntilMs
             if (beamThrottleCoolingDown) {
                 this.logging.log(
                     `[BEAM-PKG] beam-map scan: SKIPPED — throttle cooldown active for another ` +
@@ -1009,17 +1011,24 @@ export class ATXTransformHandler {
                 }
             }
 
-            // Without a beam-map, a candidate that went unread (it couldn't be downloaded, or was past
-            // the candidate cap) means the opt-in can't be told: the gate retries later (and counts it)
-            // instead of caching "not opted in" for the session. A beam-map that was read decides, even if
-            // another couldn't be downloaded: the service only publishes a beam-map where the IDE can
-            // download it when a repo in it opts in, and each newer one merges the earlier ones.
+            // A beam-map that was read and opts in decides. Otherwise a candidate that went unread (it
+            // couldn't be downloaded, or was past the candidate cap) can be a newer beam-map that opts in:
+            // the web publishes a beam-map where the IDE can download it only when a repo in it opts in,
+            // and the copy can land after the beam-map is listed. So the opt-in is unconfirmed: the gate
+            // retries later (and counts it) instead of caching "not opted in". A throttle during the scan
+            // makes it unfinished, like the throttle cooldown: retried, never counted.
             const leftOut = beamThrottleCoolingDown ? 0 : allCandidates.length - candidates.length
-            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort
-            const beamMapUnconfirmed = scanFinished && !beamMapRepos && (unreadable.length > 0 || leftOut > 0)
-            const unreadKey = beamMapUnconfirmed ? `${unreadable.join(', ')}|${leftOut}` : undefined
+            const throttledDuringScan = this.beamThrottleCooldownUntilMs !== throttleMarkBeforeScan
+            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
+            const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
+            const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
+            const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
             if (unreadKey === undefined) {
-                this.beamMapUnreadableWarned.delete(parentJobId)
+                // Only a finished scan with an answer ends the warning; a lightweight, throttled or
+                // cut-short sweep says nothing about the unread candidates.
+                if (scanFinished) {
+                    this.beamMapUnreadableWarned.delete(parentJobId)
+                }
             } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadKey) {
                 this.beamMapUnreadableWarned.delete(parentJobId)
                 this.beamMapUnreadableWarned.set(parentJobId, unreadKey)
@@ -1035,7 +1044,7 @@ export class ATXTransformHandler {
                         : '',
                 ].filter(Boolean)
                 this.logging.warn(
-                    `[BEAM-PKG] beam-map scan for job=${parentJobId} found no beam-map: ${unread.join(' and ')}; ` +
+                    `[BEAM-PKG] beam-map scan for job=${parentJobId} read no beam-map that opts in: ${unread.join(' and ')}; ` +
                         `if one is the beam-map, its ITGen opt-in is unknown until a later scan reads it`
                 )
             }
