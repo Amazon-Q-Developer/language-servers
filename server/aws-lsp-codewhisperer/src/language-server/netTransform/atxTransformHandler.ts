@@ -885,7 +885,9 @@ export class ATXTransformHandler {
             // artifact that throws (or isn't JSON, e.g. an unrelated metadata.json / binary)
             // must NOT abort the scan, or we miss the real beam-map that comes later in the list
             // and wrongly fall back to zip-discovery (empty stepId). We scan ALL candidates and
-            // keep the LAST valid repos[] (beam-map is re-written on each beam; latest wins).
+            // merge every valid repos[]: the web writes a NEW beam-map on each beam batch (each
+            // merging the earlier ones), and ListArtifacts order isn't chronological, so the last
+            // one listed can be an older map. Per repo, the entry from the newest map wins.
             // Candidate beam-map artifacts = everything EXCEPT the transformed-source
             // bundles. The beam-map is itself stored as a ZIP by FES (downloadJsonArtifact
             // unzips + parses it), so we MUST NOT exclude by ".zip" extension — that would
@@ -895,6 +897,7 @@ export class ATXTransformHandler {
             // source bundles, whose paths match "<repo>_<hash>/<repo>.zip" (ZIP_RE). Anything
             // else (including an unnamed/empty-path zip = the beam-map) is a candidate.
             let beamMapRepos: BeamMapRepo[] | null = null
+            const beamMaps: { repos: BeamMapRepo[]; createdAt: number }[] = []
             // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
             // beam-status + one plan fetch. stepId isn't resolved here; the IDE keeps the one from full
             // discovery / resolves it at Load.
@@ -968,9 +971,13 @@ export class ATXTransformHandler {
                                 `[BEAM-PKG] beam-map validation: skipped ${rejected} malformed entr(y/ies) in artifact=${a.artifactId}`
                             )
                         }
-                        beamMapRepos = validRepos as BeamMapRepo[]
+                        beamMaps.push({
+                            repos: validRepos as BeamMapRepo[],
+                            // A Date from the SDK; also takes epoch ms or an ISO string. Missing or invalid: oldest.
+                            createdAt: new Date(a.artifactCreatedTimestamp ?? 0).getTime() || 0,
+                        })
                         this.logging.log(
-                            `[BEAM-PKG] beam-map found (${beamMapRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
+                            `[BEAM-PKG] beam-map found (${validRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
                         )
                         // Do NOT break — keep scanning; a later artifact could be a newer beam-map.
                         // (Cost is bounded: only empty-path/non-zip artifacts, a handful per job.)
@@ -982,10 +989,26 @@ export class ATXTransformHandler {
                 }
             }
 
+            if (beamMaps.length > 0) {
+                // Oldest first (stable, so maps without a timestamp keep list order), so a newer entry replaces it.
+                const byRepo = new Map<string, BeamMapRepo>()
+                for (const m of [...beamMaps].sort((x, y) => x.createdAt - y.createdAt)) {
+                    for (const r of m.repos) {
+                        byRepo.set(this.normalizeBeamRepo(r).RepositoryName.toLowerCase(), r)
+                    }
+                }
+                beamMapRepos = [...byRepo.values()]
+                if (beamMaps.length > 1) {
+                    this.logging.log(
+                        `[BEAM-PKG] beam-map: merged ${beamMaps.length} beam-maps into ${beamMapRepos.length} repo(s) for job=${parentJobId}`
+                    )
+                }
+            }
+
             // Without a beam-map, an unreadable candidate means the opt-in can't be told: the gate
             // retries later instead of caching "not opted in" for the session. A beam-map that was read
-            // decides, even if a newer one couldn't be downloaded: the service publishes every beam-map
-            // where the IDE can download it, or none.
+            // decides, even if another couldn't be downloaded: the service only publishes a beam-map where
+            // the IDE can download it when a repo in it opts in, and each newer one merges the earlier ones.
             const beamMapUnreadable = !beamMapRepos && unreadable.length > 0
             const unreadableIds = beamMapUnreadable ? unreadable.join(', ') : undefined
             if (unreadableIds === undefined) {

@@ -33,11 +33,12 @@ export class ItGenJobGate {
     static readonly maxJobs = 200
     /**
      * How long after a beam-map read that couldn't tell (or is still running) the next read may start. It doubles
-     * with each read in a row that couldn't tell, up to beamRetryMaxMs: until the service publishes beam-maps where
-     * the IDE can download them, every beamed job's read can't tell, and each read is a full beam-map scan.
+     * with each read in a row that couldn't tell. After beamMaxReadsThatCannotTell of them the answer is "no" for
+     * the session: each read is a full beam-map scan, and a beam-map the IDE can't download (one the service only
+     * publishes for a job that opts in) never becomes downloadable.
      */
     static readonly beamRetryMs = 60_000
-    static readonly beamRetryMaxMs = 15 * 60_000
+    static readonly beamMaxReadsThatCannotTell = 5
 
     private readonly jobs = new Map<string, boolean>()
     // Beamed jobs without a known opt-in: the time their beam-map may be read again.
@@ -101,8 +102,8 @@ export class ItGenJobGate {
      * neither the objective nor an earlier read says yes, reads the beam-map. A beam-map without an opt-in isn't read
      * again until the job is forgotten: the beam-map is written when a repo is beamed, before the IDE loads it, and a
      * repo beamed later is picked up by the dashboard's discovery (listBeamedRepos calls rememberBeamOptIn). A read
-     * that couldn't tell is retried after beamRetryMs, doubling up to beamRetryMaxMs while reads keep coming back
-     * that way. With `waitForBeamMap` false (a poll) the read runs in the
+     * that couldn't tell is retried after beamRetryMs, doubling each time, and after beamMaxReadsThatCannotTell
+     * of them the answer is "no". With `waitForBeamMap` false (a poll) the read runs in the
      * background and the gate turns on from the next call.
      */
     async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
@@ -120,9 +121,19 @@ export class ItGenJobGate {
         // Set before the read starts, so calls while it runs don't start another one. It's also the next check
         // when this read can't tell.
         const retries = this.beamRetries.get(jobId) ?? 0
-        const retryMs = Math.min(ItGenJobGate.beamRetryMs * 2 ** retries, ItGenJobGate.beamRetryMaxMs)
-        ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + retryMs)
-        const couldNotTell = () => ItGenJobGate.setCapped(this.beamRetries, jobId, retries + 1)
+        ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRetryMs * 2 ** retries)
+        const couldNotTell = () => {
+            if (retries + 1 < ItGenJobGate.beamMaxReadsThatCannotTell) {
+                ItGenJobGate.setCapped(this.beamRetries, jobId, retries + 1)
+                return
+            }
+            this.log(
+                `ATX: job ${jobId}: ${ItGenJobGate.beamMaxReadsThatCannotTell} beam-map reads couldn't tell ` +
+                    `whether a beamed repo opts in to ITGen; treating it as not opted in this session`
+            )
+            ItGenJobGate.setCapped(this.beamChecks, jobId, Number.POSITIVE_INFINITY)
+            this.beamRetries.delete(jobId)
+        }
         const read = this.readBeamOptIn(workspaceId, jobId).then(
             optIn => {
                 if (optIn === true) {

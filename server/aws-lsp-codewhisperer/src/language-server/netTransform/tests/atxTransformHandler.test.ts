@@ -5573,6 +5573,49 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(result[0].OriginalArtifactId).to.equal('')
         })
 
+        // The web writes a new beam-map on each beam batch, and ListArtifacts order isn't chronological.
+        it('uses every beam-map, the newest entry per repo winning, whatever order they are listed in', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'map-new', fileMetadata: { path: '' }, artifactCreatedTimestamp: new Date(2_000) },
+                    { artifactId: 'not-a-map', fileMetadata: { path: '' } },
+                    {
+                        artifactId: 'map-old',
+                        fileMetadata: { path: '' },
+                        artifactCreatedTimestamp: new Date(1_000).toISOString(),
+                    },
+                ],
+            })
+            const maps: Record<string, any> = {
+                'map-old': { repos: [{ repoName: 'alice', stepId: 's1' }] },
+                'map-new': {
+                    repos: [
+                        {
+                            repoName: 'Alice',
+                            stepId: 's1',
+                            generateIntegrationTests: true,
+                            originalArtifactId: 'orig-a',
+                        },
+                        { repoName: 'bob', stepId: 's2' },
+                    ],
+                },
+                'not-a-map': { repos: 'malformed' },
+            }
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) => maps[id]) as any)
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['Alice', 'bob'])
+            const alice = result.find((r: any) => r.RepositoryName === 'Alice')!
+            expect(alice.GenerateIntegrationTests).to.equal(true)
+            expect(alice.OriginalArtifactId).to.equal('orig-a')
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
         it('carries the original-source artifact id from the beam-map entry (ITGen row 22/15)', async () => {
             sendStub.resolves({
                 artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
