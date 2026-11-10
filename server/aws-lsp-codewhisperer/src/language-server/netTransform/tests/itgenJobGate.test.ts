@@ -126,8 +126,8 @@ describe('ItGenJobGate', () => {
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
         })
 
-        it('waits twice as long after each read that could not tell, and stops at the cap with "no"', async () => {
-            readBeamOptIn.resolves(undefined)
+        it('waits twice as long after each unconfirmed read, and stops at the cap with "no"', async () => {
+            readBeamOptIn.resolves('unconfirmed')
             const readsAfter = async (ms: number) => {
                 clock += ms
                 expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.false
@@ -151,8 +151,23 @@ describe('ItGenJobGate', () => {
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
         })
 
-        it('starts the count over once a read can tell', async () => {
+        it('never gives up on reads that did not happen (throttled or cut short)', async () => {
             readBeamOptIn.resolves(undefined)
+
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            for (let i = 0; i < 2 * ItGenJobGate.beamMaxReadsThatCannotTell; i++) {
+                clock += ItGenJobGate.beamRetryMs
+                await beamGate.isBeamItGenJob('ws', 'web-1')
+            }
+            expect(readBeamOptIn.callCount).to.equal(2 * ItGenJobGate.beamMaxReadsThatCannotTell + 1, 'every 60 s')
+
+            readBeamOptIn.resolves(true)
+            clock += ItGenJobGate.beamRetryMs
+            expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
+        })
+
+        it('starts the count over once a read can tell', async () => {
+            readBeamOptIn.resolves('unconfirmed')
             await beamGate.isBeamItGenJob('ws', 'web-1')
             clock += ItGenJobGate.beamRetryMs
             await beamGate.isBeamItGenJob('ws', 'web-1')
@@ -161,7 +176,7 @@ describe('ItGenJobGate', () => {
             await beamGate.isBeamItGenJob('ws', 'web-1')
 
             beamGate.forget('web-1')
-            readBeamOptIn.resolves(undefined)
+            readBeamOptIn.resolves('unconfirmed')
             await beamGate.isBeamItGenJob('ws', 'web-1')
             clock += ItGenJobGate.beamRetryMs
             await beamGate.isBeamItGenJob('ws', 'web-1')

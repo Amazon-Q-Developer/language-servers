@@ -5698,8 +5698,9 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             }) as any)
             const warn = (handler as any).logging.warn as sinon.SinonStub
 
-            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
-            expect(warn.calledWithMatch(/couldn't download 1 candidate artifact\(s\) \(beammap-1\)/)).to.be.true
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(warn.calledWithMatch(/found no beam-map: couldn't download 1 candidate artifact\(s\) \(beammap-1\)/))
+                .to.be.true
 
             // The next sweep that finds the same unreadable candidate doesn't warn again.
             await (handler as any).readBeamOptIn('ws-1', 'job-1')
@@ -5710,6 +5711,27 @@ describe('ATXTransformHandler - Beam to IDE', () => {
                 repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
             }))
             expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+        })
+
+        it("can't confirm the opt-in when the beam-map is past the candidate cap", async () => {
+            const others = Array.from({ length: 25 }, (_, i) => ({ artifactId: `cp-${i}`, fileMetadata: { path: '' } }))
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...others,
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) =>
+                    id === 'beammap-1'
+                        ? { repos: [{ repoName: 'alice', generateIntegrationTests: true }] }
+                        : null) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(warn.calledWithMatch(/didn't read 1 candidate\(s\) past the 25-candidate cap/)).to.be.true
         })
 
         it('reads a beam-map even when another candidate cannot be downloaded', async () => {

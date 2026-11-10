@@ -791,21 +791,25 @@ export class ATXTransformHandler {
         return (await this.discoverBeamedRepos(workspaceId, parentJobId, lightweight)).repos
     }
 
-    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob). Undefined when the beam-map wasn't read. */
-    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | undefined> {
-        const { repos, beamMapScanned } = await this.discoverBeamedRepos(workspaceId, jobId, false)
-        return beamMapScanned ? repos.some(r => r.GenerateIntegrationTests) : undefined
+    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob, which says what each answer means). */
+    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | 'unconfirmed' | undefined> {
+        const { repos, beamMapScanned, beamMapUnconfirmed } = await this.discoverBeamedRepos(workspaceId, jobId, false)
+        if (beamMapScanned) {
+            return repos.some(r => r.GenerateIntegrationTests)
+        }
+        return beamMapUnconfirmed ? 'unconfirmed' : undefined
     }
 
     /**
      * listBeamedRepos, plus whether the beam-map scan ran to the end, so a "no opt-in" answer can be told apart
-     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error).
+     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error), and
+     * whether it ended without a beam-map while a candidate went unread (beamMapUnconfirmed).
      */
     private async discoverBeamedRepos(
         workspaceId: string,
         parentJobId: string,
         lightweight: boolean
-    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean }> {
+    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean; beamMapUnconfirmed: boolean }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -1005,24 +1009,34 @@ export class ATXTransformHandler {
                 }
             }
 
-            // Without a beam-map, an unreadable candidate means the opt-in can't be told: the gate
-            // retries later instead of caching "not opted in" for the session. A beam-map that was read
-            // decides, even if another couldn't be downloaded: the service only publishes a beam-map where
-            // the IDE can download it when a repo in it opts in, and each newer one merges the earlier ones.
-            const beamMapUnreadable = !beamMapRepos && unreadable.length > 0
-            const unreadableIds = beamMapUnreadable ? unreadable.join(', ') : undefined
-            if (unreadableIds === undefined) {
+            // Without a beam-map, a candidate that went unread (it couldn't be downloaded, or was past
+            // the candidate cap) means the opt-in can't be told: the gate retries later (and counts it)
+            // instead of caching "not opted in" for the session. A beam-map that was read decides, even if
+            // another couldn't be downloaded: the service only publishes a beam-map where the IDE can
+            // download it when a repo in it opts in, and each newer one merges the earlier ones.
+            const leftOut = beamThrottleCoolingDown ? 0 : allCandidates.length - candidates.length
+            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort
+            const beamMapUnconfirmed = scanFinished && !beamMapRepos && (unreadable.length > 0 || leftOut > 0)
+            const unreadKey = beamMapUnconfirmed ? `${unreadable.join(', ')}|${leftOut}` : undefined
+            if (unreadKey === undefined) {
                 this.beamMapUnreadableWarned.delete(parentJobId)
-            } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadableIds) {
+            } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadKey) {
                 this.beamMapUnreadableWarned.delete(parentJobId)
-                this.beamMapUnreadableWarned.set(parentJobId, unreadableIds)
+                this.beamMapUnreadableWarned.set(parentJobId, unreadKey)
                 while (this.beamMapUnreadableWarned.size > BEAM_MAP_UNREADABLE_WARNED_MAX) {
                     this.beamMapUnreadableWarned.delete(this.beamMapUnreadableWarned.keys().next().value!)
                 }
+                const unread = [
+                    unreadable.length > 0
+                        ? `couldn't download ${unreadable.length} candidate artifact(s) (${unreadable.join(', ')})`
+                        : '',
+                    leftOut > 0
+                        ? `didn't read ${leftOut} candidate(s) past the ${BEAM_MAP_SCAN_MAX_CANDIDATES}-candidate cap`
+                        : '',
+                ].filter(Boolean)
                 this.logging.warn(
-                    `[BEAM-PKG] beam-map scan: couldn't download ${unreadable.length} candidate artifact(s) ` +
-                        `(${unreadableIds}) for job=${parentJobId}; if one is the beam-map, its ITGen ` +
-                        `opt-in is unknown until a later scan reads it`
+                    `[BEAM-PKG] beam-map scan for job=${parentJobId} found no beam-map: ${unread.join(' and ')}; ` +
+                        `if one is the beam-map, its ITGen opt-in is unknown until a later scan reads it`
                 )
             }
 
@@ -1162,11 +1176,12 @@ export class ATXTransformHandler {
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
             return {
                 repos: beamed,
-                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort && !beamMapUnreadable,
+                beamMapScanned: scanFinished && !beamMapUnconfirmed,
+                beamMapUnconfirmed,
             }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return { repos: [], beamMapScanned: false }
+            return { repos: [], beamMapScanned: false, beamMapUnconfirmed: false }
         }
     }
 

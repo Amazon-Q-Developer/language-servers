@@ -19,10 +19,12 @@ export function objectiveHasIntegrationTests(objective: string | undefined): boo
 export type ReadJobObjective = (workspaceId: string, jobId: string) => Promise<{ objective?: string } | null>
 
 /**
- * Reads a job's beam-map: true when any beamed repo has generateIntegrationTests: true, false when none does, and
- * undefined when the beam-map couldn't be read (for example while FES throttles us).
+ * Reads a job's beam-map: true when any beamed repo has generateIntegrationTests: true, false when none does,
+ * 'unconfirmed' when the scan finished without a beam-map but couldn't read every candidate that could be one (it
+ * couldn't be downloaded, or was past the scan's candidate cap), and undefined when the beam-map wasn't read (for
+ * example while FES throttles us).
  */
-export type ReadBeamOptIn = (workspaceId: string, jobId: string) => Promise<boolean | undefined>
+export type ReadBeamOptIn = (workspaceId: string, jobId: string) => Promise<boolean | 'unconfirmed' | undefined>
 
 /**
  * Remembers, per job id, whether the job has generate_integration_tests: true. createJob records the flag it
@@ -33,9 +35,10 @@ export class ItGenJobGate {
     static readonly maxJobs = 200
     /**
      * How long after a beam-map read that couldn't tell (or is still running) the next read may start. It doubles
-     * with each read in a row that couldn't tell. After beamMaxReadsThatCannotTell of them the answer is "no" for
+     * with each 'unconfirmed' read in a row, and after beamMaxReadsThatCannotTell of them the answer is "no" for
      * the session: each read is a full beam-map scan, and a beam-map the IDE can't download (one the service only
-     * publishes for a job that opts in) never becomes downloadable.
+     * publishes for a job that opts in) never becomes downloadable. A read that didn't happen (throttled, cut short,
+     * failed) is retried at the same pace and doesn't count.
      */
     static readonly beamRetryMs = 60_000
     static readonly beamMaxReadsThatCannotTell = 5
@@ -102,8 +105,8 @@ export class ItGenJobGate {
      * neither the objective nor an earlier read says yes, reads the beam-map. A beam-map without an opt-in isn't read
      * again until the job is forgotten: the beam-map is written when a repo is beamed, before the IDE loads it, and a
      * repo beamed later is picked up by the dashboard's discovery (listBeamedRepos calls rememberBeamOptIn). A read
-     * that couldn't tell is retried after beamRetryMs, doubling each time, and after beamMaxReadsThatCannotTell
-     * of them the answer is "no". With `waitForBeamMap` false (a poll) the read runs in the
+     * that couldn't tell is retried after beamRetryMs, doubling with each 'unconfirmed' read, and after
+     * beamMaxReadsThatCannotTell of those the answer is "no". With `waitForBeamMap` false (a poll) the read runs in the
      * background and the gate turns on from the next call.
      */
     async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
@@ -122,7 +125,7 @@ export class ItGenJobGate {
         // when this read can't tell.
         const retries = this.beamRetries.get(jobId) ?? 0
         ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRetryMs * 2 ** retries)
-        const couldNotTell = () => {
+        const unconfirmed = () => {
             if (retries + 1 < ItGenJobGate.beamMaxReadsThatCannotTell) {
                 ItGenJobGate.setCapped(this.beamRetries, jobId, retries + 1)
                 return
@@ -141,14 +144,11 @@ export class ItGenJobGate {
                 } else if (optIn === false) {
                     ItGenJobGate.setCapped(this.beamChecks, jobId, Number.POSITIVE_INFINITY)
                     this.beamRetries.delete(jobId)
-                } else {
-                    couldNotTell()
+                } else if (optIn === 'unconfirmed') {
+                    unconfirmed()
                 }
             },
-            error => {
-                this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)
-                couldNotTell()
-            }
+            error => this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)
         )
         if (!waitForBeamMap) {
             return false
