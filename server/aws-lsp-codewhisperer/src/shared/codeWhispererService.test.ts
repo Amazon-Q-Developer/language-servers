@@ -404,6 +404,34 @@ describe('CodeWhispererService', function () {
 
                 assert.strictEqual(withProfileArnStub.calledOnceWith(mockRequest), true)
             })
+
+            it('logs the length of the first suggestion, not its text', async function () {
+                const suggestion = 'const token = "lsfix-suggestion-secret"'
+                ;(service as any).client = {
+                    send: sandbox.stub().resolves({
+                        completions: [{ content: suggestion, references: [] }],
+                        $metadata: { requestId: 'test-request-id' },
+                    }),
+                }
+
+                const result = await service.generateSuggestions({
+                    fileContext: {
+                        filename: 'test.js',
+                        programmingLanguage: { languageName: 'javascript' },
+                        leftFileContent: 'const token = ',
+                        rightFileContent: '',
+                    },
+                    maxResults: 1,
+                })
+
+                assert.strictEqual(result.suggestions[0].content, suggestion)
+                const logged = mockLogging.info
+                    .getCalls()
+                    .map((call: sinon.SinonSpyCall) => String(call.args[0]))
+                    .join('\n')
+                assert.ok(logged.includes(`"firstSuggestionLength": ${suggestion.length} characters`), logged)
+                assert.ok(!logged.includes('lsfix-suggestion-secret'), logged)
+            })
         })
     })
 })

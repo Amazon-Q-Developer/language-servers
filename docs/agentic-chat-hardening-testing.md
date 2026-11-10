@@ -552,3 +552,27 @@ npx ts-mocha --timeout 0 --exit -g "logs the names of the MCP server form fields
 
 The test sends a click with an environment variable value and a header value. It checks that the log
 line lists the field names and that no log line contains either value.
+
+## 14. Inline completion suggestions in the log
+
+### Behavior
+
+For each inline completion request that uses token authentication, `generateSuggestions` of
+`CodeWhispererServiceToken` in `shared/codeWhispererService.ts` wrote the text of the first suggestion
+to the log at the info level. A suggestion continues the user's file, so it can repeat a secret from
+that file.
+
+- The server now logs the length of the first suggestion instead, as
+  `"firstSuggestionLength": <n> characters`.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "logs the length of the first suggestion" \
+  src/shared/codeWhispererService.test.ts
+```
+
+The test returns a suggestion from a stubbed service client. It checks that the log has the length of
+the suggestion and not its text.
