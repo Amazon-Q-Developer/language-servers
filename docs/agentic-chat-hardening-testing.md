@@ -476,3 +476,54 @@ npm run test:unit
 - In `mcpMynahUi.test.ts`, the suite "registry server install" checks that **Install** in the list
   asks for the view, that **Install** in the view asks the server to install the server that the view
   showed, and that **Cancel** goes back to the server list.
+
+## 12. Agent config migration in a workspace folder
+
+### Behavior
+
+When the agentic chat server starts, it migrates the agent config of each workspace folder,
+`.amazonq/agents/default.json`, in `agenticChat/tools/mcp/mcpUtils.ts`:
+
+- If the file does not exist, `migrateToAgentConfig` creates it and copies into it the MCP servers of
+  the folder's `.amazonq/mcp.json`.
+- If the file exists, `migrateAgentConfigsToCLIFormat` updates it to the current format.
+
+Both checks for the file follow symbolic links, so a link whose target did not exist yet looked like a
+missing file, and the server then wrote through the link. A link at `.amazonq`, `.amazonq/agents` or
+`.amazonq/agents/default.json` could make the server create or update a file outside the workspace
+folder.
+
+- The server now writes the agent config of a workspace folder in these two steps only when its path,
+  after every symbolic link is followed, is inside that workspace folder. It resolves the path with
+  `resolveCanonicalPath`, as the file tools do.
+- Otherwise, or when the path cannot be resolved (for example, two links that point at each other),
+  it writes nothing and logs a warning that starts with "Did not create the agent config" or "Did not
+  update the agent config".
+- A link that stays inside the workspace folder, and a workspace folder that is opened through a link,
+  work as before. The migration of the global agent config is unchanged.
+- Not covered: other writes to the agent config of a workspace folder still follow links in its path:
+  the reinstall of a registry server by the periodic registry sync, and writes that the user starts
+  in the MCP settings, such as saving a workspace server or changing the permission of one of its
+  tools.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "migrateToAgentConfig" \
+  src/language-server/agenticChat/tools/mcp/mcpUtils.test.ts
+```
+
+The suite "a workspace agent config path with symbolic links" uses a temporary folder and links
+(junctions on Windows for folders). It checks that:
+
+- the agent config is created in a workspace folder with no links, through a link that stays inside
+  the workspace folder, and in a workspace folder that is opened through a link;
+- an existing workspace agent config and the global agent config are updated to the current format;
+- nothing is created or updated, and the warning is logged once, when `default.json` is a link to a
+  file outside the workspace folder (whether that file exists or not), when `.amazonq/agents` or
+  `.amazonq` links to a folder outside the workspace folder, and when two links in the path point at
+  each other.
+
+The cases with a link to a file are skipped on Windows when the test cannot create one.

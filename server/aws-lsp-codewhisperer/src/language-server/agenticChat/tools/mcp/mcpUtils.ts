@@ -17,9 +17,11 @@ import {
     isRegistryServerConfig,
 } from './mcpTypes'
 import path = require('path')
+import { workspaceUtils } from '@aws/lsp-core'
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
+import { canonicalizeWorkspaceFolders, resolveCanonicalPath } from '../toolShared'
 
 /**
  * Load, validate, and parse MCP server configurations from JSON files.
@@ -1059,15 +1061,49 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
                     wsConfigPaths[i],
                     wsPersonaPaths[i],
                     wsAgentPaths[i],
-                    agent
+                    agent,
+                    false,
+                    normalizePathFromUri(wsUris[i], logging)
                 )
             }
         }
     }
 }
 
+/** Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. False if it cannot tell. */
+async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
+    try {
+        const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
+        return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Whether a migration may write the agent config at `agentPath`: the global one (no workspace folder) always, and the
+ * one of a workspace folder only inside that folder, after symbolic links are followed. Logs a warning if not.
+ * workspace.fs.exists() follows links, so a link whose target does not exist yet looks like a missing file, and a
+ * write through a link would change its target, which can be outside the workspace folder.
+ */
+async function mayMigrateAgentConfig(
+    logging: Logger,
+    agentPath: string,
+    workspaceFolderPath: string | undefined,
+    action: 'create' | 'update'
+): Promise<boolean> {
+    if (workspaceFolderPath === undefined || (await isInsideFolder(workspaceFolderPath, agentPath))) {
+        return true
+    }
+    logging.warn(
+        `Did not ${action} the agent config ${JSON.stringify(agentPath)} because it is not inside the workspace folder, or could not be resolved, after symbolic links are followed`
+    )
+    return false
+}
+
 /**
  * Migrate a specific config and persona to an agent config
+ * @param workspaceFolderPath For a workspace config, the workspace folder that the agent config must be written in
  */
 async function migrateConfigToAgent(
     workspace: Workspace,
@@ -1076,7 +1112,8 @@ async function migrateConfigToAgent(
     personaPath: string,
     agentPath: string,
     agent: Agent,
-    isGlobalDefault: boolean = false
+    isGlobalDefault: boolean = false,
+    workspaceFolderPath?: string
 ): Promise<void> {
     // Normalize all paths to ensure consistent handling
     const normalizedConfigPath = normalizePathFromUri(configPath, logging)
@@ -1090,6 +1127,10 @@ async function migrateConfigToAgent(
     // Only migrate if agent file does not exist
     // If config exists, migrate from it; if not, create default agent config
     if (agentExists) {
+        return
+    }
+
+    if (!(await mayMigrateAgentConfig(logging, agentPath, workspaceFolderPath, 'create'))) {
         return
     }
 
@@ -1244,14 +1285,38 @@ export async function saveServerSpecificAgentConfig(
 /**
  * Migrate existing agent config to CLI format
  */
+/** Updates the existing agent configs of the workspace folders and the global agent config to the CLI format. */
+export async function migrateAgentConfigsToCLIFormat(workspace: Workspace, logging: Logger): Promise<void> {
+    const wsUris = workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+    const agentConfigs = [
+        ...getWorkspaceAgentConfigPaths(wsUris).map((agentPath, i) => ({
+            agentPath,
+            workspaceFolderPath: normalizePathFromUri(wsUris[i], logging),
+        })),
+        { agentPath: getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()), workspaceFolderPath: undefined },
+    ]
+    for (const { agentPath, workspaceFolderPath } of agentConfigs) {
+        const normalizedAgentPath = normalizePathFromUri(agentPath)
+        const exists = await workspace.fs.exists(normalizedAgentPath).catch(() => false)
+        if (exists) {
+            await migrateAgentConfigToCLIFormat(workspace, logging, normalizedAgentPath, workspaceFolderPath)
+        }
+    }
+}
+
+/**
+ * @param workspaceFolderPath For the agent config of a workspace folder, that folder, which the config must be inside
+ */
 export async function migrateAgentConfigToCLIFormat(
     workspace: Workspace,
     logging: Logger,
-    configPath: string
+    configPath: string,
+    workspaceFolderPath?: string
 ): Promise<void> {
     try {
         const exists = await workspace.fs.exists(configPath)
         if (!exists) return
+        if (!(await mayMigrateAgentConfig(logging, configPath, workspaceFolderPath, 'update'))) return
 
         const raw = await workspace.fs.readFile(configPath)
         const config = JSON.parse(raw.toString())
