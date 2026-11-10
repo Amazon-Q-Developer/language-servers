@@ -126,6 +126,35 @@ describe('ItGenJobGate', () => {
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
         })
 
+        it('waits longer each time the beam-map still could not be read, up to a cap, and starts over after', async () => {
+            readBeamOptIn.resolves(undefined)
+            const readsAfter = async (ms: number) => {
+                clock += ms
+                await beamGate.isBeamItGenJob('ws', 'web-1')
+                return readBeamOptIn.callCount
+            }
+
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            expect(await readsAfter(ItGenJobGate.beamRetryMs)).to.equal(2)
+            expect(await readsAfter(2 * ItGenJobGate.beamRetryMs - 1)).to.equal(2)
+            expect(await readsAfter(1)).to.equal(3)
+            for (let i = 0; i < 6; i++) {
+                await readsAfter(ItGenJobGate.beamRetryMaxMs)
+            }
+            const capped = readBeamOptIn.callCount
+            expect(await readsAfter(ItGenJobGate.beamRetryMaxMs - 1)).to.equal(capped)
+            expect(await readsAfter(1)).to.equal(capped + 1, 'never longer than the cap')
+
+            // An answer starts over: forgotten and read again, the first retry is back to beamRetryMs.
+            readBeamOptIn.resolves(false)
+            await readsAfter(ItGenJobGate.beamRetryMaxMs)
+            beamGate.forget('web-1')
+            readBeamOptIn.resolves(undefined)
+            const before = readBeamOptIn.callCount
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            expect(await readsAfter(ItGenJobGate.beamRetryMs)).to.equal(before + 2)
+        })
+
         it('in the background: answers at once, starts one read, and is on from the next call', async () => {
             let release!: (optIn: boolean) => void
             readBeamOptIn.returns(new Promise<boolean>(resolve => (release = resolve)))

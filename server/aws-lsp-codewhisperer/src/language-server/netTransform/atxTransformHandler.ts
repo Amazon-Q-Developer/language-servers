@@ -217,6 +217,9 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// The most jobs whose undownloadable beam-map candidates are remembered, to warn once per job.
+const BEAM_MAP_UNREADABLE_WARNED_MAX = 200
+
 // How long to stop starting optional beam-map scans after FES throttles us. Deliberately longer than
 // the 30s dashboard/info-bar poll interval: a cooldown shorter than the poll would merely delay calls
 // within one sweep instead of dropping whole sweeps, which is the only thing that reduces our rate.
@@ -274,6 +277,9 @@ export class ATXTransformHandler {
     )
     // Beam-to-IDE: customer-changes manifest writes in progress, by manifest path.
     private readonly beamManifestWrites = new Map<string, Promise<void>>()
+    // Beam-map scan: per job, the undownloadable candidates last warned about, so a sweep that finds the same ones
+    // doesn't warn again.
+    private readonly beamMapUnreadableWarned = new Map<string, string>()
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -977,12 +983,22 @@ export class ATXTransformHandler {
             }
 
             // Without a beam-map, an unreadable candidate means the opt-in can't be told: the gate
-            // retries later instead of caching "not opted in" for the session.
+            // retries later instead of caching "not opted in" for the session. A beam-map that was read
+            // decides, even if a newer one couldn't be downloaded: the service publishes every beam-map
+            // where the IDE can download it, or none.
             const beamMapUnreadable = !beamMapRepos && unreadable.length > 0
-            if (beamMapUnreadable) {
+            const unreadableIds = beamMapUnreadable ? unreadable.join(', ') : undefined
+            if (unreadableIds === undefined) {
+                this.beamMapUnreadableWarned.delete(parentJobId)
+            } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadableIds) {
+                this.beamMapUnreadableWarned.delete(parentJobId)
+                this.beamMapUnreadableWarned.set(parentJobId, unreadableIds)
+                while (this.beamMapUnreadableWarned.size > BEAM_MAP_UNREADABLE_WARNED_MAX) {
+                    this.beamMapUnreadableWarned.delete(this.beamMapUnreadableWarned.keys().next().value!)
+                }
                 this.logging.warn(
                     `[BEAM-PKG] beam-map scan: couldn't download ${unreadable.length} candidate artifact(s) ` +
-                        `(${unreadable.join(', ')}) for job=${parentJobId}; if one is the beam-map, its ITGen ` +
+                        `(${unreadableIds}) for job=${parentJobId}; if one is the beam-map, its ITGen ` +
                         `opt-in is unknown until a later scan reads it`
                 )
             }

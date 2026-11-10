@@ -31,12 +31,19 @@ export type ReadBeamOptIn = (workspaceId: string, jobId: string) => Promise<bool
  */
 export class ItGenJobGate {
     static readonly maxJobs = 200
-    /** How long after a beam-map read that couldn't tell (or is still running) the next read may start. */
+    /**
+     * How long after a beam-map read that couldn't tell (or is still running) the next read may start. It doubles
+     * with each read in a row that couldn't tell, up to beamRetryMaxMs: until the service publishes beam-maps where
+     * the IDE can download them, every beamed job's read can't tell, and each read is a full beam-map scan.
+     */
     static readonly beamRetryMs = 60_000
+    static readonly beamRetryMaxMs = 15 * 60_000
 
     private readonly jobs = new Map<string, boolean>()
     // Beamed jobs without a known opt-in: the time their beam-map may be read again.
     private readonly beamChecks = new Map<string, number>()
+    // Beamed jobs: how many reads in a row couldn't tell.
+    private readonly beamRetries = new Map<string, number>()
 
     constructor(
         private readonly readObjective: ReadJobObjective,
@@ -66,6 +73,7 @@ export class ItGenJobGate {
         }
         this.rememberFlag(jobId, true)
         this.beamChecks.delete(jobId)
+        this.beamRetries.delete(jobId)
     }
 
     rememberObjective(jobId: string, objective: string | undefined): boolean {
@@ -93,7 +101,8 @@ export class ItGenJobGate {
      * neither the objective nor an earlier read says yes, reads the beam-map. A beam-map without an opt-in isn't read
      * again until the job is forgotten: the beam-map is written when a repo is beamed, before the IDE loads it, and a
      * repo beamed later is picked up by the dashboard's discovery (listBeamedRepos calls rememberBeamOptIn). A read
-     * that couldn't tell is retried after beamRetryMs. With `waitForBeamMap` false (a poll) the read runs in the
+     * that couldn't tell is retried after beamRetryMs, doubling up to beamRetryMaxMs while reads keep coming back
+     * that way. With `waitForBeamMap` false (a poll) the read runs in the
      * background and the gate turns on from the next call.
      */
     async isBeamItGenJob(workspaceId: string, jobId: string, waitForBeamMap = true): Promise<boolean> {
@@ -108,17 +117,27 @@ export class ItGenJobGate {
         if (!this.readBeamOptIn || (nextCheck !== undefined && this.now() < nextCheck)) {
             return false
         }
-        // Set before the read starts, so calls while it runs don't start another one.
-        ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + ItGenJobGate.beamRetryMs)
+        // Set before the read starts, so calls while it runs don't start another one. It's also the next check
+        // when this read can't tell.
+        const retries = this.beamRetries.get(jobId) ?? 0
+        const retryMs = Math.min(ItGenJobGate.beamRetryMs * 2 ** retries, ItGenJobGate.beamRetryMaxMs)
+        ItGenJobGate.setCapped(this.beamChecks, jobId, this.now() + retryMs)
+        const couldNotTell = () => ItGenJobGate.setCapped(this.beamRetries, jobId, retries + 1)
         const read = this.readBeamOptIn(workspaceId, jobId).then(
             optIn => {
                 if (optIn === true) {
                     this.rememberBeamOptIn(jobId)
                 } else if (optIn === false) {
                     ItGenJobGate.setCapped(this.beamChecks, jobId, Number.POSITIVE_INFINITY)
+                    this.beamRetries.delete(jobId)
+                } else {
+                    couldNotTell()
                 }
             },
-            error => this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)
+            error => {
+                this.log(`ATX: couldn't read the beam-map of job ${jobId}: ${String(error)}`)
+                couldNotTell()
+            }
         )
         if (!waitForBeamMap) {
             return false
@@ -130,6 +149,7 @@ export class ItGenJobGate {
     forget(jobId: string): void {
         this.jobs.delete(jobId)
         this.beamChecks.delete(jobId)
+        this.beamRetries.delete(jobId)
     }
 
     // Insert as the newest entry; drop the oldest beyond maxJobs.

@@ -86,6 +86,11 @@ describe('ATXTransformHandler - Chat APIs', () => {
             expect(onUnreadable.calledOnce).to.be.true
 
             onUnreadable.resetHistory()
+            urlStub.rejects(new Error('AccessDenied'))
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'failed', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce, 'a download that fails').to.be.true
+
+            onUnreadable.resetHistory()
             ;(handler as any).beamJsonArtifactCache.set('not-json', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
             expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'not-json', onUnreadable)).to.equal(null)
             expect(onUnreadable.called).to.be.false
@@ -5652,6 +5657,10 @@ describe('ATXTransformHandler - Beam to IDE', () => {
 
             expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
             expect(warn.calledWithMatch(/couldn't download 1 candidate artifact\(s\) \(beammap-1\)/)).to.be.true
+
+            // The next sweep that finds the same unreadable candidate doesn't warn again.
+            await (handler as any).readBeamOptIn('ws-1', 'job-1')
+            expect(warn.callCount).to.equal(1)
 
             // Once it downloads, the opt-in is read.
             mapStub.callsFake(async () => ({
