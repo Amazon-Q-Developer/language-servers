@@ -126,6 +126,64 @@ describe('ItGenJobGate', () => {
             expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
         })
 
+        it('waits twice as long after each unconfirmed read, and stops at the cap with "no"', async () => {
+            readBeamOptIn.resolves('unconfirmed')
+            const readsAfter = async (ms: number) => {
+                clock += ms
+                expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.false
+                return readBeamOptIn.callCount
+            }
+
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            expect(await readsAfter(ItGenJobGate.beamRetryMs)).to.equal(2)
+            expect(await readsAfter(2 * ItGenJobGate.beamRetryMs - 1)).to.equal(2)
+            expect(await readsAfter(1)).to.equal(3)
+            expect(await readsAfter(4 * ItGenJobGate.beamRetryMs)).to.equal(4)
+            expect(await readsAfter(8 * ItGenJobGate.beamRetryMs)).to.equal(ItGenJobGate.beamMaxReadsThatCannotTell)
+            expect(log.calledWithMatch(/web-1: 5 beam-map reads couldn't tell/)).to.be.true
+
+            expect(await readsAfter(24 * 60 * 60_000)).to.equal(
+                ItGenJobGate.beamMaxReadsThatCannotTell,
+                'not read again'
+            )
+            // A repo beamed later still comes from discovery.
+            beamGate.rememberBeamOptIn('web-1')
+            expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
+        })
+
+        it('never gives up on reads that did not happen (throttled or cut short)', async () => {
+            readBeamOptIn.resolves(undefined)
+
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            for (let i = 0; i < 2 * ItGenJobGate.beamMaxReadsThatCannotTell; i++) {
+                clock += ItGenJobGate.beamRetryMs
+                await beamGate.isBeamItGenJob('ws', 'web-1')
+            }
+            expect(readBeamOptIn.callCount).to.equal(2 * ItGenJobGate.beamMaxReadsThatCannotTell + 1, 'every 60 s')
+
+            readBeamOptIn.resolves(true)
+            clock += ItGenJobGate.beamRetryMs
+            expect(await beamGate.isBeamItGenJob('ws', 'web-1')).to.be.true
+        })
+
+        it('starts the count over once a read can tell', async () => {
+            readBeamOptIn.resolves('unconfirmed')
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            clock += ItGenJobGate.beamRetryMs
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            readBeamOptIn.resolves(false)
+            clock += 2 * ItGenJobGate.beamRetryMs
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+
+            beamGate.forget('web-1')
+            readBeamOptIn.resolves('unconfirmed')
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+            clock += ItGenJobGate.beamRetryMs
+            await beamGate.isBeamItGenJob('ws', 'web-1')
+
+            expect(readBeamOptIn.callCount).to.equal(5, 'the first retry after the answer is back to beamRetryMs')
+        })
+
         it('in the background: answers at once, starts one read, and is on from the next call', async () => {
             let release!: (optIn: boolean) => void
             readBeamOptIn.returns(new Promise<boolean>(resolve => (release = resolve)))

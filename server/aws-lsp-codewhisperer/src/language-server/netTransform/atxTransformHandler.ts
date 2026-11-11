@@ -217,6 +217,9 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// The most jobs whose undownloadable beam-map candidates are remembered, to warn once per job.
+const BEAM_MAP_UNREADABLE_WARNED_MAX = 200
+
 // How long to stop starting optional beam-map scans after FES throttles us. Deliberately longer than
 // the 30s dashboard/info-bar poll interval: a cooldown shorter than the poll would merely delay calls
 // within one sweep instead of dropping whole sweeps, which is the only thing that reduces our rate.
@@ -274,6 +277,9 @@ export class ATXTransformHandler {
     )
     // Beam-to-IDE: customer-changes manifest writes in progress, by manifest path.
     private readonly beamManifestWrites = new Map<string, Promise<void>>()
+    // Beam-map scan: per job, the undownloadable candidates last warned about, so a sweep that finds the same ones
+    // doesn't warn again.
+    private readonly beamMapUnreadableWarned = new Map<string, string>()
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -785,21 +791,25 @@ export class ATXTransformHandler {
         return (await this.discoverBeamedRepos(workspaceId, parentJobId, lightweight)).repos
     }
 
-    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob). Undefined when the beam-map wasn't read. */
-    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | undefined> {
-        const { repos, beamMapScanned } = await this.discoverBeamedRepos(workspaceId, jobId, false)
-        return beamMapScanned ? repos.some(r => r.GenerateIntegrationTests) : undefined
+    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob, which says what each answer means). */
+    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | 'unconfirmed' | undefined> {
+        const { repos, beamMapScanned, beamMapUnconfirmed } = await this.discoverBeamedRepos(workspaceId, jobId, false)
+        if (beamMapScanned) {
+            return repos.some(r => r.GenerateIntegrationTests)
+        }
+        return beamMapUnconfirmed ? 'unconfirmed' : undefined
     }
 
     /**
      * listBeamedRepos, plus whether the beam-map scan ran to the end, so a "no opt-in" answer can be told apart
-     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error).
+     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error), and
+     * whether it ended without a beam-map while a candidate went unread (beamMapUnconfirmed).
      */
     private async discoverBeamedRepos(
         workspaceId: string,
         parentJobId: string,
         lightweight: boolean
-    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean }> {
+    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean; beamMapUnconfirmed: boolean }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -879,7 +889,9 @@ export class ATXTransformHandler {
             // artifact that throws (or isn't JSON, e.g. an unrelated metadata.json / binary)
             // must NOT abort the scan, or we miss the real beam-map that comes later in the list
             // and wrongly fall back to zip-discovery (empty stepId). We scan ALL candidates and
-            // keep the LAST valid repos[] (beam-map is re-written on each beam; latest wins).
+            // merge every valid repos[]: the web writes a NEW beam-map on each beam batch (each
+            // merging the earlier ones), and ListArtifacts order isn't chronological, so the last
+            // one listed can be an older map. Per repo, the entry from the newest map wins.
             // Candidate beam-map artifacts = everything EXCEPT the transformed-source
             // bundles. The beam-map is itself stored as a ZIP by FES (downloadJsonArtifact
             // unzips + parses it), so we MUST NOT exclude by ".zip" extension — that would
@@ -889,6 +901,7 @@ export class ATXTransformHandler {
             // source bundles, whose paths match "<repo>_<hash>/<repo>.zip" (ZIP_RE). Anything
             // else (including an unnamed/empty-path zip = the beam-map) is a candidate.
             let beamMapRepos: BeamMapRepo[] | null = null
+            const beamMaps: { repos: BeamMapRepo[]; createdAt: number }[] = []
             // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
             // beam-status + one plan fetch. stepId isn't resolved here; the IDE keeps the one from full
             // discovery / resolves it at Load.
@@ -911,6 +924,8 @@ export class ATXTransformHandler {
             // tab would go empty for the duration of the cooldown. Emptying skips only the optional
             // enrichment and lets the path that actually finds beamed repos run untouched.
             const beamThrottleCoolingDown = this.isBeamThrottleCooldownActive()
+            // A throttle during the scan moves this, and makes the scan unfinished (see scanFinished).
+            const throttleMarkBeforeScan = this.beamThrottleCooldownUntilMs
             if (beamThrottleCoolingDown) {
                 this.logging.log(
                     `[BEAM-PKG] beam-map scan: SKIPPED — throttle cooldown active for another ` +
@@ -926,6 +941,9 @@ export class ATXTransformHandler {
             }
             const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
             let scanCutShort = false
+            // Candidates that couldn't be downloaded (for example ResourceNotFound while the web side's
+            // copy to the user-facing bucket hasn't landed). Any of them could be the beam-map.
+            const unreadable: string[] = []
             this.logging.log(
                 `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
             )
@@ -939,7 +957,9 @@ export class ATXTransformHandler {
                     break
                 }
                 try {
-                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId)
+                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId, () =>
+                        unreadable.push(a.artifactId)
+                    )
                     // Validate shape before trusting it: the beam-map is uploaded by the web
                     // orchestrator, so a malformed, unexpectedly-shaped, or attacker-influenced
                     // payload must NOT flow into normalizeBeamRepo (which drives which artifacts
@@ -957,9 +977,13 @@ export class ATXTransformHandler {
                                 `[BEAM-PKG] beam-map validation: skipped ${rejected} malformed entr(y/ies) in artifact=${a.artifactId}`
                             )
                         }
-                        beamMapRepos = validRepos as BeamMapRepo[]
+                        beamMaps.push({
+                            repos: validRepos as BeamMapRepo[],
+                            // A Date from the SDK; also takes epoch ms or an ISO string. Missing or invalid: oldest.
+                            createdAt: new Date(a.artifactCreatedTimestamp ?? 0).getTime() || 0,
+                        })
                         this.logging.log(
-                            `[BEAM-PKG] beam-map found (${beamMapRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
+                            `[BEAM-PKG] beam-map found (${validRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
                         )
                         // Do NOT break — keep scanning; a later artifact could be a newer beam-map.
                         // (Cost is bounded: only empty-path/non-zip artifacts, a handful per job.)
@@ -969,6 +993,60 @@ export class ATXTransformHandler {
                     // download hiccup). Keep scanning the rest.
                     this.logging.log(`[BEAM-PKG] beam-map scan: skipped artifact ${a.artifactId}: ${String(e)}`)
                 }
+            }
+
+            if (beamMaps.length > 0) {
+                // Oldest first (stable, so maps without a timestamp keep list order), so a newer entry replaces it.
+                const byRepo = new Map<string, BeamMapRepo>()
+                for (const m of [...beamMaps].sort((x, y) => x.createdAt - y.createdAt)) {
+                    for (const r of m.repos) {
+                        byRepo.set(this.normalizeBeamRepo(r).RepositoryName.toLowerCase(), r)
+                    }
+                }
+                beamMapRepos = [...byRepo.values()]
+                if (beamMaps.length > 1) {
+                    this.logging.log(
+                        `[BEAM-PKG] beam-map: merged ${beamMaps.length} beam-maps into ${beamMapRepos.length} repo(s) for job=${parentJobId}`
+                    )
+                }
+            }
+
+            // A beam-map that was read and opts in decides. Otherwise a candidate that went unread (it
+            // couldn't be downloaded, or was past the candidate cap) can be a newer beam-map that opts in:
+            // the web publishes a beam-map where the IDE can download it only when a repo in it opts in,
+            // and the copy can land after the beam-map is listed. So the opt-in is unconfirmed: the gate
+            // retries later (and counts it) instead of caching "not opted in". A throttle during the scan
+            // makes it unfinished, like the throttle cooldown: retried, never counted.
+            const leftOut = beamThrottleCoolingDown ? 0 : allCandidates.length - candidates.length
+            const throttledDuringScan = this.beamThrottleCooldownUntilMs !== throttleMarkBeforeScan
+            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
+            const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
+            const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
+            const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
+            if (unreadKey === undefined) {
+                // Only a finished scan with an answer ends the warning; a lightweight, throttled or
+                // cut-short sweep says nothing about the unread candidates.
+                if (scanFinished) {
+                    this.beamMapUnreadableWarned.delete(parentJobId)
+                }
+            } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadKey) {
+                this.beamMapUnreadableWarned.delete(parentJobId)
+                this.beamMapUnreadableWarned.set(parentJobId, unreadKey)
+                while (this.beamMapUnreadableWarned.size > BEAM_MAP_UNREADABLE_WARNED_MAX) {
+                    this.beamMapUnreadableWarned.delete(this.beamMapUnreadableWarned.keys().next().value!)
+                }
+                const unread = [
+                    unreadable.length > 0
+                        ? `couldn't download ${unreadable.length} candidate artifact(s) (${unreadable.join(', ')})`
+                        : '',
+                    leftOut > 0
+                        ? `didn't read ${leftOut} candidate(s) past the ${BEAM_MAP_SCAN_MAX_CANDIDATES}-candidate cap`
+                        : '',
+                ].filter(Boolean)
+                this.logging.warn(
+                    `[BEAM-PKG] beam-map scan for job=${parentJobId} read no beam-map that opts in: ${unread.join(' and ')}; ` +
+                        `if one is the beam-map, its ITGen opt-in is unknown until a later scan reads it`
+                )
             }
 
             const beamed: BeamedRepoInfo[] = []
@@ -1107,11 +1185,12 @@ export class ATXTransformHandler {
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
             return {
                 repos: beamed,
-                beamMapScanned: !lightweight && !beamThrottleCoolingDown && !scanCutShort,
+                beamMapScanned: scanFinished && !beamMapUnconfirmed,
+                beamMapUnconfirmed,
             }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return { repos: [], beamMapScanned: false }
+            return { repos: [], beamMapScanned: false, beamMapUnconfirmed: false }
         }
     }
 
@@ -1217,7 +1296,16 @@ export class ATXTransformHandler {
         return Date.now() < this.beamThrottleCooldownUntilMs
     }
 
-    private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
+    /**
+     * `onUnreadable` is called when the artifact couldn't be downloaded (no download URL, or the
+     * download failed), as opposed to read and found not to be JSON: both return null.
+     */
+    private async downloadJsonArtifact(
+        workspaceId: string,
+        jobId: string,
+        artifactId: string,
+        onUnreadable?: () => void
+    ): Promise<any | null> {
         // Beam discovery re-scans the same candidate artifacts on every sweep, so without a cache
         // the same artifact is downloaded and re-parsed on every pass (measured: ~2000 download-URL
         // creations and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
@@ -1251,7 +1339,10 @@ export class ATXTransformHandler {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
             // No presigned URL is a transient condition (throttle/authz), so it is NOT
             // cached — the next sweep must be free to retry.
-            if (!dl?.s3PresignedUrl) return null
+            if (!dl?.s3PresignedUrl) {
+                onUnreadable?.()
+                return null
+            }
             const response = await got.get(dl.s3PresignedUrl, {
                 headers: dl.requestHeaders || {},
                 responseType: 'buffer',
@@ -1298,6 +1389,7 @@ export class ATXTransformHandler {
             // made AdmZip throw). Deliberately NOT cached — caching one of these would
             // permanently mark a readable artifact as unreadable.
             this.logging.log(`ATX: downloadJsonArtifact parse/download failed for ${artifactId}: ${String(error)}`)
+            onUnreadable?.()
             return null
         }
     }

@@ -78,6 +78,24 @@ describe('ATXTransformHandler - Chat APIs', () => {
             expect(urlStub.called).to.be.false
         })
 
+        it('says when an artifact could not be downloaded, and not when it was read and is not JSON', async () => {
+            const onUnreadable = sinon.spy()
+            urlStub.resolves(null)
+
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'gone', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce).to.be.true
+
+            onUnreadable.resetHistory()
+            urlStub.rejects(new Error('AccessDenied'))
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'failed', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce, 'a download that fails').to.be.true
+
+            onUnreadable.resetHistory()
+            ;(handler as any).beamJsonArtifactCache.set('not-json', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'not-json', onUnreadable)).to.equal(null)
+            expect(onUnreadable.called).to.be.false
+        })
+
         it('serves a fresh POSITIVE from cache without re-fetching', async () => {
             ;(handler as any).beamJsonArtifactCache.set('a2', {
                 value: { repos: ['alice'] },
@@ -5436,7 +5454,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
     beforeEach(() => {
         serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
         workspace = {} as Workspace
-        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
         runtime = {} as Runtime
         handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
         sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
@@ -5555,6 +5573,49 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect(result[0].OriginalArtifactId).to.equal('')
         })
 
+        // The web writes a new beam-map on each beam batch, and ListArtifacts order isn't chronological.
+        it('uses every beam-map, the newest entry per repo winning, whatever order they are listed in', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'map-new', fileMetadata: { path: '' }, artifactCreatedTimestamp: new Date(2_000) },
+                    { artifactId: 'not-a-map', fileMetadata: { path: '' } },
+                    {
+                        artifactId: 'map-old',
+                        fileMetadata: { path: '' },
+                        artifactCreatedTimestamp: new Date(1_000).toISOString(),
+                    },
+                ],
+            })
+            const maps: Record<string, any> = {
+                'map-old': { repos: [{ repoName: 'alice', stepId: 's1' }] },
+                'map-new': {
+                    repos: [
+                        {
+                            repoName: 'Alice',
+                            stepId: 's1',
+                            generateIntegrationTests: true,
+                            originalArtifactId: 'orig-a',
+                        },
+                        { repoName: 'bob', stepId: 's2' },
+                    ],
+                },
+                'not-a-map': { repos: 'malformed' },
+            }
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) => maps[id]) as any)
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['Alice', 'bob'])
+            const alice = result.find((r: any) => r.RepositoryName === 'Alice')!
+            expect(alice.GenerateIntegrationTests).to.equal(true)
+            expect(alice.OriginalArtifactId).to.equal('orig-a')
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
         it('carries the original-source artifact id from the beam-map entry (ITGen row 22/15)', async () => {
             sendStub.resolves({
                 artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
@@ -5618,6 +5679,112 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             // Throttle cooldown: the beam-map scan is skipped, so "no opt-in" can't be told apart from "not read".
             ;(handler as any).beamThrottleCooldownUntilMs = Date.now() + 60_000
             expect(await readBeamOptIn('job-3')).to.equal(undefined)
+        })
+
+        // A beam-map that's listed but can't be downloaded yet (ResourceNotFound until the web side's copy to the
+        // user-facing bucket lands) must not turn ITGen off for the session: the gate retries a "can't tell".
+        it("can't tell whether a job opts in while a candidate can't be downloaded and no beam-map was read", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                _id: string,
+                onUnreadable?: () => void
+            ) => {
+                onUnreadable?.()
+                return null
+            }) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(
+                warn.calledWithMatch(
+                    /read no beam-map that opts in: couldn't download 1 candidate artifact\(s\) \(beammap-1\)/
+                )
+            ).to.be.true
+
+            // The next sweep that finds the same unreadable candidate doesn't warn again, even with a lightweight
+            // sweep (a dashboard refresh) in between.
+            await handler.listBeamedRepos('ws-1', 'job-1', true)
+            await (handler as any).readBeamOptIn('ws-1', 'job-1')
+            expect(warn.callCount).to.equal(1)
+
+            // Once it downloads, the opt-in is read.
+            mapStub.callsFake(async () => ({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            }))
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+        })
+
+        it("can't confirm the opt-in when the beam-map is past the candidate cap", async () => {
+            const others = Array.from({ length: 25 }, (_, i) => ({ artifactId: `cp-${i}`, fileMetadata: { path: '' } }))
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...others,
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) =>
+                    id === 'beammap-1'
+                        ? { repos: [{ repoName: 'alice', generateIntegrationTests: true }] }
+                        : null) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(warn.calledWithMatch(/didn't read 1 candidate\(s\) past the 25-candidate cap/)).to.be.true
+        })
+
+        // The web publishes a beam-map only when a repo in it opts in, and the copy can land after it's listed: an unread
+        // candidate can be a newer beam-map that opts in.
+        for (const optIn of [false, true]) {
+            it(`with a beam-map read ${optIn ? 'that opts in, decides' : "that doesn't opt in, can't confirm"} while another candidate can't be downloaded`, async () => {
+                sendStub.resolves({
+                    artifacts: [
+                        ...zipArtifacts('alice'),
+                        { artifactId: 'newer-1', fileMetadata: { path: '' } },
+                        { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                    ],
+                })
+                sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                    _ws: string,
+                    _job: string,
+                    id: string,
+                    onUnreadable?: () => void
+                ) => {
+                    if (id === 'newer-1') {
+                        onUnreadable?.()
+                        return null
+                    }
+                    return { repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: optIn }] }
+                }) as any)
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(optIn ? true : 'unconfirmed')
+            })
+        }
+
+        // A throttle that starts during the scan is like the throttle cooldown: the scan didn't finish, so it isn't
+        // counted towards the gate's cap.
+        it("doesn't count a scan throttled part-way as unconfirmed", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                _id: string,
+                onUnreadable?: () => void
+            ) => {
+                ;(handler as any).noteBeamThrottled()
+                onUnreadable?.()
+                return null
+            }) as any)
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
         })
 
         it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
