@@ -2439,6 +2439,7 @@ describe('workspace trust for stdio MCP servers', () => {
         await settlePrompts(mgr)
         expect(showMessageStub.calledOnce).to.be.true
         expect(showMessageStub.firstCall.args[0].message).to.include(folderPath)
+        expect(showMessageStub.firstCall.args[0].message).to.include("won't ask again for this folder. ")
         expect(recordFolderApprovalStub.calledOnceWith(sinon.match.any, sinon.match.any, folderPath, 'id-1')).to.be.true
         expect(startedCwds()).to.deep.equal([folderPath])
     })
@@ -2704,6 +2705,7 @@ describe('workspace trust for stdio MCP servers', () => {
 
             expect(recordFolderApprovalStub.called).to.be.false
             expect(showMessageStub.calledOnce).to.be.true
+            expect(showMessageStub.firstCall.args[0].message).to.include('until Amazon Q restarts')
             expect(connectStub.calledTwice).to.be.true
         })
 

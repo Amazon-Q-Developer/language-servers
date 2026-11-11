@@ -4,7 +4,13 @@ import * as os from 'os'
 import * as path from 'path'
 import { URI } from 'vscode-uri'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
-import { configFileWarning, isPathExactlyApproved, requiresPathAcceptance, resolveCanonicalPath } from './toolShared'
+import {
+    configFileWarning,
+    isPathExactlyApproved,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    uncheckedConfigLinksWarning,
+} from './toolShared'
 import { FsWrite } from './fsWrite'
 import { FsReplace } from './fsReplace'
 import { withCheckedFileOperations } from './checkedFileFixtures.test'
@@ -219,19 +225,20 @@ describe('workspace configuration files', () => {
         })
 
         it('checks the requested name in a workspace opened through a link', async function () {
-            // A link deeper in a configuration folder than the search for links goes
-            const deepFolder = path.join(ws, '.amazonq', 'rules', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h')
-            fs.mkdirSync(deepFolder, { recursive: true })
+            // A link in a folder of the Git directory that the search for links leaves out
+            const unsearchedFolder = path.join(ws, '.git', 'objects')
+            fs.mkdirSync(unsearchedFolder, { recursive: true })
+            fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/main\n')
             fs.mkdirSync(path.join(ws, 'docs'))
             const openedAs = path.join(root, 'opened')
-            if (!trySymlink(ws, openedAs) || !trySymlink(path.join(ws, 'docs'), path.join(deepFolder, 'link'))) {
+            if (!trySymlink(ws, openedAs) || !trySymlink(path.join(ws, 'docs'), path.join(unsearchedFolder, 'link'))) {
                 return this.skip()
             }
             const workspace = {
                 getAllWorkspaceFolders: () => [{ uri: URI.file(openedAs).toString(), name: 'ws' }],
                 fs: withCheckedFileOperations({} as Features['workspace']['fs']),
             } as unknown as Features['workspace']
-            const requestedPath = path.join(openedAs, path.relative(ws, deepFolder), 'link', 'team.md')
+            const requestedPath = path.join(openedAs, path.relative(ws, unsearchedFolder), 'link', 'team.md')
 
             const result = await requiresPathAcceptance(requestedPath, 'fsWrite', workspace, noopLogging, undefined, {
                 flagConfigFiles: true,
@@ -365,8 +372,54 @@ describe('workspace configuration files', () => {
             assert.strictEqual(result.acceptanceReason, 'configFile')
         })
 
+        it('requires acceptance to modify the file that a hook link of a submodule in a nested folder points to', async function () {
+            fs.mkdirSync(path.join(ws, '.git', 'modules', 'vendor', 'lib', 'hooks'), { recursive: true })
+            fs.mkdirSync(path.join(ws, 'scripts'))
+            fs.writeFileSync(path.join(ws, 'scripts', 'pre-commit'), 'synthetic fixture only')
+            const hook = path.join(ws, '.git', 'modules', 'vendor', 'lib', 'hooks', 'pre-commit')
+            if (!trySymlink(path.join(ws, 'scripts', 'pre-commit'), hook, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'scripts', 'pre-commit'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+        })
+
+        it('searches a submodule whose name is the name of a Git folder that is left out', async function () {
+            fs.mkdirSync(path.join(ws, '.git', 'modules', 'refs', 'hooks'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+            fs.writeFileSync(path.join(ws, '.git', 'modules', 'refs', 'HEAD'), 'ref: refs/heads/main\n')
+            fs.mkdirSync(path.join(ws, 'scripts'))
+            fs.writeFileSync(path.join(ws, 'scripts', 'pre-commit'), 'synthetic fixture only')
+            const hook = path.join(ws, '.git', 'modules', 'refs', 'hooks', 'pre-commit')
+            if (!trySymlink(path.join(ws, 'scripts', 'pre-commit'), hook, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'scripts', 'pre-commit'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+        })
+
+        it('does not count the Git folders that hold branches and saved merge results toward the search limit', async () => {
+            fs.mkdirSync(path.join(ws, '.git'))
+            fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+            for (let i = 0; i < 2001; i++) {
+                fs.mkdirSync(path.join(ws, '.git', 'refs', 'pull', String(i)), { recursive: true })
+            }
+            for (let i = 0; i < 2001; i++) {
+                fs.mkdirSync(path.join(ws, '.git', 'rr-cache', `entry-${i}`), { recursive: true })
+            }
+
+            const result = await checkWrite(path.join(ws, 'src', 'index.ts'))
+
+            assert.strictEqual(result.requiresAcceptance, false)
+        })
+
         it('does not search the Git object folders for links', async function () {
             fs.mkdirSync(path.join(ws, '.git', 'objects'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/main\n')
             fs.mkdirSync(path.join(ws, 'scripts'))
             if (!trySymlink(path.join(ws, 'scripts'), path.join(ws, '.git', 'objects', 'linked'), 'dir')) {
                 return this.skip()
@@ -390,8 +443,27 @@ describe('workspace configuration files', () => {
             }
 
             const result = await checkWrite(path.join(ws, 'tools', 'mcp.json'))
+            const other = await checkWrite(path.join(ws, 'src', 'index.ts'))
 
             assert.strictEqual(result.acceptanceReason, 'configFile')
+            // Files that are not links don't count toward the search limit
+            assert.strictEqual(other.requiresAcceptance, false)
+        })
+
+        it('requires acceptance to modify a workspace file when a configuration folder holds more links and folders than the search reads', async () => {
+            const rules = path.join(ws, '.amazonq', 'rules')
+            fs.mkdirSync(rules, { recursive: true })
+            for (let i = 0; i < 2001; i++) {
+                fs.mkdirSync(path.join(rules, `team-${i}`))
+            }
+
+            const result = await checkWrite(path.join(ws, 'src', 'index.ts'))
+            const configFile = await checkWrite(path.join(ws, '.amazonq', 'mcp.json'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+            // The prompt says that the links could not all be checked, not that the file is configuration
+            assert.strictEqual(result.warning, uncheckedConfigLinksWarning)
+            assert.strictEqual(configFile.warning, configFileWarning)
         })
 
         it('requires acceptance to modify the file that a link in the Git hooks folder of a nested repository points to', async function () {
@@ -616,6 +688,18 @@ describe('workspace configuration files', () => {
         }
 
         it('does not flag other files in the home folder workspace', async () => {
+            const result = await checkWrite(path.join(ws, 'projects', 'notes.md'))
+
+            assert.strictEqual(result.requiresAcceptance, false)
+        })
+
+        it('does not flag other files when the global configuration holds more links and folders than the search reads', async () => {
+            const cache = path.join(ws, '.aws', 'amazonq', 'cache')
+            fs.mkdirSync(cache, { recursive: true })
+            for (let i = 0; i < 2001; i++) {
+                fs.mkdirSync(path.join(cache, `entry-${i}`))
+            }
+
             const result = await checkWrite(path.join(ws, 'projects', 'notes.md'))
 
             assert.strictEqual(result.requiresAcceptance, false)

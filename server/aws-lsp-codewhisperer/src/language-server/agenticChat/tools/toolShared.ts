@@ -198,20 +198,27 @@ export const multiplyLinkedFileWarning = (access: FileAccessKind): string =>
 export type ApprovedLinkedFiles = ReadonlyMap<string, readonly ExistingFileTarget[]>
 
 export const configFileWarning = 'This file is part of the Amazon Q, editor, or Git configuration.'
+export const uncheckedConfigLinksWarning =
+    'Amazon Q could not check every link in the configuration folders of this workspace, so this file ' +
+    'may be part of the Amazon Q, editor, or Git configuration.'
 
 // Folders inside a workspace that hold Amazon Q, editor, or Git configuration
 const configFolderNames = new Set(['.amazonq', '.vscode', '.git'])
 
-// How many folder levels to search for links inside each configuration folder. Git keeps the hooks
-// of submodules three levels down (modules/<name>/hooks); its object and log folders are large and
-// hold no configuration.
-const linkSearchDepth: Record<string, number> = { '.amazonq': 8, '.vscode': 8, '.git': 3 }
-const skippedGitFolders = new Set(['objects', 'lfs', 'logs'])
+// Folders of a Git directory that are not searched for links: they can be large and hold no
+// configuration
+const skippedGitFolders = new Set(['objects', 'lfs', 'logs', 'refs', 'rr-cache'])
 
-// The most entries to read when searching one configuration folder for links
+// The most links and folders to read when searching one configuration folder for links, at any
+// depth. Other files in the folder don't count.
 const maxLinkSearchEntries = 2000
+// How many folders the search reads at a time
+const linkSearchConcurrency = 16
 // Configuration folders whose link search stopped at that limit, logged once each
 const truncatedLinkSearches = new Set<string>()
+
+/** Thrown when the link search of a configuration folder inside the workspace stops at the limit */
+class LinkSearchLimitError extends Error {}
 
 // Rules file that Amazon Q loads from the root of each workspace folder
 const rootRulesFileName = 'AmazonQ.md'
@@ -299,44 +306,57 @@ async function resolveConfigLink(entryPath: string, logging?: Features['logging'
 }
 
 /**
- * Where the links inside a configuration folder resolve to, down to `depth` folder levels. The search
- * goes breadth first, so that a large folder cannot hide the links nearest the top.
+ * Where the links inside a configuration folder resolve to, at any depth. The search goes breadth
+ * first, so that a large folder cannot hide the links nearest the top. A folder with more links and
+ * folders than the limit can't be searched in full: the search then throws LinkSearchLimitError, or
+ * with `failAtLimit` false returns the links found so far. In a Git folder, the folders of a Git
+ * directory (one with a HEAD entry) that hold no configuration are not searched.
  */
 async function linkedLocationsInside(
     folder: string,
-    depth: number,
     isGitFolder: boolean,
-    logging?: Features['logging']
+    logging?: Features['logging'],
+    failAtLimit = true
 ): Promise<string[]> {
     const links: string[] = []
     let remainingEntries = maxLinkSearchEntries
     let dirs = [folder]
-    search: for (let level = 0; dirs.length > 0 && level <= depth; level++) {
+    search: while (dirs.length > 0) {
         const nextDirs: string[] = []
-        for (const dir of dirs) {
-            let entries: fs.Dirent[]
-            try {
-                entries = await fs.promises.readdir(dir, { withFileTypes: true })
-            } catch {
-                continue
-            }
-            for (const entry of entries) {
-                if (--remainingEntries < 0) {
-                    if (!truncatedLinkSearches.has(folder)) {
-                        truncatedLinkSearches.add(folder)
-                        logging?.warn(`Searched only the first ${maxLinkSearchEntries} entries of ${folder} for links`)
+        for (let start = 0; start < dirs.length; start += linkSearchConcurrency) {
+            // A folder that can't be read has no entries to search
+            const listings = await Promise.all(
+                dirs.slice(start, start + linkSearchConcurrency).map(async dir => ({
+                    dir,
+                    entries: await fs.promises.readdir(dir, { withFileTypes: true }).catch(() => [] as fs.Dirent[]),
+                }))
+            )
+            for (const { dir, entries } of listings) {
+                const isGitDirectory = isGitFolder && entries.some(entry => entry.name === 'HEAD')
+                for (const entry of entries) {
+                    const isSearchedFolder =
+                        entry.isDirectory() && !(isGitDirectory && skippedGitFolders.has(entry.name))
+                    if (!entry.isSymbolicLink() && !isSearchedFolder) {
+                        continue
                     }
-                    break search
-                }
-                const entryPath = path.join(dir, entry.name)
-                if (entry.isSymbolicLink()) {
-                    links.push(entryPath)
-                } else if (
-                    entry.isDirectory() &&
-                    level < depth &&
-                    !(isGitFolder && skippedGitFolders.has(entry.name))
-                ) {
-                    nextDirs.push(entryPath)
+                    if (--remainingEntries < 0) {
+                        if (!truncatedLinkSearches.has(folder)) {
+                            truncatedLinkSearches.add(folder)
+                            logging?.warn(
+                                `Searched only the first ${maxLinkSearchEntries} links and folders of ${folder} for links`
+                            )
+                        }
+                        if (failAtLimit) {
+                            throw new LinkSearchLimitError(folder)
+                        }
+                        break search
+                    }
+                    const entryPath = path.join(dir, entry.name)
+                    if (isSearchedFolder) {
+                        nextDirs.push(entryPath)
+                    } else {
+                        links.push(entryPath)
+                    }
                 }
             }
         }
@@ -378,14 +398,19 @@ async function configFolderLocations(
                 return [
                     ...(location === undefined ? [] : [location]),
                     searched,
-                    ...(await linkedLocationsInside(searched, linkSearchDepth[name], name === '.git', logging)),
+                    ...(await linkedLocationsInside(searched, name === '.git', logging)),
                 ]
             })
         ),
         resolveConfigLinkTarget(path.join(getUserHomeDir(), '.aws', 'amazonq'), logging).then(async location =>
             location === undefined
                 ? []
-                : [location, ...(await linkedLocationsInside(location, linkSearchDepth['.amazonq'], false, logging))]
+                : [
+                      location,
+                      // The user's own folder, not workspace content: a search that stops at the limit
+                      // keeps the links it found
+                      ...(await linkedLocationsInside(location, false, logging, false)),
+                  ]
         ),
     ])
     return [...new Set(locations.flat())]
@@ -405,7 +430,7 @@ async function nestedConfigFolderLocations(
     const isFolder = (await fs.promises.stat(searched).catch(() => undefined))?.isDirectory()
     return [
         ...(linked === undefined ? [] : [linked]),
-        ...(isFolder ? await linkedLocationsInside(searched, linkSearchDepth[name], name === '.git', logging) : []),
+        ...(isFolder ? await linkedLocationsInside(searched, name === '.git', logging) : []),
     ]
 }
 
@@ -445,6 +470,10 @@ async function configLocationsAbove(
  * - the AmazonQ.md rules file at the root of a workspace folder, or the file it links to
  * - in the global Amazon Q configuration folder (~/.aws/amazonq), or where a link inside it resolves
  *   to, when the workspace includes it
+ *
+ * Returns 'uncheckedLinks' for any other path inside a workspace folder when a configuration folder
+ * of the workspace holds more links and folders than the search reads, because a link that the
+ * search didn't reach may point to the path.
  */
 async function isInConfigFolder(
     inputPath: string,
@@ -452,7 +481,7 @@ async function isInConfigFolder(
     workspaceFolders: string[],
     canonicalWorkspaceFolders: string[],
     logging?: Features['logging']
-): Promise<boolean> {
+): Promise<'configuration' | 'uncheckedLinks' | false> {
     // Paths outside the workspace keep the outside-workspace prompt
     if (!workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalPath)) {
         return false
@@ -467,10 +496,10 @@ async function isInConfigFolder(
     if (
         folders.some(folder => hasConfigFolderName(folder, canonicalPath) || hasConfigFolderName(folder, inputFullPath))
     ) {
-        return true
+        return 'configuration'
     }
 
-    const [locations, linkedAbove, rootRulesFiles] = await Promise.all([
+    const found = await Promise.all([
         configFolderLocations(canonicalWorkspaceFolders, logging),
         configLocationsAbove(canonicalPath, canonicalWorkspaceFolders, logging),
         Promise.all(
@@ -478,16 +507,25 @@ async function isInConfigFolder(
                 resolveConfigLinkTarget(path.join(folder, rootRulesFileName), logging)
             )
         ),
-    ])
+    ]).catch(error => {
+        if (error instanceof LinkSearchLimitError) {
+            return undefined
+        }
+        throw error
+    })
+    if (!found) {
+        return 'uncheckedLinks'
+    }
+    const [locations, linkedAbove, rootRulesFiles] = found
     const isRulesFile = (rulesFile: string | undefined) =>
         rulesFile !== undefined &&
         isSamePath(path.dirname(rulesFile), path.dirname(canonicalPath)) &&
         isSamePath(path.basename(rulesFile), windowsFileName(path.basename(canonicalPath)))
-    return (
+    const isConfiguration =
         [...locations, ...linkedAbove].some(
             location => isSamePath(location, canonicalPath) || pathInside(location, canonicalPath) !== undefined
         ) || rootRulesFiles.some(isRulesFile)
-    )
+    return isConfiguration && 'configuration'
 }
 
 export interface PathAcceptanceOptions {
@@ -505,7 +543,9 @@ export interface PathAcceptanceOptions {
     approvedLinkedFiles?: ApprovedLinkedFiles
     /**
      * Require approval for Amazon Q, editor, or Git configuration inside the workspace (see
-     * isInConfigFolder), unless that exact path is approved. Set by tools that modify files.
+     * isInConfigFolder), unless that exact path is approved. This includes every path inside the
+     * workspace while a configuration folder there holds more links and folders than are searched.
+     * Set by tools that modify files.
      */
     flagConfigFiles?: boolean
 }
@@ -764,12 +804,14 @@ export async function requiresPathAcceptance(
         if (options?.flagConfigFiles && !isPathExactlyApproved(canonicalPath, toolName, approvedPaths)) {
             const folders = getWorkspaceFolderPaths(workspace) ?? []
             const canonicalFolders = await canonicalizeWorkspaceFolders(folders)
-            if (await isInConfigFolder(inputPath, canonicalPath, folders, canonicalFolders, logging)) {
+            const configMatch = await isInConfigFolder(inputPath, canonicalPath, folders, canonicalFolders, logging)
+            if (configMatch) {
+                const configWarning = configMatch === 'configuration' ? configFileWarning : uncheckedConfigLinksWarning
                 // A configuration file can also share its data with another name on disk
                 const sharedFileWarning = await linkedFileWarning()
                 return {
                     requiresAcceptance: true,
-                    warning: sharedFileWarning ? `${configFileWarning}\n\n${sharedFileWarning}` : configFileWarning,
+                    warning: sharedFileWarning ? `${configWarning}\n\n${sharedFileWarning}` : configWarning,
                     acceptanceReason: 'configFile',
                     ...checked,
                 }

@@ -2207,8 +2207,9 @@ export class McpManager {
                     `Your local MCP servers start with this folder as their working directory:\n${folder}\n\n` +
                     `Commands such as npx and python -m can run programs and read settings from the working ` +
                     `directory. Only allow this if you trust the contents of this folder.\n\n` +
-                    `If you allow, Amazon Q won't ask again for this folder. You can forget allowed folders from ` +
-                    `the MCP server list.`,
+                    // Without an identity the approval can't be saved, so it lasts for this session
+                    `If you allow, Amazon Q won't ask again for this folder${identity ? '' : ' until Amazon Q restarts'}. ` +
+                    `You can forget allowed folders from the MCP server list.`,
                 actions: [allowBtn, denyBtn],
             })
         } catch (e: any) {

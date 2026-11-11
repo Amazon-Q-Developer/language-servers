@@ -229,16 +229,14 @@ describe('isUsingIAMAuth', () => {
         assert.strictEqual(isUsingIAMAuth(), false)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
-    it.skip('should return true when only IAM credentials are available', () => {
+    it('should return true when only IAM credentials are available', () => {
+        // Each withArgs call is made on the stub itself, so that both kinds of credentials are set up
+        const getCredentials = sinon.stub()
+        getCredentials.withArgs('iam').returns({ accessKeyId: 'AKIA...', secretAccessKey: 'secret' })
+        getCredentials.withArgs('bearer').returns(null)
         const mockProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
-            getCredentials: sinon
-                .stub()
-                .withArgs('iam')
-                .returns({ accessKeyId: 'AKIA...', secretAccessKey: 'secret' })
-                .withArgs('bearer')
-                .returns(null),
+            getCredentials,
             getConnectionMetadata: sinon.stub(),
             getConnectionType: sinon.stub(),
             onCredentialsDeleted: sinon.stub(),
@@ -290,7 +288,7 @@ describe('getSsoConnectionType', () => {
         getConnectionType: sinon.stub(),
         onCredentialsDeleted: sinon.stub(),
     }
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as builderId', () => {
         const mockCredentialsProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
@@ -307,7 +305,7 @@ describe('getSsoConnectionType', () => {
         expect(ssoConnectionType).to.equal('builderId')
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as identityCenter', () => {
         const mockCredentialsProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
@@ -324,13 +322,13 @@ describe('getSsoConnectionType', () => {
         expect(ssoConnectionType).to.equal('identityCenter')
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as none when getConnectionMetadata returns undefined', () => {
         const ssoConnectionType = getSsoConnectionType(mockCredsProvider)
         expect(ssoConnectionType).to.equal('none')
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as none when getConnectionMetadata.sso returns undefined', () => {
         const mockCredentialsProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
@@ -345,7 +343,7 @@ describe('getSsoConnectionType', () => {
         expect(ssoConnectionType).to.equal('none')
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as none when getConnectionMetadata.sso.startUrl is empty string', () => {
         const mockCredentialsProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
@@ -362,7 +360,7 @@ describe('getSsoConnectionType', () => {
         expect(ssoConnectionType).to.equal('none')
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: written for an earlier getSsoConnectionType that read the start URL; it now returns credentialsProvider.getConnectionType()
     it.skip('should return ssoConnectionType as none when getConnectionMetadata.sso.startUrl returns undefined', () => {
         const mockCredentialsProvider: CredentialsProvider = {
             hasCredentials: sinon.stub().returns(true),
@@ -497,7 +495,7 @@ describe('isAwsThrottlingError', function () {
         assert.strictEqual(isAwsThrottlingError(nonThrottlingError), false)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: expects an Error named ThrottlingException with a $metadata field to count as throttling; only ThrottlingException and service exceptions do
     it.skip('true for AWS throttling errors', function () {
         const sdkV3Error = new ThrottlingException({
             message: 'Too many requests',
@@ -764,7 +762,7 @@ describe('listFilesWithGitignore', () => {
         assert.deepStrictEqual(files.sort(), expectedFiles)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: expects files in a folder that a .npmignore file names to be left out; they are listed
     it.skip('should respect .npmignore patterns', async () => {
         await createTestFiles({
             '.npmignore': '*.test.js\ntests/',
@@ -799,7 +797,7 @@ describe('listFilesWithGitignore', () => {
         assert.deepStrictEqual(files, [])
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: expects files that nested .gitignore and .npmignore files name to be left out; they are listed
     it.skip('should handle nested directories and multiple ignore files', async () => {
         await createTestFiles({
             '.gitignore': '*.log',
@@ -1023,16 +1021,12 @@ describe('sanitizeRequestInput', () => {
             delete process.env.USE_IAM_AUTH
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('returns true when only IAM credentials available', () => {
-            const mockProvider = {
-                getCredentials: sinon
-                    .stub()
-                    .withArgs('iam')
-                    .returns({ accessKeyId: 'key', secretAccessKey: 'secret' })
-                    .withArgs('bearer')
-                    .returns(null),
-            }
+        it('returns true when only IAM credentials available', () => {
+            // Each withArgs call is made on the stub itself, so that both kinds of credentials are set up
+            const getCredentials = sinon.stub()
+            getCredentials.withArgs('iam').returns({ accessKeyId: 'key', secretAccessKey: 'secret' })
+            getCredentials.withArgs('bearer').returns(null)
+            const mockProvider = { getCredentials }
             assert.strictEqual(isUsingIAMAuth(mockProvider as any), true)
         })
 
