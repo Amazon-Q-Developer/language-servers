@@ -157,6 +157,7 @@ import {
     shellCommandBlock,
     shellCommandBlockStart,
     toolResultMessage,
+    toolNameText,
 } from './textFormatting'
 import {
     AdditionalContentEntryAddition,
@@ -2796,7 +2797,7 @@ export class AgenticChatController implements ChatHandlers {
                             content: {
                                 header: {
                                     icon: 'tools',
-                                    body: `${toolName}`,
+                                    body: toolNameText(toolName),
                                     status: {
                                         status: 'error',
                                         icon: 'cancel-circle',
@@ -3245,7 +3246,7 @@ export class AgenticChatController implements ChatHandlers {
                         content: {
                             header: {
                                 icon: 'tools',
-                                body: `${toolName}`,
+                                body: toolNameText(toolName),
                                 status: {
                                     status: isAccept ? 'success' : 'error',
                                     icon: isAccept ? 'ok' : 'cancel',
@@ -3617,7 +3618,7 @@ export class AgenticChatController implements ChatHandlers {
                 header = {
                     icon: 'tools',
                     iconForegroundStatus: 'warning',
-                    body: `#### ${toolName}`,
+                    body: `#### ${toolNameText(toolName)}`,
                     buttons,
                 }
                 body = ' '
@@ -3646,7 +3647,7 @@ export class AgenticChatController implements ChatHandlers {
                     content: {
                         header: {
                             icon: 'tools',
-                            body: `${toolName}`,
+                            body: toolNameText(toolName),
                             buttons: [
                                 { id: BUTTON_ALLOW_TOOLS, text: 'Run', icon: 'play', status: 'clear' },
                                 {
@@ -5513,7 +5514,7 @@ export class AgenticChatController implements ChatHandlers {
                         content: {
                             header: {
                                 icon: 'tools',
-                                body: `${toolName}`,
+                                body: toolNameText(toolName),
                                 fileList: undefined,
                             },
                         },
