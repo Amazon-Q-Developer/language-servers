@@ -31,6 +31,23 @@ export const ANTLR4ServerFactory =
 
         const onInitializedHandler = async () => {}
 
+        // Publishes the diagnostics of the document. A validation error is logged rather than thrown.
+        const publishDiagnostics = async (textDocument: TextDocument, uri: string) => {
+            let diagnostics
+            try {
+                diagnostics = await service.doValidation(textDocument)
+            } catch (error) {
+                logging.error(`Validation of [${uri}] failed: ${error}`)
+                return
+            }
+
+            await lsp.publishDiagnostics({
+                uri,
+                diagnostics,
+                version: textDocument.version,
+            })
+        }
+
         const onDidChangeTextDocumentHandler = async (params: DidChangeTextDocumentParams): Promise<any> => {
             const textDocument = await workspace.getTextDocument(params.textDocument.uri)
             if (!textDocument) {
@@ -38,13 +55,7 @@ export const ANTLR4ServerFactory =
                 return
             }
 
-            const diagnostics = await service.doValidation(textDocument)
-
-            await lsp.publishDiagnostics({
-                uri: params.textDocument.uri,
-                diagnostics: diagnostics,
-                version: textDocument.version,
-            })
+            await publishDiagnostics(textDocument, params.textDocument.uri)
         }
 
         const onDidOpenTextDocumentHandler = async (params: DidOpenTextDocumentParams): Promise<any> => {
@@ -58,13 +69,7 @@ export const ANTLR4ServerFactory =
                 )
             }
 
-            const diagnostics = await service.doValidation(textDocument)
-
-            await lsp.publishDiagnostics({
-                uri: params.textDocument.uri,
-                diagnostics: diagnostics,
-                version: textDocument.version,
-            })
+            await publishDiagnostics(textDocument, params.textDocument.uri)
         }
 
         const onCompletionHandler = async (

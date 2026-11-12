@@ -21,6 +21,7 @@ import { findNodes, encodeSemanticTokens, SemanticToken, string2TokenTypes } fro
 import { type2Hover } from './hover-info/parser-type'
 import { findSignatureInfo } from './signature-help/signature-info'
 import { getSuggestions } from './completion-hint/parser-completion'
+import { parseLimitDiagnostic, parseLimitReason } from './parse-limits'
 
 // This is a constant that is used to determine if the language server supports multi-line tokens.
 const MULTILINETOKENSUPPORT = true
@@ -102,6 +103,11 @@ class PartiQLLanguageService {
     }
 
     public doValidation(textDocument: TextDocument): Diagnostic[] {
+        const limitDiagnostic = parseLimitDiagnostic(textDocument.getText())
+        if (limitDiagnostic) {
+            return [limitDiagnostic]
+        }
+
         const diagnostics: Diagnostic[] = []
 
         diagnostics.push(...doAntlrValidation(textDocument))
@@ -165,6 +171,10 @@ class PartiQLLanguageService {
         textDocument: TextDocument,
         position: { line: number; character: number }
     ): CompletionList | null {
-        return getSuggestions(normalizeQuery(textDocument.getText()), position)
+        const text = normalizeQuery(textDocument.getText())
+        if (parseLimitReason(text) !== undefined) {
+            return null
+        }
+        return getSuggestions(text, position)
     }
 }

@@ -19,6 +19,7 @@ import {
     type Parser,
 } from 'antlr4ng'
 import { getPosition, getTokenIndexFromParseTree, getCandidates } from './utils/completion'
+import { parseLimitDiagnostic, parseLimitReason } from './utils/parseLimits'
 import type { TextEdit } from 'vscode-languageserver-textdocument'
 
 export function normalizeQuery(data: string): string {
@@ -89,6 +90,11 @@ export class ANTLR4LanguageService implements AwsLanguageService {
     }
 
     public async doValidation(textDocument: TextDocument): Promise<Diagnostic[]> {
+        const limitDiagnostic = parseLimitDiagnostic(textDocument.getText())
+        if (limitDiagnostic) {
+            return [limitDiagnostic]
+        }
+
         const diagnosticsCollector = new DiagnosticsCollector(textDocument)
 
         const parser = this.createAntlrParser(textDocument.getText(), diagnosticsCollector)
@@ -103,6 +109,9 @@ export class ANTLR4LanguageService implements AwsLanguageService {
         textDocument: TextDocument,
         position: { line: number; character: number }
     ): Promise<CompletionList | null> {
+        if (parseLimitReason(textDocument.getText()) !== undefined) {
+            return null
+        }
         position = getPosition(textDocument.getText(), position)
         const parser = this.createAntlrParser(textDocument.getText())
         const tokenIndex = getTokenIndexFromParseTree(parser, this.parserRoot, position)
