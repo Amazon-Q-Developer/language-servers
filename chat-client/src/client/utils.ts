@@ -290,6 +290,8 @@ export type ChatLinkTarget = { kind: 'link' } | { kind: 'file'; filePath: string
  * go to the file-click handler, and everything else (other schemes, `//host` paths) is dropped.
  */
 export function classifyChatLink(href: string | undefined): ChatLinkTarget {
+    // As a browser reads a link: without tabs and line breaks, and without leading control characters and spaces
+    href = href?.replace(/[\t\n\r]/g, '').replace(/^[\p{Cc}\s]+/u, '')
     if (!href) {
         return { kind: 'none' }
     }

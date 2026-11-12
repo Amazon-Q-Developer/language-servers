@@ -1,3 +1,4 @@
+import * as assert from 'assert'
 import { WorkspaceFolderManager } from './workspaceFolderManager'
 import sinon, { stubInterface, StubbedInstance } from 'ts-sinon'
 import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
@@ -22,6 +23,8 @@ describe('WorkspaceFolderManager', () => {
     let workspaceFolderManager: WorkspaceFolderManager
 
     beforeEach(() => {
+        // The manager is created once per process, so each test starts without the previous test's manager
+        ;(WorkspaceFolderManager as any).instance = undefined
         mockAgent = stubInterface<Agent>()
         mockServiceManager = stubInterface<AmazonQTokenServiceManager>()
         mockLogging = stubInterface<Logging>()
@@ -141,7 +144,7 @@ describe('WorkspaceFolderManager', () => {
     })
 
     describe('isFeatureDisabled', () => {
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: listWorkspaceMetadata reports that the feature is disabled but does not clear the workspace resources; checkRemoteWorkspaceStatusAndReact does, and has its own test
         it.skip('should return true when feature is disabled', async () => {
             // Setup
             const workspaceFolders: WorkspaceFolder[] = [
@@ -184,13 +187,13 @@ describe('WorkspaceFolderManager', () => {
             await (workspaceFolderManager as any).listWorkspaceMetadata()
 
             // Assert
-            expect(workspaceFolderManager.isFeatureDisabled()).toBe(true)
+            assert.strictEqual(workspaceFolderManager.isFeatureDisabled(), true)
 
             // Verify that clearAllWorkspaceResources was called
             sinon.assert.calledOnce(clearAllWorkspaceResourcesSpy)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: isFeatureDisabled is true until the status is reset, and listWorkspaceMetadata does not change it
         it.skip('should return false when feature is not disabled', async () => {
             // Setup
             const workspaceFolders: WorkspaceFolder[] = [
@@ -229,7 +232,7 @@ describe('WorkspaceFolderManager', () => {
             await (workspaceFolderManager as any).listWorkspaceMetadata()
 
             // Assert
-            expect(workspaceFolderManager.isFeatureDisabled()).toBe(false)
+            assert.strictEqual(workspaceFolderManager.isFeatureDisabled(), false)
         })
     })
 
@@ -258,29 +261,28 @@ describe('WorkspaceFolderManager', () => {
         })
 
         describe('setSemanticSearchToolStatus', () => {
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should set semantic search tool status to enabled', () => {
+            it('should set semantic search tool status to enabled', () => {
                 // Act
                 workspaceFolderManager.setSemanticSearchToolStatus(true)
 
-                // Assert - we can't directly access the private property, but we can test the behavior
-                // through other methods that depend on this status
-                expect(workspaceFolderManager).toBeDefined()
+                // Assert
+                assert.strictEqual((workspaceFolderManager as any).semanticSearchToolEnabled, true)
             })
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should set semantic search tool status to disabled', () => {
+            it('should set semantic search tool status to disabled', () => {
+                // Setup - the status starts as disabled
+                workspaceFolderManager.setSemanticSearchToolStatus(true)
+
                 // Act
                 workspaceFolderManager.setSemanticSearchToolStatus(false)
 
                 // Assert
-                expect(workspaceFolderManager).toBeDefined()
+                assert.strictEqual((workspaceFolderManager as any).semanticSearchToolEnabled, false)
             })
         })
 
         describe('registerSemanticSearchTool', () => {
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should register semantic search tool when not already present', () => {
+            it('should register semantic search tool when not already present', () => {
                 // Setup
                 mockAgent.getTools.returns([]) // No existing tools
                 workspaceFolderManager.setSemanticSearchToolStatus(true)
@@ -307,8 +309,8 @@ describe('WorkspaceFolderManager', () => {
 
                 // Verify the tool was added with correct parameters
                 const addToolCall = mockAgent.addTool.getCall(0)
-                expect(addToolCall.args[0].name).toBe(SemanticSearch.toolName)
-                expect(addToolCall.args[2]).toBe(ToolClassification.BuiltIn)
+                assert.strictEqual(addToolCall.args[0].name, SemanticSearch.toolName)
+                assert.strictEqual(addToolCall.args[2], ToolClassification.BuiltIn)
             })
 
             it('should not register semantic search tool when already present', () => {
@@ -354,8 +356,7 @@ describe('WorkspaceFolderManager', () => {
         })
 
         describe('removeSemanticSearchTool', () => {
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should remove semantic search tool when present', () => {
+            it('should remove semantic search tool when present', () => {
                 // Setup - mock existing tool
                 const existingTool = {
                     name: SemanticSearch.toolName,
@@ -373,8 +374,7 @@ describe('WorkspaceFolderManager', () => {
                 sinon.assert.calledWith(mockAgent.removeTool, SemanticSearch.toolName)
             })
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should not remove semantic search tool when not present', () => {
+            it('should not remove semantic search tool when not present', () => {
                 // Setup - no existing tools
                 mockAgent.getTools.returns([])
                 workspaceFolderManager.setSemanticSearchToolStatus(true)
@@ -386,8 +386,7 @@ describe('WorkspaceFolderManager', () => {
                 sinon.assert.notCalled(mockAgent.removeTool)
             })
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should remove semantic search tool when session becomes idle', async () => {
+            it('should remove semantic search tool when session becomes idle', async () => {
                 // Setup
                 const existingTool = {
                     name: SemanticSearch.toolName,
@@ -421,8 +420,7 @@ describe('WorkspaceFolderManager', () => {
     })
 
     describe('resetAdminOptOutAndFeatureDisabledStatus', () => {
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should reset both opt-out and feature disabled status', () => {
+        it('should reset both opt-out and feature disabled status', () => {
             // Setup
             const workspaceFolders: WorkspaceFolder[] = [
                 {
@@ -450,14 +448,13 @@ describe('WorkspaceFolderManager', () => {
             workspaceFolderManager.resetAdminOptOutAndFeatureDisabledStatus()
 
             // Assert - verify the statuses are reset
-            expect(workspaceFolderManager.getOptOutStatus()).toBe(false)
-            expect(workspaceFolderManager.isFeatureDisabled()).toBe(false)
+            assert.strictEqual(workspaceFolderManager.getOptOutStatus(), false)
+            assert.strictEqual(workspaceFolderManager.isFeatureDisabled(), false)
         })
     })
 
     describe('feature disabled handling in checkRemoteWorkspaceStatusAndReact', () => {
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should handle feature disabled state and clear resources', async () => {
+        it('should handle feature disabled state and clear resources', async () => {
             // Setup
             const workspaceFolders: WorkspaceFolder[] = [
                 {
@@ -502,7 +499,7 @@ describe('WorkspaceFolderManager', () => {
             await workspaceFolderManager.checkRemoteWorkspaceStatusAndReact()
 
             // Assert
-            expect(workspaceFolderManager.isFeatureDisabled()).toBe(true)
+            assert.strictEqual(workspaceFolderManager.isFeatureDisabled(), true)
             sinon.assert.calledOnce(clearAllWorkspaceResourcesSpy)
             sinon.assert.calledWith(mockLogging.log, sinon.match(/Feature disabled, clearing all resources/))
         })

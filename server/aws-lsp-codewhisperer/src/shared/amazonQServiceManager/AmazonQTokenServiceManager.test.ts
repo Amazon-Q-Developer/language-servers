@@ -1139,9 +1139,10 @@ describe('AmazonQTokenServiceManager', () => {
             assert.ok(true)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should return endpoint override when configured', () => {
+        it('should return endpoint override when configured', () => {
             const endpointOverride = 'https://custom-endpoint.com'
+            // Sets its own client params, so the params with the override are set after it
+            setupServiceManager()
             features.setClientParams({
                 processId: 0,
                 rootUri: 'test',
@@ -1159,14 +1160,12 @@ describe('AmazonQTokenServiceManager', () => {
                 },
             })
 
-            setupServiceManager()
-
             assert.strictEqual(amazonQTokenServiceManager.endpointOverride(), endpointOverride)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should handle empty string profile ARN', async () => {
-            setupServiceManager()
+        it('should handle empty string profile ARN', async () => {
+            // A profile ARN is only read when developer profiles are enabled
+            setupServiceManager(true)
 
             await assert.rejects(
                 amazonQTokenServiceManager.handleOnUpdateConfiguration(
@@ -1176,8 +1175,10 @@ describe('AmazonQTokenServiceManager', () => {
                     },
                     {} as CancellationToken
                 ),
-                /Received invalid Profile ARN \(empty string\)/
+                /Failed to update configuration/
             )
+            // The reason is logged, not returned to the client
+            sinon.assert.calledWith(features.logging.log, sinon.match(/Received invalid Profile ARN \(empty string\)/))
         })
 
         it('should handle profile update cancellation', async () => {
@@ -1192,9 +1193,9 @@ describe('AmazonQTokenServiceManager', () => {
             )
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should validate profile ARN format', async () => {
-            setupServiceManager()
+        it('should validate profile ARN format', async () => {
+            // A profile ARN is only read when developer profiles are enabled
+            setupServiceManager(true)
 
             await assert.rejects(
                 amazonQTokenServiceManager.handleOnUpdateConfiguration(
@@ -1204,8 +1205,10 @@ describe('AmazonQTokenServiceManager', () => {
                     },
                     {} as CancellationToken
                 ),
-                /Invalid Profile ARN format/
+                /Failed to update configuration/
             )
+            // The reason is logged, not returned to the client
+            sinon.assert.calledWith(features.logging.log, sinon.match(/Malformed ARN/))
         })
     })
 })

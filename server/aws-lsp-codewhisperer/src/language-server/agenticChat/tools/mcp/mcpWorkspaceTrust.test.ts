@@ -140,34 +140,61 @@ describe('mcpWorkspaceTrust', () => {
             expect(await getFolderIdentity(folder)).to.not.equal(before)
         })
 
-        it('changes when a repository is cloned into the folder or its remote changes', async () => {
+        it('changes when a repository is cloned into the folder', async () => {
             const folder = path.join(tmp, 'repo')
             fs.mkdirSync(folder)
             const empty = await getFolderIdentity(folder)
             fs.mkdirSync(path.join(folder, '.git'))
-            fs.writeFileSync(
-                path.join(folder, '.git', 'config'),
-                '[remote "origin"]\n\turl = https://example.com/a.git\n'
-            )
-            const cloned = await getFolderIdentity(folder)
-            fs.writeFileSync(
-                path.join(folder, '.git', 'config'),
-                '[remote "origin"]\n\turl = https://example.com/b.git\n'
-            )
 
-            expect(cloned).to.not.equal(empty)
-            expect(await getFolderIdentity(folder)).to.not.equal(cloned)
+            expect(await getFolderIdentity(folder)).to.not.equal(empty)
         })
 
-        it('stays the same when git settings other than remotes change', async () => {
+        it('stays the same when the git settings change, such as a remote that is added or changed', async () => {
             const folder = path.join(tmp, 'repo')
             fs.mkdirSync(path.join(folder, '.git'), { recursive: true })
             const remote = '[remote "origin"]\n\turl = https://example.com/a.git\n'
             fs.writeFileSync(path.join(folder, '.git', 'config'), remote)
             const before = await getFolderIdentity(folder)
-            fs.writeFileSync(path.join(folder, '.git', 'config'), remote + '[core]\n\tfilemode = false\n')
+            fs.writeFileSync(
+                path.join(folder, '.git', 'config'),
+                '[core]\n\tfilemode = false\n[remote "origin"]\n\turl = https://example.com/b.git\n' +
+                    '[remote "upstream"]\n\turl = https://example.com/a.git\n'
+            )
 
+            expect(before).to.be.a('string')
             expect(await getFolderIdentity(folder)).to.equal(before)
+        })
+
+        describe('on a file system that does not report everything', () => {
+            // Reports the folder as a file system without the given fields would
+            const withoutFields = (...missing: ('ino' | 'birthtimeNs')[]) => {
+                const realStat = fs.promises.stat
+                sinon.stub(fs.promises, 'stat').callsFake((async (file: fs.PathLike, options: any) => {
+                    const stat: any = await (realStat as any)(file, options)
+                    for (const field of missing) {
+                        stat[field] = BigInt(0)
+                    }
+                    return stat
+                }) as any)
+            }
+
+            afterEach(() => {
+                sinon.restore()
+            })
+
+            for (const [label, missing] of [
+                ['an inode', ['ino']],
+                ['a creation time', ['birthtimeNs']],
+                ['an inode and a creation time', ['ino', 'birthtimeNs']],
+            ] as const) {
+                it(`is missing for a folder without ${label}`, async () => {
+                    const folder = path.join(tmp, 'repo')
+                    fs.mkdirSync(folder)
+                    withoutFields(...missing)
+
+                    expect(await getFolderIdentity(folder)).to.be.undefined
+                })
+            }
         })
 
         it('uses the .git file of a worktree', async () => {

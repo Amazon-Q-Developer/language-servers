@@ -56,7 +56,7 @@ describe('crossFileContextUtil', function () {
                 assert.strictEqual(actual.supplementalContextItems[2].content.split('\n').length, 10)
             }
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
+            // Skipped in #2971: expects chunks of 10 lines; crossFileContextConfig.numberOfLinesEachChunk is 50
             it.skip('control group', async function () {
                 await assertCorrectCodeChunk()
             })
@@ -233,7 +233,7 @@ describe('crossFileContextUtil', function () {
             assert.strictEqual(chunks[1].content, 'line_6\nline_7')
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: expects chunks of 10 lines; crossFileContextConfig.numberOfLinesEachChunk is 50
         it.skip('codewhisperer crossfile config should use 10 lines', function () {
             const document = TextDocument.create('file:///testfile.java', 'java', 1, SAMPLE_FILE_OF_60_LINES_IN_JAVA)
 
@@ -241,7 +241,7 @@ describe('crossFileContextUtil', function () {
             assert.strictEqual(chunks.length, 6)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: expects chunks of 10 lines; crossFileContextConfig.numberOfLinesEachChunk is 50
         it.skip('should split file with Windows line endings', function () {
             const document = TextDocument.create(
                 'file:///testfile.java',
@@ -295,7 +295,7 @@ describe('crossFileContextUtil', function () {
             })
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: written for an earlier codemapContext that read the enableLocalIndexing setting; the getInstance stub returns no controller
         it.skip('should return Empty strategy when workspace context is disabled', async () => {
             const document = TextDocument.create(
                 'file:///testfile.java',

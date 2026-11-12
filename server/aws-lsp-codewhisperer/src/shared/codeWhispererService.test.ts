@@ -27,7 +27,7 @@ import {
 } from './codeWhispererService'
 import { RecentEditTracker } from '../language-server/inline-completion/tracker/codeEditTracker'
 import { CodeWhispererSupplementalContext } from './models/model'
-import { SupplementalContext } from '@amzn/codewhisperer-runtime'
+import { GenerateCompletionsCommand, SupplementalContext } from '@amzn/codewhisperer-runtime'
 
 describe('CodeWhispererService', function () {
     let sandbox: sinon.SinonSandbox
@@ -294,21 +294,18 @@ describe('CodeWhispererService', function () {
         beforeEach(function () {
             // Mock the token client
             mockClient = {
-                generateCompletions: sandbox.stub().returns({
-                    promise: sandbox.stub().resolves({
-                        completions: [
-                            {
-                                content: 'console.log("hello");',
-                                references: [],
-                            },
-                        ],
-                        $response: {
-                            requestId: 'test-request-id',
-                            httpResponse: {
-                                headers: { 'x-amzn-sessionid': 'test-session-id' },
-                            },
+                // The service sends a GenerateCompletionsCommand through the client
+                send: sandbox.stub().resolves({
+                    completions: [
+                        {
+                            content: 'console.log("hello");',
+                            references: [],
                         },
-                    }),
+                    ],
+                    $metadata: {
+                        requestId: 'test-request-id',
+                        httpHeaders: { 'x-amzn-sessionid': 'test-session-id' },
+                    },
                 }),
                 config: {
                     update: sandbox.stub(),
@@ -345,8 +342,7 @@ describe('CodeWhispererService', function () {
         })
 
         describe('generateSuggestions', function () {
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should call client.generateCompletions and process response', async function () {
+            it('should call client.generateCompletions and process response', async function () {
                 const mockRequest: GenerateSuggestionsRequest = {
                     fileContext: {
                         filename: 'test.js',
@@ -359,14 +355,14 @@ describe('CodeWhispererService', function () {
 
                 const result = await service.generateSuggestions(mockRequest)
 
-                assert.strictEqual(mockClient.generateCompletions.calledOnce, true)
+                assert.strictEqual(mockClient.send.calledOnce, true)
+                assert.ok(mockClient.send.firstCall.args[0] instanceof GenerateCompletionsCommand)
                 assert.strictEqual(Array.isArray(result.suggestions), true)
                 assert.strictEqual(typeof result.responseContext.requestId, 'string')
                 assert.strictEqual(typeof result.responseContext.codewhispererSessionId, 'string')
             })
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should add customizationArn to request if set', async function () {
+            it('should add customizationArn to request if set', async function () {
                 service.customizationArn = 'test-arn'
 
                 const mockRequest: GenerateSuggestionsRequest = {
@@ -381,12 +377,11 @@ describe('CodeWhispererService', function () {
 
                 await service.generateSuggestions(mockRequest)
 
-                const clientCall = mockClient.generateCompletions.getCall(0)
-                assert.strictEqual(clientCall.args[0].customizationArn, 'test-arn')
+                const clientCall = mockClient.send.getCall(0)
+                assert.strictEqual(clientCall.args[0].input.customizationArn, 'test-arn')
             })
 
-            // Skipped: fails since this file last ran in CI; see the PR that skipped it
-            it.skip('should process profile ARN with withProfileArn method', async function () {
+            it('should process profile ARN with withProfileArn method', async function () {
                 const mockRequest: GenerateSuggestionsRequest = {
                     fileContext: {
                         filename: 'test.js',
