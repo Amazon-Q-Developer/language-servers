@@ -1,5 +1,12 @@
 import * as assert from 'assert'
-import { codeBlockLines, codeFence, shellCommandBlock, shellCommandBlockStart } from './textFormatting'
+import {
+    codeBlockLines,
+    codeFence,
+    MAX_SHOWN_TOOL_NAME_LENGTH,
+    shellCommandBlock,
+    shellCommandBlockStart,
+    toolNameText,
+} from './textFormatting'
 import { AgenticChatResultStream } from './agenticChatResultStream'
 
 describe('textFormatting', () => {
@@ -49,6 +56,47 @@ describe('textFormatting', () => {
             const text = 'echo `date`\n`x`\n``y``\n    ```\n\t```\n-- ```'
 
             assert.strictEqual(codeBlockLines(text), text)
+        })
+    })
+
+    describe('MCP tool names', () => {
+        it('leave letters, digits and spaces unchanged', () => {
+            assert.strictEqual(toolNameText('Search docs 2'), 'Search docs 2')
+        })
+
+        it('escape markdown punctuation', () => {
+            assert.strictEqual(toolNameText('get_weather-v1.2'), 'get\\_weather\\-v1\\.2')
+            assert.strictEqual(
+                toolNameText('**a** [b](c) `d` <e> #f'),
+                '\\*\\*a\\*\\* \\[b\\]\\(c\\) \\`d\\` \\<e\\> \\#f'
+            )
+            assert.strictEqual(toolNameText('a\\b'), 'a\\\\b')
+        })
+
+        it('show the name on one line', () => {
+            assert.strictEqual(toolNameText('  a\n\nb\r\n\tc\u0007d\u2028e  '), 'a b c d e')
+        })
+
+        it('remove invisible formatting characters', () => {
+            assert.strictEqual(toolNameText('report\u202Efdp.exe\u200B'), 'reportfdp\\.exe')
+        })
+
+        it('keep a name of the maximum length', () => {
+            const name = 'a'.repeat(MAX_SHOWN_TOOL_NAME_LENGTH)
+
+            assert.strictEqual(toolNameText(name), name)
+        })
+
+        it('cut a longer name short with an ellipsis', () => {
+            const shown = toolNameText('a'.repeat(MAX_SHOWN_TOOL_NAME_LENGTH + 10))
+
+            assert.strictEqual(shown, 'a'.repeat(MAX_SHOWN_TOOL_NAME_LENGTH - 1) + '\u2026')
+        })
+
+        it('do not split a character made of two code units', () => {
+            const shown = toolNameText('\u{1F600}'.repeat(MAX_SHOWN_TOOL_NAME_LENGTH + 1))
+
+            assert.strictEqual(shown, '\u{1F600}'.repeat(MAX_SHOWN_TOOL_NAME_LENGTH - 1) + '\u2026')
         })
     })
 })
