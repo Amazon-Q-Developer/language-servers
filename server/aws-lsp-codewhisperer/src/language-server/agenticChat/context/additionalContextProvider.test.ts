@@ -1,3 +1,5 @@
+import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import * as sinon from 'sinon'
 import { URI } from 'vscode-uri'
@@ -9,6 +11,7 @@ import { getInitialContextInfo, getUserPromptsDirectory } from './contextUtils'
 import { LocalProjectContextController } from '../../../shared/localProjectContextController'
 import { workspaceUtils } from '@aws/lsp-core'
 import { ChatDatabase } from '../tools/chatDb/chatDb'
+import { AgentResourceSource } from '../tools/mcp/mcpTypes'
 import { TriggerContext, workspaceChunkMaxSize } from './agenticChatTriggerContext'
 import { expect } from 'chai'
 
@@ -453,6 +456,257 @@ describe('AdditionalContextProvider', () => {
 
             // Restore original path.join
             ;(path.join as sinon.SinonStub).restore()
+        })
+    })
+
+    describe('workspace rule resources (real filesystem)', () => {
+        let root: string
+        let ws: string
+        let outside: string
+
+        const trySymlink = (target: string, linkPath: string, type: 'file' | 'dir'): boolean => {
+            try {
+                fs.symlinkSync(target, linkPath, type)
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        const warned = (text: string) => testFeatures.logging.warn.args.some(args => String(args[0]).includes(text))
+
+        // A resource that the global agent config lists
+        const globalSource = { global: true, configPaths: [] }
+
+        const collectIds = async (
+            resources: string[] = [],
+            sources: ReadonlyMap<string, AgentResourceSource> = new Map()
+        ) => {
+            const rules = await new AdditionalContextProvider(
+                testFeatures,
+                chatHistoryDb,
+                () => resources,
+                () => sources
+            ).collectWorkspaceRules()
+            return rules.map(rule => rule.id)
+        }
+
+        beforeEach(async () => {
+            root = await fs.promises.realpath(fs.mkdtempSync(path.join(os.tmpdir(), 'rule-resources-')))
+            ws = path.join(root, 'workspace')
+            outside = path.join(root, 'outside')
+            fs.mkdirSync(ws)
+            fs.mkdirSync(outside)
+            fs.writeFileSync(path.join(outside, 'notes.md'), 'synthetic fixture only')
+            testFeatures.workspace.fs.exists = async (filePath: string) => fs.existsSync(filePath)
+            testFeatures.workspace.fs.readdir = async (dirPath: string) =>
+                fs.promises.readdir(dirPath, { withFileTypes: true })
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([ws])
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('includes default rule files inside the workspace', async () => {
+            fs.writeFileSync(path.join(ws, 'AmazonQ.md'), 'synthetic fixture only')
+            fs.mkdirSync(path.join(ws, '.amazonq', 'rules'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.amazonq', 'rules', 'team.md'), 'synthetic fixture only')
+
+            const ids = await collectIds()
+
+            assert.deepStrictEqual(ids.sort(), [
+                path.join(ws, '.amazonq', 'rules', 'team.md'),
+                path.join(ws, 'AmazonQ.md'),
+            ])
+        })
+
+        it('skips a default rule file that links outside the workspace', async function () {
+            if (!trySymlink(path.join(outside, 'notes.md'), path.join(ws, 'README.md'), 'file')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [])
+            assert.ok(warned('file://README.md'))
+        })
+
+        it('skips a rules folder that links outside the workspace', async function () {
+            fs.mkdirSync(path.join(ws, '.amazonq'))
+            if (!trySymlink(outside, path.join(ws, '.amazonq', 'rules'), 'dir')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [])
+            assert.ok(warned(path.join(ws, '.amazonq', 'rules')))
+        })
+
+        it('skips a relative resource that resolves outside the workspace', async () => {
+            fs.mkdirSync(path.join(ws, 'docs'))
+            fs.writeFileSync(path.join(ws, 'docs', 'notes.md'), 'synthetic fixture only')
+
+            const ids = await collectIds(['file://docs/notes.md', 'file://../outside/notes.md'])
+
+            assert.deepStrictEqual(ids, [path.join(ws, 'docs', 'notes.md')])
+            assert.ok(warned(JSON.stringify('file://../outside/notes.md')))
+        })
+
+        it('still includes an absolute resource that the global agent config lists', async () => {
+            const absolutePath = path.join(outside, 'notes.md')
+            // Written as in an agent config: file:///abs/path, or file://C:/abs/path on Windows
+            const resource = 'file://' + absolutePath.replace(/\\/g, '/')
+
+            const ids = await collectIds([resource], new Map([[resource, globalSource]]))
+
+            assert.deepStrictEqual(ids, [absolutePath])
+        })
+
+        it('skips an absolute resource that the global agent config does not list', async () => {
+            const resource = 'file://' + path.join(outside, 'notes.md').replace(/\\/g, '/')
+            const workspaceConfig = path.join(ws, '.amazonq', 'agents', 'default.json')
+
+            const fromWorkspace = await collectIds(
+                [resource],
+                new Map([[resource, { global: false, configPaths: [workspaceConfig] }]])
+            )
+            const unknown = await collectIds([resource])
+
+            assert.deepStrictEqual(fromWorkspace, [])
+            assert.deepStrictEqual(unknown, [])
+            assert.ok(warned(JSON.stringify(resource)))
+        })
+
+        describe('in a multi-root workspace', () => {
+            let second: string
+
+            beforeEach(() => {
+                second = path.join(root, 'second')
+                for (const folder of [ws, second]) {
+                    fs.mkdirSync(path.join(folder, 'docs'), { recursive: true })
+                    fs.writeFileSync(path.join(folder, 'docs', 'notes.md'), 'synthetic fixture only')
+                }
+                ;(workspaceUtils.getWorkspaceFolderPaths as sinon.SinonStub).returns([ws, second])
+            })
+
+            it("resolves a workspace folder's agent config resources in that folder only", async () => {
+                const resource = 'file://docs/notes.md'
+                const workspaceConfig = path.join(ws, '.amazonq', 'agents', 'default.json')
+
+                const ids = await collectIds(
+                    [resource],
+                    new Map([[resource, { global: false, configPaths: [workspaceConfig] }]])
+                )
+
+                assert.deepStrictEqual(ids, [path.join(ws, 'docs', 'notes.md')])
+            })
+
+            it("resolves the global agent config's resources in every folder", async () => {
+                const resource = 'file://docs/notes.md'
+
+                const ids = await collectIds([resource], new Map([[resource, globalSource]]))
+
+                assert.deepStrictEqual(
+                    ids.sort(),
+                    [path.join(second, 'docs', 'notes.md'), path.join(ws, 'docs', 'notes.md')].sort()
+                )
+            })
+
+            it('resolves the default resources in every folder', async () => {
+                for (const folder of [ws, second]) {
+                    fs.writeFileSync(path.join(folder, 'AmazonQ.md'), 'synthetic fixture only')
+                }
+
+                const ids = await collectIds()
+
+                assert.deepStrictEqual(
+                    ids.sort(),
+                    [path.join(second, 'AmazonQ.md'), path.join(ws, 'AmazonQ.md')].sort()
+                )
+            })
+
+            it("resolves the default resources in a folder that no other folder's agent config resources apply to", async () => {
+                for (const folder of [ws, second]) {
+                    fs.writeFileSync(path.join(folder, 'AmazonQ.md'), 'synthetic fixture only')
+                }
+                const resource = 'file://docs/notes.md'
+                const secondConfig = path.join(second, '.amazonq', 'agents', 'default.json')
+
+                const ids = await collectIds(
+                    [resource],
+                    new Map([[resource, { global: false, configPaths: [secondConfig] }]])
+                )
+
+                assert.deepStrictEqual(
+                    ids.sort(),
+                    [path.join(second, 'docs', 'notes.md'), path.join(ws, 'AmazonQ.md')].sort()
+                )
+            })
+        })
+
+        it("does not resolve a nested workspace folder's agent config resources in the folder around it", async () => {
+            const nested = path.join(ws, 'nested')
+            for (const folder of [ws, nested]) {
+                fs.mkdirSync(path.join(folder, 'docs'), { recursive: true })
+                fs.writeFileSync(path.join(folder, 'docs', 'notes.md'), 'synthetic fixture only')
+            }
+            ;(workspaceUtils.getWorkspaceFolderPaths as sinon.SinonStub).returns([ws, nested])
+            const resource = 'file://docs/notes.md'
+            const nestedConfig = path.join(nested, '.amazonq', 'agents', 'default.json')
+
+            const ids = await collectIds(
+                [resource],
+                new Map([[resource, { global: false, configPaths: [nestedConfig] }]])
+            )
+
+            assert.deepStrictEqual(ids, [path.join(nested, 'docs', 'notes.md')])
+        })
+
+        it("skips a rules folder that links to the workspace folder's parent", async function () {
+            fs.writeFileSync(path.join(root, 'top.md'), 'synthetic fixture only')
+            fs.mkdirSync(path.join(ws, '.amazonq'))
+            if (!trySymlink(root, path.join(ws, '.amazonq', 'rules'), 'dir')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [])
+        })
+
+        it('skips a rule file that shares its data with another name on disk', async function () {
+            fs.mkdirSync(path.join(ws, '.amazonq', 'rules'), { recursive: true })
+            fs.mkdirSync(path.join(ws, 'docs'))
+            try {
+                fs.linkSync(path.join(outside, 'notes.md'), path.join(ws, '.amazonq', 'rules', 'team.md'))
+                fs.linkSync(path.join(outside, 'notes.md'), path.join(ws, 'docs', 'notes.md'))
+            } catch {
+                return this.skip()
+            }
+            const resources = ['file://.amazonq/rules/**/*.md', 'file://docs/notes.md']
+
+            const ids = await collectIds(resources, new Map(resources.map(resource => [resource, globalSource])))
+
+            assert.deepStrictEqual(ids, [])
+            assert.ok(warned(path.join(ws, '.amazonq', 'rules', 'team.md')))
+            assert.ok(warned(JSON.stringify('file://docs/notes.md')))
+        })
+
+        it('includes a file in the workspace whose name starts with two dots', async () => {
+            fs.writeFileSync(path.join(ws, '..notes.md'), 'synthetic fixture only')
+            const resource = 'file://..notes.md'
+
+            const ids = await collectIds([resource], new Map([[resource, globalSource]]))
+
+            assert.deepStrictEqual(ids, [path.join(ws, '..notes.md')])
+        })
+
+        // The directory walk lists real files only, so a symlinked rule file is not loaded whether it
+        // points inside or outside the workspace. This is existing behavior, not the containment check.
+        it('does not list a symlinked rule file inside the rules folder', async function () {
+            fs.mkdirSync(path.join(ws, '.amazonq', 'rules'), { recursive: true })
+            fs.writeFileSync(path.join(ws, '.amazonq', 'rules', 'team.md'), 'synthetic fixture only')
+            if (!trySymlink(path.join(outside, 'notes.md'), path.join(ws, '.amazonq', 'rules', 'linked.md'), 'file')) {
+                return this.skip()
+            }
+
+            assert.deepStrictEqual(await collectIds(), [path.join(ws, '.amazonq', 'rules', 'team.md')])
         })
     })
 

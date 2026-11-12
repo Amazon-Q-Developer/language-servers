@@ -80,6 +80,16 @@ export class MemoryBankController {
     }
 
     /**
+     * Paths of the files that memory bank generation writes in the workspace folder
+     */
+    getMemoryBankFilePaths(workspaceFolderUri: string): string[] {
+        const normalizedWorkspacePath = normalizePathFromUri(workspaceFolderUri, this.features.logging)
+        return Object.values(MEMORY_BANK_FILES).map(
+            fileName => `${normalizedWorkspacePath}/${MEMORY_BANK_DIRECTORY}/${fileName}`
+        )
+    }
+
+    /**
      * Prepare comprehensive memory bank creation prompt with all necessary input
      * This does all the programmatic work upfront and creates a single comprehensive prompt
      */

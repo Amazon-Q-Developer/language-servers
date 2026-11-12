@@ -1,4 +1,11 @@
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import {
+    CommandValidation,
+    InvokeOutput,
+    isRegularFile,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    validatePath,
+} from './toolShared'
 import { CancellationError } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
@@ -83,14 +90,23 @@ export class GrepSearch {
     // symlink-aware requiresPathAcceptance helper (as fsRead/fsWrite/
     // listDirectory do) so a search path that is a symlink escaping the
     // workspace, or that targets a sensitive location, is not silently allowed.
-    // Note this tool is not currently registered as an active tool (see
-    // toolServer.ts).
+    // A search path that is a file with more than one hard link needs approval,
+    // as for fsRead. Note this tool is not currently registered as an active
+    // tool (see toolServer.ts).
     public async requiresAcceptance(
         params: GrepSearchParams,
         approvedPaths?: Map<string, Set<string>>
     ): Promise<CommandValidation> {
         const path = this.getSearchDirectory(params.path)
-        return requiresPathAcceptance(path, 'grepSearch', this.workspace, this.logging, approvedPaths)
+        const isFile = await resolveCanonicalPath(path).then(isRegularFile, () => false)
+        return requiresPathAcceptance(
+            path,
+            'grepSearch',
+            this.workspace,
+            this.logging,
+            approvedPaths,
+            isFile ? { flagMultiplyLinkedFiles: 'read' } : undefined
+        )
     }
 
     public async invoke(params: GrepSearchParams, token?: CancellationToken): Promise<InvokeOutput> {

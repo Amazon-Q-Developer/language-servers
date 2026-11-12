@@ -19,6 +19,7 @@ import {
 } from './amazonQServer'
 import { BaseAmazonQServiceManager } from './amazonQServiceManager/BaseAmazonQServiceManager'
 import { AtxTokenServiceManager } from './amazonQServiceManager/AtxTokenServiceManager'
+import { Q_CONFIGURATION_SECTION } from './constants'
 
 const TEST_SERVER_NAME = 'Test Amazon Q Server'
 
@@ -126,7 +127,10 @@ describe('AmazonQServiceServer', () => {
         await features.initialize(server)
         sinon.assert.notCalled(handleOnUpdateConfigurationSpy)
 
-        await features.doUpdateConfiguration({} as UpdateConfigurationParams, {} as any)
+        await features.doUpdateConfiguration(
+            { section: Q_CONFIGURATION_SECTION } as UpdateConfigurationParams,
+            {} as any
+        )
         sinon.assert.calledOnce(handleOnUpdateConfigurationSpy)
     })
 

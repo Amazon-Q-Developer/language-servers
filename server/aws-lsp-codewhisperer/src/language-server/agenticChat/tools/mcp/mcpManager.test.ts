@@ -103,6 +103,43 @@ describe('init()', () => {
     })
 })
 
+describe('getResourceSources()', () => {
+    let loadStub: sinon.SinonStub
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('returns the agent configs that list each resource, as the agent config loader found them', async () => {
+        const resourceSources = new Map([['file://docs/rules.md', { global: false, configPaths: ['/ws/a.json'] }]])
+        loadStub = sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map(),
+            serverNameMapping: new Map(),
+            errors: new Map(),
+            agentConfig: {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                toolsSettings: {},
+                resources: ['file://docs/rules.md'],
+            },
+            resourceSources,
+        })
+
+        const mgr = await McpManager.init([], features)
+        await mgr.discoverAllServers()
+
+        expect(loadStub.called).to.be.true
+        expect(mgr.getResources()).to.deep.equal(['file://docs/rules.md'])
+        expect(mgr.getResourceSources()).to.deep.equal(resourceSources)
+    })
+})
+
 describe('getAllTools()', () => {
     let loadStub: sinon.SinonStub
 
@@ -2052,6 +2089,8 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
             },
         })
         const mgr = await McpManager.init([], featuresWithPrompt as any)
+        // These tests cover per-server consent, which applies once the workspace is trusted
+        await mgr.setWorkspaceTrust('trusted')
         setStateSpy = sinon.spy(mgr as any, 'setState')
         return mgr
     }
@@ -2216,5 +2255,894 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
             await (mgr as any).initOneServerInternal('svc', cfg)
         } catch {}
         expect(recordApprovalStub.calledOnce).to.be.true
+    })
+})
+
+describe('workspace trust for stdio MCP servers', () => {
+    const fakeHome = '/home/testuser'
+    const globalMcp = mcpUtils.getGlobalMcpConfigPath(fakeHome)
+    const folderUri = 'file:///tmp/ws-trust'
+    const folderPath = require('vscode-uri').URI.parse(folderUri).fsPath
+    const workspaceMcp = require('path').join(folderPath, '.amazonq', 'mcp.json')
+
+    let showMessageStub: sinon.SinonStub
+    let recordFolderApprovalStub: sinon.SinonStub
+    let connectStub: sinon.SinonStub
+    let folders: { uri: string }[]
+    // Folder path to the identity it was approved with
+    let approvedFolders: Map<string, string>
+    // Folder path to its current identity; a folder not listed has identity 'id-1'
+    let folderIdentities: Map<string, string | undefined>
+    let forgetStoreStub: sinon.SinonStub
+    // When approvals were last forgotten, as the approval file reports it
+    let forgottenAt: number
+
+    async function buildMgr(trust?: 'trusted' | 'restricted' | 'prompt'): Promise<any> {
+        const trustStore = require('./mcpWorkspaceTrust')
+        approvedFolders = new Map()
+        folderIdentities = new Map()
+        sinon
+            .stub(trustStore, 'getFolderIdentity')
+            .callsFake(async (f: any) => (folderIdentities.has(f) ? folderIdentities.get(f) : 'id-1'))
+        // The approval store behaves like the real one: recorded folders count as approved afterwards
+        sinon
+            .stub(trustStore, 'isFolderApproved')
+            .callsFake(async (_w: any, _l: any, f: any, id: any) => approvedFolders.get(f) === id)
+        recordFolderApprovalStub = sinon
+            .stub(trustStore, 'recordFolderApproval')
+            .callsFake(async (_w: any, _l: any, f: any, id: any) => {
+                approvedFolders.set(f, id)
+                return true
+            })
+        forgottenAt = 0
+        sinon.stub(trustStore, 'getFolderApprovalsForgottenAt').callsFake(async () => forgottenAt)
+        forgetStoreStub = sinon.stub(trustStore, 'forgetFolderApprovals').callsFake(async () => {
+            approvedFolders.clear()
+            forgottenAt = Date.now()
+            return true
+        })
+        sinon.stub(require('./mcpConsentStore'), 'recordApproval').resolves()
+        showMessageStub = sinon.stub()
+        // Capture the transport the server would start with, without spawning a process
+        connectStub = sinon.stub(Client.prototype, 'connect').rejects(new Error('connect stubbed'))
+        folders = [{ uri: folderUri }]
+        const featuresWithFolders = {
+            ...features,
+            workspace: {
+                ...fakeWorkspace,
+                fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome },
+                getAllWorkspaceFolders: () => folders,
+            },
+            lsp: { window: { showMessageRequest: showMessageStub, showDocument: sinon.stub() } },
+        }
+        sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map(),
+            serverNameMapping: new Map(),
+            errors: new Map(),
+            agentConfig: {
+                name: 'test',
+                description: '',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            },
+        })
+        const mgr = await McpManager.init([], featuresWithFolders as any)
+        if (trust) {
+            await mgr.setWorkspaceTrust(trust)
+        }
+        return mgr
+    }
+
+    const stdioCfg: MCPServerConfig = { command: 'npx', args: ['-y', 'some-server'], __configPath__: globalMcp }
+    const startedCwds = () => connectStub.getCalls().map(c => c.args[0]?._serverParams?.cwd)
+
+    // Start a server the way discovery does, so held servers can be restarted later
+    async function start(mgr: any, name = 'svc', cfg: MCPServerConfig = stdioCfg) {
+        mgr.mcpServers.set(name, cfg)
+        try {
+            await mgr.initOneServer(name, cfg)
+        } catch {}
+    }
+
+    // Wait for open folder prompts and the restarts they trigger
+    async function settlePrompts(mgr: any) {
+        while (mgr.pendingFolderPrompts.size > 0) {
+            await Promise.all([...mgr.pendingFolderPrompts.values()])
+        }
+    }
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('defaults to prompting when the client reports no trust state', async () => {
+        const mgr = await buildMgr()
+        expect(mgr.getWorkspaceTrust()).to.equal('prompt')
+    })
+
+    it('starts a stdio server in the workspace folder when the workspace is trusted', async () => {
+        const mgr = await buildMgr('trusted')
+        await start(mgr)
+        expect(showMessageStub.called).to.be.false
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('does not start a stdio server while the workspace is restricted', async () => {
+        const mgr = await buildMgr('restricted')
+        await start(mgr)
+        expect(connectStub.called).to.be.false
+        expect(showMessageStub.called).to.be.false
+        expect(mgr.getServerState('svc')).to.deep.include({
+            status: McpServerStatus.DISABLED,
+            lastError: 'Waiting for workspace trust',
+        })
+    })
+
+    it('holds a workspace-scoped stdio server back before its own consent prompt', async () => {
+        const mgr = await buildMgr('restricted')
+        await start(mgr, 'svc', { command: 'node', args: ['./server.js'], __configPath__: workspaceMcp })
+        expect(showMessageStub.called).to.be.false
+        expect(connectStub.called).to.be.false
+    })
+
+    it('does not hold back an HTTP server while the workspace is restricted', async () => {
+        const mgr = await buildMgr('restricted')
+        const fetchStub = sinon.stub(globalThis, 'fetch').rejects(new Error('no network in tests'))
+        await start(mgr, 'remote', { url: 'https://example.com/mcp', __configPath__: globalMcp })
+        expect(mgr.getServerState('remote')?.lastError).to.not.equal('Waiting for workspace trust')
+        fetchStub.restore()
+    })
+
+    it('starts a stdio server in an empty Amazon Q folder, without a folder check, when no workspace folder is open', async () => {
+        const mgr = await buildMgr('restricted')
+        const mkdir = sinon.spy(mgr.features.workspace.fs, 'mkdir')
+        folders = []
+        await start(mgr)
+        const expected = require('path').join(fakeHome, '.aws', 'amazonq', 'mcp-cwd')
+        expect(mkdir.calledWith(expected, sinon.match({ recursive: true }))).to.be.true
+        expect(startedCwds()).to.deep.equal([expected])
+        expect(showMessageStub.called).to.be.false
+    })
+
+    it('does not start a stdio server when the empty Amazon Q folder cannot be created', async () => {
+        const mgr = await buildMgr('trusted')
+        sinon.stub(mgr.features.workspace.fs, 'mkdir').rejects(new Error('read-only file system'))
+        folders = []
+        await start(mgr)
+        expect(connectStub.called).to.be.false
+        expect(mgr.getServerState('svc')).to.deep.include({
+            status: McpServerStatus.FAILED,
+            lastError: 'Could not prepare a working directory',
+        })
+    })
+
+    it('does not wait for the folder prompt before returning', async () => {
+        const mgr = await buildMgr('prompt')
+        showMessageStub.returns(new Promise(() => {}))
+        await start(mgr)
+        expect(showMessageStub.calledOnce).to.be.true
+        expect(connectStub.called).to.be.false
+        expect(mgr.getServerState('svc')?.lastError).to.equal('Waiting for workspace trust')
+    })
+
+    it('starts the server after the user allows the folder, and remembers the folder', async () => {
+        const mgr = await buildMgr('prompt')
+        showMessageStub.resolves({ title: 'Allow' })
+        await start(mgr)
+        await settlePrompts(mgr)
+        expect(showMessageStub.calledOnce).to.be.true
+        expect(showMessageStub.firstCall.args[0].message).to.include(folderPath)
+        expect(showMessageStub.firstCall.args[0].message).to.include("won't ask again for this folder. ")
+        expect(recordFolderApprovalStub.calledOnceWith(sinon.match.any, sinon.match.any, folderPath, 'id-1')).to.be.true
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('does not ask again for a folder that was already allowed', async () => {
+        const mgr = await buildMgr('prompt')
+        approvedFolders.set(folderPath, 'id-1')
+        await start(mgr)
+        expect(showMessageStub.called).to.be.false
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('does not ask again in this session when saving the approval fails', async () => {
+        const mgr = await buildMgr('prompt')
+        recordFolderApprovalStub.resolves(false)
+        showMessageStub.resolves({ title: 'Allow' })
+        await start(mgr, 'one')
+        await settlePrompts(mgr)
+        await start(mgr, 'two')
+        expect(showMessageStub.calledOnce).to.be.true
+        expect(connectStub.calledTwice).to.be.true
+    })
+
+    it('does not start the server and does not ask again in this session after the user declines', async () => {
+        const mgr = await buildMgr('prompt')
+        showMessageStub.resolves({ title: "Don't allow" })
+        await start(mgr, 'one')
+        await settlePrompts(mgr)
+        await start(mgr, 'two')
+        expect(showMessageStub.calledOnce).to.be.true
+        expect(recordFolderApprovalStub.called).to.be.false
+        expect(connectStub.called).to.be.false
+        expect(mgr.getServerState('two')?.lastError).to.equal('Not allowed in this folder')
+    })
+
+    it('asks again after declined folders are cleared', async () => {
+        const mgr = await buildMgr('prompt')
+        showMessageStub.onFirstCall().resolves({ title: "Don't allow" })
+        showMessageStub.onSecondCall().resolves({ title: 'Allow' })
+        await start(mgr)
+        await settlePrompts(mgr)
+        mgr.clearDeclinedFolders()
+        await start(mgr)
+        await settlePrompts(mgr)
+        expect(showMessageStub.calledTwice).to.be.true
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('treats a failed prompt as not allowed', async () => {
+        const mgr = await buildMgr('prompt')
+        showMessageStub.rejects(new Error('client does not support prompts'))
+        await start(mgr)
+        await settlePrompts(mgr)
+        expect(connectStub.called).to.be.false
+        expect(recordFolderApprovalStub.called).to.be.false
+    })
+
+    it('asks once when several servers start in the same folder at the same time', async () => {
+        const mgr = await buildMgr('prompt')
+        let answer!: (v: { title: string }) => void
+        showMessageStub.returns(new Promise(resolve => (answer = resolve)))
+        await Promise.all([start(mgr, 'one'), start(mgr, 'two')])
+        answer({ title: 'Allow' })
+        await settlePrompts(mgr)
+        expect(showMessageStub.calledOnce).to.be.true
+        expect(connectStub.calledTwice).to.be.true
+    })
+
+    it('starts held servers once the workspace becomes trusted', async () => {
+        const mgr = await buildMgr('restricted')
+        await start(mgr)
+        expect(connectStub.called).to.be.false
+
+        await mgr.setWorkspaceTrust('trusted')
+
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('stops stdio servers running in a workspace folder when the workspace becomes restricted', async () => {
+        const mgr = await buildMgr('trusted')
+        const closeStub = sinon.stub().resolves()
+        mgr.clients.set('svc', { close: closeStub })
+        mgr.stdioLaunchFolders.set('svc', folderPath)
+        mgr.mcpTools.push({ serverName: 'svc', toolName: 't', description: '', inputSchema: {} })
+
+        await mgr.setWorkspaceTrust('restricted')
+
+        expect(closeStub.calledOnce).to.be.true
+        expect(mgr.clients.has('svc')).to.be.false
+        expect(mgr.getAllTools().some((t: any) => t.serverName === 'svc')).to.be.false
+        expect(mgr.getServerState('svc')?.lastError).to.equal('Waiting for workspace trust')
+    })
+
+    it('does not stop the remaining servers when the workspace becomes trusted again during the stop', async () => {
+        const mgr = await buildMgr('trusted')
+        let trustedAgain!: Promise<void>
+        const closeA = sinon.stub().callsFake(async () => {
+            // The client reports trusted again while the first server is still stopping
+            trustedAgain = mgr.setWorkspaceTrust('trusted')
+        })
+        const closeB = sinon.stub().resolves()
+        mgr.mcpServers.set('a', stdioCfg)
+        mgr.mcpServers.set('b', stdioCfg)
+        mgr.clients.set('a', { close: closeA })
+        mgr.clients.set('b', { close: closeB })
+        mgr.stdioLaunchFolders.set('a', folderPath)
+        mgr.stdioLaunchFolders.set('b', folderPath)
+
+        await mgr.setWorkspaceTrust('restricted')
+        await trustedAgain
+
+        expect(closeB.called).to.be.false
+        expect(mgr.clients.has('b')).to.be.true
+        // The first server was stopped, then started again once trusted
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    it('starts held servers in batches, not one at a time and not all at once', async () => {
+        const mgr = await buildMgr('restricted')
+        const names = ['s1', 's2', 's3', 's4', 's5', 's6', 's7']
+        for (const name of names) {
+            await start(mgr, name)
+        }
+        let active = 0
+        let maxActive = 0
+        connectStub.callsFake(async () => {
+            active++
+            maxActive = Math.max(maxActive, active)
+            await new Promise(resolve => setTimeout(resolve, 5))
+            active--
+            throw new Error('connect stubbed')
+        })
+
+        await mgr.setWorkspaceTrust('trusted')
+
+        expect(connectStub.callCount).to.equal(names.length)
+        expect(maxActive).to.equal(5)
+    })
+
+    it('starts a held server once when two trust triggers arrive together', async () => {
+        const mgr = await buildMgr('restricted')
+        await start(mgr)
+        mgr.workspaceTrust = 'trusted'
+
+        await Promise.all([mgr.startServersAwaitingTrust(), mgr.startServersAwaitingTrust()])
+
+        expect(connectStub.calledOnce).to.be.true
+    })
+
+    it('stops running servers at the same time when the workspace becomes restricted', async () => {
+        const mgr = await buildMgr('trusted')
+        let finishFirst!: () => void
+        const closeA = sinon.stub().returns(new Promise<void>(resolve => (finishFirst = resolve)))
+        const closeB = sinon.stub().resolves()
+        mgr.clients.set('a', { close: closeA })
+        mgr.clients.set('b', { close: closeB })
+        mgr.stdioLaunchFolders.set('a', folderPath)
+        mgr.stdioLaunchFolders.set('b', folderPath)
+
+        const stopping = mgr.setWorkspaceTrust('restricted')
+        await new Promise(resolve => setImmediate(resolve))
+        expect(closeB.calledOnce).to.be.true
+        finishFirst()
+        await stopping
+
+        expect(mgr.clients.size).to.equal(0)
+    })
+
+    it('forgets a removed server, so a later restricted change does not report it', async () => {
+        const mgr = await buildMgr('trusted')
+        sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+        mgr.mcpServers.set('svc', stdioCfg)
+        mgr.stdioLaunchFolders.set('svc', folderPath)
+
+        await mgr.removeServer('svc')
+        await mgr.setWorkspaceTrust('restricted')
+
+        expect(mgr.stdioLaunchFolders.has('svc')).to.be.false
+        expect(mgr.getServerState('svc')).to.be.undefined
+    })
+
+    it('does not start a held server that was disabled in the meantime', async () => {
+        const mgr = await buildMgr('restricted')
+        await start(mgr)
+        sinon.stub(mgr, 'isServerDisabled').returns(true)
+
+        await mgr.setWorkspaceTrust('trusted')
+
+        expect(connectStub.called).to.be.false
+        expect(mgr.serversAwaitingTrust.has('svc')).to.be.false
+    })
+
+    it('does not start a server whose consent prompt is answered after the workspace becomes restricted', async () => {
+        const mgr = await buildMgr('trusted')
+        showMessageStub.callsFake(async () => {
+            await mgr.setWorkspaceTrust('restricted')
+            return { title: 'Allow for this server' }
+        })
+        await start(mgr, 'svc', { command: 'node', args: ['./server.js'], __configPath__: workspaceMcp })
+        expect(connectStub.called).to.be.false
+        expect(mgr.getServerState('svc')?.lastError).to.equal('Waiting for workspace trust')
+    })
+
+    it('starts the server in the folder that was checked, even if the folder list changes before it starts', async () => {
+        const mgr = await buildMgr('prompt')
+        approvedFolders.set(folderPath, 'id-1')
+        showMessageStub.callsFake(async () => {
+            // The folder list changes while the per-server consent prompt is open
+            folders = [{ uri: 'file:///tmp/other-folder' }]
+            return { title: 'Allow for this server' }
+        })
+        await start(mgr, 'svc', { command: 'node', args: ['./server.js'], __configPath__: workspaceMcp })
+        expect(startedCwds()).to.deep.equal([folderPath])
+    })
+
+    describe('folder identity, forgetting approvals and folder changes', () => {
+        const otherUri = 'file:///tmp/ws-other'
+        const otherPath = require('vscode-uri').URI.parse(otherUri).fsPath
+
+        // A stdio server already running in a folder
+        function running(mgr: any, name: string, folder: string | undefined) {
+            const close = sinon.stub().resolves()
+            mgr.mcpServers.set(name, stdioCfg)
+            mgr.clients.set(name, { close })
+            mgr.stdioLaunchFolders.set(name, folder)
+            return close
+        }
+
+        it('asks again when a different folder now exists at an allowed path', async () => {
+            const mgr = await buildMgr('prompt')
+            approvedFolders.set(folderPath, 'id-1')
+            folderIdentities.set(folderPath, 'id-2')
+            showMessageStub.returns(new Promise(() => {}))
+
+            await start(mgr)
+
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(connectStub.called).to.be.false
+        })
+
+        it('asks again when a folder allowed earlier in this session was replaced', async () => {
+            const mgr = await buildMgr('prompt')
+            showMessageStub.onFirstCall().resolves({ title: 'Allow' })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            // The folder is deleted and created again at the same path
+            folderIdentities.set(folderPath, 'id-2')
+
+            await start(mgr, 'two')
+
+            expect(showMessageStub.calledTwice).to.be.true
+            expect(connectStub.calledOnce).to.be.true
+        })
+
+        it('keeps the approval for this session only when the folder identity is unknown', async () => {
+            const mgr = await buildMgr('prompt')
+            folderIdentities.set(folderPath, undefined)
+            showMessageStub.resolves({ title: 'Allow' })
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            await start(mgr, 'two')
+
+            expect(recordFolderApprovalStub.called).to.be.false
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(showMessageStub.firstCall.args[0].message).to.include('until Amazon Q restarts')
+            expect(connectStub.calledTwice).to.be.true
+        })
+
+        it('forgets allowed folders, stops servers in them and asks again', async () => {
+            const mgr = await buildMgr('prompt')
+            approvedFolders.set(folderPath, 'id-1')
+            const close = running(mgr, 'svc', folderPath)
+            showMessageStub.returns(new Promise(() => {}))
+
+            expect(await mgr.forgetFolderApprovals()).to.be.true
+
+            expect(forgetStoreStub.calledOnce).to.be.true
+            expect(close.calledOnce).to.be.true
+            expect(mgr.clients.has('svc')).to.be.false
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(mgr.getServerState('svc')?.lastError).to.equal('Waiting for workspace trust')
+        })
+
+        it('forgets folders allowed and declined in this session', async () => {
+            const mgr = await buildMgr('prompt')
+            folderIdentities.set(folderPath, undefined)
+            showMessageStub.onFirstCall().resolves({ title: 'Allow' })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr)
+            await settlePrompts(mgr)
+            mgr.sessionDeniedFolders.add('some-other-folder')
+
+            await mgr.forgetFolderApprovals()
+
+            expect(mgr.sessionAllowedFolders.size).to.equal(0)
+            expect(mgr.sessionDeniedFolders.size).to.equal(0)
+            expect(showMessageStub.calledTwice).to.be.true
+        })
+
+        it('still forgets folders for this session when the saved approvals cannot be cleared', async () => {
+            const mgr = await buildMgr('prompt')
+            forgetStoreStub.resolves(false)
+            approvedFolders.set(folderPath, 'id-1')
+            const close = running(mgr, 'svc', folderPath)
+            showMessageStub.onFirstCall().returns(new Promise(() => {}))
+
+            expect(await mgr.forgetFolderApprovals()).to.be.false
+
+            // The approval left in the file does not apply, so the server stops and Amazon Q asks again
+            expect(close.calledOnce).to.be.true
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(connectStub.called).to.be.false
+        })
+
+        it('clears the forgotten approvals before saving a new one', async () => {
+            const mgr = await buildMgr('prompt')
+            forgetStoreStub.onFirstCall().resolves(false)
+            showMessageStub.resolves({ title: 'Allow' })
+            await mgr.forgetFolderApprovals()
+
+            await start(mgr)
+            await settlePrompts(mgr)
+
+            expect(forgetStoreStub.calledTwice).to.be.true
+            expect(forgetStoreStub.secondCall.calledBefore(recordFolderApprovalStub.firstCall)).to.be.true
+            expect(startedCwds()).to.deep.equal([folderPath])
+        })
+
+        it('keeps a new approval for this session only while the forgotten approvals cannot be cleared', async () => {
+            const mgr = await buildMgr('prompt')
+            forgetStoreStub.resolves(false)
+            showMessageStub.resolves({ title: 'Allow' })
+            await mgr.forgetFolderApprovals()
+
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            await start(mgr, 'two')
+
+            expect(recordFolderApprovalStub.called).to.be.false
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(connectStub.calledTwice).to.be.true
+        })
+
+        it('uses saved approvals again after a later forget clears them', async () => {
+            const mgr = await buildMgr('prompt')
+            forgetStoreStub.onFirstCall().resolves(false)
+            showMessageStub.returns(new Promise(() => {}))
+            await mgr.forgetFolderApprovals()
+            await mgr.forgetFolderApprovals()
+            approvedFolders.set(folderPath, 'id-1')
+
+            await start(mgr)
+
+            expect(startedCwds()).to.deep.equal([folderPath])
+        })
+
+        it('reads saved approvals from the approval file, so a change made elsewhere applies', async () => {
+            const mgr = await buildMgr('prompt')
+            showMessageStub.onFirstCall().resolves({ title: 'Allow' })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            // Another window forgets the approval
+            approvedFolders.clear()
+
+            await start(mgr, 'two')
+
+            expect(mgr.sessionAllowedFolders.size).to.equal(0)
+            expect(showMessageStub.calledTwice).to.be.true
+            expect(connectStub.calledOnce).to.be.true
+        })
+
+        it('drops an approval kept for this session when another window forgets allowed folders', async () => {
+            const mgr = await buildMgr('prompt')
+            folderIdentities.set(folderPath, undefined)
+            showMessageStub.onFirstCall().resolves({ title: 'Allow' })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            forgottenAt = Date.now() + 1
+
+            await start(mgr, 'two')
+
+            expect(showMessageStub.calledTwice).to.be.true
+            expect(connectStub.calledOnce).to.be.true
+        })
+
+        it('starts a waiting server when another window allows its folder', async () => {
+            const mgr = await buildMgr('prompt')
+            showMessageStub.returns(new Promise(() => {}))
+            await start(mgr)
+            expect(connectStub.called).to.be.false
+            approvedFolders.set(folderPath, 'id-1')
+
+            await mgr.onFolderApprovalsChanged()
+
+            expect(startedCwds()).to.deep.equal([folderPath])
+        })
+
+        it('stops a running server when another window forgets its folder', async () => {
+            const mgr = await buildMgr('prompt')
+            approvedFolders.set(folderPath, 'id-1')
+            const close = running(mgr, 'svc', folderPath)
+            showMessageStub.returns(new Promise(() => {}))
+            approvedFolders.clear()
+
+            await mgr.onFolderApprovalsChanged()
+
+            expect(close.calledOnce).to.be.true
+            expect(showMessageStub.calledOnce).to.be.true
+        })
+
+        it('ignores approval file changes while the IDE reports a trust decision', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+
+            await mgr.onFolderApprovalsChanged()
+
+            expect(close.called).to.be.false
+            expect(showMessageStub.called).to.be.false
+        })
+
+        it('keeps approvals given after a failed forget once the file is cleared', async () => {
+            const mgr = await buildMgr('prompt')
+            const otherFolderUri = 'file:///tmp/ws-third'
+            forgetStoreStub.onFirstCall().resolves(false)
+            forgetStoreStub.onSecondCall().resolves(false)
+            showMessageStub.resolves({ title: 'Allow' })
+            await mgr.forgetFolderApprovals()
+            // Saved for this session only, because the file still can't be cleared
+            await start(mgr, 'one')
+            await settlePrompts(mgr)
+            // The file is cleared before this approval is saved
+            folders = [{ uri: otherFolderUri }]
+            await start(mgr, 'two')
+            await settlePrompts(mgr)
+            folders = [{ uri: folderUri }]
+
+            await start(mgr, 'three')
+
+            expect(forgetStoreStub.calledThrice).to.be.true
+            expect(showMessageStub.calledTwice).to.be.true
+            expect(connectStub.calledThrice).to.be.true
+        })
+
+        it('does not stop servers when approvals are forgotten in a trusted workspace', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+
+            await mgr.forgetFolderApprovals()
+
+            expect(forgetStoreStub.calledOnce).to.be.true
+            expect(close.called).to.be.false
+        })
+
+        it('keeps servers started with no folder open running when the workspace changes to prompting', async () => {
+            const mgr = await buildMgr('trusted')
+            folders = []
+            const close = running(mgr, 'plain', undefined)
+
+            await mgr.setWorkspaceTrust('prompt')
+
+            expect(close.called).to.be.false
+            expect(showMessageStub.called).to.be.false
+        })
+
+        it('asks about a folder the IDE had trusted when the workspace changes to prompting', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+            showMessageStub.returns(new Promise(() => {}))
+
+            await mgr.setWorkspaceTrust('prompt')
+
+            expect(close.calledOnce).to.be.true
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(connectStub.called).to.be.false
+        })
+
+        it('keeps servers in allowed folders running when the workspace changes to prompting', async () => {
+            const mgr = await buildMgr('trusted')
+            approvedFolders.set(folderPath, 'id-1')
+            const close = running(mgr, 'svc', folderPath)
+
+            await mgr.setWorkspaceTrust('prompt')
+
+            expect(close.called).to.be.false
+            expect(showMessageStub.called).to.be.false
+        })
+
+        it('keeps servers started with no folder open running when the workspace becomes restricted', async () => {
+            const mgr = await buildMgr('trusted')
+            folders = []
+            const close = running(mgr, 'plain', undefined)
+
+            await mgr.setWorkspaceTrust('restricted')
+
+            expect(close.called).to.be.false
+            expect(mgr.clients.has('plain')).to.be.true
+        })
+
+        it('restarts a server in the new first folder when the workspace folders change', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+            folders = [{ uri: otherUri }, { uri: folderUri }]
+
+            await mgr.onWorkspaceFoldersChanged()
+
+            expect(close.calledOnce).to.be.true
+            expect(startedCwds()).to.deep.equal([otherPath])
+        })
+
+        it('checks the new first folder before restarting a server in it', async () => {
+            const mgr = await buildMgr('prompt')
+            approvedFolders.set(folderPath, 'id-1')
+            const close = running(mgr, 'svc', folderPath)
+            folders = [{ uri: otherUri }]
+            showMessageStub.returns(new Promise(() => {}))
+
+            await mgr.onWorkspaceFoldersChanged()
+
+            expect(close.calledOnce).to.be.true
+            expect(showMessageStub.calledOnce).to.be.true
+            expect(showMessageStub.firstCall.args[0].message).to.include(otherPath)
+            expect(connectStub.called).to.be.false
+        })
+
+        it('holds a server started with no folder open once a folder opens in a restricted workspace', async () => {
+            const mgr = await buildMgr('restricted')
+            const close = running(mgr, 'plain', undefined)
+            folders = [{ uri: folderUri }]
+
+            await mgr.onWorkspaceFoldersChanged()
+
+            expect(close.calledOnce).to.be.true
+            expect(connectStub.called).to.be.false
+            expect(mgr.getServerState('plain')?.lastError).to.equal('Waiting for workspace trust')
+        })
+
+        it('does not restart servers when the first folder stays the same', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+            folders = [{ uri: folderUri }, { uri: otherUri }]
+
+            await mgr.onWorkspaceFoldersChanged()
+
+            expect(close.called).to.be.false
+            expect(connectStub.called).to.be.false
+        })
+
+        it('starts again from the folder check when the folders change while a server is starting', async () => {
+            const mgr = await buildMgr('trusted')
+            let changed: Promise<void> | undefined
+            showMessageStub.callsFake(async () => {
+                if (!changed) {
+                    // The folders change while the per-server consent prompt is open
+                    folders = [{ uri: otherUri }]
+                    changed = mgr.onWorkspaceFoldersChanged()
+                }
+                return { title: 'Allow for this server' }
+            })
+
+            await start(mgr, 'svc', { command: 'node', args: ['./server.js'], __configPath__: workspaceMcp })
+            await changed
+            // The restart runs in the background once the first start gives up its lock
+            for (let i = 0; i < 100 && !connectStub.called; i++) {
+                await new Promise(resolve => setTimeout(resolve, 5))
+            }
+
+            expect(startedCwds()).to.deep.equal([otherPath])
+        })
+
+        it('starts a server whose folder check was still running when the workspace became trusted', async () => {
+            const mgr = await buildMgr('prompt')
+            let releaseCheck!: () => void
+            const checkHeld = new Promise<void>(resolve => (releaseCheck = resolve))
+            const identity = require('./mcpWorkspaceTrust').getFolderIdentity as sinon.SinonStub
+            identity.callsFake(async () => {
+                await checkHeld
+                return 'id-1'
+            })
+            showMessageStub.returns(new Promise(() => {}))
+
+            const starting = start(mgr)
+            await new Promise(resolve => setImmediate(resolve))
+            await mgr.setWorkspaceTrust('trusted')
+            releaseCheck()
+            await starting
+            for (let i = 0; i < 100 && !connectStub.called; i++) {
+                await new Promise(resolve => setTimeout(resolve, 5))
+            }
+
+            expect(startedCwds()).to.deep.equal([folderPath])
+        })
+
+        it('does not start a server when its folder is replaced while the consent prompt is open', async () => {
+            const mgr = await buildMgr('prompt')
+            approvedFolders.set(folderPath, 'id-1')
+            showMessageStub.callsFake(async (params: any) => {
+                if (params.message.includes('workspace configuration file')) {
+                    folderIdentities.set(folderPath, 'id-2')
+                    return { title: 'Allow for this server' }
+                }
+                return new Promise(() => {})
+            })
+
+            await start(mgr, 'svc', { command: 'node', args: ['./server.js'], __configPath__: workspaceMcp })
+
+            expect(connectStub.called).to.be.false
+            expect(mgr.getServerState('svc')?.lastError).to.equal('Waiting for workspace trust')
+            expect(showMessageStub.lastCall.args[0].message).to.include('Start MCP servers in this folder')
+        })
+
+        it('does not start a server that failed to start again when the folders change', async () => {
+            const mgr = await buildMgr('trusted')
+            const close = running(mgr, 'svc', folderPath)
+            mgr.setState('svc', McpServerStatus.FAILED, 0, 'connect failed')
+            folders = [{ uri: otherUri }]
+
+            await mgr.onWorkspaceFoldersChanged()
+
+            expect(close.calledOnce).to.be.true
+            expect(connectStub.called).to.be.false
+            expect(mgr.stdioLaunchFolders.has('svc')).to.be.false
+            expect(mgr.getServerState('svc')?.lastError).to.equal('connect failed')
+        })
+
+        it('stops a server started in a trusted folder when the folder is no longer trusted, and starts it again once trusted', async () => {
+            const mgr = await buildMgr('trusted')
+            await start(mgr)
+            expect(startedCwds()).to.deep.equal([folderPath])
+            const close = sinon.stub().resolves()
+            mgr.clients.set('svc', { close })
+            mgr.mcpTools.push({ serverName: 'svc', toolName: 't', description: '', inputSchema: {} })
+
+            await mgr.setWorkspaceTrust('restricted')
+
+            expect(close.calledOnce).to.be.true
+            expect(mgr.clients.has('svc')).to.be.false
+            expect(mgr.getAllTools().some((t: any) => t.serverName === 'svc')).to.be.false
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.setWorkspaceTrust('trusted')
+
+            expect(startedCwds()).to.deep.equal([folderPath, folderPath])
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
+        it('reports why a server is held, and stops reporting it once the server starts', async () => {
+            const mgr = await buildMgr('restricted')
+            await start(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.setWorkspaceTrust('trusted')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
+        it('reports a declined folder, and a waiting folder again after declines are cleared', async () => {
+            const mgr = await buildMgr('prompt')
+            showMessageStub.onFirstCall().resolves({ title: "Don't allow" })
+            showMessageStub.onSecondCall().returns(new Promise(() => {}))
+            await start(mgr)
+            await settlePrompts(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('declined')
+
+            mgr.clearDeclinedFolders()
+            await start(mgr)
+
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+        })
+
+        it('does not report a hold for a server that is restarting', async () => {
+            const mgr = await buildMgr('restricted')
+            await start(mgr)
+            expect(mgr.getTrustHold('svc')).to.equal('waiting')
+
+            await mgr.holdServerUntilTrusted('svc', 'restarting')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+            expect(mgr.serversAwaitingTrust.has('svc')).to.be.true
+        })
+
+        it('does not report a hold for a removed server', async () => {
+            const mgr = await buildMgr('restricted')
+            sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+            await start(mgr)
+
+            await mgr.removeServer('svc')
+
+            expect(mgr.getTrustHold('svc')).to.be.undefined
+        })
+
+        it('starts a held server with the config as it is when it starts, not as it was when it was held', async () => {
+            const mgr = await buildMgr('restricted')
+            await start(mgr)
+            mgr.mcpServers.set('svc', { ...stdioCfg, args: ['-y', 'edited-server'] })
+
+            await mgr.setWorkspaceTrust('trusted')
+
+            expect(connectStub.getCalls().map(c => c.args[0]?._serverParams?.args)).to.deep.equal([
+                ['-y', 'edited-server'],
+            ])
+        })
     })
 })

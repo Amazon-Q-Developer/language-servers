@@ -12,6 +12,7 @@ import {
     MCPServerPermission,
     McpPermissionType,
     AgentConfig,
+    AgentResourceSource,
     McpRegistryData,
     isRegistryServerConfig,
 } from './mcpTypes'
@@ -232,6 +233,15 @@ const DEFAULT_PERSONA_RAW = `{
   }
 }`
 
+/** True for a file:// resource with an absolute path, such as file:///abs/path or file://C:/path */
+function isAbsoluteFileResource(resource: string): boolean {
+    if (!resource.startsWith('file://')) {
+        return false
+    }
+    const resourcePath = resource.slice('file://'.length)
+    return path.isAbsolute(resourcePath) || resourcePath.startsWith('/') || /^[a-zA-Z]:/.test(resourcePath)
+}
+
 /**
  * Load, validate, and parse agent configurations from JSON files.
  * - If both global and workspace files are missing, create a default global.
@@ -252,11 +262,14 @@ export async function loadAgentConfig(
     serverNameMapping: Map<string, string>
     errors: Map<string, string>
     agentConfig: AgentConfig
+    /** The agent configs that list each resource in agentConfig.resources */
+    resourceSources?: Map<string, AgentResourceSource>
 }> {
     // Initialize return values similar to loadMcpServerConfigs
     const servers = new Map<string, MCPServerConfig>()
     const serverNameMapping = new Map<string, string>()
     const configErrors = new Map<string, string>()
+    const resourceSources = new Map<string, AgentResourceSource>()
 
     // Create base agent config
     const agentConfig: AgentConfig = {
@@ -408,10 +421,27 @@ export async function loadAgentConfig(
             }
         }
 
-        // 5b) Process resources
+        // 5b) Process resources. Files outside the workspace can only come from the global config.
         if (Array.isArray(json.resources)) {
             for (const resource of json.resources) {
-                if (typeof resource === 'string' && !agentConfig.resources!.includes(resource)) {
+                if (typeof resource !== 'string') {
+                    continue
+                }
+                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                    logging.warn(
+                        `Ignoring absolute resource path ${JSON.stringify(resource)} in agent config at ${fsPath}. Add it to the global agent config instead.`
+                    )
+                    continue
+                }
+                // A resource from a workspace folder's agent config applies to that folder only
+                const source = resourceSources.get(resource) ?? { global: false, configPaths: [] }
+                if (fsPath === globalConfigPath) {
+                    source.global = true
+                } else if (!source.configPaths.includes(fsPath)) {
+                    source.configPaths.push(fsPath)
+                }
+                resourceSources.set(resource, source)
+                if (!agentConfig.resources!.includes(resource)) {
                     agentConfig.resources!.push(resource)
                 }
             }
@@ -664,6 +694,7 @@ export async function loadAgentConfig(
         serverNameMapping,
         errors: configErrors,
         agentConfig,
+        resourceSources,
     }
 }
 
@@ -1291,17 +1322,28 @@ export function findServerInRegistry(registry: McpRegistryData, serverName: stri
  * Create a namespaced tool name from server and tool names.
  * Handles truncation and conflicts according to specific rules.
  * Also stores the mapping from namespaced name back to original names.
+ *
+ * `reservedNames` holds names an MCP tool must never occupy (the built-in tool
+ * names). Without it an MCP server could advertise e.g. `fsRead` and win the
+ * bare name, so the request would be routed through the built-in permission
+ * branch instead of the MCP one.
  */
 export function createNamespacedToolName(
     serverName: string,
     toolName: string,
     allNamespacedTools: Set<string>,
-    toolNameMapping: Map<string, { serverName: string; toolName: string }>
+    toolNameMapping: Map<string, { serverName: string; toolName: string }>,
+    reservedNames: Set<string>
 ): string {
     // First, check if this server/tool combination already has a mapping
     // If it does, reuse that name to maintain consistency across reinitializations
     for (const [existingName, mapping] of toolNameMapping.entries()) {
         if (mapping.serverName === serverName && mapping.toolName === toolName) {
+            // Never reuse a stale mapping that points at a reserved built-in name.
+            if (reservedNames.has(existingName)) {
+                toolNameMapping.delete(existingName)
+                break
+            }
             // If the name is already in the set, it's already registered
             // If not, add it to the set
             if (!allNamespacedTools.has(existingName)) {
@@ -1314,8 +1356,13 @@ export function createNamespacedToolName(
     // Sanitize the tool name
     const sanitizedToolName = sanitizeName(toolName)
 
-    // First try to use just the tool name if it's not already in use and fits within length limit
-    if (sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(sanitizedToolName)) {
+    // First try to use just the tool name if it's not already in use, is not a
+    // reserved built-in name, and fits within length limit
+    if (
+        sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH &&
+        !allNamespacedTools.has(sanitizedToolName) &&
+        !reservedNames.has(sanitizedToolName)
+    ) {
         allNamespacedTools.add(sanitizedToolName)
         toolNameMapping.set(sanitizedToolName, { serverName, toolName })
         return sanitizedToolName
@@ -1326,7 +1373,7 @@ export function createNamespacedToolName(
     const fullName = `${serverName}${sep}${sanitizedToolName}`
 
     // If the full name fits and is unique, use it
-    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName)) {
+    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName) && !reservedNames.has(fullName)) {
         allNamespacedTools.add(fullName)
         toolNameMapping.set(fullName, { serverName, toolName })
         return fullName
@@ -1339,7 +1386,7 @@ export function createNamespacedToolName(
             const truncatedServer = serverName.substring(0, maxServerLength)
             const namespacedName = `${truncatedServer}${sep}${sanitizedToolName}`
 
-            if (!allNamespacedTools.has(namespacedName)) {
+            if (!allNamespacedTools.has(namespacedName) && !reservedNames.has(namespacedName)) {
                 allNamespacedTools.add(namespacedName)
                 toolNameMapping.set(namespacedName, { serverName, toolName })
                 return namespacedName
@@ -1367,7 +1414,7 @@ export function createNamespacedToolName(
             candidateName = `${truncatedTool}${suffix}`
         }
 
-        if (!allNamespacedTools.has(candidateName)) {
+        if (!allNamespacedTools.has(candidateName) && !reservedNames.has(candidateName)) {
             allNamespacedTools.add(candidateName)
             toolNameMapping.set(candidateName, { serverName, toolName })
             return candidateName

@@ -1,12 +1,20 @@
 import * as assert from 'assert'
 import * as fs from 'fs'
+import * as os from 'os'
 import * as path from 'path'
 import sinon from 'ts-sinon'
-import { hasAdditionalHardLinks, isPathApproved, requiresPathAcceptance, resolveSymlinkAwarePath } from './toolShared'
+import {
+    hasAdditionalHardLinks,
+    isPathApproved,
+    isRegularFile,
+    requiresPathAcceptance,
+    resolveSymlinkAwarePath,
+} from './toolShared'
 import { workspaceUtils } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import * as workspaceUtilsModule from '@aws/lsp-core/out/util/workspaceUtils'
 import { TestFeatures, createCheckedFileOperations } from '@aws/language-server-runtimes/testing'
+import { ChatSessionService } from '../../chat/chatSessionService'
 import { Context } from 'mocha'
 
 // Re-export isSensitivePath for testing via the module's internal function
@@ -27,6 +35,24 @@ describe('toolShared', () => {
             const filePath = '/test/path'
 
             assert.strictEqual(isPathApproved(filePath, 'testTool', approvedPaths), true)
+        })
+
+        it('matches an exact Windows file approval stored by the session', () => {
+            const session = new ChatSessionService()
+            const filePath = 'C:\\workspace\\notes.txt'
+            session.addApprovedPath(filePath, 'fsRead')
+            assert.ok(session.approvedPaths.get('fsRead')?.has('C:/workspace/notes.txt'))
+            assert.strictEqual(isPathApproved(filePath, 'fsRead', session.approvedPaths), true)
+            assert.strictEqual(isPathApproved(filePath, 'fsWrite', session.approvedPaths), false)
+            assert.strictEqual(isPathApproved('C:\\workspace\\other.txt', 'fsRead', session.approvedPaths), false)
+        })
+
+        it('matches an exact UNC file approval stored by the session', () => {
+            const session = new ChatSessionService()
+            const filePath = '\\\\server\\share\\notes.txt'
+            session.addApprovedPath(filePath, 'fsRead')
+            assert.ok(session.approvedPaths.get('fsRead')?.has('//server/share/notes.txt'))
+            assert.strictEqual(isPathApproved(filePath, 'fsRead', session.approvedPaths), true)
         })
 
         it('should return true if a path is a parent folder', () => {
@@ -383,7 +409,7 @@ describe('toolShared', () => {
         })
 
         it('should require acceptance for sensitive paths', async () => {
-            const filePath = '/home/user/.ssh/id_rsa'
+            const filePath = path.join(path.parse(process.cwd()).root, 'fixture-home', '.ssh', 'id_rsa')
 
             const result = await requiresPathAcceptance(
                 filePath,
@@ -395,6 +421,24 @@ describe('toolShared', () => {
             assert.strictEqual(result.requiresAcceptance, true)
             assert.ok(result.warning?.includes('sensitive system files'))
         })
+
+        for (const filePath of [
+            'C:\\Users\\developer\\.ssh\\id_rsa',
+            'C:\\Users\\developer\\.aws\\config',
+            'C:\\project\\.env',
+        ]) {
+            it(`should identify Windows-style sensitive path ${filePath}`, async () => {
+                const result = await requiresPathAcceptance(
+                    filePath,
+                    'testTool',
+                    mockWorkspace,
+                    mockLogging as unknown as Features['logging']
+                )
+
+                assert.strictEqual(result.requiresAcceptance, true)
+                assert.ok(result.warning?.includes('sensitive system files'))
+            })
+        }
 
         it('should require acceptance for paths with traversal that resolve to sensitive locations', async () => {
             // Path that looks workspace-relative but resolves to /etc via traversal
@@ -1092,30 +1136,53 @@ describe('toolShared', () => {
                 assert.strictEqual(result.requiresAcceptance, false)
             })
 
-            it('still honors a path the user has explicitly approved', async function (this: Context) {
+            it('still honors a file the user approved, as it was when approved', async function (this: Context) {
                 if (process.platform === 'win32') {
                     this.skip()
                     return
                 }
 
-                const approvedPaths = new Map([['fsWrite', new Set([fs.realpathSync(hardLinkInWorkspace)])]])
+                const canonicalPath = fs.realpathSync(hardLinkInWorkspace)
+                const approvedFile = await mockWorkspace.fs.checkedFiles!.capture(canonicalPath)
+                assert.strictEqual(approvedFile.state, 'existing')
                 const result = await requiresPathAcceptance(
                     hardLinkInWorkspace,
                     'fsWrite',
                     mockWorkspace,
                     mockLogging as unknown as Features['logging'],
-                    approvedPaths,
-                    { flagMultiplyLinkedFiles: 'modify' }
+                    new Map([['fsWrite', new Set([canonicalPath])]]),
+                    { flagMultiplyLinkedFiles: 'modify', approvedLinkedFiles: new Map([['fsWrite', [approvedFile]]]) }
                 )
 
                 assert.strictEqual(
                     result.requiresAcceptance,
                     false,
-                    'Approval short-circuits before the hard link check, so an allowed path is not re-prompted. ' +
-                        'This is only sound because the session records approvals the user actually granted ' +
+                    'An approved file is not asked about again while it is the same file. This is only sound ' +
+                        'because the session records approvals the user actually granted ' +
                         '(see agenticChatController), not every path a tool has touched.'
                 )
             })
+        })
+    })
+
+    describe('isRegularFile', () => {
+        let dir: string
+
+        beforeEach(async () => {
+            dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'regular-file-'))
+        })
+
+        afterEach(async () => {
+            await fs.promises.rm(dir, { recursive: true, force: true })
+        })
+
+        it('is true for a file and false for a directory or a missing path', async () => {
+            const file = path.join(dir, 'a.txt')
+            await fs.promises.writeFile(file, 'a')
+
+            assert.strictEqual(await isRegularFile(file), true)
+            assert.strictEqual(await isRegularFile(dir), false)
+            assert.strictEqual(await isRegularFile(path.join(dir, 'missing.txt')), false)
         })
     })
 
