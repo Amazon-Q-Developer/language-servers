@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.0.134](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.133...lsp-codewhisperer/v0.0.134) (2026-11-12)
+
+
+### Bug Fixes
+
+* address security issues ([#3041](https://github.com/Amazon-Q-Developer/language-servers/issues/3041)) ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+* **amazonq:** stricter checks for chat file links and configuration files ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+
+## [0.0.133](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.132...lsp-codewhisperer/v0.0.133) (2026-10-28)
+
+
+### Features
+
+* AWS Transform: IAM (SigV4) authentication in the language server ([#2948](https://github.com/Amazon-Q-Developer/language-servers/issues/2948)) ([725370f](https://github.com/Amazon-Q-Developer/language-servers/commit/725370f905a32da661b59bbdd7ea31718b8a1936))
+
+## [0.0.132](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.131...lsp-codewhisperer/v0.0.132) (2026-10-21)
+
+
+### Bug Fixes
+
+* mcp and path resolver ([#2957](https://github.com/Amazon-Q-Developer/language-servers/issues/2957)) ([96372c0](https://github.com/Amazon-Q-Developer/language-servers/commit/96372c0e11a85404dbff254f334d38fd21e9b13f))
+
 ## [0.0.131](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.130...lsp-codewhisperer/v0.0.131) (2026-10-15)
 
 
