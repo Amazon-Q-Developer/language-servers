@@ -33,7 +33,12 @@ import { Features } from '../../types'
 import { ChatDatabase } from '../tools/chatDb/chatDb'
 import { ChatMessage, ImageBlock, ImageFormat } from '@amzn/codewhisperer-streaming'
 import { getRelativePathWithUri, getRelativePathWithWorkspaceFolder } from '../../workspaceContext/util'
-import { isSupportedImageExtension, MAX_IMAGE_CONTEXT_COUNT } from '../../../shared/imageVerification'
+import {
+    isFileSizeValid,
+    isSupportedImageExtension,
+    MAX_IMAGE_CONTEXT_COUNT,
+    verifyServerImage,
+} from '../../../shared/imageVerification'
 import { MemoryBankController } from './memorybank/memoryBankController'
 import { canonicalizeWorkspaceFolders, hasAdditionalHardLinks, resolveSymlinkAwarePath } from '../tools/toolShared'
 import type { AgentResourceSource } from '../tools/mcp/mcpTypes'
@@ -820,6 +825,8 @@ export class AdditionalContextProvider {
     /**
      * Extracts image blocks from a context array, reading image files and returning them as ImageBlock objects.
      * Optionally, appends pinned image context from chatDb for the given tabId.
+     * An image is left out unless it passes the same checks as an image picked in the file dialog. A file is not
+     * read when it is larger than the image size limit.
      * @param contextArr The context array to extract image blocks from.
      * @param tabId Optional tabId to fetch pinned image context from chatDb.
      */
@@ -834,42 +841,51 @@ export class AdditionalContextProvider {
             if (context.label === 'image' && context.route && context.route.length > 0) {
                 try {
                     const imagePath = context.route[0]
-                    let format = imagePath.split('.').pop()?.toLowerCase() || ''
-                    // Both .jpg and .jpeg files use the exact same JPEG compression algorithm and file structure.
-                    if (format === 'jpg') {
-                        format = 'jpeg'
-                    }
-                    if (!isSupportedImageExtension(format)) {
-                        this.features.logging.warn(`Unsupported image format: ${format}`)
+                    const extension = imagePath.split('.').pop()?.toLowerCase() || ''
+                    if (!isSupportedImageExtension(extension)) {
+                        this.features.logging.warn(`Unsupported image format: ${extension}`)
                         continue
                     }
+                    let imageBuffer: Buffer | undefined
                     if ('content' in context && context.content) {
-                        // Validate content has actual byte data before creating Uint8Array
+                        // Validate content has actual byte data before creating a buffer
                         // After JSON deserialization, Uint8Array becomes plain object with numeric keys
                         const values = Object.values(context.content)
                         if (values.length > 0 && values.every((v): v is number => typeof v === 'number')) {
-                            imageBlocks.push({
-                                format: format as ImageFormat,
-                                source: {
-                                    bytes: new Uint8Array(values),
-                                },
-                            })
+                            imageBuffer = Buffer.from(values)
+                        } else {
+                            // Invalid content data, fall through to read from file
+                            this.features.logging.warn(
+                                `Invalid image content data for ${imagePath}, attempting to read from file`
+                            )
+                        }
+                    }
+                    if (!imageBuffer) {
+                        const { size } = await this.features.workspace.fs.getFileSize(imagePath)
+                        if (!isFileSizeValid(size)) {
+                            this.features.logging.warn(`Image file is too large to add as context: ${imagePath}`)
                             continue
                         }
-                        // Invalid content data, fall through to read from file
-                        this.features.logging.warn(
-                            `Invalid image content data for ${imagePath}, attempting to read from file`
-                        )
+                        const fileContent = await this.features.workspace.fs.readFile(imagePath, {
+                            encoding: 'binary',
+                        })
+                        imageBuffer = Buffer.from(fileContent, 'binary')
                     }
-                    const fileContent = await this.features.workspace.fs.readFile(imagePath, {
-                        encoding: 'binary',
-                    })
-                    const imageBuffer = Buffer.from(fileContent, 'binary')
-                    const imageBytes = new Uint8Array(imageBuffer)
+                    const verification = await verifyServerImage(
+                        path.basename(imagePath),
+                        imageBuffer.length,
+                        imageBuffer
+                    )
+                    if (!verification.isValid || !verification.format) {
+                        this.features.logging.warn(
+                            `Image not added as context: ${verification.errors[0] ?? path.basename(imagePath)}`
+                        )
+                        continue
+                    }
                     imageBlocks.push({
-                        format: format as ImageFormat,
+                        format: verification.format as ImageFormat,
                         source: {
-                            bytes: imageBytes,
+                            bytes: new Uint8Array(imageBuffer),
                         },
                     })
                 } catch (err) {
