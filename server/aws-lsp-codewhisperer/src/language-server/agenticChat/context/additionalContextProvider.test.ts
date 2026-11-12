@@ -14,6 +14,7 @@ import { ChatDatabase } from '../tools/chatDb/chatDb'
 import { AgentResourceSource } from '../tools/mcp/mcpTypes'
 import { TriggerContext, workspaceChunkMaxSize } from './agenticChatTriggerContext'
 import { expect } from 'chai'
+import { DEFAULT_IMAGE_VERIFICATION_OPTIONS } from '../../../shared/imageVerification'
 
 describe('AdditionalContextProvider', () => {
     let provider: AdditionalContextProvider
@@ -1303,5 +1304,134 @@ describe('AdditionalContextProvider', () => {
             assert.strictEqual(result[0].rules[0].active, true) // Explicitly set to true
             assert.strictEqual(result[0].rules[1].active, false) // Explicitly set to false
         })
+    })
+})
+
+describe('AdditionalContextProvider getImageBlocksFromContext', () => {
+    const { maxSizeBytes } = DEFAULT_IMAGE_VERIFICATION_OPTIONS
+    let testFeatures: TestFeatures
+    let provider: AdditionalContextProvider
+    let getFileSizeStub: sinon.SinonStub
+    let readFileStub: sinon.SinonStub
+
+    // Smallest headers that image-size reads the format and dimensions from
+    function png(width: number, height: number): Buffer {
+        const image = Buffer.alloc(33)
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(image, 0)
+        image.writeUInt32BE(13, 8)
+        image.write('IHDR', 12, 'ascii')
+        image.writeUInt32BE(width, 16)
+        image.writeUInt32BE(height, 20)
+        return image
+    }
+
+    function gif(width: number, height: number): Buffer {
+        const image = Buffer.alloc(16)
+        image.write('GIF89a', 0, 'ascii')
+        image.writeUInt16LE(width, 6)
+        image.writeUInt16LE(height, 8)
+        return image
+    }
+
+    function bmp(width: number, height: number): Buffer {
+        const image = Buffer.alloc(32)
+        image.write('BM', 0, 'ascii')
+        image.writeInt32LE(width, 18)
+        image.writeInt32LE(height, 22)
+        return image
+    }
+
+    const imageContext = (route: string, content?: Buffer) =>
+        ({
+            label: 'image',
+            description: path.basename(route),
+            route: [route],
+            ...(content ? { content: { ...Array.from(content) } } : {}),
+        }) as any
+
+    beforeEach(() => {
+        testFeatures = new TestFeatures()
+        getFileSizeStub = sinon.stub()
+        readFileStub = sinon.stub()
+        testFeatures.workspace.fs.getFileSize = getFileSizeStub
+        testFeatures.workspace.fs.readFile = readFileStub
+        const chatDb = { getPinnedContext: sinon.stub().returns([]) } as unknown as ChatDatabase
+        provider = new AdditionalContextProvider(testFeatures, chatDb)
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    const fileOnDisk = (content: Buffer, size = content.length) => {
+        getFileSizeStub.resolves({ size })
+        readFileStub.resolves(content.toString('binary'))
+    }
+
+    it('sends an image file with the format read from its content', async () => {
+        const image = png(10, 20)
+        fileOnDisk(image)
+
+        const blocks = await provider.getImageBlocksFromContext([imageContext('/images/photo.jpg')])
+
+        assert.strictEqual(blocks.length, 1)
+        assert.strictEqual(blocks[0].format, 'png')
+        assert.deepStrictEqual(Buffer.from(blocks[0].source!.bytes!), image)
+    })
+
+    it('leaves out a file that is not an image', async () => {
+        fileOnDisk(Buffer.from('not an image'))
+
+        const blocks = await provider.getImageBlocksFromContext([imageContext('/images/photo.png')])
+
+        assert.deepStrictEqual(blocks, [])
+        sinon.assert.calledWithMatch(
+            testFeatures.logging.warn as unknown as sinon.SinonStub,
+            'Image not added as context'
+        )
+    })
+
+    it('does not read a file over the size limit', async () => {
+        fileOnDisk(png(10, 20), maxSizeBytes + 1)
+
+        const blocks = await provider.getImageBlocksFromContext([imageContext('/images/photo.png')])
+
+        assert.deepStrictEqual(blocks, [])
+        sinon.assert.notCalled(readFileStub)
+    })
+
+    it('sends image content from the client with the format read from it', async () => {
+        const image = gif(10, 20)
+
+        const blocks = await provider.getImageBlocksFromContext([imageContext('/images/photo.png', image)])
+
+        assert.strictEqual(blocks.length, 1)
+        assert.strictEqual(blocks[0].format, 'gif')
+        assert.deepStrictEqual(Buffer.from(blocks[0].source!.bytes!), image)
+        sinon.assert.notCalled(readFileStub)
+    })
+
+    it('leaves out content from the client that is not an image', async () => {
+        const blocks = await provider.getImageBlocksFromContext([
+            imageContext('/images/photo.png', Buffer.from('not an image')),
+        ])
+
+        assert.deepStrictEqual(blocks, [])
+        sinon.assert.notCalled(readFileStub)
+    })
+
+    it('keeps the valid images when another one is left out', async () => {
+        const image = png(10, 20)
+        getFileSizeStub.resolves({ size: image.length })
+        readFileStub.withArgs('/images/a.png').resolves(Buffer.from('not an image').toString('binary'))
+        readFileStub.withArgs('/images/b.png').resolves(image.toString('binary'))
+
+        const blocks = await provider.getImageBlocksFromContext([
+            imageContext('/images/a.png'),
+            imageContext('/images/b.png'),
+        ])
+
+        assert.strictEqual(blocks.length, 1)
+        assert.deepStrictEqual(Buffer.from(blocks[0].source!.bytes!), image)
     })
 })
