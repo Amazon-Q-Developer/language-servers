@@ -6246,3 +6246,86 @@ describe('ATXTransformHandler - isRepoLbvOpen: repo node terminal with no LBV ch
         expect(isOpen(plan)).to.be.true
     })
 })
+
+describe('ATXTransformHandler - source files manifest skips directories', () => {
+    let handler: ATXTransformHandler
+    let tmpRoot: string
+
+    beforeEach(() => {
+        const serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        const logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        handler = new ATXTransformHandler(serviceManager, {} as Workspace, logging, {} as Runtime)
+        tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-manifest-dirs-'))
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(tmpRoot, { recursive: true, force: true })
+    })
+
+    function readManifest(jobId: string): any {
+        const p = path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+        return JSON.parse(fs.readFileSync(p, 'utf-8'))
+    }
+
+    it('leaves a Web Site folder out of source-files.json and keeps its files', () => {
+        // A Web Site project's ProjectPath is its folder; listed as a file it shows up as a
+        // modified file and breaks the review uplink zip.
+        const site = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(path.join(site, 'App_Code'), { recursive: true })
+        const page = path.join(site, 'Default.aspx')
+        fs.writeFileSync(page, '<%@ Page %>')
+        const lib = path.join(tmpRoot, 'Lib', 'Lib.csproj')
+        fs.mkdirSync(path.dirname(lib), { recursive: true })
+        fs.writeFileSync(lib, '<Project />')
+        const sln = path.join(tmpRoot, 'App.sln')
+        fs.writeFileSync(sln, '')
+        ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+            ProjectMetadata: [
+                { ProjectPath: site, SourceCodeFilePaths: [page, path.join(site, 'App_Code')] },
+                { ProjectPath: lib, SourceCodeFilePaths: [] },
+            ],
+            SolutionFilePath: sln,
+        })
+
+        const files: string[] = readManifest('job-1').sourceFiles
+        expect(files).to.include.members([page, lib, sln])
+        expect(files).to.not.include(site)
+        expect(files).to.not.include(path.join(site, 'App_Code'))
+    })
+
+    it('does not add a directory when a checkpoint lists one', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'New.aspx'), '')
+        ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-2', { ProjectMetadata: [] })
+        ;(handler as any).updateSourceFilesManifest(tmpRoot, 'job-2', ['WebSite1', path.join('WebSite1', 'New.aspx')])
+
+        const files: string[] = readManifest('job-2').sourceFiles
+        expect(files).to.deep.equal([path.join(tmpRoot, 'WebSite1', 'New.aspx')])
+    })
+
+    it('never reports a directory as modified, also from a manifest written before the skip', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        const page = path.join(dir, 'Default.aspx')
+        fs.writeFileSync(page, '')
+        const checkpointsDir = path.join(tmpRoot, workspaceFolderName, 'job-3', 'checkpoints')
+        fs.mkdirSync(checkpointsDir, { recursive: true })
+        const past = new Date(Date.now() - 60_000)
+        fs.writeFileSync(
+            path.join(checkpointsDir, 'source-files.json'),
+            JSON.stringify({
+                createdAt: past.toISOString(),
+                lastAppliedTimestamp: past.getTime(),
+                sourceFiles: [dir, page],
+            })
+        )
+        // Both the folder and the page change after the baseline.
+        fs.writeFileSync(path.join(dir, 'Added.aspx'), '')
+        fs.writeFileSync(page, 'changed')
+
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3')).to.deep.equal([page])
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3', true)).to.deep.equal([page])
+    })
+})

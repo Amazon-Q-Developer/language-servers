@@ -3985,6 +3985,15 @@ export class ATXTransformHandler {
         }
     }
 
+    /** True when *p* exists and is a directory; a missing or unreadable path is not one. */
+    private isDirectory(p: string): boolean {
+        try {
+            return fs.statSync(p).isDirectory()
+        } catch {
+            return false
+        }
+    }
+
     /**
      * Writes a manifest of source files to the checkpoints folder for tracking changes.
      * Creates source-files.json containing all source code file paths from the transformation request.
@@ -4030,17 +4039,21 @@ export class ATXTransformHandler {
                 }
             }
 
+            // A Web Site project's ProjectPath (and any folder a request lists) is a directory,
+            // not a file: listed here it would show up as a modified file and break the uplink zip.
+            const files = sourceFiles.filter(p => !this.isDirectory(p))
+
             const manifest = {
                 jobId: jobId,
                 solutionRootPath: solutionRootPath,
                 createdAt: new Date().toISOString(),
-                sourceFiles: sourceFiles,
+                sourceFiles: files,
             }
 
             const manifestPath = path.join(checkpointsDir, 'source-files.json')
             fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
 
-            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${sourceFiles.length} files`)
+            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${files.length} files`)
         } catch (error) {
             this.logging.error(`ATX: Failed to write source files manifest: ${String(error)}`)
         }
@@ -4073,7 +4086,7 @@ export class ATXTransformHandler {
 
             for (const relativePath of newFiles) {
                 const absolutePath = path.join(solutionRootPath, relativePath)
-                if (!existingFiles.has(absolutePath)) {
+                if (!existingFiles.has(absolutePath) && !this.isDirectory(absolutePath)) {
                     manifest.sourceFiles.push(absolutePath)
                     existingFiles.add(absolutePath)
                     addedCount++
@@ -4161,7 +4174,9 @@ export class ATXTransformHandler {
                 try {
                     if (fs.existsSync(filePath)) {
                         const stats = fs.statSync(filePath)
-                        if (stats.mtimeMs > baseline) {
+                        // A directory is never a modified file; a manifest written before
+                        // directories were skipped can still list one.
+                        if (!stats.isDirectory() && stats.mtimeMs > baseline) {
                             modifiedFiles.push(filePath)
                         }
                     }
