@@ -23,6 +23,9 @@ export interface StartTransformRequest extends ExecuteCommandParams {
     TransformNetStandardProjects: boolean
     EnableRazorViewTransform: boolean
     EnableWebFormsTransform: boolean
+    // Customer's up-front unit-test choice, forwarded to the ATX job objective as
+    // `generate_unit_tests`. Optional: absent means "no choice sent" (legacy behavior).
+    GenerateUnitTests?: boolean
     PackageReferences?: PackageReferenceMetadata[]
     DmsArn?: string
     DatabaseSettings?: DatabaseSettings
