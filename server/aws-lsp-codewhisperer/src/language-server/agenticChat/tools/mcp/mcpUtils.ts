@@ -1432,7 +1432,9 @@ export function restoreServerScopedPermissions(
     pendingServerTools: Map<string, Set<string>>,
     pendingServerAllowedTools: Map<string, Set<string>>
 ): void {
-    const globalPath = path.normalize(globalAgentConfigPath)
+    // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
+    const key = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
+    const globalPath = key(globalAgentConfigPath)
 
     // Mirrors the agent path McpManager derives when saving a server's permissions.
     const permissionFileFor = (cfg: MCPServerConfig | undefined): string | undefined => {
@@ -1441,9 +1443,9 @@ export function restoreServerScopedPermissions(
             return undefined
         }
         const p = path.normalize(cfgPath)
-        return p.endsWith(path.sep + 'mcp.json')
-            ? p.slice(0, -'mcp.json'.length) + path.join('agents', 'default.json')
-            : p
+        return key(
+            p.endsWith(path.sep + 'mcp.json') ? p.slice(0, -'mcp.json'.length) + path.join('agents', 'default.json') : p
+        )
     }
 
     const applies = (entry: string, sources: Set<string>): boolean => {
@@ -1453,7 +1455,7 @@ export function restoreServerScopedPermissions(
             }
             const owner = permissionFileFor(servers.get(sanitized))
             for (const source of sources) {
-                const src = path.normalize(source)
+                const src = key(source)
                 if (src === globalPath || src === owner) {
                     return true
                 }

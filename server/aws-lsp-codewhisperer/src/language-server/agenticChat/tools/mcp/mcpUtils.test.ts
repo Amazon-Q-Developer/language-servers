@@ -1696,6 +1696,25 @@ describe('restoreServerScopedPermissions()', () => {
 
         expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
     })
+
+    it('matches config paths that differ only in drive-letter case on Windows', function () {
+        if (process.platform !== 'win32') {
+            this.skip()
+        }
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt('d:\\ws\\.amazonq\\mcp.json', 'srv'),
+            globalAgentPath,
+            new Map(),
+            fromFile('D:\\ws\\.amazonq\\agents\\default.json', '@srv/tool')
+        )
+
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
 })
 
 describe('isPermissionForServer()', () => {
