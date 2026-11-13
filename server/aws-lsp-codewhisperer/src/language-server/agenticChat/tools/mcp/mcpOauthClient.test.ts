@@ -991,7 +991,7 @@ describe('OAuthClient getValidAccessToken()', () => {
         expect(metaWrite!.args[1]).to.deep.equal(discovered)
     })
 
-    it('pins the discovered endpoints after an interactive refresh-token sign-in', async () => {
+    describe('interactive refresh', () => {
         const expiredToken = {
             access_token: 'expired',
             expires_in: 1,
@@ -1003,34 +1003,115 @@ describe('OAuthClient getValidAccessToken()', () => {
             client_secret: 'csecret',
             redirect_uri: 'http://localhost:12345/oauth/callback',
         }
-        stubFileSystem(expiredToken, cachedReg)
-        const meta = {
-            authorization_endpoint: 'https://auth.example.com/authorize',
-            token_endpoint: 'https://auth.example.com/token',
-            registration_endpoint: 'https://auth.example.com/register',
+        const pinnedMeta = {
+            authorization_endpoint: 'https://pinned.example.com/authorize',
+            token_endpoint: 'https://pinned.example.com/token',
         }
-        sinon.stub(OAuthClient as any, 'discoverAS').resolves(meta)
-        sinon.stub(OAuthClient as any, 'obtainClient').resolves({
-            client_id: 'cid',
-            client_secret: 'csecret',
-            redirect_uri: 'http://localhost:12345/oauth/callback',
-        })
-        sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
-            access_token: 'refreshed_access',
-            expires_in: 3600,
-            obtained_at: Date.now(),
-        })
-        const pkce = sinon.stub(OAuthClient as any, 'pkceGrant')
-        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+            registration_endpoint: 'https://discovered.example.com/register',
+        }
+        const browserToken = { access_token: 'browser_access', expires_in: 3600, obtained_at: now }
 
-        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
-            interactive: true,
+        function stubDisk(meta: unknown, reg: unknown = cachedReg): void {
+            sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+                if (String(file).endsWith('.token.json')) return expiredToken
+                if (String(file).endsWith('.registration.json')) return reg
+                if (String(file).endsWith('.meta.json')) return meta
+                return undefined
+            })
+        }
+
+        function pinsWritten(write: sinon.SinonStub): unknown[] {
+            return write
+                .getCalls()
+                .filter((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+                .map((c: sinon.SinonSpyCall) => c.args[1])
+        }
+
+        function signIn(): Promise<string | undefined> {
+            return OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), { interactive: true })
+        }
+
+        it('refreshes with the pinned endpoints, does not run discovery, and keeps the pin', async () => {
+            stubDisk(pinnedMeta)
+            const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+                access_token: 'refreshed_access',
+                expires_in: 3600,
+                obtained_at: now,
+            })
+            const pkce = sinon.stub(OAuthClient as any, 'pkceGrant')
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('refreshed_access')
+            expect(discover.called).to.be.false
+            expect(pkce.called).to.be.false
+            expect(refresh.calledOnce).to.be.true
+            expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+            expect(refresh.firstCall.args[1]).to.deep.equal(cachedReg)
+            expect(pinsWritten(write)).to.deep.equal([])
         })
 
-        expect(token).to.equal('refreshed_access')
-        expect(pkce.called).to.be.false
-        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
-        expect(metaWrite, 'the interactive refresh path should pin the endpoints').to.not.be.undefined
-        expect(metaWrite!.args[1]).to.deep.equal(meta)
+        it('does not send the refresh token when no endpoints were pinned, and pins after the browser sign-in', async () => {
+            stubDisk(undefined)
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant')
+            const pkce = sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(refresh.called).to.be.false
+            expect(pkce.firstCall.args[0]).to.deep.equal(discovered)
+            expect(pinsWritten(write)).to.deep.equal([discovered])
+        })
+
+        it('does not send the refresh token to a pinned token endpoint that is not secure', async () => {
+            stubDisk({ token_endpoint: 'http://evil.example.com/token' })
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(fetchStub.called).to.be.false
+            expect(pinsWritten(write)).to.deep.equal([discovered])
+        })
+
+        it('does not send the refresh token when no client registration is saved', async () => {
+            stubDisk(pinnedMeta, null)
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant')
+            sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(refresh.called).to.be.false
+        })
+
+        for (const [failure, outcome] of [
+            ['is rejected', () => Promise.resolve(undefined)],
+            ['throws', () => Promise.reject(new Error('connection reset'))],
+        ] as const) {
+            it(`signs in in the browser and re-pins when the refresh with the pinned endpoints ${failure}`, async () => {
+                stubDisk(pinnedMeta)
+                sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+                sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+                const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').callsFake(outcome)
+                const pkce = sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+                const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+                expect(await signIn()).to.equal('browser_access')
+                // The refresh token went to the pinned token endpoint only, never to a discovered one
+                expect(refresh.callCount).to.equal(1)
+                expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+                expect(pkce.firstCall.args[0]).to.deep.equal(discovered)
+                expect(pinsWritten(write)).to.deep.equal([discovered])
+            })
+        }
     })
 })

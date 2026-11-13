@@ -645,15 +645,23 @@ After this change:
 - Discovery skips an authorization server or a `resource_metadata` link that fails the check, and tries
   the next discovery step. An authorization endpoint or a registration endpoint that fails the check
   stops the sign-in with an error, and the browser does not open.
-- After an interactive sign-in, the server saves the endpoints that it used in
+- After a sign-in in the browser, the server saves the endpoints that it used in
   `~/.aws/sso/cache/<key>.meta.json`, next to the cached token. A silent refresh uses the saved token
   endpoint and does not find the endpoints again. When no endpoints are saved, for example after a
   sign-in with an earlier version, or when the saved token endpoint fails the check, the silent refresh
   finds the endpoints again and saves them after the refresh succeeds.
-- Not covered: when the user adds, installs or edits a server and has no valid cached token, the server
-  signs in interactively and finds the endpoints again. Before it opens the browser, it tries the saved
-  refresh token, if there is one, with the token endpoint that it found. Then it saves the new
-  endpoints.
+- When the user adds, installs or edits a server and has no valid cached token, the server signs in
+  interactively. Before it opens the browser, it tries the saved refresh token with the saved token
+  endpoint and the saved client registration, and does not find the endpoints again for this. It does
+  not send the refresh token when no endpoints or no client registration are saved, or when the saved
+  token endpoint fails the check. When the refresh succeeds, the saved endpoints stay as they are. When
+  the refresh fails or is skipped, the server finds the endpoints again, opens the browser, and saves
+  the endpoints that it found only after the sign-in in the browser succeeds. Before this change, the
+  interactive sign-in found the endpoints first, sent the refresh token to the token endpoint that it
+  found, and saved those endpoints.
+- Not covered: a silent refresh with no saved endpoints, for example the first refresh after a sign-in
+  with an earlier version, still finds the endpoints and sends the refresh token to the token endpoint
+  that it found.
 
 ### How to test
 
@@ -670,7 +678,12 @@ npx ts-mocha --timeout 0 --exit src/language-server/agenticChat/tools/mcp/mcpOau
 - The suites "OAuthClient.discoverAS()", "OAuthClient.fetchASFromResourceMeta()" and
   "OAuthClient.obtainClient()" check that the server sends no request to an authorization server, a
   `resource_metadata` link or a registration endpoint that fails the check.
-- The suite "OAuthClient getValidAccessToken()" checks that the server saves the endpoints after an
-  interactive sign-in, and that a silent refresh uses the saved token endpoint. It also checks that a
+- The suite "OAuthClient getValidAccessToken()" checks that the server saves the endpoints after a
+  sign-in in the browser, and that a silent refresh uses the saved token endpoint. It also checks that a
   silent refresh finds the endpoints again, and saves them, when no endpoints are saved or the saved
   token endpoint fails the check.
+- Its suite "interactive refresh" checks that an interactive sign-in sends the refresh token only to
+  the saved token endpoint, with the saved client registration, and keeps the saved endpoints after the
+  refresh. It checks that the refresh token is not sent when no endpoints or no client registration are
+  saved or the saved token endpoint fails the check, and that the endpoints found for the browser
+  sign-in are saved only after that sign-in, also when the refresh is rejected or throws.

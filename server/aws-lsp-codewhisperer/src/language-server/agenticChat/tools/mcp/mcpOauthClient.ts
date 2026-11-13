@@ -134,6 +134,23 @@ export class OAuthClient {
                 }
             }
 
+            // Try the refresh token before opening a browser, but only with the endpoints and the client
+            // registration of the last sign-in. Discovery results come from the server, so sending the refresh
+            // token to a token endpoint that discovery finds now would let the server take the token.
+            if (cached?.refresh_token) {
+                const refreshed = await this.refreshWithPinnedEndpoints(
+                    metaPath,
+                    regPath,
+                    mcpBase,
+                    cached.refresh_token
+                )
+                if (refreshed) {
+                    await this.write(tokPath, refreshed)
+                    this.logger.info('OAuth: refresh grant succeeded')
+                    return refreshed.access_token
+                }
+            }
+
             const meta = await this.discoverAS(mcpBase)
 
             // Use scopes from discovery metadata, fall back to OIDC defaults
@@ -144,18 +161,7 @@ export class OAuthClient {
 
             const reg = await this.obtainClient(meta, regPath, scopes, redirectUri)
 
-            // Try refresh-token grant first
-            if (cached?.refresh_token) {
-                const refreshed = await this.refreshGrant(meta, reg, mcpBase, cached.refresh_token)
-                if (refreshed) {
-                    await this.write(tokPath, refreshed)
-                    await this.write(metaPath, meta)
-                    this.logger.info('OAuth: refresh grant succeeded')
-                    return refreshed.access_token
-                }
-            }
-
-            // PKCE interactive flow
+            // PKCE flow in the browser. The endpoints found now are pinned only after it succeeds.
             const fresh = await this.pkceGrant(meta, reg, mcpBase, scopes, redirectUri, server)
             await this.write(tokPath, fresh)
             await this.write(metaPath, meta)
@@ -186,24 +192,66 @@ export class OAuthClient {
      *
      * Returns `pinned` so the caller can migrate a legacy token by pinning the
      * endpoints that just worked. A legitimately rotated token endpoint is
-     * recovered on the next interactive sign-in, which re-pins.
+     * recovered on the next sign-in in the browser, which re-pins.
      */
     private static async pinnedOrDiscoveredMeta(
         metaPath: string,
         mcpBase: URL
     ): Promise<{ meta: Meta; pinned: boolean }> {
-        const pinned = await this.read<Meta>(metaPath)
-        if (pinned?.token_endpoint) {
-            try {
-                this.validateTokenEndpoint(pinned.token_endpoint)
-                return { meta: pinned, pinned: true }
-            } catch (e) {
-                this.logger.warn(
-                    `OAuth: ignoring invalid pinned token endpoint — ${e instanceof Error ? e.message : String(e)}`
-                )
-            }
+        const pinned = await this.readPinnedMeta(metaPath)
+        if (pinned) {
+            return { meta: pinned, pinned: true }
         }
         return { meta: await this.discoverAS(mcpBase), pinned: false }
+    }
+
+    /**
+     * The endpoints pinned at the last sign-in, or undefined when none were pinned (a token cached before
+     * pinning existed) or when the pinned token endpoint is not secure.
+     */
+    private static async readPinnedMeta(metaPath: string): Promise<Meta | undefined> {
+        const pinned = await this.read<Meta>(metaPath)
+        if (!pinned?.token_endpoint) {
+            return undefined
+        }
+        try {
+            this.validateTokenEndpoint(pinned.token_endpoint)
+            return pinned
+        } catch (e) {
+            this.logger.warn(
+                `OAuth: ignoring invalid pinned token endpoint — ${e instanceof Error ? e.message : String(e)}`
+            )
+            return undefined
+        }
+    }
+
+    /**
+     * One refresh_token grant for an interactive sign-in, with the pinned endpoints and the client registration on
+     * disk only. Returns undefined, and sends nothing, when no valid endpoints were pinned or no registration is
+     * saved. Also returns undefined when the grant fails, so that the caller signs in in the browser instead.
+     * Unlike a silent refresh, this never falls back to discovery: the browser sign-in that follows re-pins the
+     * endpoints, so a token cached before pinning existed does not need to be sent to discovered endpoints.
+     */
+    private static async refreshWithPinnedEndpoints(
+        metaPath: string,
+        regPath: string,
+        mcpBase: URL,
+        refreshToken: string
+    ): Promise<Token | undefined> {
+        const pinned = await this.readPinnedMeta(metaPath)
+        const reg = await this.read<Registration>(regPath)
+        if (!pinned || !reg) {
+            this.logger.info('OAuth: no pinned endpoints or client registration; skipping the refresh grant')
+            return undefined
+        }
+        try {
+            return await this.refreshGrant(pinned, reg, mcpBase, refreshToken)
+        } catch (e) {
+            this.logger.warn(
+                `OAuth: refresh grant with the pinned endpoints failed — ${e instanceof Error ? e.message : String(e)}`
+            )
+            return undefined
+        }
     }
 
     /**
