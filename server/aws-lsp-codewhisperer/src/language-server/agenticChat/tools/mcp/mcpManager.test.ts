@@ -10,6 +10,10 @@ import * as mcpUtils from './mcpUtils'
 import { McpPermissionType, McpServerStatus, type MCPServerConfig, type MCPServerPermission } from './mcpTypes'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import { pathToFileURL } from 'url'
 
 const fakeLogging = {
     log: () => {},
@@ -3144,5 +3148,130 @@ describe('workspace trust for stdio MCP servers', () => {
                 ['-y', 'edited-server'],
             ])
         })
+    })
+})
+
+describe('Always Allow persists across a restart', () => {
+    let tmpDir: string
+    let wsRoot: string
+    let roundTripFeatures: any
+
+    const writeJson = (p: string, value: unknown) => {
+        fs.mkdirSync(path.dirname(p), { recursive: true })
+        fs.writeFileSync(p, JSON.stringify(value))
+    }
+
+    const agentPaths = () => [
+        path.join(wsRoot, '.amazonq', 'agents', 'default.json'),
+        mcpUtils.getGlobalAgentConfigPath(tmpDir),
+    ]
+
+    const loadManager = async () => {
+        const mgr = await McpManager.init(agentPaths(), roundTripFeatures)
+        await mgr.discoverAllServers()
+        return mgr
+    }
+
+    // Sets Always Allow the way the MCP permission UI does, restarts, and returns the reloaded manager.
+    const allowAndRestart = async (serverName: string) => {
+        const mgr = await loadManager()
+        expect(mgr.requiresApproval(serverName, 'tool1')).to.be.true
+        await mgr.updateServerPermission(serverName, {
+            enabled: true,
+            toolPerms: { tool1: McpPermissionType.alwaysAllow },
+            __configPath__: mgr.getAllServerConfigs().get(serverName)?.__configPath__,
+        })
+        expect(mgr.requiresApproval(serverName, 'tool1')).to.be.false
+        await mgr.close()
+        return loadManager()
+    }
+
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcpPermRoundTrip-'))
+        wsRoot = path.join(tmpDir, 'ws')
+        fs.mkdirSync(wsRoot, { recursive: true })
+        roundTripFeatures = {
+            ...features,
+            workspace: {
+                fs: {
+                    exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                    readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                    writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
+                    mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts?.recursive })),
+                    getUserHomeDir: () => tmpDir,
+                },
+                getUserHomeDir: () => tmpDir,
+                getAllWorkspaceFolders: () => [{ uri: pathToFileURL(wsRoot).href, name: 'ws' }],
+            },
+        }
+        stubInitOneServer()
+    })
+
+    afterEach(async () => {
+        try {
+            await McpManager.instance.close()
+        } catch {}
+        sinon.restore()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('for a server in the global mcp.json', async () => {
+        writeJson(mcpUtils.getGlobalMcpConfigPath(tmpDir), { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+
+        const mgr = await allowAndRestart('srv')
+
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+        expect(mgr.getToolPerm('srv', 'tool1')).to.equal(McpPermissionType.alwaysAllow)
+    })
+
+    it('for a server in the global agent config', async () => {
+        writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), {
+            name: 'q_ide_default',
+            mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            tools: ['@srv'],
+            allowedTools: [],
+        })
+
+        const mgr = await allowAndRestart('srv')
+
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+    })
+
+    it('for a server in a workspace mcp.json', async () => {
+        writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+
+        const mgr = await allowAndRestart('srv')
+
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+    })
+
+    it('for a server in a workspace agent config', async () => {
+        writeJson(path.join(wsRoot, '.amazonq', 'agents', 'default.json'), {
+            mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            tools: ['@srv'],
+            allowedTools: [],
+        })
+
+        const mgr = await allowAndRestart('srv')
+
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+    })
+
+    it('for a workspace server that overrides a global server of the same name', async () => {
+        writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), {
+            name: 'q_ide_default',
+            mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            tools: ['@srv'],
+            allowedTools: [],
+        })
+        writeJson(path.join(wsRoot, '.amazonq', 'agents', 'default.json'), {
+            mcpServers: { srv: { command: 'srv-mcp', args: ['--ws'] } },
+            tools: ['@srv'],
+            allowedTools: [],
+        })
+
+        const mgr = await allowAndRestart('srv')
+
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
     })
 })
