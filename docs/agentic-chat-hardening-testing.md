@@ -309,6 +309,10 @@ the workspace folder. It then creates that folder if it does not exist.
 - Otherwise, the server removes and creates nothing there, and logs a warning. Memory bank generation
   continues. The files that the agent writes next go through the approval check for files outside the
   workspace, like any other file write.
+- The same applies when the path cannot be resolved, for example when two links point at each other or
+  a folder in the path cannot be read. Before, the error from resolving the path stopped memory bank
+  generation, and the log said "Memory Bank directory creation failed". The check is `isInsideFolder` in
+  `agenticChat/tools/mcp/mcpUtils.ts`, which the agent config migration uses as well (section 12).
 - A symbolic link that stays inside the workspace folder, and a workspace folder that is opened
   through a symbolic link, work as before.
 
@@ -330,7 +334,9 @@ Windows). It checks that:
   folder is opened through a link;
 - the folder is created when it does not exist;
 - nothing is removed or created, and a warning is logged, when `.amazonq`, `.amazonq/rules` or
-  `.amazonq/rules/memory-bank` links to a folder outside the workspace folder.
+  `.amazonq/rules/memory-bank` links to a folder outside the workspace folder;
+- nothing is removed or created, a warning is logged, and the cleanup does not throw, when two links
+  point at each other in the path. Windows skips this case when the test cannot create the links.
 
 ## 9. C# imports in the security scan
 

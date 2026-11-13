@@ -1073,8 +1073,12 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
     }
 }
 
-/** Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. False if it cannot tell. */
-async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
+/**
+ * Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. A part of the path that
+ * does not exist yet is resolved as written. False if it cannot tell, for example for links that point at each
+ * other or a folder that cannot be read.
+ */
+export async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
     try {
         const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
         return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))

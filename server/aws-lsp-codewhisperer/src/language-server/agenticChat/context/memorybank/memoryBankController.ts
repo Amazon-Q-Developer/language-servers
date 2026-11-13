@@ -5,9 +5,7 @@
 
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { MemoryBankPrompts } from './memoryBankPrompts'
-import { workspaceUtils } from '@aws/lsp-core'
-import { normalizePathFromUri } from '../../tools/mcp/mcpUtils'
-import { canonicalizeWorkspaceFolders, resolveCanonicalPath } from '../../tools/toolShared'
+import { isInsideFolder, normalizePathFromUri } from '../../tools/mcp/mcpUtils'
 import { MAX_NUMBER_OF_FILES_FOR_MEMORY_BANK_RANKING } from '../../constants/constants'
 
 const MEMORY_BANK_DIRECTORY = '.amazonq/rules/memory-bank'
@@ -181,11 +179,12 @@ export class MemoryBankController {
             const memoryBankPath = `${normalizedWorkspacePath}/${MEMORY_BANK_DIRECTORY}`
 
             // Remove and create files only where the memory bank folder really is. If a symbolic link takes
-            // it out of the workspace folder, leave it alone; the agent's later file writes are then checked
-            // like any other write outside the workspace.
-            if (!(await this.isInsideWorkspaceFolder(normalizedWorkspacePath, memoryBankPath))) {
+            // it out of the workspace folder, or the path cannot be resolved (for example links that point at
+            // each other), leave it alone; the agent's later file writes are then checked like any other write
+            // outside the workspace.
+            if (!(await isInsideFolder(normalizedWorkspacePath, memoryBankPath))) {
                 this.features.logging.warn(
-                    `Memory Bank: did not clean ${MEMORY_BANK_DIRECTORY} because it resolves to a location outside the workspace folder`
+                    `Memory Bank: did not clean ${MEMORY_BANK_DIRECTORY} because it resolves to a location outside the workspace folder, or cannot be resolved`
                 )
                 return
             }
@@ -217,16 +216,6 @@ export class MemoryBankController {
             this.features.logging.error(`Memory Bank directory creation failed: ${error}`)
             throw error
         }
-    }
-
-    /**
-     * Whether `memoryBankPath`, after every symbolic link in it is followed, is inside the workspace folder.
-     * A part of the path that does not exist yet is resolved as written.
-     */
-    private async isInsideWorkspaceFolder(workspacePath: string, memoryBankPath: string): Promise<boolean> {
-        const [canonicalWorkspacePath] = await canonicalizeWorkspaceFolders([workspacePath])
-        const canonicalMemoryBankPath = await resolveCanonicalPath(memoryBankPath)
-        return workspaceUtils.isParentFolder(canonicalWorkspacePath, canonicalMemoryBankPath)
     }
 
     /**

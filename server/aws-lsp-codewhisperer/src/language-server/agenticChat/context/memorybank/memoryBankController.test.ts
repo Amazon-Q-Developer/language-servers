@@ -514,5 +514,24 @@ describe('MemoryBankController', () => {
             assert.deepStrictEqual(fs.readdirSync(target), [])
             sinon.assert.notCalled(mockFs.mkdir)
         })
+
+        it('logs a warning and changes nothing when the memory bank path cannot be resolved', async function () {
+            try {
+                // Two links that point at each other, so the path cannot be resolved
+                fs.symlinkSync(path.join(workspacePath, 'loop'), path.join(workspacePath, '.amazonq'), 'dir')
+                fs.symlinkSync(path.join(workspacePath, '.amazonq'), path.join(workspacePath, 'loop'), 'dir')
+            } catch {
+                // A directory link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            // Memory bank generation goes on: the cleanup does not throw
+            await controller.cleanMemoryBankDirectory(workspacePath)
+
+            sinon.assert.notCalled(mockFs.rm)
+            sinon.assert.notCalled(mockFs.mkdir)
+            sinon.assert.calledOnceWithMatch(mockLogging.warn, /outside the workspace folder, or cannot be resolved/)
+            sinon.assert.notCalled(mockLogging.error)
+        })
     })
 })
