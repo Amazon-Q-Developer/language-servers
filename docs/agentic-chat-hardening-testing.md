@@ -435,9 +435,9 @@ prompt for workspace MCP configurations does not apply to it.
   the view:
   - The language server builds the configuration of each installed registry server from the current
     registry entry when it loads the MCP configuration: when it starts, when the user refreshes the
-    server list, when an agent configuration file changes, when a registry becomes active after the
-    user signs in or selects a profile, and when MCP is turned on again for the profile.
-  - The periodic registry sync reinstalls a server when its version in the registry changes.
+    server list, when an agent or MCP configuration file changes, and when MCP is turned on again for
+    the profile.
+  - The periodic registry sync reinstalls a local server when its version in the registry changes.
   - **Save** in the edit view of an installed registry server reinstalls it from the current registry
     entry.
 
@@ -501,10 +501,13 @@ folder.
   update the agent config".
 - A link that stays inside the workspace folder, and a workspace folder that is opened through a link,
   work as before. The migration of the global agent config is unchanged.
-- Not covered: other writes to the agent config of a workspace folder still follow links in its path:
-  the reinstall of a registry server by the periodic registry sync, and writes that the user starts
-  in the MCP settings, such as saving a workspace server or changing the permission of one of its
-  tools.
+- Not covered:
+  - Other writes to the agent config of a workspace folder still follow links in its path: the
+    reinstall of a registry server by the periodic registry sync, and writes that the user starts in
+    the MCP settings, such as saving a workspace server or changing the permission of one of its tools.
+  - A link that is made after the check and before the write.
+  - A hard link. A hard link at `default.json` to a file outside the workspace folder passes the check,
+    and the update can write to that file.
 
 ### How to test
 
@@ -539,7 +542,9 @@ tokens.
 
 - The server now logs the action id, the title and the names of the form fields, not their values.
 - Not covered: when the server starts a local MCP server, it still logs the command and its
-  arguments. It logs only the names of the environment variables.
+  arguments. When it connects to a remote MCP server, it still logs the URL, which can contain a token
+  in its query. These lines show the names of the environment variables and the headers, not their
+  values.
 
 ### How to test
 
@@ -564,6 +569,10 @@ that file.
 
 - The server now logs the length of the first suggestion instead, as
   `"firstSuggestionLength": <n> characters`.
+- Not covered: when the server handles an edit suggestion request, `EditClassifier` in
+  `inline-completion/auto-trigger/editPredictionAutoTrigger.ts` still logs the text before the cursor
+  on the current line and the recent edits of the file. It logs them at the `log` level, which the
+  language server runtime writes by default.
 
 ### How to test
 
@@ -611,3 +620,57 @@ npx ts-mocha --timeout 0 --exit src/language-server/workspaceContext/artifactMan
 The suite "ArtifactManager" checks that `addNewDirectories` and `handleRename` process a directory with
 the workspace folder that the caller gives, also when the path of another open workspace folder is a
 prefix of the path of that folder, and when the URI of the folder has an uppercase drive letter.
+
+## 16. OAuth endpoints of a remote MCP server
+
+### Behavior
+
+When a remote MCP server needs OAuth, `OAuthClient` in `agenticChat/tools/mcp/mcpOauthClient.ts` finds
+the OAuth endpoints from metadata that the MCP server returns. Before this change, the server checked
+only the token endpoint:
+
+- It opened the authorization endpoint in the external browser when the value parsed as a URL. So an
+  MCP server could make the IDE open a `javascript:`, `file:` or plaintext `http:` URL.
+- It fetched the authorization server and the `resource_metadata` link, and sent the client
+  registration, to the URLs in the metadata with any transport.
+- Each silent token refresh found the endpoints again. So an MCP server could change the token endpoint
+  after the user signed in, and receive the refresh token.
+
+After this change:
+
+- The server requires `https`, or `http` with a loopback host (`localhost`, `[::1]` or an IPv4 address
+  that starts with `127.`), for the authorization endpoint before it opens the browser. It requires the
+  same for the authorization server, the `resource_metadata` link in the `WWW-Authenticate` header and
+  the registration endpoint before it sends a request to them. The token endpoint had this check before.
+- Discovery skips an authorization server or a `resource_metadata` link that fails the check, and tries
+  the next discovery step. An authorization endpoint or a registration endpoint that fails the check
+  stops the sign-in with an error, and the browser does not open.
+- After an interactive sign-in, the server saves the endpoints that it used in
+  `~/.aws/sso/cache/<key>.meta.json`, next to the cached token. A silent refresh uses the saved token
+  endpoint and does not find the endpoints again. When no endpoints are saved, for example after a
+  sign-in with an earlier version, or when the saved token endpoint fails the check, the silent refresh
+  finds the endpoints again and saves them after the refresh succeeds.
+- Not covered: when the user adds, installs or edits a server and has no valid cached token, the server
+  signs in interactively and finds the endpoints again. Before it opens the browser, it tries the saved
+  refresh token, if there is one, with the token endpoint that it found. Then it saves the new
+  endpoints.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit src/language-server/agenticChat/tools/mcp/mcpOauthClient.test.ts
+```
+
+- The suites "validateTokenEndpoint()" and "validateAuthorizationEndpoint()" check the schemes and
+  hosts that the server accepts and rejects.
+- The suite "OAuthClient.pkceGrant() authorization endpoint" checks that the browser does not open for
+  an authorization endpoint that fails the check.
+- The suites "OAuthClient.discoverAS()", "OAuthClient.fetchASFromResourceMeta()" and
+  "OAuthClient.obtainClient()" check that the server sends no request to an authorization server, a
+  `resource_metadata` link or a registration endpoint that fails the check.
+- The suite "OAuthClient getValidAccessToken()" checks that the server saves the endpoints after an
+  interactive sign-in, and that a silent refresh uses the saved token endpoint. It also checks that a
+  silent refresh finds the endpoints again, and saves them, when no endpoints are saved or the saved
+  token endpoint fails the check.
