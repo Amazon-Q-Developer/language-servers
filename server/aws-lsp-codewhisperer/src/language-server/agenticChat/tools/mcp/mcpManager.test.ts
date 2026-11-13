@@ -4,6 +4,9 @@
  */
 
 import { expect } from 'chai'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import * as sinon from 'sinon'
 import { AGENT_TOOLS_CHANGED, MCP_SERVER_STATUS_CHANGED, McpManager } from './mcpManager'
 import * as mcpUtils from './mcpUtils'
@@ -622,6 +625,36 @@ describe('mutateConfigFile()', () => {
         // Verify the content was created correctly
         const writtenContent = JSON.parse(writeFileStub.firstCall.args[1])
         expect(writtenContent.mcpServers).to.have.property('newServer')
+    })
+
+    it('writes the config file readable only by the owner', async () => {
+        const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+        await mutateConfigFile('test/path.json', (json: any) => {
+            json.mcpServers.newServer = { command: 'test', env: { API_TOKEN: 'secret' } }
+        })
+
+        expect(writeFileStub.firstCall.args[2]).to.deep.equal({ mode: 0o600 })
+    })
+
+    const posixOnly = process.platform === 'win32' ? it.skip : it
+    posixOnly('removes group and other access from an existing config file before writing it', async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mutateConfigMode-'))
+        try {
+            const configPath = path.join(tmpDir, 'mcp.json')
+            fs.writeFileSync(configPath, '{}')
+            fs.chmodSync(configPath, 0o644)
+            const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+            await mutateConfigFile(configPath, (json: any) => {
+                json.mcpServers.newServer = { command: 'test' }
+            })
+
+            expect(fs.statSync(configPath).mode & 0o777).to.equal(0o600)
+            expect(writeFileStub.calledOnce).to.be.true
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true })
+        }
     })
 })
 
