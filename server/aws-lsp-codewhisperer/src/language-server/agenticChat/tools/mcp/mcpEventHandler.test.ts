@@ -14,6 +14,7 @@ import { getGlobalAgentConfigPath } from './mcpUtils'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
 import { ChokidarFileWatcher } from './chokidarFileWatcher'
 import { getFolderApprovalsPath } from './mcpWorkspaceTrust'
+import { fingerprintServerConfig } from './mcpConsentStore'
 
 describe('McpEventHandler error handling', () => {
     // Mock getGlobalAgentConfigPath to return a test path
@@ -709,6 +710,7 @@ describe('McpEventHandler error handling', () => {
         }
 
         let addRegistryServer: sinon.SinonStub
+        let recordApproval: sinon.SinonStub
         let registryServers: Map<string, McpRegistryServer>
 
         const field = (view: any, id: string) => view.filterOptions.find((option: any) => option.id === id)
@@ -744,6 +746,7 @@ describe('McpEventHandler error handling', () => {
             sinon.stub(mgr, 'getAllServerConfigs').returns(new Map())
             sinon.stub(mgr, 'getAllToolsWithPermissions').returns([])
             addRegistryServer = sinon.stub(mgr, 'addRegistryServer').resolves()
+            recordApproval = sinon.stub(mgr, 'recordRegistryServerApproval').resolves()
         })
 
         it('shows the command, arguments and environment variables of a local server before installing it', async () => {
@@ -955,6 +958,49 @@ describe('McpEventHandler error handling', () => {
 
                 await confirm(serverName)
                 sinon.assert.calledOnce(addRegistryServer)
+            })
+        }
+
+        it('records the approval of the previewed configuration before it installs the server', async () => {
+            await preview('docs-server 1.2.3')
+            await confirm('docs-server')
+
+            sinon.assert.calledOnce(recordApproval)
+            const [name, config, agentPath] = recordApproval.firstCall.args
+            expect(name).to.equal('docs-server')
+            // The approval covers what the server starts with, so it matches the configuration that is installed
+            expect(fingerprintServerConfig(config)).to.equal(
+                fingerprintServerConfig(addRegistryServer.firstCall.args[1])
+            )
+            expect(agentPath).to.equal(getGlobalAgentConfigPath('/fake/home'))
+            sinon.assert.callOrder(recordApproval, addRegistryServer)
+        })
+
+        it('records no approval when the registry changed the server after the preview', async () => {
+            await preview('docs-server 1.2.3')
+            registryServers.get('docs-server')!.version = '1.2.4'
+            await confirm('docs-server')
+
+            sinon.assert.notCalled(recordApproval)
+            sinon.assert.notCalled(addRegistryServer)
+        })
+
+        const leaveActions: [string, () => Promise<unknown>][] = [
+            ['Cancel or Back, which list the servers', () => eventHandler.onListMcpServers({})],
+            ['another view', () => eventHandler.onMcpServerClick({ id: 'add-new-mcp' })],
+            ['an action on another server', () => eventHandler.onMcpServerClick({ id: 'refresh-mcp-list' })],
+        ]
+        for (const [leave, action] of leaveActions) {
+            it(`does not install a server after the user leaves its preview with ${leave}`, async () => {
+                await preview('docs-server 1.2.3')
+                await action().catch(() => undefined)
+                const view = await confirm('docs-server')
+
+                sinon.assert.notCalled(addRegistryServer)
+                sinon.assert.notCalled(recordApproval)
+                // The server shows the preview again instead
+                expect(view.header.title).to.equal('Install MCP Server')
+                expect(view.header.status).to.include({ status: 'info' })
             })
         }
 

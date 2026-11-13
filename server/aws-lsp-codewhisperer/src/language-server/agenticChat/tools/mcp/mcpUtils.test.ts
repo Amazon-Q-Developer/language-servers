@@ -1237,6 +1237,9 @@ describe('loadAgentConfig with registry support', () => {
         expect(result.servers.has('manual-server')).to.be.false
         const server = result.servers.get('test-remote')!
         expect(server.url).to.equal('https://example.com/mcp')
+        // The agent config entry holds the converted fields, so the mark is what the consent gate checks
+        expect(server.__registryServer__).to.equal(true)
+        expect(result.agentConfig.mcpServers['test-remote']).to.not.have.property('type')
     })
 
     it('should load manual servers when registry is not active', async () => {
@@ -1265,6 +1268,7 @@ describe('loadAgentConfig with registry support', () => {
         expect(result.servers.has('manual-server')).to.be.true
         const server = result.servers.get('manual-server')!
         expect(server.command).to.equal('node')
+        expect(server.__registryServer__).to.equal(undefined)
     })
 
     it('should warn when registry server not found in registry', async () => {

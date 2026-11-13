@@ -402,8 +402,10 @@ When an administrator configures an MCP registry for the profile, the **Add MCP 
 the servers of the registry. The list shows only the name, version and description of each server.
 The registry entry decides the rest: for a local server, the package, the command (`npx`, `uvx` or
 `docker`), the arguments, the environment variables and the package index; for a remote server, the
-URL and the headers. A registry server is installed in the global agent configuration, so the consent
-prompt for workspace MCP configurations does not apply to it.
+URL and the headers. **Install** in the registry list installs a registry server in the global agent
+configuration, so before this change no consent prompt applied to it. A registry server in the agent
+configuration of a workspace folder, which **Save** in the edit view can write and a repository can
+contain, got the consent prompt for workspace MCP configurations before this change, and still does.
 
 - **Install** in the registry list now opens an **Install MCP Server** view for that server instead
   of installing it. The view shows the configuration that the server starts with after the install,
@@ -431,24 +433,51 @@ prompt for workspace MCP configurations does not apply to it.
   server that left the registry, installs nothing.
 - A registry entry that cannot be converted, for example one with neither packages nor remotes, now
   logs an error and shows the registry list. Before, the install request failed.
-- Not covered: these paths start a registry server from the current registry entry without showing
-  the view:
+- **Cancel**, **Back** and any other action in the MCP views withdraw the view. A confirmation that
+  arrives after the user left the view installs nothing, and the server shows the view again.
+- When the user confirms, the server records the approval of the shown configuration in the MCP
+  consent store (`McpManager.recordRegistryServerApproval`, which uses the store of the workspace
+  consent prompt), and then installs the server.
+- A registry server now starts only with a configuration that the user approved. Before a registry
+  server starts, `initOneServerInternal` checks the consent store for an approval of its current
+  configuration, as it does for a server from a workspace configuration file. The loader
+  (`loadAgentConfig`) and `addRegistryServer` mark the configuration of a registry server
+  (`__registryServer__`), because the agent config entry that the loader keeps holds the converted
+  fields, not the registry reference. When there is no approval, it shows the prompt "Amazon Q — MCP
+  Server from the Registry" with the command or URL, the names of the environment variables and
+  headers (not their values), and **Allow for this server** and **Deny**. A registry server in the
+  agent config of a workspace folder gets the workspace prompt instead, with its source file and
+  **View full configuration**. **Allow** records the approval and starts the server; **Deny** or
+  closing the prompt disables the server for the session. So the user is asked again in these cases,
+  which started the server from the current registry entry with no question before:
   - The language server builds the configuration of each installed registry server from the current
     registry entry when it loads the MCP configuration: when it starts, when the user refreshes the
     server list, when an agent or MCP configuration file changes, and when MCP is turned on again for
-    the profile.
+    the profile. The prompt appears when the registry changed the configuration since the approval.
   - The periodic registry sync reinstalls a local server when its version in the registry changes.
-  - **Save** in the edit view of an installed registry server reinstalls it from the current registry
-    entry.
+    The arguments contain the version, so the prompt appears after each version change. The sync
+    finds a server by its agent config entry, so it reinstalls only servers that were installed or
+    saved since the language server last loaded the configuration; it skips the servers that the
+    loader read, as before this change. Their new configuration starts, after the prompt, the next time
+    the configuration loads.
+  - **Save** in the edit view of an installed registry server reinstalls it. Removing the server
+    removes its approval, so the prompt appears after **Save**.
+- This changes behavior for registry servers that were installed with an earlier version: no
+  approval is recorded for them, so the prompt appears once for each of them, the next time they
+  start. The language server starts the servers in batches of five, and an open prompt holds the start
+  of the next batches until the user answers, as the workspace consent prompt does. **Save** in the
+  edit view also shows the prompt when nothing changed, because it removes and adds the server.
 
 ### How to test
 
 From `server/aws-lsp-codewhisperer`:
 
 ```sh
-npx ts-mocha --timeout 0 --exit -g "installing a registry server|formatServerConfigForReview|code spans" \
+npx ts-mocha --timeout 0 --exit -g "installing a registry server|formatServerConfigForReview|code spans|consent gate for MCP registry servers|approval of a registry server|loadAgentConfig with registry support|addRegistryServer with additional" \
   src/language-server/agenticChat/tools/mcp/mcpEventHandler.test.ts \
   src/language-server/agenticChat/tools/mcp/mcpConsentStore.test.ts \
+  src/language-server/agenticChat/tools/mcp/mcpManager.test.ts \
+  src/language-server/agenticChat/tools/mcp/mcpUtils.test.ts \
   src/language-server/agenticChat/textFormatting.test.ts
 npm run lint
 ```
@@ -468,7 +497,24 @@ npm run test:unit
   installs exactly the shown configuration once and does not use form values. It checks that nothing
   is installed when the registry changed an argument, an environment variable, the package index,
   the version, the URL or a header after the view was shown, when the view showed another server or
-  no server, when the server left the registry, or when the entry cannot be converted.
+  no server, when the server left the registry, or when the entry cannot be converted. It checks that
+  the approval of the shown configuration is recorded before the install and not when the view is
+  shown again, and that nothing is installed after **Cancel**, **Back** or another MCP action.
+- The suite "consent gate for MCP registry servers" in `mcpManager.test.ts` checks that a registry
+  server with no approval of its configuration does not start before the prompt, that the prompt shows
+  the command or URL and only the names of the environment variables and headers, that a registry
+  server in the agent config of a workspace folder gets the workspace prompt, that **Allow** records the
+  approval, that an approved configuration starts with no prompt, that a changed configuration prompts
+  again, and that a server in the global agent config that is not from the registry starts with no
+  prompt. The suite "approval of a registry server from the install preview, with the real consent
+  store" records an approval as the preview does, for a name that `sanitizeName` changes and a
+  `file://` path, and checks that the server then passes the gate with no prompt, and that a changed
+  URL prompts. The suites "loadAgentConfig with registry support" (`mcpUtils.test.ts`) and
+  "addRegistryServer with additional headers/env" check that both mark a registry server and that the
+  loader does not mark a manual server. The case "checks a registry server that the loader reads,
+  before discoverAllServers starts it" uses the real loader and consent store: an approved
+  configuration starts with no prompt, and after the registry changes it, the next load shows the
+  prompt and does not start the server.
 - The suite "formatServerConfigForReview" checks the JSON for a local and a remote server, that
   empty parts are left out, that hidden characters, spaces other than U+0020, and `<`, `>` and `&`
   become escapes and the JSON still parses to the exact values, and that visible non-ASCII

@@ -673,7 +673,15 @@ export class McpManager {
         const globalPersona = getGlobalPersonaConfigPath(home)
         const isWorkspaceScoped =
             !!configPath && configPath !== globalMcp && configPath !== globalAgent && configPath !== globalPersona
-        if (isWorkspaceScoped && configPath) {
+        // A registry server runs what the MCP registry lists, and the registry can change that after the install.
+        // The install preview records the approval of the configuration that it showed
+        // (recordRegistryServerApproval). Any other configuration of a registry server needs approval here before
+        // the server starts: after a version change in the registry, when the language server loads the
+        // configuration again, or after Save in the edit view. A registry server in the agent config of a
+        // workspace folder keeps the workspace prompt, because that file can add environment variables and headers.
+        const isRegistryServer = cfg.__registryServer__ === true
+        const consentKind = isWorkspaceScoped ? 'workspace-scoped' : 'registry'
+        if ((isWorkspaceScoped || isRegistryServer) && configPath) {
             const denyKey = `${serverName}|${configPath}|${fingerprintServerConfig(cfg)}`
             if (this.sessionDeniedConsent.has(denyKey)) {
                 this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
@@ -705,28 +713,46 @@ export class McpManager {
                 const allowBtn = { title: 'Allow for this server' }
                 const denyBtn = { title: 'Deny' }
                 const reviewBtn = { title: 'View full configuration' }
+                const message = !isWorkspaceScoped
+                    ? `Amazon Q — MCP Server from the Registry\n\n` +
+                      `The MCP registry lists this server with a configuration that you have not allowed yet, ` +
+                      `for example after the registry changed the server to a new version.\n` +
+                      `Server: ${serverName}\n` +
+                      `Command: ${cmdLine}\n` +
+                      envLine +
+                      headerLine +
+                      `\n` +
+                      (cfg.command
+                          ? `Running this server executes the above command on your machine, ` +
+                            `with the environment variables listed above. ` +
+                            `Variables such as NODE_OPTIONS can cause additional code to run. `
+                          : `Starting this server connects Amazon Q to the above URL, with the headers listed above. `) +
+                      `Only allow if you expect this server and this configuration from your MCP registry.\n\n` +
+                      `If you allow, you won't be asked again unless the registry changes the server configuration.`
+                    : `Amazon Q — Untrusted MCP Server\n\n` +
+                      `A workspace configuration file wants to start an MCP server.\n` +
+                      `Server: ${serverName}\n` +
+                      `Command: ${cmdLine}\n` +
+                      envLine +
+                      headerLine +
+                      `• Source: ${configPath}\n\n` +
+                      `Running this server executes the above command on your machine, ` +
+                      `with the environment variables listed above. ` +
+                      `Use View full configuration to inspect the source before allowing. ` +
+                      `Variables such as NODE_OPTIONS can cause additional code to run. ` +
+                      `Only allow if you trust the authors of this workspace.\n\n` +
+                      `Your choice will be remembered for this workspace. ` +
+                      `If you allow, you won't be asked again unless the server configuration changes.`
 
                 while (true) {
                     let choice: { title: string } | null | undefined
                     try {
                         choice = await this.features.lsp.window.showMessageRequest({
                             type: MessageType.Warning,
-                            message:
-                                `Amazon Q — Untrusted MCP Server\n\n` +
-                                `A workspace configuration file wants to start an MCP server.\n` +
-                                `Server: ${serverName}\n` +
-                                `Command: ${cmdLine}\n` +
-                                envLine +
-                                headerLine +
-                                `• Source: ${configPath}\n\n` +
-                                `Running this server executes the above command on your machine, ` +
-                                `with the environment variables listed above. ` +
-                                `Use View full configuration to inspect the source before allowing. ` +
-                                `Variables such as NODE_OPTIONS can cause additional code to run. ` +
-                                `Only allow if you trust the authors of this workspace.\n\n` +
-                                `Your choice will be remembered for this workspace. ` +
-                                `If you allow, you won't be asked again unless the server configuration changes.`,
-                            actions: [reviewBtn, allowBtn, denyBtn],
+                            message,
+                            // The command of a registry server comes from the registry, so its agent config file does
+                            // not show what runs
+                            actions: isWorkspaceScoped ? [reviewBtn, allowBtn, denyBtn] : [allowBtn, denyBtn],
                         })
                     } catch (e: any) {
                         this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
@@ -748,14 +774,14 @@ export class McpManager {
                     }
                     if (choice?.title !== allowBtn.title) {
                         this.features.logging.info(
-                            `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
+                            `MCP: user declined consent for ${consentKind} server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
                         )
                         this.sessionDeniedConsent.add(denyKey)
                         this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
                         return
                     }
                     await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
-                    this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
+                    this.features.logging.info(`MCP: recorded consent for ${consentKind} server '${serverName}'`)
                     break
                 }
             }
@@ -1228,6 +1254,24 @@ export class McpManager {
     }
 
     /**
+     * Records that the user approved this configuration of a registry server, as the install preview showed it, so
+     * that the server starts without the consent prompt. A different configuration needs approval again.
+     */
+    public async recordRegistryServerApproval(
+        serverName: string,
+        cfg: MCPServerConfig,
+        configPath: string
+    ): Promise<void> {
+        await recordApproval(
+            this.features.workspace,
+            this.features.logging,
+            sanitizeName(serverName),
+            cfg,
+            normalizePathFromUri(configPath, this.features.logging)
+        )
+    }
+
+    /**
      * Add a registry server: persist config, register in memory, and initialize.
      */
     public async addRegistryServer(
@@ -1284,7 +1328,7 @@ export class McpManager {
         )
 
         // Store additional headers/env separately and merge for runtime
-        const newCfg: MCPServerConfig = { ...cfg, __configPath__: configPath }
+        const newCfg: MCPServerConfig = { ...cfg, __configPath__: configPath, __registryServer__: true }
         if (additionalHeaders && Object.keys(additionalHeaders).length > 0) {
             newCfg.__additionalHeaders__ = additionalHeaders
         }

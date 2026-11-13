@@ -526,6 +526,9 @@ export async function loadAgentConfig(
                     try {
                         cfg = converter.convertRegistryServer(registryServer, entry.env)
                         cfg.__configPath__ = fsPath
+                        // The agent config entry below holds the converted fields, so the mark is the only record
+                        // that the configuration comes from the registry
+                        cfg.__registryServer__ = true
 
                         // Apply timeout from registry server config if provided
                         if (typeof entry.timeout === 'number') {

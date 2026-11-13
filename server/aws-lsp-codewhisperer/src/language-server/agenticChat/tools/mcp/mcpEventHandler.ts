@@ -122,6 +122,9 @@ export class McpEventHandler {
      */
     async onListMcpServers(params: ListMcpServersParams) {
         this.#currentEditingServerName = undefined
+        // Cancel and Back in the install preview of a registry server open the server list, so the preview is
+        // withdrawn: a confirmation that arrives later installs nothing
+        this.#previewedRegistryInstall = undefined
         let mcpManager
         try {
             mcpManager = McpManager.instance
@@ -438,6 +441,11 @@ export class McpEventHandler {
 
         // Execute the appropriate handler or return default response
         const handler = handlers[params.id]
+        // Any other action in the MCP views leaves the install preview of a registry server, so the preview is
+        // withdrawn. Install in the registry list shows a new preview.
+        if (params.id !== CONFIRM_INSTALL_REGISTRY_SERVER) {
+            this.#previewedRegistryInstall = undefined
+        }
         if (handler) {
             return await handler()
         }
@@ -2410,7 +2418,8 @@ export class McpEventHandler {
             isMcpRegistry: true,
             header: {
                 title: 'Install MCP Server',
-                description: 'Review this server before you install it.',
+                description:
+                    'Review this server before you install it. If the registry changes it later, Amazon Q asks you again before the server starts.',
                 // The fields below cut off long values, so the status also shows the whole configuration. The chat
                 // client shows the status as markdown. In a code span, markdown is not applied and the text wraps,
                 // and formatServerConfigForReview escapes the characters that the chat client could read as HTML.
@@ -2478,6 +2487,9 @@ export class McpEventHandler {
         this.#isProgrammaticChange = true
 
         try {
+            // The user approved this configuration in the preview. Later changes in the registry need approval again
+            // before the server starts.
+            await McpManager.instance.recordRegistryServerApproval(serverName, config, agentPath)
             await McpManager.instance.addRegistryServer(serverName, config, agentPath)
             this.#releaseProgrammaticAfterDebounce()
             return this.#handleOpenMcpServer({ id: 'open-mcp-server', title: serverName })
