@@ -576,3 +576,38 @@ npx ts-mocha --timeout 0 --exit -g "logs the length of the first suggestion" \
 
 The test returns a suggestion from a stubbed service client. It checks that the log has the length of
 the suggestion and not its text.
+
+## 15. Workspace folder of a new directory in workspace context
+
+### Behavior
+
+When workspace context is on, the `didCreateFiles` and `didRenameFiles` handlers in
+`workspaceContext/workspaceContextServer.ts` pass a new or renamed directory to `addNewDirectories` in
+`workspaceContext/artifactManager.ts`, which processes the files of the directory as part of the
+workspace folder that contains it. The handlers find that folder with `findWorkspaceRootFolder` in
+`workspaceContext/util.ts`, which compares whole path segments and takes the most specific folder.
+`addNewDirectories` then looked up the folder again with a plain prefix match of the paths, and took the
+first match in its list of workspace folders. So with the workspace folders `proj` and `proj-other`
+open, a directory in `proj-other` could be processed as part of `proj`, and in nested workspace folders,
+as part of the outer folder when that folder came first in the list.
+
+- `addNewDirectories` now takes the workspace folder that the handler found, and does not look it up
+  again. So it processes a new or renamed directory with the same folder as the handler.
+- Not covered:
+  - When a file or directory is deleted or renamed, the server still finds the tracked files of the old
+    path with a plain prefix match of their paths.
+  - As before, the `didCreateFiles` handler skips a new directory whose name does not end with the file
+    extension of a supported language, before it calls `addNewDirectories`. The `didRenameFiles`
+    handler does not check the name.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit src/language-server/workspaceContext/artifactManager.test.ts
+```
+
+The suite "ArtifactManager" checks that `addNewDirectories` and `handleRename` process a directory with
+the workspace folder that the caller gives, also when the path of another open workspace folder is a
+prefix of the path of that folder, and when the URI of the folder has an uppercase drive letter.
