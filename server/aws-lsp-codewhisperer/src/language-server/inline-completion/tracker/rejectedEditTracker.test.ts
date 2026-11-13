@@ -5,7 +5,11 @@
 
 import * as assert from 'assert'
 import * as sinon from 'sinon'
-import { RejectedEditTracker, DEFAULT_REJECTED_EDIT_TRACKER_CONFIG } from './rejectedEditTracker'
+import {
+    RejectedEditTracker,
+    DEFAULT_REJECTED_EDIT_TRACKER_CONFIG,
+    MAX_SIMILARITY_INPUT_LENGTH,
+} from './rejectedEditTracker'
 
 describe('RejectedEditTracker', function () {
     let sandbox: sinon.SinonSandbox
@@ -278,6 +282,55 @@ describe('RejectedEditTracker', function () {
             // Levenshtein distance between 'kitten' and 'sitting' is 3
             // Similarity = 1 - (3 / 7) = 1 - 0.428... = 0.571...
             assert.strictEqual(similarity, 1 - 3 / 7)
+        })
+
+        it('should not compute edit distance above the length cap', function () {
+            // The distance here is 1, so a computed similarity would not be 0
+            const str1 = 'a'.repeat(200_000)
+            const str2 = 'a'.repeat(199_999) + 'b'
+
+            const similarity = (tracker as any).calculateSimilarity(str1, str2)
+
+            assert.strictEqual(similarity, 0.0)
+        })
+
+        it('should still compute edit distance at the length cap', function () {
+            const str1 = 'a'.repeat(MAX_SIMILARITY_INPUT_LENGTH)
+            const str2 = 'a'.repeat(MAX_SIMILARITY_INPUT_LENGTH - 1) + 'b'
+
+            const similarity = (tracker as any).calculateSimilarity(str1, str2)
+
+            assert.strictEqual(similarity, 1 - 1 / MAX_SIMILARITY_INPUT_LENGTH)
+        })
+    })
+
+    describe('isSimilarToRejected above the length cap', function () {
+        const documentUri = 'file:///test.js'
+        const longContent = 'x'.repeat(MAX_SIMILARITY_INPUT_LENGTH * 10)
+
+        function recordRejections(content: string, count: number) {
+            for (let i = 0; i < count; i++) {
+                tracker.recordRejectedEdit({
+                    content,
+                    timestamp: Date.now(),
+                    documentUri,
+                    position: { line: 0, character: 0 },
+                })
+            }
+        }
+
+        it('should still match an identical rejection', function () {
+            recordRejections(longContent, 1)
+
+            assert.strictEqual(tracker.isSimilarToRejected(longContent, documentUri), true)
+        })
+
+        it('should not compare a different edit by edit distance', function () {
+            // At this threshold a computed similarity (1 - 1/20,001) would match every stored rejection
+            tracker = new RejectedEditTracker(mockLogging, { maxEntries: 50, similarityThreshold: 0.5 })
+            recordRejections(longContent, 50)
+
+            assert.strictEqual(tracker.isSimilarToRejected(longContent + 'y', documentUri), false)
         })
     })
 
