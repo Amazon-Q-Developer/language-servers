@@ -17,6 +17,7 @@ import {
     isRegistryServerConfig,
 } from './mcpTypes'
 import path = require('path')
+import * as fs from 'fs'
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
@@ -68,6 +69,10 @@ export async function loadMcpServerConfigs(
             const errorMsg = `MCP config not found at ${fsPath}, skipping.`
             logging.warn(errorMsg)
             continue
+        }
+        if (fsPath === globalConfigPath) {
+            // Files written by earlier versions were created readable by other users
+            await restrictFileToOwner(logging, fsPath)
         }
 
         // 3) read + parse JSON
@@ -299,6 +304,12 @@ export async function loadAgentConfig(
 
     const globalConfigPath = getGlobalAgentConfigPath(workspace.fs.getUserHomeDir())
 
+    // The global mcp.json can hold MCP server env and header values even when this agent config doesn't load it.
+    // Files written by earlier versions were created readable by other users.
+    const homeDir = workspace.fs.getUserHomeDir()
+    if (homeDir && path.isAbsolute(homeDir)) {
+        await restrictFileToOwner(logging, getGlobalMcpConfigPath(homeDir))
+    }
     // Sort paths to process global config last
     const sortedPaths = uniquePaths.sort((a, b) => {
         if (a === globalConfigPath) return 1
@@ -334,7 +345,7 @@ export async function loadAgentConfig(
             if (fsPath === globalConfigPath) {
                 try {
                     await workspace.fs.mkdir(path.dirname(fsPath), { recursive: true })
-                    await workspace.fs.writeFile(fsPath, DEFAULT_AGENT_RAW)
+                    await writeOwnerOnlyConfigFile(workspace, logging, fsPath, DEFAULT_AGENT_RAW)
                     logging.info(`Created default agent file at ${fsPath}`)
                     exists = true
                 } catch (e: any) {
@@ -348,6 +359,9 @@ export async function loadAgentConfig(
                 logging.warn(errorMsg)
                 continue
             }
+        } else if (fsPath === globalConfigPath) {
+            // Files written by earlier versions were created readable by other users
+            await restrictFileToOwner(logging, fsPath)
         }
 
         // 2) Read and parse JSON
@@ -839,6 +853,42 @@ export function getGlobalMcpConfigPath(homeDir: string): string {
     return path.join(homeDir, '.aws', 'amazonq', 'mcp.json')
 }
 
+/**
+ * Removes group and other access from an existing file. MCP and agent config files can hold the env and header
+ * values of MCP servers, which are often tokens. Best effort: a failure is logged and never blocks the caller.
+ */
+export async function restrictFileToOwner(logging: Logger, filePath: string): Promise<void> {
+    // POSIX mode bits don't control access on Windows
+    if (process.platform === 'win32') {
+        return
+    }
+    try {
+        const stat = await fs.promises.stat(filePath)
+        if ((stat.mode & 0o077) !== 0) {
+            await fs.promises.chmod(filePath, stat.mode & 0o700)
+            logging.info(`Removed group and other access from ${filePath}`)
+        }
+    } catch (e: any) {
+        if (e?.code !== 'ENOENT') {
+            logging.warn(`Could not restrict access to ${filePath}: ${e?.message}`)
+        }
+    }
+}
+
+/**
+ * Writes an MCP or agent config file that only the owner can read. `mode` applies only when the file is created,
+ * so an existing file is restricted first, before the new content is written into it.
+ */
+export async function writeOwnerOnlyConfigFile(
+    workspace: Workspace,
+    logging: Logger,
+    filePath: string,
+    data: string
+): Promise<void> {
+    await restrictFileToOwner(logging, filePath)
+    await workspace.fs.writeFile(filePath, data, { mode: 0o600 })
+}
+
 /** Returns true if env object is undefined, null, contains only empty keys or values */
 export function isEmptyEnv(env: Record<string, string>): boolean {
     if (!env || typeof env !== 'object') {
@@ -1160,7 +1210,7 @@ export async function saveAgentConfig(
     try {
         await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
         // Save the whole config
-        await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
+        await writeOwnerOnlyConfigFile(workspace, logging, configPath, JSON.stringify(config, null, 2))
         logging.info(`Saved agent config to ${configPath}`)
     } catch (err: any) {
         logging.error(`Failed to save agent config to ${configPath}: ${err.message}`)
@@ -1218,7 +1268,7 @@ export async function saveServerSpecificAgentConfig(
         existingConfig.tools.push(...serverTools)
         existingConfig.allowedTools.push(...serverAllowedTools)
 
-        await workspace.fs.writeFile(configPath, JSON.stringify(existingConfig, null, 2))
+        await writeOwnerOnlyConfigFile(workspace, logging, configPath, JSON.stringify(existingConfig, null, 2))
         logging.info(`Saved server-specific agent config for ${serverName} to ${configPath}`)
     } catch (err: any) {
         logging.error(`Failed to save server-specific agent config to ${configPath}: ${err.message}`)
@@ -1300,7 +1350,7 @@ export async function migrateAgentConfigToCLIFormat(
         updated = true
 
         if (updated) {
-            await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
+            await writeOwnerOnlyConfigFile(workspace, logging, configPath, JSON.stringify(config, null, 2))
             logging.info(`Migrated agent config to CLI format: ${configPath}`)
         }
     } catch (err: any) {

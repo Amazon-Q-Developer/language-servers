@@ -23,6 +23,7 @@ import {
     normalizePathFromUri,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
+    restrictFileToOwner,
     isEmptyEnv,
     sanitizeName,
     convertPersonaToAgent,
@@ -460,6 +461,168 @@ describe('saveAgentConfig', () => {
 
         // Verify the file was created
         expect(fs.existsSync(configPath)).to.be.true
+    })
+})
+
+describe('MCP and agent config file permissions', () => {
+    const posixOnly = process.platform === 'win32' ? it.skip : it
+    let tmpDir: string
+    let workspace: any
+    let logger: any
+
+    const modeOf = (p: string) => fs.statSync(p).mode & 0o777
+    const writeWithMode = (p: string, data: string, mode: number) => {
+        fs.mkdirSync(path.dirname(p), { recursive: true })
+        fs.writeFileSync(p, data)
+        fs.chmodSync(p, mode)
+    }
+    const config = {
+        name: 'test-agent',
+        description: 'Test agent',
+        mcpServers: { srv: { command: 'node', env: { API_TOKEN: 'secret' } } },
+        tools: ['@srv'],
+        allowedTools: [],
+        toolsSettings: {},
+        resources: [],
+    }
+
+    beforeEach(() => {
+        sinon.restore()
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'configModeTest-'))
+        workspace = {
+            fs: {
+                exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                // Forward options so the requested mode reaches Node, like the runtime does
+                writeFile: (p: string, d: string, o?: { mode?: number }) => fs.promises.writeFile(p, d, o),
+                mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
+                getUserHomeDir: () => tmpDir,
+            },
+            getAllWorkspaceFolders: () => [],
+        }
+        logger = { warn: sinon.spy(), info: () => {}, error: () => {}, debug: () => {} }
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    posixOnly('saveAgentConfig creates a new file readable only by the owner', async () => {
+        const configPath = path.join(tmpDir, 'agents', 'default.json')
+        await saveAgentConfig(workspace, logger, config, configPath)
+        expect(modeOf(configPath)).to.equal(0o600)
+    })
+
+    posixOnly('saveAgentConfig removes group and other access from an existing file', async () => {
+        const configPath = path.join(tmpDir, 'agents', 'default.json')
+        writeWithMode(configPath, '{}', 0o644)
+        await saveAgentConfig(workspace, logger, config, configPath)
+        expect(modeOf(configPath)).to.equal(0o600)
+        expect(JSON.parse(fs.readFileSync(configPath, 'utf-8'))).to.deep.equal(config)
+    })
+
+    posixOnly('saveServerSpecificAgentConfig removes group and other access from an existing file', async () => {
+        const configPath = path.join(tmpDir, 'agents', 'default.json')
+        writeWithMode(configPath, JSON.stringify({ ...config, mcpServers: {} }), 0o644)
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'srv',
+            { command: 'node', env: { API_TOKEN: 'secret' } },
+            ['@srv'],
+            [],
+            configPath
+        )
+        expect(modeOf(configPath)).to.equal(0o600)
+    })
+
+    posixOnly('loadAgentConfig creates the default global agent file readable only by the owner', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await loadAgentConfig(workspace, logger, [agentPath], null, false)
+        expect(modeOf(agentPath)).to.equal(0o600)
+    })
+
+    posixOnly('loadAgentConfig restricts an existing global agent file but not a workspace one', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const wsPath = path.join(tmpDir, 'project', '.amazonq', 'agents', 'default.json')
+        writeWithMode(globalPath, JSON.stringify(config), 0o644)
+        writeWithMode(wsPath, JSON.stringify({ ...config, mcpServers: {} }), 0o644)
+
+        await loadAgentConfig(workspace, logger, [wsPath, globalPath], null, false)
+
+        expect(modeOf(globalPath)).to.equal(0o600)
+        expect(modeOf(wsPath)).to.equal(0o644)
+    })
+
+    posixOnly('loadMcpServerConfigs restricts an existing global mcp.json but not a workspace one', async () => {
+        const globalPath = getGlobalMcpConfigPath(tmpDir)
+        const wsPath = path.join(tmpDir, 'project', '.amazonq', 'mcp.json')
+        const mcpJson = JSON.stringify({ mcpServers: { srv: { command: 'node', env: { API_TOKEN: 'secret' } } } })
+        writeWithMode(globalPath, mcpJson, 0o644)
+        writeWithMode(wsPath, mcpJson, 0o644)
+
+        await loadMcpServerConfigs(workspace, logger, [wsPath, globalPath])
+
+        expect(modeOf(globalPath)).to.equal(0o600)
+        expect(modeOf(wsPath)).to.equal(0o644)
+    })
+
+    posixOnly('loadAgentConfig restricts an existing global mcp.json even when it is not loaded', async () => {
+        const mcpPath = getGlobalMcpConfigPath(tmpDir)
+        writeWithMode(mcpPath, JSON.stringify({ mcpServers: { srv: { command: 'node' } } }), 0o644)
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        writeWithMode(agentPath, JSON.stringify({ ...config, mcpServers: {}, useLegacyMcpJson: false }), 0o600)
+
+        await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(modeOf(mcpPath)).to.equal(0o600)
+    })
+
+    posixOnly(
+        'loadAgentConfig does not touch a relative mcp.json path when the home directory is unknown',
+        async () => {
+            const cwd = process.cwd()
+            process.chdir(tmpDir)
+            try {
+                const relativeMcp = path.join(tmpDir, '.aws', 'amazonq', 'mcp.json')
+                writeWithMode(relativeMcp, '{}', 0o644)
+                workspace.fs.getUserHomeDir = () => ''
+
+                await loadAgentConfig(workspace, logger, [], null, false)
+
+                expect(modeOf(relativeMcp)).to.equal(0o644)
+            } finally {
+                process.chdir(cwd)
+            }
+        }
+    )
+
+    posixOnly('restrictFileToOwner keeps the owner bits and leaves an owner-only file alone', async () => {
+        const p = path.join(tmpDir, 'a.json')
+        writeWithMode(p, '{}', 0o754)
+        await restrictFileToOwner(logger, p)
+        expect(modeOf(p)).to.equal(0o700)
+
+        const chmodSpy = sinon.spy(fs.promises, 'chmod')
+        await restrictFileToOwner(logger, p)
+        expect(chmodSpy.called).to.be.false
+    })
+
+    it('restrictFileToOwner ignores a missing file', async () => {
+        await restrictFileToOwner(logger, path.join(tmpDir, 'missing.json'))
+        expect(logger.warn.called).to.be.false
+    })
+
+    posixOnly('still saves the config when the existing file cannot be restricted', async () => {
+        const configPath = path.join(tmpDir, 'agents', 'default.json')
+        writeWithMode(configPath, '{}', 0o644)
+        sinon.stub(fs.promises, 'chmod').rejects(Object.assign(new Error('not permitted'), { code: 'EPERM' }))
+
+        await saveAgentConfig(workspace, logger, config, configPath)
+
+        expect(JSON.parse(fs.readFileSync(configPath, 'utf-8'))).to.deep.equal(config)
+        expect(logger.warn.calledOnce).to.be.true
     })
 })
 
