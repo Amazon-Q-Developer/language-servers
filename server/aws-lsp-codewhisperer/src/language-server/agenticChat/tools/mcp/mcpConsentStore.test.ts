@@ -8,6 +8,8 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import {
+    effectiveEnv,
+    effectiveHeaders,
     fingerprintServerConfig,
     fingerprintWorkspace,
     hasApproval,
@@ -73,6 +75,71 @@ describe('mcpConsentStore', () => {
             const a: MCPServerConfig = { url: 'https://a.example' }
             const b: MCPServerConfig = { url: 'https://b.example' }
             expect(fingerprintServerConfig(a)).to.not.equal(fingerprintServerConfig(b))
+        })
+
+        // __additionalEnv__ / __additionalHeaders__ are merged into the spawn env/headers,
+        // so they must be covered by the fingerprint alongside the raw fields — otherwise a
+        // post-approval config edit to those fields would not re-prompt.
+        it('differs when __additionalEnv__ is added', () => {
+            const a: MCPServerConfig = { command: 'npx', args: ['-y', 's'], env: { LOG_LEVEL: 'info' } }
+            const b: MCPServerConfig = {
+                ...a,
+                __additionalEnv__: { EXTRA: '1' },
+            }
+            expect(fingerprintServerConfig(a)).to.not.equal(fingerprintServerConfig(b))
+        })
+
+        it('differs when __additionalEnv__ overrides an existing env value', () => {
+            const a: MCPServerConfig = { command: 'sh', args: [], env: { FOO: '1' } }
+            const b: MCPServerConfig = { command: 'sh', args: [], env: { FOO: '1' }, __additionalEnv__: { FOO: '2' } }
+            expect(fingerprintServerConfig(a)).to.not.equal(fingerprintServerConfig(b))
+        })
+
+        it('differs when headers change', () => {
+            const a: MCPServerConfig = { url: 'https://a.example', headers: { Authorization: 'Bearer good' } }
+            const b: MCPServerConfig = { url: 'https://a.example', headers: { Authorization: 'Bearer attacker' } }
+            expect(fingerprintServerConfig(a)).to.not.equal(fingerprintServerConfig(b))
+        })
+
+        it('differs when __additionalHeaders__ overrides an existing header', () => {
+            const a: MCPServerConfig = { url: 'https://a.example', headers: { Authorization: 'Bearer good' } }
+            const b: MCPServerConfig = {
+                url: 'https://a.example',
+                headers: { Authorization: 'Bearer good' },
+                __additionalHeaders__: { Authorization: 'Bearer attacker' },
+            }
+            expect(fingerprintServerConfig(a)).to.not.equal(fingerprintServerConfig(b))
+        })
+
+        // Consent is about what will execute, not how the config is spelled: two configs
+        // that spawn the process with the identical effective env share a fingerprint.
+        it('hashes the merged spawn env, so the same effective env matches either field', () => {
+            const viaEnv: MCPServerConfig = { command: 'sh', args: [], env: { FOO: '1' } }
+            const viaAdditional: MCPServerConfig = { command: 'sh', args: [], __additionalEnv__: { FOO: '1' } }
+            expect(fingerprintServerConfig(viaEnv)).to.equal(fingerprintServerConfig(viaAdditional))
+        })
+
+        it('is stable regardless of __additionalEnv__ key order', () => {
+            const a: MCPServerConfig = { command: 'sh', args: [], __additionalEnv__: { A: '1', B: '2' } }
+            const b: MCPServerConfig = { command: 'sh', args: [], __additionalEnv__: { B: '2', A: '1' } }
+            expect(fingerprintServerConfig(a)).to.equal(fingerprintServerConfig(b))
+        })
+    })
+
+    describe('effectiveEnv / effectiveHeaders', () => {
+        it('merges __additionalEnv__ over env, matching the spawn-time merge', () => {
+            const cfg: MCPServerConfig = { env: { A: '1', B: '2' }, __additionalEnv__: { B: 'override', C: '3' } }
+            expect(effectiveEnv(cfg)).to.deep.equal({ A: '1', B: 'override', C: '3' })
+        })
+
+        it('merges __additionalHeaders__ over headers', () => {
+            const cfg: MCPServerConfig = { headers: { X: '1' }, __additionalHeaders__: { X: '2', Y: '3' } }
+            expect(effectiveHeaders(cfg)).to.deep.equal({ X: '2', Y: '3' })
+        })
+
+        it('returns an empty object when nothing is set', () => {
+            expect(effectiveEnv({})).to.deep.equal({})
+            expect(effectiveHeaders({})).to.deep.equal({})
         })
     })
 
@@ -183,9 +250,32 @@ describe('mcpConsentStore', () => {
             const storeDir = path.join(tmpHome, '.aws', 'amazonq')
             fs.mkdirSync(storeDir, { recursive: true })
             fs.writeFileSync(path.join(storeDir, 'mcp-approvals.json'), JSON.stringify({ version: 999, approvals: [] }))
-            // record should still work (overwrites with v1)
+            // record should still work (overwrites with the current version)
             await recordApproval(workspace, logger, 'poc', cfg, configPath)
             expect(await hasApproval(workspace, logger, 'poc', cfg, configPath)).to.be.true
+        })
+
+        // STORE_VERSION 1 -> 2: v1 fingerprints were computed over a narrower field set and
+        // cannot be trusted to cover the merged env/headers, so they are discarded and the
+        // user is re-prompted once per workspace-scoped server after upgrade.
+        it('discards legacy v1 approvals so the user is re-prompted once after upgrade', async () => {
+            const storeDir = path.join(tmpHome, '.aws', 'amazonq')
+            fs.mkdirSync(storeDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(storeDir, 'mcp-approvals.json'),
+                JSON.stringify({
+                    version: 1,
+                    approvals: [
+                        {
+                            serverName: 'poc',
+                            fingerprint: fingerprintServerConfig(cfg),
+                            workspaceHash: fingerprintWorkspace(configPath),
+                            approvedAt: new Date().toISOString(),
+                        },
+                    ],
+                })
+            )
+            expect(await hasApproval(workspace, logger, 'poc', cfg, configPath)).to.be.false
         })
 
         it('treats a malformed store as empty', async () => {
