@@ -128,11 +128,10 @@ describe('ListAllAvailableProfiles Handler', () => {
                 })
                 assert.fail('Expected method to throw')
             } catch (error) {
-                // Verify that debug logging was called for complete error object
-                sinon.assert.called(logging.debug)
-                const debugCalls = logging.debug.getCalls()
-                const hasCompleteErrorLogging = debugCalls.some(call => call.args[0].includes('Complete error object'))
-                assert.ok(hasCompleteErrorLogging, 'Should log complete error object in debug logs')
+                // Verify that the complete error object was logged
+                const logCalls = logging.log.getCalls()
+                const hasCompleteErrorLogging = logCalls.some(call => call.args[0].includes('Complete error object'))
+                assert.ok(hasCompleteErrorLogging, 'Should log complete error object')
             }
         })
     })
