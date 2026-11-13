@@ -269,7 +269,9 @@ export class ChatDatabase {
             const historyId = this.getOrCreateHistoryId(tabId)
             if (historyId) {
                 const tab = collection.findOne({ historyId })
-                return tab?.tabContext?.pinnedContext || DEFAULT_PINNED_CONTEXT
+                // Return a copy of the default so callers cannot mutate the shared
+                // module-level DEFAULT_PINNED_CONTEXT array.
+                return tab?.tabContext?.pinnedContext || [...DEFAULT_PINNED_CONTEXT]
             }
         }
         return []
@@ -313,7 +315,10 @@ export class ChatDatabase {
                         tab.tabContext = {}
                     }
                     if (!tab.tabContext.pinnedContext) {
-                        tab.tabContext.pinnedContext = DEFAULT_PINNED_CONTEXT
+                        // Use a copy: DEFAULT_PINNED_CONTEXT is a shared module-level array,
+                        // and the unshift/push below would otherwise mutate it, polluting the
+                        // default pinned context for every new tab/chat window.
+                        tab.tabContext.pinnedContext = [...DEFAULT_PINNED_CONTEXT]
                     }
                     // Only add context item if its not already in this tab's pinned context
                     if (!tab.tabContext.pinnedContext.find(c => c.id === context.id)) {
