@@ -39,6 +39,8 @@ export interface QClientCapabilities {
     developerProfiles?: boolean
     customizationsWithMetadata?: boolean
     mcp?: boolean
+    /** Trust state of the open workspace; see `WorkspaceTrustState` in mcpWorkspaceTrust.ts. Defaults to 'prompt'. */
+    workspaceTrust?: 'trusted' | 'restricted' | 'prompt'
     modelSelection?: boolean
     reroute?: boolean
     codeReviewInChat?: boolean
