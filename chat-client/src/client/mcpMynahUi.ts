@@ -39,6 +39,8 @@ export const MCP_IDS = {
 // MCP UI display constants
 export const MCP_UI_CONSTANTS = {
     MAX_SERVER_NAME_LENGTH: 25, // Maximum length for server name display before truncation when deleting a server
+    // Group the language server uses for servers held back until the workspace or folder is trusted
+    AWAITING_TRUST_GROUP: 'Waiting for trust',
 }
 
 // Type definitions for MCP server parameters
@@ -309,6 +311,7 @@ export class McpMynahUi {
                     const statusChild = serverInfoGroup?.children?.find(child => child.title === 'status')
                     const status = statusChild?.description || 'DISABLED'
                     const consentDenied = group.groupName === 'Denied'
+                    const awaitingTrust = group.groupName === MCP_UI_CONSTANTS.AWAITING_TRUST_GROUP
 
                     if (status === 'ENABLED') {
                         icon = 'ok-circled'
@@ -319,7 +322,7 @@ export class McpMynahUi {
                     } else if (status === 'INITIALIZING') {
                         icon = 'progress'
                         iconForegroundStatus = 'info'
-                    } else if (consentDenied) {
+                    } else if (consentDenied || awaitingTrust) {
                         icon = 'block'
                         iconForegroundStatus = 'warning'
                     } else if (group.groupName === 'Disabled') {
@@ -375,6 +378,12 @@ export class McpMynahUi {
                             id: MCP_IDS.OPEN_SERVER,
                             icon: toMynahIcon('right-open'),
                             description: 'View consent status and server configuration',
+                        })
+                    } else if (awaitingTrust) {
+                        actions.push({
+                            id: MCP_IDS.OPEN_SERVER,
+                            icon: toMynahIcon('right-open'),
+                            description: 'View why the server is not running and its configuration',
                         })
                     } else if (group.groupName === 'Disabled') {
                         actions.push({
