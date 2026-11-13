@@ -1874,7 +1874,7 @@ export class ATXTransformHandler {
             // Step 7: Write source files list to checkpoints folder for tracking (only in interactive mode)
             if (request.interactiveMode && request.interactiveMode !== 'Autonomous') {
                 const startTransformReq = request.startTransformRequest as any
-                this.writeSourceFilesManifest(
+                await this.writeSourceFilesManifest(
                     startTransformReq.SolutionRootPath,
                     createJobResponse.jobId,
                     startTransformReq
@@ -3986,19 +3986,18 @@ export class ATXTransformHandler {
     }
 
     /** True when *p* exists and is a directory; a missing or unreadable path is not one. */
-    private isDirectory(p: string): boolean {
-        try {
-            return fs.statSync(p).isDirectory()
-        } catch {
-            return false
-        }
+    private isDirectory(p: string): Promise<boolean> {
+        return fs.promises.stat(p).then(
+            s => s.isDirectory(),
+            () => false
+        )
     }
 
     /**
      * Writes a manifest of source files to the checkpoints folder for tracking changes.
      * Creates source-files.json containing all source code file paths from the transformation request.
      */
-    private writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): void {
+    private async writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): Promise<void> {
         try {
             const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
 
@@ -4039,9 +4038,15 @@ export class ATXTransformHandler {
                 }
             }
 
-            // A Web Site project's ProjectPath (and any folder a request lists) is a directory,
-            // not a file: listed here it would show up as a modified file and break the uplink zip.
-            const files = sourceFiles.filter(p => !this.isDirectory(p))
+            // A Web Site project's ProjectPath is its folder, not a file: listed here it would show
+            // up as a modified file and break the uplink zip. Only a ProjectPath can be a folder, so
+            // only those are checked, without blocking; getModifiedFilesSinceCheckpoint is the backstop.
+            const projectPaths: string[] = (request.ProjectMetadata ?? [])
+                .map((project: any) => project.ProjectPath)
+                .filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+            const isFolder = await Promise.all(projectPaths.map(p => this.isDirectory(p)))
+            const folders = new Set(projectPaths.filter((_, i) => isFolder[i]))
+            const files = sourceFiles.filter(p => !folders.has(p))
 
             const manifest = {
                 jobId: jobId,
@@ -4086,7 +4091,7 @@ export class ATXTransformHandler {
 
             for (const relativePath of newFiles) {
                 const absolutePath = path.join(solutionRootPath, relativePath)
-                if (!existingFiles.has(absolutePath) && !this.isDirectory(absolutePath)) {
+                if (!existingFiles.has(absolutePath)) {
                     manifest.sourceFiles.push(absolutePath)
                     existingFiles.add(absolutePath)
                     addedCount++
@@ -4174,9 +4179,9 @@ export class ATXTransformHandler {
                 try {
                     if (fs.existsSync(filePath)) {
                         const stats = fs.statSync(filePath)
-                        // A directory is never a modified file; a manifest written before
-                        // directories were skipped can still list one.
-                        if (!stats.isDirectory() && stats.mtimeMs > baseline) {
+                        // Only a file can be a modified file: a manifest can still list a folder
+                        // (written before folders were skipped, or added from a checkpoint).
+                        if (stats.isFile() && stats.mtimeMs > baseline) {
                             modifiedFiles.push(filePath)
                         }
                     }
