@@ -1,6 +1,7 @@
 import { IdleWorkspaceManager } from './IdleWorkspaceManager'
 import { WorkspaceFolderManager } from './workspaceFolderManager'
 import sinon, { stubInterface, StubbedInstance } from 'ts-sinon'
+import { expect } from 'chai'
 
 describe('IdleWorkspaceManager', () => {
     let clock: sinon.SinonFakeTimers
@@ -24,7 +25,7 @@ describe('IdleWorkspaceManager', () => {
 
             const result = IdleWorkspaceManager.isSessionIdle()
 
-            expect(result).toBe(false)
+            expect(result).to.equal(false)
         })
 
         it('should return true when session exceeds idle threshold', () => {
@@ -33,7 +34,7 @@ describe('IdleWorkspaceManager', () => {
 
             const result = IdleWorkspaceManager.isSessionIdle()
 
-            expect(result).toBe(true)
+            expect(result).to.equal(true)
         })
     })
 
@@ -41,7 +42,7 @@ describe('IdleWorkspaceManager', () => {
         it('should update activity timestamp', async () => {
             IdleWorkspaceManager.recordActivityTimestamp()
 
-            expect(IdleWorkspaceManager.isSessionIdle()).toBe(false)
+            expect(IdleWorkspaceManager.isSessionIdle()).to.equal(false)
         })
 
         it('should not trigger workspace check when session was not idle', async () => {

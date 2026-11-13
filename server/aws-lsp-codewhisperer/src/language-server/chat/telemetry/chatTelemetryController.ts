@@ -197,7 +197,8 @@ export class ChatTelemetryController {
         cwsprChatTimeBetweenChunks?: number[],
         agenticCodingMode?: boolean,
         experimentName?: string,
-        userVariation?: string
+        userVariation?: string,
+        reason?: string
     ) {
         this.#telemetry.emitMetric({
             name: ChatTelemetryEventName.AgencticLoop_InvokeLLM,
@@ -218,6 +219,7 @@ export class ChatTelemetryController {
                 modelId,
                 experimentName: experimentName,
                 userVariation: userVariation,
+                reason,
             },
         })
     }
