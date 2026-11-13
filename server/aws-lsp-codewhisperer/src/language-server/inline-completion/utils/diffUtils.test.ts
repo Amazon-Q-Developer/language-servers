@@ -5,6 +5,7 @@ import {
     getAddedAndDeletedLines,
     getCharacterDifferences,
     generateDiffContexts,
+    MAX_LCS_CELLS,
 } from './diffUtils'
 
 describe('extractAdditions', function () {
@@ -380,6 +381,70 @@ describe('diffUtils', () => {
 
             assert.equal(result.charactersAdded, 11) // 'hello world' = 11 chars
             assert.equal(result.charactersRemoved, 0)
+        })
+
+        // Dense-table LCS, the implementation before the table was bounded
+        function referenceCharacterDifferences(added: string, deleted: string) {
+            const dp = Array.from({ length: deleted.length + 1 }, () => new Array(added.length + 1).fill(0))
+            for (let i = 1; i <= deleted.length; i++) {
+                for (let j = 1; j <= added.length; j++) {
+                    dp[i][j] =
+                        deleted[i - 1] === added[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1])
+                }
+            }
+            const lcs = dp[deleted.length][added.length]
+            return { charactersAdded: added.length - lcs, charactersRemoved: deleted.length - lcs }
+        }
+
+        it('should match a dense LCS table below the size cap', () => {
+            const pairs: [string, string][] = [
+                ['aa', 'aaa'],
+                ['aaa', 'aa'],
+                ['abab', 'ba'],
+                ['abcXdef', 'abcYYdef'],
+                ['const x = 1', 'const y = 2'],
+                ['same', 'same'],
+            ]
+            // Deterministic pseudo-random pairs over a small alphabet, so prefixes, suffixes and repeats all occur
+            let seed = 7
+            const next = () => (seed = (seed * 1103515245 + 12345) % 2147483648)
+            const randomText = (length: number) => Array.from({ length }, () => 'ab\nc'[next() % 4]).join('')
+            for (let i = 0; i < 200; i++) {
+                pairs.push([randomText(next() % 40), randomText(next() % 40)])
+            }
+
+            for (const [added, deleted] of pairs) {
+                if (added.length === 0 || deleted.length === 0) {
+                    continue
+                }
+                assert.deepEqual(
+                    getCharacterDifferences([added], [deleted]),
+                    referenceCharacterDifferences(added, deleted),
+                    JSON.stringify({ added, deleted })
+                )
+            }
+        })
+
+        it('should only compare the text between a common prefix and suffix', () => {
+            const prefix = 'p'.repeat(100_000)
+            const suffix = 's'.repeat(100_000)
+
+            const result = getCharacterDifferences([prefix + 'hello world' + suffix], [prefix + 'hello there' + suffix])
+
+            assert.deepEqual(result, { charactersAdded: 4, charactersRemoved: 4 })
+        })
+
+        it('should not build a table above the size cap', () => {
+            const added = 'a'.repeat(32_000) + 'b'.repeat(32_000)
+            const deleted = 'b'.repeat(32_000) + 'a'.repeat(32_000)
+            assert.ok(added.length * deleted.length > MAX_LCS_CELLS)
+
+            const start = Date.now()
+            const result = getCharacterDifferences([added], [deleted])
+
+            assert.ok(Date.now() - start < 1_000, `took ${Date.now() - start} ms`)
+            // The text is counted as entirely replaced
+            assert.deepEqual(result, { charactersAdded: 64_000, charactersRemoved: 64_000 })
         })
     })
 

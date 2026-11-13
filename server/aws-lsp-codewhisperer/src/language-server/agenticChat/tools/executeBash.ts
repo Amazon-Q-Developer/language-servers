@@ -1,18 +1,32 @@
 // Port from VSC https://github.com/aws/aws-toolkit-vscode/blob/741c2c481bcf0dca2d9554e32dc91d8514b1b1d1/packages/core/src/codewhispererChat/tools/executeBash.ts#L134
 
-import { CommandValidation, ExplanatoryParams, InvokeOutput, isPathApproved } from './toolShared'
+import {
+    CommandValidation,
+    ExplanatoryParams,
+    InvokeOutput,
+    isPathApproved,
+    isPathExactlyApproved,
+    isSamePath,
+    multiplyLinkedFileWarning,
+    needsExactApproval,
+    resolveSymlinkAwarePath,
+    canonicalizeWorkspaceFolders,
+} from './toolShared'
 import { split } from 'shlex'
 import { Logging } from '@aws/language-server-runtimes/server-interface'
 import { CancellationError, processUtils, workspaceUtils } from '@aws/lsp-core'
 import { CancellationToken } from 'vscode-languageserver'
 import { ChildProcess, ChildProcessOptions } from '@aws/lsp-core/out/util/processUtils'
 // eslint-disable-next-line import/no-nodejs-modules
-import { isAbsolute, resolve, extname } from 'path' // Safe to import on web since this is part of path-browserify
+import { isAbsolute, resolve, extname, join, parse } from 'path' // Safe to import on web since this is part of path-browserify
 import { Features } from '../../types'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
 // eslint-disable-next-line import/no-nodejs-modules
-import { existsSync, statSync } from 'fs'
+import { existsSync, statSync, lstatSync } from 'fs'
+// eslint-disable-next-line import/no-nodejs-modules
+import { homedir } from 'os'
 import { parseBaseCommands } from '../utils/commandParser'
+import { shellCommandBlock } from '../textFormatting'
 import { BashCommandEvent, ChatTelemetryEventName } from '../../../shared/telemetry/types'
 
 export enum CommandCategory {
@@ -192,6 +206,11 @@ export class ExecuteBash {
                 }
             }
 
+            // Tokenization does not evaluate shell syntax. Retain the raw approval requirement,
+            // including quoted or escaped markers, while collecting category and warning metadata.
+            const expansionPattern = IS_WINDOWS_PLATFORM ? /[%!^*?[\]]/ : /[$`{}*?[\]]/
+            const requiresShellApproval = expansionPattern.test(params.command) || /[<>();&|\r\n]/.test(params.command)
+
             const args = split(params.command)
             if (!args || args.length === 0) {
                 return { requiresAcceptance: true }
@@ -221,6 +240,29 @@ export class ExecuteBash {
             // Track highest command category (ReadOnly < Mutate < Destructive)
             let highestCommandCategory = CommandCategory.ReadOnly
 
+            // Canonicalize the workspace folders once so every boundary check below
+            // is symlink-aware: a workspace reached through a symlinked directory
+            // (e.g. macOS /tmp -> /private/tmp) still compares correctly.
+            const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(
+                getWorkspaceFolderPaths(this.workspace)
+            )
+            // The cwd, when running in it needs approval. An approval of an out-of-workspace prompt
+            // allows the cwd for later commands only for a read-only command without shell syntax,
+            // and only for a cwd that canAllowCwd accepts: the card does not show the cwd.
+            const cwdNeedingApproval = params.cwd
+                ? await this.cwdNeedingApproval(params.cwd, canonicalWorkspaceFolders, approvedPaths)
+                : undefined
+            const isReadOnlyCommand = allCommands.every(
+                cmdArgs => commandCategories.get(cmdArgs[0]) === CommandCategory.ReadOnly
+            )
+            const cwdApproval =
+                cwdNeedingApproval &&
+                isReadOnlyCommand &&
+                !requiresShellApproval &&
+                (await ExecuteBash.canAllowCwd(params.cwd!, cwdNeedingApproval))
+                    ? { approvalPaths: [cwdNeedingApproval] }
+                    : {}
+
             for (const cmdArgs of allCommands) {
                 if (cmdArgs.length === 0) {
                     return { requiresAcceptance: true, commandCategory: highestCommandCategory }
@@ -228,67 +270,95 @@ export class ExecuteBash {
 
                 // For each command, validate arguments for path safety within workspace
                 for (const arg of cmdArgs) {
-                    if (this.looksLikePath(arg)) {
-                        // Special handling for tilde paths in Unix-like systems
-                        let fullPath: string
-                        if (!IS_WINDOWS_PLATFORM && arg.startsWith('~')) {
-                            // Treat tilde paths as absolute paths (they will be expanded by the shell)
-                            return {
-                                requiresAcceptance: true,
-                                warning: destructiveCommandWarningMessage,
-                                commandCategory: CommandCategory.Destructive,
-                            }
-                        } else if (!isAbsolute(arg) && params.cwd) {
-                            // If not absolute, resolve to canonical path (eliminates ".." traversal)
-                            fullPath = resolve(params.cwd, arg)
-                        } else {
-                            // Resolve absolute paths too to canonicalize any ".." sequences
-                            fullPath = resolve(arg)
-                        }
+                    // looksLikePath catches obvious paths (absolute, ./, ../, ".."
+                    // traversal, Windows drive letters, tilde, ...).
+                    // looksLikeRelativePath additionally catches bare relative
+                    // arguments such as "notes.txt" or "sub/notes.txt" that would
+                    // otherwise bypass the boundary and credential checks. Flags and
+                    // plain-text tokens are intentionally not treated as paths.
+                    if (!this.looksLikePath(arg) && !this.looksLikeRelativePath(arg, params.cwd)) {
+                        continue
+                    }
 
-                        // Check if the path is already approved
-                        if (approvedPaths && isPathApproved(fullPath, 'executeBash', approvedPaths)) {
-                            continue
+                    // Special handling for tilde paths in Unix-like systems
+                    if (!IS_WINDOWS_PLATFORM && arg.startsWith('~')) {
+                        // Treat tilde paths as absolute paths (they will be expanded by the shell)
+                        return {
+                            requiresAcceptance: true,
+                            warning: destructiveCommandWarningMessage,
+                            commandCategory: CommandCategory.Destructive,
                         }
+                    }
 
-                        // Check if this is a credential file that needs protection
-                        try {
-                            if (existsSync(fullPath) && statSync(fullPath).isFile()) {
-                                // Check for credential files
-                                if (this.isLikelyCredentialFile(fullPath)) {
-                                    this.logging.info(`Detected credential file in command: ${fullPath}`)
-                                    return {
-                                        requiresAcceptance: true,
-                                        warning: credentialFileWarningMessage,
-                                        commandCategory: CommandCategory.Mutate,
-                                    }
+                    // Resolve to an absolute path against cwd, then canonicalize it in
+                    // a symlink-aware way (eliminates ".." traversal AND follows a
+                    // symlink whose name is in-workspace but whose target is outside).
+                    let candidate: string
+                    if (!isAbsolute(arg) && params.cwd) {
+                        candidate = resolve(params.cwd, arg)
+                    } else {
+                        candidate = resolve(arg)
+                    }
+                    const fullPath = await resolveSymlinkAwarePath(candidate)
+
+                    // Check if this is a credential or binary file that needs
+                    // protection. The existence / regular-file guard stays on the
+                    // canonical fullPath (as before), but the sensitivity
+                    // heuristic considers BOTH the lexical spelling (candidate)
+                    // and the canonical target (fullPath). Otherwise a symlink
+                    // named ".env" or "tool.exe" whose target is an ordinary file
+                    // would hide a credential/binary name behind an innocuous
+                    // canonical name. This only widens the warning; approval
+                    // (isPathApproved) and the workspace boundary remain
+                    // canonical-only and are unchanged.
+                    try {
+                        if (existsSync(fullPath) && statSync(fullPath).isFile()) {
+                            // Check for credential files by lexical name OR canonical target.
+                            if (this.isLikelyCredentialFile(candidate) || this.isLikelyCredentialFile(fullPath)) {
+                                this.logging.info(`Detected credential file in command: ${fullPath}`)
+                                return {
+                                    requiresAcceptance: true,
+                                    warning: credentialFileWarningMessage,
+                                    commandCategory: CommandCategory.Mutate,
                                 }
+                            }
 
-                                // Check for binary files
-                                if (this.isLikelyBinaryFile(fullPath)) {
-                                    this.logging.info(`Detected binary file in command: ${fullPath}`)
-                                    return {
-                                        requiresAcceptance: true,
-                                        warning: binaryFileWarningMessage,
-                                        commandCategory: CommandCategory.Mutate,
-                                    }
+                            // Check for binary files by lexical name OR canonical target.
+                            if (this.isLikelyBinaryFile(candidate) || this.isLikelyBinaryFile(fullPath)) {
+                                this.logging.info(`Detected binary file in command: ${fullPath}`)
+                                return {
+                                    requiresAcceptance: true,
+                                    warning: binaryFileWarningMessage,
+                                    commandCategory: CommandCategory.Mutate,
                                 }
                             }
-                        } catch (err) {
-                            // Ignore errors for files that don't exist or can't be accessed
-                            this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
                         }
+                    } catch (err) {
+                        // Ignore errors for files that don't exist or can't be accessed
+                        this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
+                    }
 
-                        const isInWorkspace = workspaceUtils.isInWorkspace(
-                            getWorkspaceFolderPaths(this.workspace),
-                            fullPath
-                        )
-                        if (!isInWorkspace) {
-                            return {
-                                requiresAcceptance: true,
-                                warning: outOfWorkspaceWarningmessage,
-                                commandCategory: highestCommandCategory,
-                            }
+                    // A file that shares its data with another name on disk, which may be outside the
+                    // workspace, needs approval wherever it is
+                    if (ExecuteBash.hasOtherNames(fullPath)) {
+                        return {
+                            requiresAcceptance: true,
+                            warning: multiplyLinkedFileWarning(isReadOnlyCommand ? 'read' : 'modify'),
+                            commandCategory: highestCommandCategory,
+                        }
+                    }
+
+                    // An approved path skips the workspace check, not the file checks above
+                    if (approvedPaths && this.isApprovedArgument(candidate, fullPath, approvedPaths)) {
+                        continue
+                    }
+
+                    const isInWorkspace = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, fullPath)
+                    if (!isInWorkspace) {
+                        return {
+                            requiresAcceptance: true,
+                            warning: outOfWorkspaceWarningmessage,
+                            commandCategory: highestCommandCategory,
                         }
                     }
                 }
@@ -338,46 +408,91 @@ export class ExecuteBash {
                 }
             }
             // Finally, check if the cwd is outside the workspace
-            if (params.cwd) {
-                // Check if the cwd is already approved
-                if (!(approvedPaths && isPathApproved(params.cwd, 'executeBash', approvedPaths))) {
-                    const workspaceFolders = getWorkspaceFolderPaths(this.workspace)
-
-                    // If there are no workspace folders, we can't validate the path
-                    if (!workspaceFolders || workspaceFolders.length === 0) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: outOfWorkspaceWarningmessage,
-                            commandCategory: highestCommandCategory,
-                        }
-                    }
-
-                    // Resolve the cwd to canonicalize any ".." traversal sequences
-                    const resolvedCwd = resolve(params.cwd).replace(/\\/g, '/')
-                    const normalizedWorkspaceFolders = workspaceFolders.map(folder =>
-                        resolve(folder).replace(/\\/g, '/')
-                    )
-
-                    // Check if the resolved cwd is in any of the resolved workspace folders
-                    const isInWorkspace = normalizedWorkspaceFolders.some(
-                        folder => resolvedCwd === folder || resolvedCwd.startsWith(folder + '/')
-                    )
-
-                    if (!isInWorkspace) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: outOfWorkspaceWarningmessage,
-                            commandCategory: highestCommandCategory,
-                        }
-                    }
+            if (cwdNeedingApproval) {
+                return {
+                    requiresAcceptance: true,
+                    warning: outOfWorkspaceWarningmessage,
+                    commandCategory: highestCommandCategory,
+                    ...cwdApproval,
                 }
             }
 
-            // If we've checked all commands and none required acceptance, we're good
-            return { requiresAcceptance: false, commandCategory: highestCommandCategory }
+            // Only simple commands that passed every check can run without approval.
+            return { requiresAcceptance: requiresShellApproval, commandCategory: highestCommandCategory }
         } catch (error) {
             this.logging.warn(`Error while checking acceptance: ${(error as Error).message}`)
             return { requiresAcceptance: true, commandCategory: CommandCategory.ReadOnly }
+        }
+    }
+
+    /**
+     * The canonical cwd when it is outside the workspace and not approved, otherwise undefined. A
+     * credential or system folder needs an approval of that folder itself.
+     */
+    private async cwdNeedingApproval(
+        cwd: string,
+        canonicalWorkspaceFolders: string[],
+        approvedPaths?: Map<string, Set<string>>
+    ): Promise<string | undefined> {
+        // Canonicalize the cwd in a symlink-aware way so a symlinked cwd is
+        // compared at its real location (and any ".." is eliminated).
+        const canonicalCwd = await resolveSymlinkAwarePath(cwd)
+        const isCwdApproved =
+            approvedPaths &&
+            (needsExactApproval(cwd) || needsExactApproval(canonicalCwd)
+                ? isPathExactlyApproved(canonicalCwd, 'executeBash', approvedPaths)
+                : isPathApproved(canonicalCwd, 'executeBash', approvedPaths))
+        if (isCwdApproved) {
+            return undefined
+        }
+        // Without workspace folders the cwd cannot be validated
+        return workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, canonicalCwd) ? undefined : canonicalCwd
+    }
+
+    /**
+     * True when an approved path covers a path argument. A credential or system path needs an
+     * approval of that path itself.
+     */
+    private isApprovedArgument(candidate: string, fullPath: string, approvedPaths: Map<string, Set<string>>): boolean {
+        return needsExactApproval(candidate) || needsExactApproval(fullPath)
+            ? isPathExactlyApproved(fullPath, 'executeBash', approvedPaths)
+            : isPathApproved(fullPath, 'executeBash', approvedPaths)
+    }
+
+    /**
+     * True when an approval can allow the cwd for later commands: it is not a credential or system
+     * folder, a hidden folder or a folder in one, the home folder or a folder above it, a folder for
+     * application settings in the home folder (Library, AppData\Roaming), or a file system root
+     */
+    private static async canAllowCwd(cwd: string, canonicalCwd: string): Promise<boolean> {
+        if (
+            needsExactApproval(cwd) ||
+            needsExactApproval(canonicalCwd) ||
+            parse(canonicalCwd).root === canonicalCwd ||
+            canonicalCwd.split(/[\\/]/).some(segment => segment.startsWith('.'))
+        ) {
+            return false
+        }
+        const isSameOrInside = (folder: string) =>
+            isSamePath(canonicalCwd, folder) || workspaceUtils.isParentFolder(folder, canonicalCwd)
+        const home = homedir()
+        const canonicalHome = await resolveSymlinkAwarePath(home).catch(() => home)
+        return [home, canonicalHome].every(
+            homeFolder =>
+                !isSamePath(canonicalCwd, homeFolder) &&
+                !workspaceUtils.isParentFolder(canonicalCwd, homeFolder) &&
+                !isSameOrInside(join(homeFolder, 'Library')) &&
+                !isSameOrInside(join(homeFolder, 'AppData', 'Roaming'))
+        )
+    }
+
+    /** True for a file that shares its data with another name on disk (a hard link) */
+    private static hasOtherNames(filePath: string): boolean {
+        try {
+            const stats = statSync(filePath, { throwIfNoEntry: false })
+            return stats !== undefined && stats.isFile() && stats.nlink > 1
+        } catch {
+            return false
         }
     }
 
@@ -407,6 +522,49 @@ export class ExecuteBash {
                 arg.startsWith('../') ||
                 arg.startsWith('~')
             )
+        }
+    }
+
+    /**
+     * Detects bare relative path arguments that {@link looksLikePath} does not,
+     * for example "notes.txt" or "sub/notes.txt". Without this, such arguments
+     * skip the workspace-boundary and credential checks entirely.
+     *
+     * To avoid forcing harmless command flags and plain-text arguments
+     * out-of-workspace, an argument is treated as a path ONLY when a cwd is
+     * available to resolve it against, it is not a flag, and one of:
+     *   - it contains a path separator ("sub/notes.txt"), or
+     *   - it has a file extension ("notes.txt"), or
+     *   - a real filesystem entry exists at cwd/arg (including a dangling
+     *     symlink, detected with lstat rather than stat).
+     *
+     * A bare relative name resolves inside cwd, so an in-workspace file is not
+     * flagged as out-of-workspace. The check exists to catch a bare name that
+     * is a symlink escaping the workspace, or that targets a credential file.
+     */
+    private looksLikeRelativePath(arg: string, cwd?: string): boolean {
+        // Without a cwd there is no base to resolve a relative argument against,
+        // so keep the previous behavior and do not treat it as a path.
+        if (!cwd || arg.length === 0 || arg.startsWith('-')) {
+            return false
+        }
+
+        // A path separator or a file extension is a strong path signal on its own.
+        if (arg.includes('/') || (IS_WINDOWS_PLATFORM && arg.includes('\\'))) {
+            return true
+        }
+        if (extname(arg).length > 1) {
+            return true
+        }
+
+        // Otherwise, only treat it as a path when a real filesystem entry exists
+        // at cwd/arg. lstat (not stat) is used so a dangling symlink still counts,
+        // while plain-text tokens and command names that do not exist do not.
+        try {
+            lstatSync(resolve(cwd, arg))
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -657,7 +815,8 @@ export class ExecuteBash {
                     return abort(new CancellationError('user'))
                 }
 
-                const exitStatus = result.exitCode ?? 0
+                // A command stopped by a signal has no exit code, which is not a success
+                const exitStatus = result.signal !== undefined ? -1 : (result.exitCode ?? -1)
                 const stdout = stdoutBuffer.join('\n')
                 const stderr = stderrBuffer.join('\n')
                 success = exitStatus === 0 && !stderr
@@ -808,7 +967,7 @@ export class ExecuteBash {
 
     public async queueDescription(command: string, updates: WritableStream) {
         const writer = updates.getWriter()
-        await writer.write('```shell\n' + command + '\n```')
+        await writer.write(shellCommandBlock(command))
         await writer.close()
         writer.releaseLock()
     }

@@ -33,6 +33,13 @@ export const DEFAULT_REJECTED_EDIT_TRACKER_CONFIG: RejectedEditTrackerConfig = {
 }
 
 /**
+ * Longest edit, after normalization, that is compared by edit distance. Each suggestion is compared with up to
+ * maxEntries rejections, so this keeps the check to a few milliseconds per comparison. Longer edits only match an
+ * identical rejection.
+ */
+export const MAX_SIMILARITY_INPUT_LENGTH = 2_000
+
+/**
  * Tracks rejected edit predictions to avoid showing similar edits again
  */
 export class RejectedEditTracker {
@@ -68,9 +75,9 @@ export class RejectedEditTracker {
      */
     public isSimilarToRejected(content: string, documentUri: string): boolean {
         const relevantRejections = this.rejectedEdits.filter(edit => edit.documentUri === documentUri)
+        const normalizedContent = this.normalizeEditContent(content)
 
         for (const rejection of relevantRejections) {
-            const normalizedContent = this.normalizeEditContent(content)
             const normalizedRejection = this.normalizeEditContent(rejection.content)
 
             const similarity = this.calculateSimilarity(normalizedContent, normalizedRejection)
@@ -135,6 +142,8 @@ export class RejectedEditTracker {
         if (str1.length === 0 || str2.length === 0) return 0.0
 
         const maxLength = Math.max(str1.length, str2.length)
+        if (maxLength > MAX_SIMILARITY_INPUT_LENGTH) return 0.0
+
         const levenshteinDistance = distance(str1, str2)
 
         return 1.0 - levenshteinDistance / maxLength
