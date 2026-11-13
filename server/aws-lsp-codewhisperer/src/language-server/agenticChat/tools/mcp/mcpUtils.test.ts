@@ -1468,9 +1468,111 @@ describe('loadAgentConfig server-scoped permission restore', () => {
         expect(result.agentConfig.allowedTools).to.not.include('@jira2/other_tool')
         expect(result.agentConfig.allowedTools).to.not.include('@jirax')
     })
+
+    describe('permissions listed in a workspace agent config', () => {
+        let wsRoot: string
+        let wsAgentPath: string
+        let globalAgentPath: string
+
+        beforeEach(async () => {
+            wsRoot = path.join(tmpDir, 'ws')
+            wsAgentPath = path.join(wsRoot, '.amazonq', 'agents', 'default.json')
+            globalAgentPath = getGlobalAgentConfigPath(tmpDir)
+            workspace.getAllWorkspaceFolders = () => [{ uri: pathToFileURL(wsRoot).href, name: 'ws' }]
+            await writeJson(globalAgentPath, { name: 'q_ide_default', mcpServers: {}, tools: [], allowedTools: [] })
+        })
+
+        it('are not applied to a server declared in the global agent config', async () => {
+            await writeJson(globalAgentPath, {
+                name: 'q_ide_default',
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: [],
+            })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: ['@srv/extra'], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(globalAgentPath)
+            expect(result.agentConfig.tools).to.deep.equal(['@srv'])
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are not applied to a server declared in the global mcp.json', async () => {
+            await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: [], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.has('srv')).to.be.true
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are not applied when the global mcp.json replaces a server the workspace declared', async () => {
+            const globalMcpPath = getGlobalMcpConfigPath(tmpDir)
+            await writeJson(globalMcpPath, { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+            await writeJson(wsAgentPath, {
+                mcpServers: { srv: { command: 'other-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: ['@srv/tool'],
+            })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(globalMcpPath)
+            expect(result.agentConfig.allowedTools).to.not.include('@srv/tool')
+        })
+
+        it('are not applied to a server declared in another workspace folder', async () => {
+            const otherRoot = path.join(tmpDir, 'other')
+            const otherAgentPath = path.join(otherRoot, '.amazonq', 'agents', 'default.json')
+            await writeJson(otherAgentPath, { mcpServers: { srv: { command: 'srv-mcp', args: [] } }, tools: ['@srv'] })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: [], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(
+                workspace,
+                logger,
+                [wsAgentPath, otherAgentPath, globalAgentPath],
+                null,
+                false
+            )
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(otherAgentPath)
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are applied to a server declared in the same file', async () => {
+            await writeJson(wsAgentPath, {
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: ['@srv/tool'],
+            })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.agentConfig.tools).to.include('@srv')
+            expect(result.agentConfig.allowedTools).to.include('@srv/tool')
+        })
+
+        it('are applied to a server declared in the mcp.json of the same folder', async () => {
+            await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: ['@srv'], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.has('srv')).to.be.true
+            expect(result.agentConfig.allowedTools).to.include('@srv/tool')
+        })
+    })
 })
 
 describe('restoreServerScopedPermissions()', () => {
+    const home = path.join(os.tmpdir(), 'home')
+    const globalAgentPath = getGlobalAgentConfigPath(home)
+    const wsAgentPath = path.join(os.tmpdir(), 'ws', '.amazonq', 'agents', 'default.json')
+
     const baseAgentConfig = () =>
         ({
             name: 'a',
@@ -1482,6 +1584,12 @@ describe('restoreServerScopedPermissions()', () => {
             resources: [],
         }) as any
 
+    const fromFile = (file: string, ...entries: string[]) =>
+        new Map(entries.map(entry => [entry, new Set([file])] as [string, Set<string>]))
+
+    const serversAt = (configPath: string, ...names: string[]) =>
+        new Map(names.map(name => [name, { command: 'x', __configPath__: configPath } as MCPServerConfig]))
+
     it('restores only entries belonging to a loaded server', () => {
         const agentConfig = baseAgentConfig()
         const mapping = new Map([['srv', 'srv']])
@@ -1489,8 +1597,10 @@ describe('restoreServerScopedPermissions()', () => {
         restoreServerScopedPermissions(
             agentConfig,
             mapping,
-            ['@srv', '@srv/tool', '@gone'],
-            ['@srv/tool', '@gone/tool']
+            serversAt(globalAgentPath, 'srv'),
+            globalAgentPath,
+            fromFile(globalAgentPath, '@srv', '@srv/tool', '@gone'),
+            fromFile(globalAgentPath, '@srv/tool', '@gone/tool')
         )
 
         expect(agentConfig.tools).to.deep.equal(['@srv', '@srv/tool'])
@@ -1501,7 +1611,14 @@ describe('restoreServerScopedPermissions()', () => {
         const agentConfig = baseAgentConfig()
         const mapping = new Map([['my_server', 'my-server']])
 
-        restoreServerScopedPermissions(agentConfig, mapping, ['@my-server'], ['@my-server/tool'])
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(globalAgentPath, 'my_server'),
+            globalAgentPath,
+            fromFile(globalAgentPath, '@my-server'),
+            fromFile(globalAgentPath, '@my-server/tool')
+        )
 
         expect(agentConfig.tools).to.deep.equal(['@my-server'])
         expect(agentConfig.allowedTools).to.deep.equal(['@my-server/tool'])
@@ -1513,7 +1630,14 @@ describe('restoreServerScopedPermissions()', () => {
         agentConfig.allowedTools.push('@srv/tool')
         const mapping = new Map([['srv', 'srv']])
 
-        restoreServerScopedPermissions(agentConfig, mapping, ['@srv'], ['@srv/tool'])
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(globalAgentPath, 'srv'),
+            globalAgentPath,
+            fromFile(globalAgentPath, '@srv'),
+            fromFile(globalAgentPath, '@srv/tool')
+        )
 
         expect(agentConfig.tools).to.deep.equal(['@srv'])
         expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
@@ -1522,10 +1646,55 @@ describe('restoreServerScopedPermissions()', () => {
     it('is a no-op when no servers loaded', () => {
         const agentConfig = baseAgentConfig()
 
-        restoreServerScopedPermissions(agentConfig, new Map(), ['@srv'], ['@srv/tool'])
+        restoreServerScopedPermissions(
+            agentConfig,
+            new Map(),
+            new Map(),
+            globalAgentPath,
+            fromFile(globalAgentPath, '@srv'),
+            fromFile(globalAgentPath, '@srv/tool')
+        )
 
         expect(agentConfig.tools).to.be.empty
         expect(agentConfig.allowedTools).to.be.empty
+    })
+
+    it('applies entries from a workspace file only to servers whose permissions live in that file', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([
+            ['global_srv', 'global_srv'],
+            ['ws_srv', 'ws_srv'],
+        ])
+        const servers = new Map([...serversAt(globalAgentPath, 'global_srv'), ...serversAt(wsAgentPath, 'ws_srv')])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            servers,
+            globalAgentPath,
+            fromFile(wsAgentPath, '@global_srv', '@ws_srv'),
+            fromFile(wsAgentPath, '@global_srv/tool', '@ws_srv/tool')
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@ws_srv'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@ws_srv/tool'])
+    })
+
+    it('maps a legacy mcp.json server to the agents/default.json next to it', () => {
+        const agentConfig = baseAgentConfig()
+        const wsMcpPath = path.join(path.dirname(path.dirname(wsAgentPath)), 'mcp.json')
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(wsMcpPath, 'srv'),
+            globalAgentPath,
+            new Map(),
+            fromFile(wsAgentPath, '@srv/tool')
+        )
+
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
     })
 })
 
