@@ -266,6 +266,13 @@ the response. The chat UI shows them under the answer, and a click on one asks t
   `classifyChatLink` classifies the link as a web link. Clicks on links in answers and on info links
   already used this check. For any other source link, the client records the `sourceLinkClick`
   telemetry event, does not send the click to the IDE, and shows the "Link not opened" notification.
+- The telemetry event is the same for a click that goes to the IDE and for a click that the client
+  does not send, as it is for links in answers and info links. Both carry the link, and the server
+  records it as the interaction target of the `ClickLink` interaction, so the scheme of the target
+  tells a blocked click from a sent one. The servers drop non-web source links, so a blocked click is
+  expected to be rare. The service event has no field for the outcome, and the server records nothing
+  for an event name that it does not know, so a new field or a new event name would not reach the
+  service.
 
 ### How to test
 
@@ -292,7 +299,8 @@ npm run test:unit
   unchanged, and that an event with no such link adds no related content. The agentic suite also
   checks that the links of earlier events are kept.
 - The suite "source link clicks" checks that `http` and `https` links go to the IDE with telemetry,
-  and that other links and local paths do not go to the IDE and show the notification.
+  and that other links and local paths do not go to the IDE and show the notification, with a
+  telemetry event that carries each link.
 
 ## 8. Memory bank folder cleanup
 

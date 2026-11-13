@@ -227,7 +227,11 @@ export class Messager {
         this.onSourceLinkClickTelemetry(params)
     }
 
-    /** Records a source-link click that chat did not send to the IDE (a link that is not http or https). */
+    /**
+     * Records the telemetry of a source-link click: of every click, both the clicks that chat sends to the IDE
+     * (onSourceLinkClick) and the ones that it does not send because the link is not http or https. The event
+     * carries the link, and the server records it as the interaction target, so the scheme tells them apart.
+     */
     onSourceLinkClickTelemetry = (params: SourceLinkClickParams): void => {
         this.chatApi.telemetry({ ...params, name: SOURCE_LINK_CLICK_TELEMETRY_EVENT })
     }
