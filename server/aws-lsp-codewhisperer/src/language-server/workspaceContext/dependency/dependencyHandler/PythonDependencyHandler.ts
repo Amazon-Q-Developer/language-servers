@@ -2,7 +2,7 @@ import { BaseDependencyInfo, Dependency, LanguageDependencyHandler } from './Lan
 import { WorkspaceFolder } from '@aws/language-server-runtimes/server-interface'
 import * as path from 'path'
 import * as fs from 'fs'
-import { resolveSymlink, isDirectory } from '../../util'
+import { resolvePathInside, isDirectory } from '../../util'
 import { DependencyWatcher } from './DependencyWatcher'
 
 export interface PythonDependencyInfo extends BaseDependencyInfo {
@@ -181,7 +181,12 @@ export class PythonDependencyHandler extends LanguageDependencyHandler<PythonDep
             // Add to dependency map if not already present
             if (!dependencyMap.has(dependencyName)) {
                 let dependencySize: number = 0
-                let truePath: string = resolveSymlink(dependencyPath)
+                // A site-packages entry that links elsewhere must not pull in files from outside site-packages
+                const truePath = resolvePathInside(dependencyPath, path.dirname(dependencyPath))
+                if (truePath === undefined) {
+                    this.logging.warn(`Skipping dependency ${dependencyName}: it resolves outside its parent directory`)
+                    return
+                }
 
                 if (isDirectory(truePath)) {
                     dependencySize = this.getDirectorySize(truePath)
@@ -215,8 +220,8 @@ export class PythonDependencyHandler extends LanguageDependencyHandler<PythonDep
         const dependencyName = metadataDir.split('-')[0]
 
         // Check if we have this package in our dependency map
-        const dependencyPath = resolveSymlink(path.join(sitePackagesPath, dependencyName))
-        if (fs.existsSync(dependencyPath)) {
+        const dependencyPath = resolvePathInside(path.join(sitePackagesPath, dependencyName), sitePackagesPath)
+        if (dependencyPath !== undefined) {
             // Mark the package as updated
             const updatedDependency = {
                 name: dependencyName,
@@ -235,8 +240,8 @@ export class PythonDependencyHandler extends LanguageDependencyHandler<PythonDep
         fileName: string,
         updatedDependencyMap: Map<string, Dependency>
     ): void {
-        const dependencyPath = resolveSymlink(path.join(sitePackagesPath, fileName))
-        if (fs.existsSync(dependencyPath)) {
+        const dependencyPath = resolvePathInside(path.join(sitePackagesPath, fileName), sitePackagesPath)
+        if (dependencyPath !== undefined) {
             const updatedDependency = {
                 name: fileName,
                 version: 'unknown',
