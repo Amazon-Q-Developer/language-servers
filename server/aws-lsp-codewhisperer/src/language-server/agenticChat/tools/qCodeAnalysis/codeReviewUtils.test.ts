@@ -154,29 +154,109 @@ describe('CodeReviewUtils', () => {
     })
 
     describe('executeGitCommand', () => {
-        it('should execute git command and return output on success', async () => {
-            const execStub = sandbox.stub(childProcess, 'exec').callsFake((cmd, callback: any) => {
-                callback(null, 'command output', '')
-                return {} as childProcess.ChildProcess
-            })
+        it('should execute git via execFile (no shell) and return trimmed output on success', async () => {
+            const execFileStub = sandbox
+                .stub(childProcess, 'execFile')
+                .callsFake((file: any, args: any, options: any, callback: any) => {
+                    callback(null, 'command output\n', '')
+                    return {} as childProcess.ChildProcess
+                })
 
-            const result = await CodeReviewUtils.executeGitCommand('git status', 'status', mockLogging)
+            const result = await CodeReviewUtils.executeGitCommand(
+                ['diff', '--', ':(literal)/repo/file.ts'],
+                '/repo',
+                'unstaged',
+                mockLogging
+            )
             expect(result).to.equal('command output')
-            sinon.assert.calledWith(execStub, 'git status', sinon.match.func)
+
+            // The binary is the literal 'git', the argv is passed verbatim, the
+            // working directory is set via cwd, and no shell option is present.
+            const [file, args, options] = execFileStub.firstCall.args as unknown as [string, string[], any]
+            expect(file).to.equal('git')
+            expect(args).to.deep.equal(['diff', '--', ':(literal)/repo/file.ts'])
+            expect(options.cwd).to.equal('/repo')
+            expect(options.shell).to.be.undefined
         })
 
         it('should handle errors and return empty string', async () => {
-            sandbox.stub(childProcess, 'exec').callsFake((cmd, callback: any) => {
+            sandbox.stub(childProcess, 'execFile').callsFake((file: any, args: any, options: any, callback: any) => {
                 callback(new Error('git error'), '', 'error output')
                 return {} as childProcess.ChildProcess
             })
 
-            const result = await CodeReviewUtils.executeGitCommand('git status', 'status', mockLogging)
+            const result = await CodeReviewUtils.executeGitCommand(['diff'], '/repo', 'status', mockLogging)
             expect(result).to.equal('')
             sinon.assert.calledWith(
                 mockLogging.warn,
                 sinon.match(str => str.includes('Git diff failed for status'))
             )
+        })
+    })
+
+    describe('git command construction (path-injection hardening)', () => {
+        let executeGitCommandStub: sinon.SinonStub
+
+        beforeEach(() => {
+            executeGitCommandStub = sandbox.stub(CodeReviewUtils, 'executeGitCommand').resolves('')
+        })
+
+        it('getGitDiff builds argv with a -- separator and a literal pathspec (no shell string)', async () => {
+            await CodeReviewUtils.getGitDiff('/repo/src/app.ts', mockLogging)
+
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'unstaged',
+                mockLogging
+            )
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--staged', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'staged',
+                mockLogging
+            )
+        })
+
+        it('getGitDiffNames builds --name-only argv with a -- separator and a literal pathspec', async () => {
+            await CodeReviewUtils.getGitDiffNames('/repo/src/app.ts', mockLogging)
+
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--name-only', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'unstaged name only',
+                mockLogging
+            )
+            sinon.assert.calledWithExactly(
+                executeGitCommandStub,
+                ['diff', '--name-only', '--staged', '--', ':(literal)/repo/src/app.ts'],
+                '/repo/src',
+                'staged name only',
+                mockLogging
+            )
+        })
+
+        it('passes shell-metacharacter and glob paths verbatim as a single literal pathspec argument', async () => {
+            // Inert special-character names. A shell command line would split or
+            // expand these; execFile + ':(literal)' + '--' pass them to git as a
+            // single, literal argv element instead.
+            const trickyPath = '/repo/notes; echo hi.txt'
+            await CodeReviewUtils.getGitDiff(trickyPath, mockLogging)
+
+            const firstArgv = executeGitCommandStub.firstCall.args[0] as string[]
+            expect(firstArgv).to.deep.equal(['diff', '--', `:(literal)${trickyPath}`])
+            // The entire path is exactly one argv element (no shell tokenization).
+            expect(firstArgv[firstArgv.length - 1]).to.equal(`:(literal)${trickyPath}`)
+
+            executeGitCommandStub.resetHistory()
+
+            const globPath = '/repo/*.ts'
+            await CodeReviewUtils.getGitDiffNames(globPath, mockLogging)
+            const namesArgv = executeGitCommandStub.firstCall.args[0] as string[]
+            expect(namesArgv).to.deep.equal(['diff', '--name-only', '--', `:(literal)${globPath}`])
         })
     })
 
@@ -727,5 +807,532 @@ describe('CodeReviewUtils', () => {
                 },
             })
         })
+    })
+})
+
+// End-to-end regression tests against a REAL temporary git repository. These
+// prove the fix in practice: an inert special-character filename is matched
+// literally (no shell tokenization) and a glob character in a filename is NOT
+// expanded (literal pathspec). No command-injection payload is executed.
+describe('CodeReviewUtils git diff (real repo, injection-safe)', () => {
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    let repo: string
+    let gitReady = false
+
+    const git = (args: string[], cwd: string) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe' })
+
+    beforeEach(() => {
+        gitReady = false
+        try {
+            childProcess.execFileSync('git', ['--version'], { stdio: 'pipe' })
+        } catch {
+            return
+        }
+        repo = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'cru-git-'))
+        try {
+            git(['init', '-q'], repo)
+            git(['config', 'user.email', 'test@example.com'], repo)
+            git(['config', 'user.name', 'test'], repo)
+            git(['config', 'commit.gpgsign', 'false'], repo)
+            gitReady = true
+        } catch {
+            gitReady = false
+        }
+    })
+
+    afterEach(() => {
+        if (repo) {
+            fs.rmSync(repo, { recursive: true, force: true })
+        }
+    })
+
+    it('returns the changed file for an inert special-character filename without shell interpretation', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        // A shell parsing "git diff ... note;echo.txt" would split on ';' into a
+        // second command; execFile + ':(literal)' + '--' pass it to git literally.
+        const weird = 'note;echo.txt'
+        const filePath = path.join(repo, weird)
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        git(['commit', '-qm', 'init'], repo)
+        fs.appendFileSync(filePath, 'v2\n')
+
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, noopLogging)
+        expect(names.has(weird)).to.equal(true)
+
+        const diff = await CodeReviewUtils.getGitDiff(filePath, noopLogging)
+        expect(diff).to.be.a('string')
+        expect((diff as string).includes(weird)).to.equal(true)
+
+        // A shell split would have tried to run a second command; assert no artifact.
+        expect(fs.existsSync(path.join(repo, 'echo.txt'))).to.equal(false)
+    })
+
+    it('does not expand a glob character in a filename (literal pathspec)', async function () {
+        // Windows does not permit '*' in filenames. Argument construction is tested above on every platform.
+        if (!gitReady || process.platform === 'win32') {
+            return this.skip()
+        }
+        const star = 'star*.txt' // literal file whose NAME contains a glob char
+        const other = 'starXYZ.txt' // would match if '*' were treated as a glob
+        fs.writeFileSync(path.join(repo, star), 'v1\n')
+        fs.writeFileSync(path.join(repo, other), 'v1\n')
+        git(['add', '-A'], repo)
+        git(['commit', '-qm', 'init'], repo)
+        fs.appendFileSync(path.join(repo, star), 'v2\n')
+        fs.appendFileSync(path.join(repo, other), 'v2\n')
+
+        const names = await CodeReviewUtils.getGitDiffNames(path.join(repo, star), noopLogging)
+        expect(names.has(star)).to.equal(true)
+        expect(names.has(other)).to.equal(false)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// Expanded regression coverage for the git path-injection hardening in
+// getGitDiff / getGitDiffNames. These complement the suites above by
+// exercising the REAL child_process boundary: production must call execFile
+// (no shell) and must never call the shell-using exec. All adversarial path
+// strings below are inert, single argv elements — execFile is stubbed so no
+// process runs, and exec is stubbed AND asserted never-called so nothing can
+// reach a shell even against unfixed code. The real path library is used
+// throughout (path.extname / path.dirname are never stubbed to invented
+// semantics). No reporter payloads, network calls, or internal identifiers
+// are used.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils git argv construction (child_process boundary)', () => {
+    let sandbox: sinon.SinonSandbox
+    let execStub: sinon.SinonStub
+
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    // Every execFile invocation, recorded as {file, args, cwd, shell}. The stub
+    // resolves with empty output so the real executeGitCommand completes without
+    // spawning anything.
+    let calls: Array<{ file: string; args: string[]; cwd: unknown; shell: unknown }>
+
+    beforeEach(() => {
+        sandbox = sinon.createSandbox()
+        calls = []
+        sandbox.stub(childProcess, 'execFile').callsFake((file: any, args: any, options: any, callback: any) => {
+            calls.push({ file, args, cwd: options?.cwd, shell: options?.shell })
+            callback(null, '', '')
+            return {} as childProcess.ChildProcess
+        })
+        // Trap: production must never route git through the shell-using exec.
+        execStub = sandbox.stub(childProcess, 'exec').throws(new Error('Unexpected shell-based Git execution'))
+    })
+
+    afterEach(() => {
+        sandbox.restore()
+    })
+
+    const unstagedOf = () => calls.find(c => !c.args.includes('--staged'))
+    const stagedOf = () => calls.find(c => c.args.includes('--staged'))
+
+    it('getGitDiff runs unstaged and staged diffs via execFile with -- and a literal pathspec', async () => {
+        const artifact = '/repo/src/app.ts'
+        const dir = path.dirname(artifact)
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiff(artifact, noopLogging)
+
+        expect(calls.length).to.equal(2)
+        const unstaged = unstagedOf()
+        const staged = stagedOf()
+        expect(unstaged, 'expected an unstaged diff call').to.not.be.undefined
+        expect(staged, 'expected a staged diff call').to.not.be.undefined
+        expect(unstaged!.args).to.deep.equal(['diff', '--', lit])
+        expect(staged!.args).to.deep.equal(['diff', '--staged', '--', lit])
+        for (const c of calls) {
+            expect(c.file).to.equal('git')
+            expect(c.cwd).to.equal(dir)
+            expect(c.shell).to.be.undefined
+        }
+        sinon.assert.notCalled(execStub)
+    })
+
+    it('getGitDiffNames runs unstaged and staged --name-only diffs via execFile with -- and a literal pathspec', async () => {
+        const artifact = '/repo/src/app.ts'
+        const dir = path.dirname(artifact)
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+        expect(calls.length).to.equal(2)
+        expect(unstagedOf()!.args).to.deep.equal(['diff', '--name-only', '--', lit])
+        expect(stagedOf()!.args).to.deep.equal(['diff', '--name-only', '--staged', '--', lit])
+        for (const c of calls) {
+            expect(c.file).to.equal('git')
+            expect(c.cwd).to.equal(dir)
+            expect(c.shell).to.be.undefined
+        }
+        sinon.assert.notCalled(execStub)
+    })
+
+    // Inert, mocked names covering spaces + metacharacters in BOTH the directory
+    // (cwd) and artifact (pathspec) slots, extension-bearing semicolon and
+    // command-substitution forms, option-like leading dashes, pathspec-magic
+    // leading colon, and glob characters. Each must survive verbatim as a single
+    // literal pathspec argument placed after '--'.
+    const trickyArtifacts: Array<{ label: string; artifact: string }> = [
+        {
+            label: 'spaces and semicolon in directory and artifact slots',
+            artifact: '/a dir; fixture/b sub/app; end.ts',
+        },
+        { label: 'extension before semicolon and comment marker', artifact: '/repo/src/app.ts; fixture #' },
+        { label: 'command-substitution syntax in filename (mocked)', artifact: '/repo/app$(fixture).ts' },
+        { label: 'command-substitution syntax in directory (mocked)', artifact: '/repo/$(fixture)/app.ts' },
+        { label: 'backtick syntax in filename (mocked)', artifact: '/repo/app`fixture`.ts' },
+        { label: 'option-like relative path', artifact: '--output.ts' },
+        { label: 'pathspec-magic relative path', artifact: ':(glob)*.ts' },
+        { label: 'glob star', artifact: '/repo/*.ts' },
+        { label: 'glob bracket class', artifact: '/repo/file[0-9].ts' },
+    ]
+
+    trickyArtifacts.forEach(({ label, artifact }) => {
+        it(`passes ${label} literally in all four Git variants`, async () => {
+            const dir = path.dirname(artifact)
+            const lit = `:(literal)${artifact}`
+
+            await CodeReviewUtils.getGitDiff(artifact, noopLogging)
+            await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+            expect(calls.map(c => c.args)).to.deep.equal([
+                ['diff', '--', lit],
+                ['diff', '--staged', '--', lit],
+                ['diff', '--name-only', '--', lit],
+                ['diff', '--name-only', '--staged', '--', lit],
+            ])
+            for (const call of calls) {
+                expect(call.file).to.equal('git')
+                expect(call.cwd).to.equal(dir)
+                expect(call.shell).to.be.undefined
+            }
+            sinon.assert.notCalled(execStub)
+        })
+    })
+
+    it('getGitDiffNames passes an option-like + glob name verbatim as one literal pathspec after --', async () => {
+        const artifact = '/repo/-rf *.ts'
+        const lit = `:(literal)${artifact}`
+
+        await CodeReviewUtils.getGitDiffNames(artifact, noopLogging)
+
+        const unstaged = unstagedOf()!
+        expect(unstaged.args).to.deep.equal(['diff', '--name-only', '--', lit])
+        expect(unstaged.args[unstaged.args.length - 1]).to.equal(lit)
+        sinon.assert.notCalled(execStub)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// Result-combination contract for getGitDiff / getGitDiffNames: how staged and
+// unstaged outputs are merged, de-duplicated, trimmed of empties, and reduced
+// to null / an empty set. Uses the higher-level executeGitCommand stub (same
+// style as the getGitDiff suite above); no process is spawned.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils diff result combination and dedup', () => {
+    let sandbox: sinon.SinonSandbox
+    let execGit: sinon.SinonStub
+
+    const noopLogging = {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    beforeEach(() => {
+        sandbox = sinon.createSandbox()
+        sandbox.stub(CodeReviewUtils, 'getFolderPath').returns('/mock/dir')
+        execGit = sandbox.stub(CodeReviewUtils, 'executeGitCommand')
+    })
+
+    afterEach(() => {
+        sandbox.restore()
+    })
+
+    it('getGitDiff returns unstaged-only content when staged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? '' : 'U'))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('U')
+    })
+
+    it('getGitDiff returns staged-only content when unstaged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'S' : ''))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('S')
+    })
+
+    it('getGitDiff joins unstaged and staged with a blank line', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'S' : 'U'))
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.equal('U\n\nS')
+    })
+
+    it('getGitDiff returns null when both unstaged and staged are empty', async () => {
+        execGit.resolves('')
+        expect(await CodeReviewUtils.getGitDiff('/mock/dir/f.ts', noopLogging)).to.be.null
+    })
+
+    it('getGitDiffNames de-duplicates names across staged and unstaged', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'b\nc' : 'a\nb'))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names).sort()).to.deep.equal(['a', 'b', 'c'])
+    })
+
+    it('getGitDiffNames returns unstaged-only names when staged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? '' : 'a\nb'))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names).sort()).to.deep.equal(['a', 'b'])
+    })
+
+    it('getGitDiffNames returns staged-only names when unstaged is empty', async () => {
+        execGit.callsFake(async (args: string[]) => (args.includes('--staged') ? 'c' : ''))
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(Array.from(names)).to.deep.equal(['c'])
+    })
+
+    it('getGitDiffNames returns an empty set when both are empty (blank lines filtered)', async () => {
+        execGit.resolves('')
+        const names = await CodeReviewUtils.getGitDiffNames('/mock/dir/f.ts', noopLogging)
+        expect(names.size).to.equal(0)
+    })
+})
+
+// ---------------------------------------------------------------------------
+// getFolderPath contract pinned against the REAL path library (no stubbing of
+// path.extname / path.dirname). Covers the file-vs-directory decision and the
+// missing/empty inputs. These assert only the existing behavior; they do not
+// add any new policy.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils.getFolderPath contract (real path library)', () => {
+    it('returns the parent directory for a file path with an extension', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src/app.ts')).to.equal(path.dirname('/repo/src/app.ts'))
+    })
+
+    it('returns a directory path (no extension) unchanged', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src')).to.equal('/repo/src')
+    })
+
+    it('strips a single trailing slash from a directory path', () => {
+        expect(CodeReviewUtils.getFolderPath('/repo/src/')).to.equal('/repo/src')
+    })
+
+    it('treats a dotfile as a directory (path.extname of a dotfile is empty)', () => {
+        expect(path.extname('.env')).to.equal('')
+        expect(CodeReviewUtils.getFolderPath('/repo/.env')).to.equal('/repo/.env')
+    })
+
+    it('returns an empty string for empty input (existing contract; no policy added)', () => {
+        expect(CodeReviewUtils.getFolderPath('')).to.equal('')
+    })
+})
+
+// ---------------------------------------------------------------------------
+// Real-repository coverage for NATIVE ABSOLUTE pathspecs and for the Git error
+// path. These complement the injection-safe real-repo suite above. A separate,
+// scoped harness is used so a host WITHOUT git self-skips, while any other
+// setup failure surfaces as a real failure instead of a silent skip. Repository
+// identity is supplied per-command via `-c` (no git config is written). Only
+// synthetic files are used; no command is ever executed from a path string and
+// invoke() is never called.
+// ---------------------------------------------------------------------------
+describe('CodeReviewUtils git diff native absolute pathspec (real repo)', () => {
+    let repo = ''
+    let outside = ''
+    let gitReady = false
+    let warnings: string[] = []
+
+    // Records warn text so a test can assert that an ERROR occurred and key on
+    // the STABLE, non-localized classification our code prepends
+    // ("Git diff failed for <type>:") rather than on localized git stderr text.
+    const recordingLogging = {
+        info: () => {},
+        warn: (m: string) => {
+            warnings.push(m)
+        },
+        error: () => {},
+        log: () => {},
+        debug: () => {},
+    } as unknown as Features['logging']
+
+    const git = (args: string[], cwd: string) => childProcess.execFileSync('git', args, { cwd, stdio: 'pipe' })
+
+    // Commit without writing repository or global git config: identity and the
+    // no-gpg-sign setting are passed per-command via `-c`.
+    const commit = (msg: string) =>
+        git(
+            [
+                '-c',
+                'user.email=test@example.com',
+                '-c',
+                'user.name=test',
+                '-c',
+                'commit.gpgsign=false',
+                'commit',
+                '-qm',
+                msg,
+            ],
+            repo
+        )
+
+    beforeEach(function () {
+        warnings = []
+        repo = ''
+        outside = ''
+        gitReady = false
+        // Skip ONLY when git itself is unavailable. Any later setup failure is a
+        // real error and must not be swallowed into a skip.
+        try {
+            childProcess.execFileSync('git', ['--version'], { stdio: 'pipe' })
+        } catch {
+            this.skip()
+            return
+        }
+        const realTmp = fs.realpathSync(os.tmpdir())
+        repo = fs.mkdtempSync(path.join(realTmp, 'cru-abs-'))
+        outside = fs.mkdtempSync(path.join(realTmp, 'cru-out-'))
+        git(['init', '-q'], repo)
+        gitReady = true
+    })
+
+    afterEach(() => {
+        if (repo) {
+            fs.rmSync(repo, { recursive: true, force: true })
+        }
+        if (outside) {
+            fs.rmSync(outside, { recursive: true, force: true })
+        }
+    })
+
+    it('matches an ordinary file by native absolute pathspec (unstaged) via executeGitCommand and the wrappers', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const name = 'ordinary.ts'
+        const filePath = path.join(repo, name)
+        // The wrappers derive the pathspec from this native absolute path; the
+        // separators are not forced to POSIX. Assert win32-absolute only on win.
+        expect(path.isAbsolute(filePath)).to.equal(true)
+        if (process.platform === 'win32') {
+            expect(path.win32.isAbsolute(filePath)).to.equal(true)
+        }
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        commit('init')
+        fs.appendFileSync(filePath, 'v2\n') // working-tree (unstaged) change
+
+        // Low-level: literal absolute pathspec with an explicit cwd = repo.
+        const raw = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', CodeReviewUtils.toLiteralPathspec(filePath)],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(raw).to.be.a('string')
+        expect(raw.length).to.be.greaterThan(0)
+        expect(raw.includes(name)).to.equal(true)
+
+        // High-level wrappers (cwd derived from the artifact path).
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, recordingLogging)
+        expect(names.has(name)).to.equal(true)
+        const diff = await CodeReviewUtils.getGitDiff(filePath, recordingLogging)
+        expect(diff).to.be.a('string')
+        expect((diff as string).includes(name)).to.equal(true)
+    })
+
+    it('matches an ordinary file by native absolute pathspec (staged only)', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const name = 'staged.ts'
+        const filePath = path.join(repo, name)
+        fs.writeFileSync(filePath, 'v1\n')
+        git(['add', '-A'], repo)
+        commit('init')
+        fs.appendFileSync(filePath, 'v2\n')
+        git(['add', '-A'], repo) // stage the change
+
+        const lit = CodeReviewUtils.toLiteralPathspec(filePath)
+        // The staged probe sees the change...
+        const staged = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--staged', '--', lit],
+            repo,
+            'staged',
+            recordingLogging
+        )
+        expect(staged.length).to.be.greaterThan(0)
+        expect(staged.includes(name)).to.equal(true)
+        // ...and the working-tree probe is genuinely empty (the change is staged).
+        const unstaged = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', lit],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(unstaged).to.equal('')
+        // No warning was recorded, so the empty unstaged result is a real
+        // no-changes result and not a swallowed git error.
+        expect(warnings.length).to.equal(0)
+
+        // The combined wrapper still returns the staged content, and the names
+        // include the file.
+        const diff = await CodeReviewUtils.getGitDiff(filePath, recordingLogging)
+        expect((diff as string).includes(name)).to.equal(true)
+        const names = await CodeReviewUtils.getGitDiffNames(filePath, recordingLogging)
+        expect(names.has(name)).to.equal(true)
+    })
+
+    it('yields empty output AND a classified warning for an outside-repo pathspec run with cwd = repo', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        const outsideFile = path.join(outside, 'outside.ts')
+        fs.writeFileSync(outsideFile, 'v1\n')
+        // git runs INSIDE the repo, but the literal pathspec points OUTSIDE it.
+        const result = await CodeReviewUtils.executeGitCommand(
+            ['diff', '--', CodeReviewUtils.toLiteralPathspec(outsideFile)],
+            repo,
+            'unstaged',
+            recordingLogging
+        )
+        expect(result).to.equal('')
+        // The empty string is an ERROR result, not a no-changes result: the warn
+        // is emitted only on executeGitCommand's error branch. Assert the stable,
+        // non-localized prefix our code prepends (git's stderr text is localized).
+        expect(warnings.some(w => w.startsWith('Git diff failed for unstaged:'))).to.equal(true)
+    })
+
+    it('getGitDiff returns null and getGitDiffNames returns an empty set in a non-repo directory (error, not no-changes)', async function () {
+        if (!gitReady) {
+            return this.skip()
+        }
+        // 'outside' is a real directory that is NOT a git repository, so every
+        // probe git runs there errors out.
+        const file = path.join(outside, 'file.ts')
+        fs.writeFileSync(file, 'v1\n')
+
+        const diff = await CodeReviewUtils.getGitDiff(file, recordingLogging)
+        expect(diff).to.be.null
+        const names = await CodeReviewUtils.getGitDiffNames(file, recordingLogging)
+        expect(names.size).to.equal(0)
+        // A classified warning proves the null / empty result came from a git
+        // error rather than from a tracked file with no changes.
+        expect(warnings.some(w => w.startsWith('Git diff failed for'))).to.equal(true)
     })
 })
