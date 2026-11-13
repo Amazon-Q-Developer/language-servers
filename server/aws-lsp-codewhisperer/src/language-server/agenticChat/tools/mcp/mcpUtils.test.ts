@@ -28,6 +28,7 @@ import {
     convertPersonaToAgent,
     migrateToAgentConfig,
     migrateAgentConfigsToCLIFormat,
+    migrateAgentConfigToCLIFormat,
     restoreServerScopedPermissions,
     removeUntrustedScopedPermissions,
     isPermissionForServer,
@@ -1160,6 +1161,22 @@ describe('migrateToAgentConfig', () => {
 
             expect(fs.readFileSync(path.join(outsideDir, 'default.json'), 'utf-8')).to.equal(legacyAgentConfig)
             expect(warnings.filter(warning => warning.includes(updateRefusal))).to.have.length(1)
+        })
+
+        it('checks the workspace folder when a caller says which agent config it updates', async () => {
+            fs.mkdirSync(path.join(wsDir, '.amazonq'))
+            fs.writeFileSync(path.join(outsideDir, 'default.json'), legacyAgentConfig)
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+            await migrateAgentConfigToCLIFormat(workspace, logger, agentPath, { kind: 'workspace', folderPath: wsDir })
+
+            expect(fs.readFileSync(path.join(outsideDir, 'default.json'), 'utf-8')).to.equal(legacyAgentConfig)
+            expect(warnings.filter(warning => warning.includes(updateRefusal))).to.have.length(1)
+            // A caller has to name the location: one that leaves it out does not compile
+            // @ts-expect-error The location of the agent config is required
+            const leftOut: Parameters<typeof migrateAgentConfigToCLIFormat> = [workspace, logger, agentPath]
+            expect(leftOut).to.have.length(3)
         })
     })
 })

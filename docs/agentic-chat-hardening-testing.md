@@ -553,6 +553,9 @@ folder.
   update the agent config".
 - A link that stays inside the workspace folder, and a workspace folder that is opened through a link,
   work as before. The migration of the global agent config is unchanged.
+- Each caller of the two steps states which agent config it writes, the global one or the one of a
+  workspace folder with that folder (`AgentConfigLocation`). Before, the folder was an optional last
+  parameter, so a caller that left it out skipped the check with no error from the compiler.
 - Not covered:
   - Other writes to the agent config of a workspace folder still follow links in its path: the
     reinstall of a registry server by the periodic registry sync, and writes that the user starts in
@@ -579,7 +582,9 @@ The suite "a workspace agent config path with symbolic links" uses a temporary f
 - nothing is created or updated, and the warning is logged once, when `default.json` is a link to a
   file outside the workspace folder (whether that file exists or not), when `.amazonq/agents` or
   `.amazonq` links to a folder outside the workspace folder, and when two links in the path point at
-  each other.
+  each other;
+- `migrateAgentConfigToCLIFormat` checks the workspace folder that its caller names, and a call that
+  names no location does not compile (the test has a `@ts-expect-error` line that `tsc` checks).
 
 The cases with a link to a file are skipped on Windows when the test cannot create one.
 
