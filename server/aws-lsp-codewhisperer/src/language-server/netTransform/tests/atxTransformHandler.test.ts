@@ -4777,8 +4777,8 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
     })
 
     describe('writeSourceFilesManifest & updateSourceFilesManifest', () => {
-        it('should write source-files.json with project paths', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should write source-files.json with project paths', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [
                     {
                         SourceCodeFilePaths: ['C:/sln/A.cs', 'C:/sln/B.cs'],
@@ -4801,8 +4801,8 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             ])
         })
 
-        it('should append new files to existing manifest', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should append new files to existing manifest', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [{ SourceCodeFilePaths: ['C:/sln/A.cs'] }],
             })
             ;(handler as any).updateSourceFilesManifest(tmpRoot, 'job-1', ['NewFile.cs'])
@@ -5300,8 +5300,8 @@ describe('ATXTransformHandler - final coverage push', () => {
     })
 
     describe('writeSourceFilesManifest edge cases', () => {
-        it('should produce empty sourceFiles when request has no metadata', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {})
+        it('should produce empty sourceFiles when request has no metadata', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {})
 
             const filePath = path.join(tmpRoot, workspaceFolderName, 'job-1', 'checkpoints', 'source-files.json')
             expect(fs.existsSync(filePath)).to.be.true
@@ -5309,8 +5309,8 @@ describe('ATXTransformHandler - final coverage push', () => {
             expect(data.sourceFiles).to.deep.equal([])
         })
 
-        it('should skip falsy file paths in SourceCodeFilePaths', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should skip falsy file paths in SourceCodeFilePaths', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [{ SourceCodeFilePaths: ['', null, 'C:/real.cs'] }],
             })
 
@@ -6244,5 +6244,105 @@ describe('ATXTransformHandler - isRepoLbvOpen: repo node terminal with no LBV ch
         // been marked terminal early.
         const plan = planWith('SUCCEEDED', { StepName: 'Local Build Verification', Status: 'IN_PROGRESS' })
         expect(isOpen(plan)).to.be.true
+    })
+})
+
+describe('ATXTransformHandler - source files manifest skips directories', () => {
+    let handler: ATXTransformHandler
+    let tmpRoot: string
+
+    beforeEach(() => {
+        const serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        const logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        handler = new ATXTransformHandler(serviceManager, {} as Workspace, logging, {} as Runtime)
+        tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-manifest-dirs-'))
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(tmpRoot, { recursive: true, force: true })
+    })
+
+    function readManifest(jobId: string): any {
+        const p = path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+        return JSON.parse(fs.readFileSync(p, 'utf-8'))
+    }
+
+    it('leaves a Web Site folder out of source-files.json and keeps its files', async () => {
+        // A Web Site project's ProjectPath is its folder; listed as a file it shows up as a
+        // modified file and breaks the review uplink zip.
+        const site = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(site, { recursive: true })
+        const page = path.join(site, 'Default.aspx')
+        fs.writeFileSync(page, '<%@ Page %>')
+        const lib = path.join(tmpRoot, 'Lib', 'Lib.csproj')
+        fs.mkdirSync(path.dirname(lib), { recursive: true })
+        fs.writeFileSync(lib, '<Project />')
+        const sln = path.join(tmpRoot, 'App.sln')
+        fs.writeFileSync(sln, '')
+        await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+            ProjectMetadata: [
+                { ProjectPath: site, SourceCodeFilePaths: [page] },
+                { ProjectPath: lib, SourceCodeFilePaths: [] },
+            ],
+            SolutionFilePath: sln,
+        })
+
+        const files: string[] = readManifest('job-1').sourceFiles
+        expect(files).to.include.members([page, lib, sln])
+        expect(files).to.not.include(site)
+    })
+
+    it('writes the manifest without a blocking stat', async () => {
+        // The check runs on the startTransform request path, so it must not call fs.statSync.
+        const statSync = sinon.spy(fs, 'statSync')
+        await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-2', {
+            ProjectMetadata: [{ ProjectPath: path.join(tmpRoot, 'Missing.csproj'), SourceCodeFilePaths: [] }],
+        })
+        expect(statSync.called).to.be.false
+        expect(readManifest('job-2').sourceFiles).to.deep.equal([path.join(tmpRoot, 'Missing.csproj')])
+    })
+
+    it('never reports a folder a checkpoint added as modified', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        const page = path.join(dir, 'New.aspx')
+        fs.writeFileSync(page, '')
+        const checkpointsDir = path.join(tmpRoot, workspaceFolderName, 'job-4', 'checkpoints')
+        fs.mkdirSync(checkpointsDir, { recursive: true })
+        const past = new Date(Date.now() - 60_000)
+        fs.writeFileSync(
+            path.join(checkpointsDir, 'source-files.json'),
+            JSON.stringify({ createdAt: past.toISOString(), lastAppliedTimestamp: past.getTime(), sourceFiles: [] })
+        )
+        ;(handler as any).updateSourceFilesManifest(tmpRoot, 'job-4', ['WebSite1', path.join('WebSite1', 'New.aspx')])
+        fs.writeFileSync(path.join(dir, 'Added.aspx'), '')
+        fs.writeFileSync(page, 'changed')
+
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-4')).to.deep.equal([page])
+    })
+
+    it('never reports a directory as modified, also from a manifest written before the skip', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        const page = path.join(dir, 'Default.aspx')
+        fs.writeFileSync(page, '')
+        const checkpointsDir = path.join(tmpRoot, workspaceFolderName, 'job-3', 'checkpoints')
+        fs.mkdirSync(checkpointsDir, { recursive: true })
+        const past = new Date(Date.now() - 60_000)
+        fs.writeFileSync(
+            path.join(checkpointsDir, 'source-files.json'),
+            JSON.stringify({
+                createdAt: past.toISOString(),
+                lastAppliedTimestamp: past.getTime(),
+                sourceFiles: [dir, page],
+            })
+        )
+        // Both the folder and the page change after the baseline.
+        fs.writeFileSync(path.join(dir, 'Added.aspx'), '')
+        fs.writeFileSync(page, 'changed')
+
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3')).to.deep.equal([page])
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3', true)).to.deep.equal([page])
     })
 })

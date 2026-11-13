@@ -1874,7 +1874,7 @@ export class ATXTransformHandler {
             // Step 7: Write source files list to checkpoints folder for tracking (only in interactive mode)
             if (request.interactiveMode && request.interactiveMode !== 'Autonomous') {
                 const startTransformReq = request.startTransformRequest as any
-                this.writeSourceFilesManifest(
+                await this.writeSourceFilesManifest(
                     startTransformReq.SolutionRootPath,
                     createJobResponse.jobId,
                     startTransformReq
@@ -3985,11 +3985,19 @@ export class ATXTransformHandler {
         }
     }
 
+    /** True when *p* exists and is a directory; a missing or unreadable path is not one. */
+    private isDirectory(p: string): Promise<boolean> {
+        return fs.promises.stat(p).then(
+            s => s.isDirectory(),
+            () => false
+        )
+    }
+
     /**
      * Writes a manifest of source files to the checkpoints folder for tracking changes.
      * Creates source-files.json containing all source code file paths from the transformation request.
      */
-    private writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): void {
+    private async writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): Promise<void> {
         try {
             const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
 
@@ -4030,17 +4038,27 @@ export class ATXTransformHandler {
                 }
             }
 
+            // A Web Site project's ProjectPath is its folder, not a file: listed here it would show
+            // up as a modified file and break the uplink zip. Only a ProjectPath can be a folder, so
+            // only those are checked, without blocking; getModifiedFilesSinceCheckpoint is the backstop.
+            const projectPaths: string[] = (request.ProjectMetadata ?? [])
+                .map((project: any) => project.ProjectPath)
+                .filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+            const isFolder = await Promise.all(projectPaths.map(p => this.isDirectory(p)))
+            const folders = new Set(projectPaths.filter((_, i) => isFolder[i]))
+            const files = sourceFiles.filter(p => !folders.has(p))
+
             const manifest = {
                 jobId: jobId,
                 solutionRootPath: solutionRootPath,
                 createdAt: new Date().toISOString(),
-                sourceFiles: sourceFiles,
+                sourceFiles: files,
             }
 
             const manifestPath = path.join(checkpointsDir, 'source-files.json')
             fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
 
-            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${sourceFiles.length} files`)
+            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${files.length} files`)
         } catch (error) {
             this.logging.error(`ATX: Failed to write source files manifest: ${String(error)}`)
         }
@@ -4161,7 +4179,9 @@ export class ATXTransformHandler {
                 try {
                     if (fs.existsSync(filePath)) {
                         const stats = fs.statSync(filePath)
-                        if (stats.mtimeMs > baseline) {
+                        // Only a file can be a modified file: a manifest can still list a folder
+                        // (written before folders were skipped, or added from a checkpoint).
+                        if (stats.isFile() && stats.mtimeMs > baseline) {
                             modifiedFiles.push(filePath)
                         }
                     }
