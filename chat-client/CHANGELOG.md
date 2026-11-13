@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.59](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.58...chat-client/v0.1.59) (2026-11-12)
+
+
+### Bug Fixes
+
+* address security issues ([#3041](https://github.com/Amazon-Q-Developer/language-servers/issues/3041)) ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+* **amazonq:** stricter checks for chat file links and configuration files ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+
 ## [0.1.58](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.57...chat-client/v0.1.58) (2026-10-08)
 
 
