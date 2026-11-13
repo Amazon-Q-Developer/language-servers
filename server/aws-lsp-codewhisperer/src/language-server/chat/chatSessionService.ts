@@ -20,8 +20,12 @@ import { MAX_REQUEST_ATTEMPTS } from '../agenticChat/constants/constants'
 import { TokenLimits, TokenLimitsCalculator } from '../agenticChat/utils/tokenLimitsCalculator'
 import { Model } from '@aws/language-server-runtimes/protocol'
 
+import { CheckedTarget } from '../agenticChat/tools/checkedFileIo'
+import { ApprovedLinkedFiles } from '../agenticChat/tools/toolShared'
+import { ExistingFileTarget } from '@aws/language-server-runtimes/server-interface'
+
 export type ChatSessionServiceConfig = CodeWhispererStreamingClientConfig
-type FileChange = { before?: string; after?: string }
+type FileChange = { before?: string; after?: string; targetPath?: string; target?: CheckedTarget }
 
 type DeferredHandler = {
     resolve: () => void
@@ -30,7 +34,6 @@ type DeferredHandler = {
 export class ChatSessionService {
     public pairProgrammingMode: boolean = true
     public contextListSent: boolean = false
-    public isMemoryBankGeneration: boolean = false
     #modelId: string | undefined
     #lsp?: Features['lsp']
     #abortController?: AbortController
@@ -45,6 +48,7 @@ export class ChatSessionService {
     #currentUndoAllId?: string
     // Map to store approved paths to avoid repeated validation
     #approvedPaths: Map<string, Set<string>> = new Map<string, Set<string>>()
+    #approvedLinkedFiles = new Map<string, readonly ExistingFileTarget[]>()
     #serviceManager?: AmazonQBaseServiceManager
     #logging?: Logging
     #origin?: Origin
@@ -120,11 +124,21 @@ export class ChatSessionService {
     }
 
     /**
+     * Files with more than one hard link that the user approved in this session, per tool name, as
+     * they were when approved
+     */
+    public get approvedLinkedFiles(): ApprovedLinkedFiles {
+        return this.#approvedLinkedFiles
+    }
+
+    /**
      * Adds a path to the approved paths list for this session
      * @param filePath The absolute path to add
      * @param toolName The name of the tool that should have access to this path
+     * @param target The file the check found at the path. When it has more than one hard link, the
+     * approval covers it only while it is the same file with no more names (see approvedLinkedFiles).
      */
-    public addApprovedPath(filePath: string, toolName: string): void {
+    public addApprovedPath(filePath: string, toolName: string, target?: CheckedTarget): void {
         if (!filePath || !toolName) {
             return
         }
@@ -137,6 +151,11 @@ export class ChatSessionService {
         }
 
         this.#approvedPaths.get(toolName)!.add(normalizedPath)
+
+        if (target?.state === 'existing' && BigInt(target.linkCount) > 1n) {
+            const linkedFiles = this.#approvedLinkedFiles.get(toolName) ?? []
+            this.#approvedLinkedFiles.set(toolName, [...linkedFiles, target])
+        }
     }
 
     constructor(serviceManager?: AmazonQBaseServiceManager, lsp?: Features['lsp'], logging?: Logging) {

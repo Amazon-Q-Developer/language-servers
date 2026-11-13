@@ -1,6 +1,6 @@
 import { ParsedIniData, IniSectionType, IniSection } from '@smithy/types'
 import * as fs from 'fs'
-import { mkdir, readFile, rename, writeFile } from 'fs/promises'
+import { chmod, mkdir, readFile, rename, stat, writeFile } from 'fs/promises'
 import { EOL } from 'os'
 import { IniFileType, Setting, SectionHeader } from './types'
 import { CONFIG_PREFIX_SEPARATOR } from '@smithy/shared-ini-file-loader'
@@ -8,6 +8,10 @@ import path from 'path'
 
 const sectionHeaderKey = '#sectionHeader'
 const nextSettingKey = '#nextSetting'
+
+// Modes for newly created shared config files and directories
+const newFileMode = 0o600
+const newDirectoryMode = 0o700
 
 export async function saveSharedConfigFile(
     filepath: string,
@@ -83,13 +87,26 @@ export async function saveSharedConfigFile(
         }
     }
 
+    // The rewritten file keeps the mode of the file it replaces
+    let mode = newFileMode
+
     // Backup file just in case
     if (filepathExists) {
+        const existingMode = (await stat(filepath)).mode & 0o777
+        // Credentials files are owner-only
+        mode = filetype === IniFileType.credentials ? existingMode & ~0o077 : existingMode
+
+        // Apply before the rename so the backup has the same mode
+        if (mode !== existingMode) {
+            await chmod(filepath, mode)
+        }
+
         await rename(filepath, filepath + '~')
     }
 
-    await mkdir(path.dirname(filepath), { mode: 0o755, recursive: true })
-    await writeFile(filepath, output.join(EOL), { encoding: 'utf-8', flush: true })
+    await mkdir(path.dirname(filepath), { mode: newDirectoryMode, recursive: true })
+    // The file was renamed away or did not exist, so it is created here with mode
+    await writeFile(filepath, output.join(EOL), { encoding: 'utf-8', flush: true, mode })
 }
 
 function compareObjectEntries(a?: [string, unknown], b?: [string, unknown]): number {

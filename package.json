@@ -36,7 +36,7 @@
         "ci:generate:agentic:attribution": "ts-node ./script/prepare-agentic-attribution-dependencies.ts && ./script/generate-agentic-attribution.sh && git restore package.json"
     },
     "dependencies": {
-        "@aws/language-server-runtimes": "^0.3.14",
+        "@aws/language-server-runtimes": "0.3.22",
         "@smithy/types": "4.2.0",
         "clean": "^4.0.2",
         "typescript": "^5.8.2"
