@@ -1,5 +1,11 @@
 import { CheckedTarget, readCheckedFile } from './checkedFileIo'
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import {
+    ApprovedLinkedFiles,
+    CommandValidation,
+    InvokeOutput,
+    requiresPathAcceptance,
+    validatePath,
+} from './toolShared'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { FSREAD_MAX_PER_FILE, FSREAD_MAX_TOTAL } from '../constants/constants'
 
@@ -47,13 +53,14 @@ export class FsRead {
 
     public async requiresAcceptance(
         params: FsReadParams,
-        approvedPaths?: Map<string, Set<string>>
+        approvedPaths?: Map<string, Set<string>>,
+        approvedLinkedFiles?: ApprovedLinkedFiles
     ): Promise<CommandValidation> {
         // Check every path and collect each canonical result, so the caller
         // receives one resolved target per requested path even when the first
         // path already requires approval.
         const checkedTargets: CheckedTarget[] = []
-        let firstRequired: CommandValidation | undefined
+        const required: CommandValidation[] = []
         for (const path of params.paths) {
             const validation = await requiresPathAcceptance(
                 path,
@@ -61,7 +68,7 @@ export class FsRead {
                 this.workspace,
                 this.logging,
                 approvedPaths,
-                { flagMultiplyLinkedFiles: 'read' }
+                { flagMultiplyLinkedFiles: 'read', approvedLinkedFiles }
             )
             const target = validation.checkedTargets?.[0]
             if (!target) {
@@ -72,11 +79,19 @@ export class FsRead {
                 }
             }
             checkedTargets.push(target)
-            if (validation.requiresAcceptance && !firstRequired) firstRequired = validation
+            if (validation.requiresAcceptance) required.push(validation)
         }
+        // One prompt covers every path, so it shows each distinct warning. The shared-file
+        // wording applies only when that is why every path needs approval.
+        const warnings = [...new Set(required.map(validation => validation.warning).filter(Boolean))]
+        const acceptanceReason =
+            required.length > 0 && required.every(validation => validation.acceptanceReason === 'multiplyLinkedFile')
+                ? required[0].acceptanceReason
+                : undefined
         return {
-            ...firstRequired,
-            requiresAcceptance: firstRequired?.requiresAcceptance ?? false,
+            requiresAcceptance: required.length > 0,
+            ...(warnings.length > 0 ? { warning: warnings.join('\n\n') } : {}),
+            ...(acceptanceReason ? { acceptanceReason } : {}),
             canonicalPaths: checkedTargets.map(target => target.path),
             checkedTargets: Object.freeze(checkedTargets),
         }
