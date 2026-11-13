@@ -5488,6 +5488,22 @@ ${' '.repeat(8)}}
                     }
                 })
 
+                it('leaves out a memory bank file that cannot be resolved', async function () {
+                    await fs.mkdir(memoryBankDir(), { recursive: true })
+                    const loop = path.join(memoryBankDir(), 'tech.md')
+                    try {
+                        await fs.symlink(loop, loop, 'file')
+                    } catch {
+                        return this.skip()
+                    }
+
+                    const approvedPaths = await memoryBankApprovedPaths(path.join(memoryBankDir(), 'product.md'))
+
+                    const fsWritePaths = approvedPaths.get('fsWrite') ?? new Set()
+                    assert.ok(fsWritePaths.has(path.join(memoryBankDir(), 'product.md')))
+                    assert.ok(!fsWritePaths.has(loop))
+                })
+
                 it('does not treat a memory bank file with another name on disk as approved', async function () {
                     const outsideFile = path.join(outsideDir, 'notes.md')
                     writeFileSync(outsideFile, 'notes')
@@ -5931,6 +5947,94 @@ ${' '.repeat(8)}}
                 request.actions.map((a: { title: string }) => a.title),
                 ['Open', 'Cancel']
             )
+            assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
+        })
+
+        it('shows the path on one line and bounded in the prompt', async () => {
+            const longPath = path.join(
+                outsideDir,
+                ...Array.from({ length: 20 }, () => 'd'.repeat(50)),
+                'a\r\u2028\nOpen notes.txt'
+            )
+
+            await chatController.onFileClicked({ tabId: mockTabId, filePath: 'notes.txt', fullPath: longPath })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            const message: string = showMessageRequestStub.firstCall.args[0].message
+            const question = message.slice(message.lastIndexOf('\n') + 1)
+            assert.ok(question.startsWith(`Open ${outsideDir}`), question)
+            assert.ok(question.endsWith('a Open notes.txt in the editor?'), question)
+            assert.ok(question.length < 400, `${question.length} characters`)
+        })
+
+        describe('paths that resolve to a network path', () => {
+            let acceptanceStub: sinon.SinonStub
+
+            // Resolves the clicked file as a link to `target` would, without a network host
+            const resolveInsideFileTo = (target: string) => {
+                const resolveCanonicalPath = toolShared.resolveCanonicalPath
+                sinon
+                    .stub(toolShared, 'resolveCanonicalPath')
+                    .callsFake(async inputPath => (inputPath === insideFile ? target : resolveCanonicalPath(inputPath)))
+            }
+
+            beforeEach(() => {
+                // Stubbed so that no test waits for the host
+                acceptanceStub = sinon.stub(toolShared, 'requiresPathAcceptance').resolves({ requiresAcceptance: true })
+            })
+
+            it('does not open or check a path that resolves to a network path outside the workspace', async () => {
+                resolveInsideFileTo('//host/share/x')
+
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: 'inside.txt', fullPath: insideFile })
+
+                sinon.assert.notCalled(acceptanceStub)
+                sinon.assert.notCalled(showMessageRequestStub)
+                sinon.assert.notCalled(showDocumentStub)
+            })
+
+            it('opens a path that resolves to a network path inside the workspace', async () => {
+                resolveInsideFileTo('//host/share/ws/inside.txt')
+                sinon.stub(toolShared, 'canonicalizeWorkspaceFolders').resolves(['//host/share/ws'])
+                acceptanceStub.resolves({ requiresAcceptance: false })
+
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: 'inside.txt', fullPath: insideFile })
+
+                assert.deepStrictEqual(openedUris(), [URI.file('//host/share/ws/inside.txt').toString()])
+            })
+
+            it('opens a path that resolves to a network path already approved for the tool', async () => {
+                resolveInsideFileTo('//host/share/x')
+                acceptanceStub.resolves({ requiresAcceptance: false })
+                const session = chatSessionManagementService.getSession(mockTabId).data!
+                session.addApprovedPath('//host/share/x', 'fsRead')
+
+                await chatController.onFileClicked({ tabId: mockTabId, filePath: 'inside.txt', fullPath: insideFile })
+
+                assert.deepStrictEqual(openedUris(), [URI.file('//host/share/x').toString()])
+            })
+        })
+
+        it('still asks about an fsRead file when another fsRead path cannot be resolved', async function () {
+            showMessageRequestStub.resolves(OPEN)
+            const loop = path.join(outsideDir, 'loop')
+            try {
+                await fs.symlink(loop, loop)
+            } catch {
+                return this.skip()
+            }
+            const session = chatSessionManagementService.getSession(mockTabId).data!
+            session.toolUseLookup.set('read-loop', {
+                toolUseId: 'read-loop',
+                name: 'fsRead',
+                input: { paths: [loop, outsideFile] },
+            })
+
+            await chatController.onFileClicked({ tabId: mockTabId, messageId: 'read-loop', filePath: outsideFile })
+
+            sinon.assert.calledOnce(showMessageRequestStub)
+            // The path after the one that can't be resolved is still found
+            assert.ok(showMessageRequestStub.firstCall.args[0].message.includes('able to read this file'))
             assert.deepStrictEqual(openedUris(), [URI.file(outsideFile).toString()])
         })
 
