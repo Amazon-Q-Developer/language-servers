@@ -20,6 +20,31 @@ export const EXECUTE_BASH = 'executeBash'
 
 // Code analysis tools
 export const CODE_REVIEW = 'codeReview'
+export const DISPLAY_FINDINGS = 'displayFindings'
+export const SEMANTIC_SEARCH = 'semanticSearch'
+
+/**
+ * Names routed through built-in controller branches even when the corresponding
+ * tool is disabled, conditionally registered, or registered later. MCP tools
+ * must never claim one of these bare names.
+ */
+export const STATIC_BUILT_IN_TOOL_NAMES = [
+    FS_READ,
+    FS_WRITE,
+    FS_REPLACE,
+    LIST_DIRECTORY,
+    GREP_SEARCH,
+    FILE_SEARCH,
+    EXECUTE_BASH,
+    CODE_REVIEW,
+    DISPLAY_FINDINGS,
+    SEMANTIC_SEARCH,
+] as const
+
+/** Include both statically dispatched and currently registered built-in names. */
+export function getReservedBuiltInToolNames(registeredNames: Iterable<string>): Set<string> {
+    return new Set([...STATIC_BUILT_IN_TOOL_NAMES, ...registeredNames])
+}
 
 // Tool use button IDs
 export const BUTTON_RUN_SHELL_COMMAND = 'run-shell-command'
