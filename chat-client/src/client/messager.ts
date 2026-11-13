@@ -214,6 +214,11 @@ export class Messager {
 
     onLinkClick = (params: LinkClickParams): void => {
         this.chatApi.linkClick(params)
+        this.onLinkClickTelemetry(params)
+    }
+
+    /** Records an answer-link click that chat handled itself (a file link or an unsupported link). */
+    onLinkClickTelemetry = (params: LinkClickParams): void => {
         this.chatApi.telemetry({ ...params, name: LINK_CLICK_TELEMETRY_EVENT })
     }
 
@@ -224,6 +229,11 @@ export class Messager {
 
     onInfoLinkClick = (params: InfoLinkClickParams): void => {
         this.chatApi.infoLinkClick(params)
+        this.onInfoLinkClickTelemetry(params)
+    }
+
+    /** Records an info-link click that chat handled itself (a file link or an unsupported link). */
+    onInfoLinkClickTelemetry = (params: InfoLinkClickParams): void => {
         this.chatApi.telemetry({ ...params, name: INFO_LINK_CLICK_TELEMETRY_EVENT })
     }
 
