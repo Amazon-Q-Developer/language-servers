@@ -319,6 +319,11 @@ describe('utils', () => {
             'Makefile:3',
             '',
             '%E0%A4%A',
+            // Leading spaces and control characters, and tabs and line breaks anywhere, don't hide a scheme or host.
+            ' javascript:x',
+            '\u0001\tjavascript:x',
+            'java\nscript:x',
+            ' //host/x',
         ]
         for (const href of ignored) {
             it(`sends nothing for ${JSON.stringify(href)}`, () => {

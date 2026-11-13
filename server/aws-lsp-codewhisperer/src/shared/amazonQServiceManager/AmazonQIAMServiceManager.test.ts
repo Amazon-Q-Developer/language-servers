@@ -59,7 +59,7 @@ describe('AmazonQIAMServiceManager', () => {
             deepStrictEqual(serviceManager.getStreamingClient(), streamingClient)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: expects getCodewhispererService to throw without IAM credentials; it creates the service without checking for them
         it.skip('should handle missing IAM credentials gracefully', () => {
             features.credentialsProvider.hasCredentials.withArgs('iam').returns(false)
 
@@ -71,7 +71,8 @@ describe('AmazonQIAMServiceManager', () => {
             }
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
+        // Skipped in #2971: spies on hasCredentials, which TestFeatures already stubs, and expects
+        // getCodewhispererService to check for IAM credentials; it does not
         it.skip('should validate credentials before creating service', () => {
             const hasCredentialsSpy = sinon.spy(features.credentialsProvider, 'hasCredentials')
 

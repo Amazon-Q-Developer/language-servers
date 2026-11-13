@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.133](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.132...lsp-codewhisperer/v0.0.133) (2026-10-28)
+
+
+### Features
+
+* AWS Transform: IAM (SigV4) authentication in the language server ([#2948](https://github.com/Amazon-Q-Developer/language-servers/issues/2948)) ([725370f](https://github.com/Amazon-Q-Developer/language-servers/commit/725370f905a32da661b59bbdd7ea31718b8a1936))
+
 ## [0.0.132](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.131...lsp-codewhisperer/v0.0.132) (2026-10-21)
 
 

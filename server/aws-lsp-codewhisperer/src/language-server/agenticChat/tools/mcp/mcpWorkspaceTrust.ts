@@ -84,7 +84,7 @@ export function fingerprintFolder(folder: string): string {
     return 'sha256:' + createHash('sha256').update(normalized).digest('hex')
 }
 
-// Larger git files are not read; their remotes count as missing
+// A larger .git file is not read; it counts as empty
 const MAX_GIT_FILE_BYTES = 256 * 1024
 
 /**
@@ -110,48 +110,33 @@ async function readGitFile(file: string): Promise<string | undefined> {
 }
 
 /**
- * Remote URLs of the git repository in a folder, or an empty string when there is none. Only files inside the
- * folder are read, and links are described by their target text without being followed. For a worktree or
- * submodule, where `.git` is a file that points to the git directory, the pointer text is used.
+ * What tells the git repository in a folder from another repository at the same path, or an empty string when
+ * there is none: the inode and creation time of the `.git` directory, the text of a `.git` file (the pointer of a
+ * worktree or submodule), or the target text of a `.git` link. Only `.git` itself is read, and a link is not
+ * followed. The settings of the repository, such as its remotes, are not part of it.
  */
-async function getGitRemotes(folder: string): Promise<string> {
+async function getRepositoryMarker(folder: string): Promise<string> {
     const dotGit = path.join(folder, '.git')
-    const configFile = path.join(dotGit, 'config')
     try {
-        const gitStat = await fs.promises.lstat(dotGit)
+        const gitStat = await fs.promises.lstat(dotGit, { bigint: true })
         if (gitStat.isSymbolicLink()) {
             return `link: ${await fs.promises.readlink(dotGit)}`
         }
         if (gitStat.isFile()) {
             return (await readGitFile(dotGit))?.trim() ?? ''
         }
-        if (!gitStat.isDirectory()) {
-            return ''
-        }
-        const configStat = await fs.promises.lstat(configFile)
-        if (configStat.isSymbolicLink()) {
-            return `config link: ${await fs.promises.readlink(configFile)}`
-        }
-        if (!configStat.isFile()) {
-            return ''
-        }
+        return gitStat.isDirectory() ? `directory: ${gitStat.ino}:${gitStat.birthtimeNs}` : ''
     } catch {
         return ''
     }
-    return ((await readGitFile(configFile)) ?? '')
-        .split(/\r?\n/)
-        .map(line => /^\s*url\s*=\s*(.*?)\s*$/i.exec(line)?.[1])
-        .filter((url): url is string => !!url)
-        .sort()
-        .join('\n')
 }
 
 /**
- * Identity of the folder at a path: its device, inode and creation time, and the remotes of the git repository
- * in it. A folder deleted and created again at the same path, for example by cloning or extracting into it, or
- * a repository cloned into an existing folder, gets a new identity. Returns undefined when the folder is missing
- * or the file system does not report an inode and creation time, so the folder can't be told apart from a
- * replacement.
+ * Identity of the folder at a path: its device, inode and creation time, and the git repository in it. A folder
+ * deleted and created again at the same path, for example by cloning or extracting into it, or a repository
+ * cloned into an existing folder, gets a new identity. Changing the settings of the repository, such as its
+ * remotes, keeps the identity. Returns undefined when the folder is missing or the file system does not report
+ * both an inode and a creation time, so the folder can't be told apart from a replacement.
  */
 export async function getFolderIdentity(folder: string): Promise<string | undefined> {
     try {
@@ -159,10 +144,10 @@ export async function getFolderIdentity(folder: string): Promise<string | undefi
         if (!stat.isDirectory() || stat.ino === BigInt(0) || stat.birthtimeNs === BigInt(0)) {
             return undefined
         }
-        const remotes = await getGitRemotes(folder)
+        const repository = await getRepositoryMarker(folder)
         return (
             'sha256:' +
-            createHash('sha256').update(`${stat.dev}:${stat.ino}:${stat.birthtimeNs}\n${remotes}`).digest('hex')
+            createHash('sha256').update(`${stat.dev}:${stat.ino}:${stat.birthtimeNs}\n${repository}`).digest('hex')
         )
     } catch {
         return undefined

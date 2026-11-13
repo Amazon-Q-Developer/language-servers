@@ -28,6 +28,7 @@ import { ChatSessionManagementService } from '../chat/chatSessionManagementServi
 import { QAgenticChatServer } from './qAgenticChatServer'
 import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 import { AmazonQBaseServiceManager } from '../../shared/amazonQServiceManager/BaseAmazonQServiceManager'
+import { LocalProjectContextController } from '../../shared/localProjectContextController'
 import { unhandledRejectionsDuring } from '../../shared/testUtils'
 import { Features } from '../types'
 
@@ -76,6 +77,11 @@ describe('QAgenticChatServer', () => {
         amazonQServiceManager = AmazonQTokenServiceManager.getInstance()
 
         disposeStub = sinon.stub(ChatSessionManagementService.prototype, 'dispose')
+        // Without an instance, the chat's context commands wait up to 60 seconds for one and then set
+        // onContextItemsUpdated on whichever controller a later test file creates
+        sinon.stub(LocalProjectContextController, 'getInstance').resolves({
+            getContextCommandItems: sinon.stub().resolves([]),
+        } as any)
         chatSessionManagementService = ChatSessionManagementService.getInstance()
         withAmazonQServiceSpy = sinon.spy(chatSessionManagementService, 'withAmazonQServiceManager')
 

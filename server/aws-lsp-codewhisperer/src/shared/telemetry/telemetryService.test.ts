@@ -50,7 +50,15 @@ class MockCredentialsProvider implements CredentialsProvider {
     }
 
     getConnectionType(): SsoConnectionType {
-        return this.mockConnectionType ?? 'none'
+        if (this.mockConnectionType) {
+            return this.mockConnectionType
+        }
+        // Without an explicit type, the type that goes with the start URL of the connection
+        const startUrl = this.mockConnectionMetadata?.sso?.startUrl
+        if (!startUrl) {
+            return 'none'
+        }
+        return startUrl === BUILDER_ID_START_URL ? 'builderId' : 'identityCenter'
     }
 
     setConnectionMetadata(metadata: ConnectionMetadata | undefined) {
@@ -165,7 +173,7 @@ describe('TelemetryService', () => {
         sinon.assert.match((telemetryService as any).enableTelemetryEventsToDestination, true)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: expects ACCEPT; getSuggestionState returns EMPTY for this session
     it.skip('getSuggestionState fetches the suggestion state from CodeWhispererSession', () => {
         telemetryService = new TelemetryService(serviceManagerStub, mockCredentialsProvider, {} as Telemetry, logging)
         const getSuggestionState = (telemetryService as any).getSuggestionState.bind(telemetryService)
@@ -232,8 +240,7 @@ describe('TelemetryService', () => {
         sinon.assert.notCalled(codeWhisperServiceStub.sendTelemetryEvent)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
-    it.skip('should handle SSO connection type change at runtime', () => {
+    it('should handle SSO connection type change at runtime', () => {
         telemetryService = new TelemetryService(serviceManagerStub, mockCredentialsProvider, telemetry, logging)
 
         telemetryService.updateOptOutPreference('OPTOUT') // Disables telemetry for builderId startUrl
@@ -261,7 +268,7 @@ describe('TelemetryService', () => {
         sinon.assert.notCalled(codeWhisperServiceStub.sendTelemetryEvent)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
+    // Skipped in #2971: the event that is sent differs from the expected event in its character counts and suggestionType
     it.skip('should emit userTriggerDecision event to STE and to the destination', () => {
         const expectedUserTriggerDecisionEvent = {
             telemetryEvent: {
@@ -368,8 +375,7 @@ describe('TelemetryService', () => {
             sinon.restore()
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should send InteractWithMessage event with correct parameters and emit metric to destination', () => {
+        it('should send InteractWithMessage event with correct parameters and emit metric to destination', () => {
             const metric = {
                 cwsprChatMessageId: 'message123',
                 codewhispererCustomizationArn: 'arn:123',
@@ -397,6 +403,7 @@ describe('TelemetryService', () => {
                         acceptedLineCount: acceptedLineCount,
                         acceptedSnippetHasReference: false,
                         hasProjectLevelContext: false,
+                        programmingLanguage: undefined,
                     },
                 },
             } satisfies SendTelemetryEventRequest
@@ -505,8 +512,7 @@ describe('TelemetryService', () => {
             sinon.assert.notCalled(codeWhisperServiceStub.sendTelemetryEvent)
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should send InteractWithMessage but with optional acceptedLineCount parameter', () => {
+        it('should send InteractWithMessage but with optional acceptedLineCount parameter', () => {
             const metric = {
                 cwsprChatMessageId: 'message123',
                 codewhispererCustomizationArn: 'arn:123',
@@ -532,14 +538,14 @@ describe('TelemetryService', () => {
                         acceptedLineCount: undefined, // Should be undefined
                         acceptedSnippetHasReference: false,
                         hasProjectLevelContext: false,
+                        programmingLanguage: undefined,
                     },
                 },
             })
         })
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
-    it.skip('should emit CodeCoverageEvent event to STE and to the destination', () => {
+    it('should emit CodeCoverageEvent event to STE and to the destination', () => {
         const expectedEvent = {
             telemetryEvent: {
                 codeCoverageEvent: {
@@ -619,8 +625,7 @@ describe('TelemetryService', () => {
         })
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
-    it.skip('should emit userModificationEvent event', () => {
+    it('should emit userModificationEvent event', () => {
         mockCredentialsProvider.setConnectionMetadata({
             sso: {
                 startUrl: 'idc-start-url',
@@ -684,8 +689,7 @@ describe('TelemetryService', () => {
         sinon.assert.calledOnceWithExactly(codeWhisperServiceStub.sendTelemetryEvent, expectedEvent)
     })
 
-    // Skipped: fails since this file last ran in CI; see the PR that skipped it
-    it.skip('should emit chatUserModificationEvent event including emitting event to destination', () => {
+    it('should emit chatUserModificationEvent event including emitting event to destination', () => {
         mockCredentialsProvider.setConnectionMetadata({
             sso: {
                 startUrl: 'idc-start-url',
@@ -767,8 +771,7 @@ describe('TelemetryService', () => {
             sinon.restore()
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should send ChatAddMessage event with correct parameters and emit metric to destination', () => {
+        it('should send ChatAddMessage event with correct parameters and emit metric to destination', () => {
             telemetryService.updateEnableTelemetryEventsToDestination(true)
             telemetryService.emitChatAddMessage(
                 {
@@ -874,6 +877,7 @@ describe('TelemetryService', () => {
                     cwsprChatPinnedPromptContextCount: undefined,
                     errorMessage: undefined,
                     errorCode: undefined,
+                    modelId: undefined,
                 },
             })
         })
@@ -968,8 +972,7 @@ describe('TelemetryService', () => {
             sinon.restore()
         })
 
-        // Skipped: fails since this file last ran in CI; see the PR that skipped it
-        it.skip('should send InlineChatEvent with correct parameters', () => {
+        it('should send InlineChatEvent with correct parameters', () => {
             const timestamp = new Date()
             telemetryService.emitInlineChatResultLog({
                 requestId: 'mock-request-id',

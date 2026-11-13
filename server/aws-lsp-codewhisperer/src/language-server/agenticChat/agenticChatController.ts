@@ -187,6 +187,7 @@ import {
     withResolvedTargets,
     getFileUpdate,
     hasAdditionalHardLinks,
+    isPathApproved,
     isSamePath,
     isRegularFile,
     requiresPathAcceptance,
@@ -297,6 +298,21 @@ type ChatHandlers = Omit<
 // `\\host\share`, `//host/x`, `\\?\` and `\\.\` paths reach a remote host or a device, not a local file.
 function isNetworkOrDevicePath(filePath: string | undefined): boolean {
     return !!filePath && filePath.replace(/\\/g, '/').startsWith('//')
+}
+
+// The most characters of a path to show in a prompt
+const maxPromptPathLength = 300
+
+/**
+ * A path as shown in a prompt. The path can come from model output, so it is shown on one line, and a
+ * path longer than the limit keeps only its start and end.
+ */
+function pathForPrompt(filePath: string): string {
+    const singleLine = filePath.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ')
+    const half = maxPromptPathLength / 2
+    return singleLine.length > maxPromptPathLength
+        ? `${singleLine.slice(0, half)}...${singleLine.slice(-half)}`
+        : singleLine
 }
 
 export class AgenticChatController implements ChatHandlers {
@@ -2110,9 +2126,14 @@ export class AgenticChatController implements ChatHandlers {
         const [canonicalWorkspaceFolder] = await canonicalizeWorkspaceFolders([workspaceFolders[0]])
         const memoryBankFilePaths: string[] = []
         for (const filePath of this.#memoryBankController.getMemoryBankFilePaths(workspaceFolders[0])) {
-            const resolvedPath = await resolveSymlinkAwarePath(sanitize(filePath))
+            // A file that can't be resolved, such as a link to itself, is left out as well
+            const resolvedPath = await resolveSymlinkAwarePath(sanitize(filePath)).catch(() => undefined)
             const expectedPath = path.join(canonicalWorkspaceFolder, path.relative(workspaceFolders[0], filePath))
-            if (isSamePath(resolvedPath, expectedPath) && !(await hasAdditionalHardLinks(resolvedPath))) {
+            if (
+                resolvedPath !== undefined &&
+                isSamePath(resolvedPath, expectedPath) &&
+                !(await hasAdditionalHardLinks(resolvedPath))
+            ) {
                 memoryBankFilePaths.push(resolvedPath)
             }
         }
@@ -4409,6 +4430,20 @@ export class AgenticChatController implements ChatHandlers {
             return
         }
         const canonicalPath = await resolveCanonicalPath(filePath)
+        // A link can resolve to a network or device path that the check on the clicked path did not see, so the
+        // resolved path is checked before anything else reads it. A workspace on a mapped network drive resolves
+        // to such a path as well, so a path inside the workspace or already approved for the tool is let through.
+        if (
+            isNetworkOrDevicePath(canonicalPath) &&
+            !workspaceUtils.isInWorkspace(
+                await canonicalizeWorkspaceFolders(workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)),
+                canonicalPath
+            ) &&
+            !isPathApproved(canonicalPath, toolName, session?.approvedPaths)
+        ) {
+            this.#features.logging.info(`Not opening network or device path from a chat file click`)
+            return
+        }
         const promptsDirectory = await resolveCanonicalPath(getUserPromptsDirectory())
         const isPromptFile =
             canonicalPath.endsWith(promptFileExtension) &&
@@ -4431,7 +4466,7 @@ export class AgenticChatController implements ChatHandlers {
                     type: MessageType.Warning,
                     message:
                         `${warning ?? 'This file is outside your workspace.'}\n\n` +
-                        `Open ${canonicalPath} in the editor?` +
+                        `Open ${pathForPrompt(canonicalPath)} in the editor?` +
                         (retainApproval
                             ? ' Amazon Q will also be able to read this file for the rest of this chat.'
                             : ''),
@@ -4466,11 +4501,15 @@ export class AgenticChatController implements ChatHandlers {
             const paths = (toolUse.input as unknown as FsReadParams | undefined)?.paths
             for (const requested of Array.isArray(paths) ? paths : []) {
                 if (
-                    typeof requested === 'string' &&
-                    (path.isAbsolute(requested) || /^~(?:[\\/]|$)/.test(requested)) &&
-                    !isNetworkOrDevicePath(requested) &&
-                    isSamePath(await resolveCanonicalPath(requested), canonicalPath)
+                    typeof requested !== 'string' ||
+                    !(path.isAbsolute(requested) || /^~(?:[\\/]|$)/.test(requested)) ||
+                    isNetworkOrDevicePath(requested)
                 ) {
+                    continue
+                }
+                // A path that can't be resolved, such as a link to itself, is not the clicked file
+                const requestedPath = await resolveCanonicalPath(requested).catch(() => undefined)
+                if (requestedPath !== undefined && isSamePath(requestedPath, canonicalPath)) {
                     return true
                 }
             }
