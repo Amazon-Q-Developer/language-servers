@@ -1,5 +1,12 @@
-import { CommandValidation, InvokeOutput, validatePath } from './toolShared'
-import { CancellationError, workspaceUtils } from '@aws/lsp-core'
+import {
+    CommandValidation,
+    InvokeOutput,
+    isRegularFile,
+    requiresPathAcceptance,
+    resolveCanonicalPath,
+    validatePath,
+} from './toolShared'
+import { CancellationError } from '@aws/lsp-core'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
 import { CancellationToken } from '@aws/language-server-runtimes/protocol'
@@ -79,15 +86,27 @@ export class GrepSearch {
         await closeWriter(writer)
     }
 
-    // TODO (workspace-boundary hardening): this acceptance check performs a
-    // string-only, non-symlink-aware workspace containment test on the raw
-    // search path. For parity with the file tools, route it through the
+    // Workspace-boundary check for the search path. Routes through the shared,
     // symlink-aware requiresPathAcceptance helper (as fsRead/fsWrite/
-    // listDirectory do) before this tool is enabled. Note this tool is not
-    // currently registered as an active tool (see toolServer.ts).
-    public async requiresAcceptance(params: GrepSearchParams): Promise<CommandValidation> {
+    // listDirectory do) so a search path that is a symlink escaping the
+    // workspace, or that targets a sensitive location, is not silently allowed.
+    // A search path that is a file with more than one hard link needs approval,
+    // as for fsRead. Note this tool is not currently registered as an active
+    // tool (see toolServer.ts).
+    public async requiresAcceptance(
+        params: GrepSearchParams,
+        approvedPaths?: Map<string, Set<string>>
+    ): Promise<CommandValidation> {
         const path = this.getSearchDirectory(params.path)
-        return { requiresAcceptance: !workspaceUtils.isInWorkspace(getWorkspaceFolderPaths(this.workspace), path) }
+        const isFile = await resolveCanonicalPath(path).then(isRegularFile, () => false)
+        return requiresPathAcceptance(
+            path,
+            'grepSearch',
+            this.workspace,
+            this.logging,
+            approvedPaths,
+            isFile ? { flagMultiplyLinkedFiles: 'read' } : undefined
+        )
     }
 
     public async invoke(params: GrepSearchParams, token?: CancellationToken): Promise<InvokeOutput> {
