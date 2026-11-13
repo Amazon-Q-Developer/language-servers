@@ -641,34 +641,84 @@ After this change:
 - The server requires `https`, or `http` with a loopback host (`localhost`, `[::1]` or an IPv4 address
   that starts with `127.`), for the authorization endpoint before it opens the browser. It requires the
   same for the authorization server, the `resource_metadata` link in the `WWW-Authenticate` header and
-  the registration endpoint before it sends a request to them. The token endpoint had this check before.
-- Discovery skips an authorization server or a `resource_metadata` link that fails the check, and tries
-  the next discovery step. An authorization endpoint or a registration endpoint that fails the check
-  stops the sign-in with an error, and the browser does not open.
+  the registration endpoint before it sends a request to them. The token endpoint had this scheme check
+  before.
+- Discovery skips an authorization server or a `resource_metadata` link that fails the scheme check,
+  and tries the next discovery step. An authorization endpoint or a registration endpoint that fails
+  the scheme check stops the sign-in with an error, and the browser does not open.
 - After a sign-in in the browser, the server saves the endpoints that it used in
   `~/.aws/sso/cache/<key>.meta.json`, next to the cached token. A silent refresh uses the saved token
   endpoint and does not find the endpoints again. When no endpoints are saved, for example after a
-  sign-in with an earlier version, or when the saved token endpoint fails the check, the silent refresh
-  finds the endpoints again and saves them after the refresh succeeds.
+  sign-in with an earlier version, or when the saved token endpoint fails the scheme check, the silent
+  refresh finds the endpoints again and saves them after the refresh succeeds.
 - When the user adds, installs or edits a server and has no valid cached token, the server signs in
   interactively. Before it opens the browser, it tries the saved refresh token with the saved token
   endpoint and the saved client registration, and does not find the endpoints again for this. It does
   not send the refresh token when no endpoints or no client registration are saved, or when the saved
-  token endpoint fails the check. When the refresh succeeds, the saved endpoints stay as they are. When
-  the refresh fails or is skipped, the server finds the endpoints again, opens the browser, and saves
-  the endpoints that it found only after the sign-in in the browser succeeds. Before this change, the
-  interactive sign-in found the endpoints first, sent the refresh token to the token endpoint that it
-  found, and saved those endpoints.
+  token endpoint fails the scheme check or the address check below. When the refresh succeeds, the
+  saved endpoints stay as they are. When the refresh fails or is skipped, the server finds the
+  endpoints again, opens the browser, and saves the endpoints that it found only after the sign-in in
+  the browser succeeds. Before this change, the interactive sign-in found the endpoints first, sent the
+  refresh token to the token endpoint that it found, and saved those endpoints.
 - Not covered: a silent refresh with no saved endpoints, for example the first refresh after a sign-in
   with an earlier version, still finds the endpoints and sends the refresh token to the token endpoint
   that it found.
+- The server also runs an address check on each URL that the MCP server supplies before it sends a
+  request to it: the authorization server, the `resource_metadata` link, the registration endpoint
+  and the token endpoint. A public MCP server may send the client to public addresses only. An MCP
+  server on a private network may also use private addresses, and an MCP server on this computer may
+  also use loopback addresses. `ipv4Scope` and `ipv6Scope` define the ranges:
+  - loopback: 127.0.0.0/8, `::1`, and the names `localhost` and `*.localhost`;
+  - private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 192.0.0.0/24, 198.18.0.0/15,
+    fc00::/7 and fec0::/10;
+  - blocked: 0.0.0.0/8, 169.254.0.0/16 (link-local, such as 169.254.169.254), 224.0.0.0 and above,
+    `::`, fe80::/10 and ff00::/8;
+  - an IPv4-mapped, IPv4-compatible or NAT64 (64:ff9b::/96) address counts as its IPv4 address;
+  - every other address is public.
+- No MCP server may send the client to a blocked address. A URL on the host name of the MCP server is
+  always allowed, whatever its address, because the user chose that host.
+- Where the MCP server is depends on the addresses of its own host name, and the address farthest from
+  this computer decides, because the server controls those addresses: a name with any public or blocked
+  address counts as public, and so does a name that does not resolve. A name whose addresses are all
+  private, or private and loopback, counts as private, and a name with only loopback addresses counts
+  as this computer.
+- A target host name is checked by all the addresses that it resolves to: one blocked address blocks
+  it, and otherwise the address closest to this computer decides. A target host name that does not
+  resolve is refused ("has a host name that could not be resolved"), so that a lookup that fails for
+  the check cannot let the lookup of the request choose the address. The server checks the token
+  endpoint before it opens the browser.
+- Discovery requests no longer follow redirects automatically. The server follows up to five
+  redirects itself, checks the address of each one, and releases the body of each redirect response.
+  It does not follow a redirect from `https` to `http`, a redirect to another scheme, or a redirect
+  over `http` to another host or port that is not a loopback address. The client registration and the
+  token requests fail on a redirect.
+- This changes behavior for some setups, where sign-in now fails with an error that names the
+  endpoint:
+  - a public MCP server whose authorization server is only on a private network, including an overlay
+    network in 100.64.0.0/10;
+  - an authorization server name that resolves to both a public and a private address, as split DNS
+    can return;
+  - an MCP server name that resolves to both a public and a private address, while the authorization
+    server is on the private network;
+  - an MCP server name that only a proxy can resolve, while the authorization server resolves to a
+    private address;
+  - an authorization server name that this computer cannot resolve, for example when only a proxy can
+    resolve it.
+
+  A saved token endpoint that now fails the address check makes the silent refresh fail, and the
+  silent refresh does not find the endpoints again. The server then signs in interactively, which needs
+  endpoints that pass the address check too.
+- Not covered: the request resolves the host name again after the check, so a DNS answer that changes
+  between the check and the request is not covered. The authorization endpoint that opens in the
+  browser gets the scheme check only.
 
 ### How to test
 
 From `server/aws-lsp-codewhisperer`:
 
 ```sh
-npx ts-mocha --timeout 0 --exit src/language-server/agenticChat/tools/mcp/mcpOauthClient.test.ts
+npx ts-mocha --timeout 0 --exit src/language-server/agenticChat/tools/mcp/mcpOauthClient.test.ts \
+  src/language-server/agenticChat/tools/mcp/mcpOauthClient.requests.test.ts
 ```
 
 - The suites "validateTokenEndpoint()" and "validateAuthorizationEndpoint()" check the schemes and
@@ -687,3 +737,20 @@ npx ts-mocha --timeout 0 --exit src/language-server/agenticChat/tools/mcp/mcpOau
   refresh. It checks that the refresh token is not sent when no endpoints or no client registration are
   saved or the saved token endpoint fails the check, and that the endpoints found for the browser
   sign-in are saved only after that sign-in, also when the refresh is rejected or throws.
+- The suite "OAuthClient check of the addresses that an MCP server sends the client to" checks how
+  `hostScope()` classifies IPv4 and IPv6 addresses, mapped and NAT64 addresses, other forms of
+  127.0.0.1, localhost names and host names, which targets `assertAllowedTarget()` allows for a public
+  MCP server, an MCP server on a private network and an MCP server on this computer, including MCP
+  server names that also resolve to loopback, private or link-local addresses, and that a host name
+  that does not resolve is refused unless it is the host of the MCP server. It checks that
+  `discoveryFetch()` follows a redirect itself, releases the body of each redirect response (a web
+  stream or a Node stream, also at the redirect limit), follows a redirect over `http` to a loopback
+  address for an MCP server on this computer, and does not follow a redirect to a blocked or plaintext
+  URL, over `http` to another host, or after five redirects. It
+  also checks that discovery skips an authorization server on a private address, that the client
+  registration is sent once with redirects refused, and that the client registration, the refresh
+  token and the browser sign-in stop before any request for a blocked endpoint.
+- `mcpOauthClient.requests.test.ts` sends the token requests to token endpoints on local HTTP servers,
+  with the built-in `fetch` and with the fallback. Its MCP server is on this computer, so the target
+  check allows the local token endpoint. It checks that a token request fails on a redirect, and that
+  the refresh token does not reach a local token endpoint of a public MCP server.

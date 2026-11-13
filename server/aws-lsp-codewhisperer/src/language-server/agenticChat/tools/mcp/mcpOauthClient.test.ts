@@ -76,6 +76,11 @@ function stubHttpServer(): void {
     })
 }
 
+/** Resolves every host name to a public address, so that the target check of OAuthClient needs no DNS */
+function stubPublicDns(): sinon.SinonStub {
+    return sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
+}
+
 describe('OAuthClient helpers', () => {
     it('computeKey() generates deterministic SHA-256 hex', () => {
         const url = new URL('https://example.com/api')
@@ -174,6 +179,7 @@ describe('OAuthClient.refreshGrant()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -206,11 +212,12 @@ describe('OAuthClient.pkceGrant() authorization endpoint', () => {
         sinon.restore()
         showDocument = sinon.stub().rejects(new Error('BROWSER_LAUNCHED'))
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, { window: { showDocument } } as any)
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
 
-    // The token endpoint is a valid loopback URL so the flow reaches the browser step;
+    // The token endpoint is a valid public https URL so the flow reaches the browser step;
     // only the server-supplied authorization_endpoint is hostile.
     for (const authorization_endpoint of [
         'javascript:alert(document.domain)',
@@ -220,7 +227,7 @@ describe('OAuthClient.pkceGrant() authorization endpoint', () => {
         'vscode://extension/evil',
     ]) {
         it(`refuses to open ${authorization_endpoint} and never calls showDocument`, async () => {
-            const meta = { authorization_endpoint, token_endpoint: 'http://127.0.0.1:12345/token' }
+            const meta = { authorization_endpoint, token_endpoint: 'https://auth.example.com/token' }
             const reg = { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' }
             const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
 
@@ -339,6 +346,7 @@ describe('OAuthClient.discoverAS()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -488,6 +496,7 @@ describe('OAuthClient.fetchASFromResourceMeta()', () => {
     beforeEach(() => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -498,7 +507,8 @@ describe('OAuthClient.fetchASFromResourceMeta()', () => {
             try {
                 await (OAuthClient as any).fetchASFromResourceMeta(
                     { authorization_server: authServer },
-                    'https://mcp.example.com/.well-known/oauth-protected-resource'
+                    'https://mcp.example.com/.well-known/oauth-protected-resource',
+                    new URL('https://mcp.example.com/mcp')
                 )
                 expect.fail('should have thrown')
             } catch (e: any) {
@@ -522,7 +532,8 @@ describe('OAuthClient.fetchASFromResourceMeta()', () => {
 
         const result = await (OAuthClient as any).fetchASFromResourceMeta(
             { authorization_server: 'https://auth.example.com' },
-            'https://mcp.example.com/.well-known/oauth-protected-resource'
+            'https://mcp.example.com/.well-known/oauth-protected-resource',
+            new URL('https://mcp.example.com/mcp')
         )
         expect(result.token_endpoint).to.equal('https://auth.example.com/token')
     })
@@ -535,6 +546,7 @@ describe('OAuthClient.obtainClient()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
         sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
         sinon.stub(fakeWorkspace.fs, 'readFile').resolves(Buffer.from('{}'))
         sinon.stub(fakeWorkspace.fs, 'writeFile').resolves()
@@ -568,7 +580,8 @@ describe('OAuthClient.obtainClient()', () => {
             meta,
             '/tmp/test.registration.json',
             ['mcp:connect'],
-            'http://localhost:12345/oauth/callback'
+            'http://localhost:12345/oauth/callback',
+            new URL('https://mcp.example.com/mcp')
         )
 
         // DCR body should NOT contain token_endpoint_auth_method or scope
@@ -591,7 +604,13 @@ describe('OAuthClient.obtainClient()', () => {
         }
 
         try {
-            await (OAuthClient as any).obtainClient(meta, '/tmp/test.json', [], 'http://localhost:12345/oauth/callback')
+            await (OAuthClient as any).obtainClient(
+                meta,
+                '/tmp/test.json',
+                [],
+                'http://localhost:12345/oauth/callback',
+                new URL('https://mcp.example.com/mcp')
+            )
             expect.fail('should have thrown')
         } catch (e: any) {
             expect(e.message).to.include('does not support dynamic registration')
@@ -611,7 +630,8 @@ describe('OAuthClient.obtainClient()', () => {
                     meta,
                     '/tmp/test.json',
                     [],
-                    'http://localhost:12345/oauth/callback'
+                    'http://localhost:12345/oauth/callback',
+                    new URL('https://mcp.example.com/mcp')
                 )
                 expect.fail('should have thrown')
             } catch (e: any) {
@@ -630,6 +650,7 @@ describe('OAuthClient.discoverProtectedResourceMetadata()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -693,6 +714,7 @@ describe('OAuthClient getValidAccessToken()', () => {
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         sinon.stub(OAuthClient as any, 'computeKey').returns('testkey')
         stubHttpServer()
+        stubPublicDns()
         ;(fakeLsp.window.showDocument as sinon.SinonStub).resetHistory()
     })
 
@@ -1113,5 +1135,392 @@ describe('OAuthClient getValidAccessToken()', () => {
                 expect(pinsWritten(write)).to.deep.equal([discovered])
             })
         }
+    })
+})
+
+describe('OAuthClient check of the addresses that an MCP server sends the client to', () => {
+    const publicServer = new URL('https://mcp.example.com/mcp')
+    let lookup: sinon.SinonStub
+
+    beforeEach(() => {
+        sinon.restore()
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+        lookup = sinon.stub(OAuthClient as any, 'lookupHost').callsFake(async (host: unknown) => {
+            const addresses: Record<string, string[]> = {
+                'mcp.example.com': ['93.184.216.34'],
+                'auth.example.com': ['93.184.216.35'],
+                'metadata.example.com': ['169.254.169.254'],
+                'intranet.example.com': ['10.1.2.3'],
+                'mixed.example.com': ['93.184.216.36', '192.168.0.10'],
+                'mcp.corp.example.com': ['10.0.0.2'],
+                'sso.corp.example.com': ['10.0.0.3'],
+                // MCP server names that add addresses close to this computer to a public one
+                'mcp.mixed.example.com': ['93.184.216.34', '127.0.0.1'],
+                'mcp.metadata.example.com': ['93.184.216.34', '169.254.169.254'],
+                'mcp.split.example.com': ['10.0.0.4', '127.0.0.1'],
+            }
+            const found = addresses[String(host)]
+            if (!found) {
+                throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' })
+            }
+            return found.map(address => ({ address, family: 4 }))
+        })
+    })
+
+    afterEach(() => sinon.restore())
+
+    describe('hostScope()', () => {
+        const cases: [string, string | undefined][] = [
+            ['https://93.184.216.34/', 'public'],
+            ['https://[2606:4700::1111]/', 'public'],
+            ['https://172.32.0.1/', 'public'],
+            ['https://100.128.0.1/', 'public'],
+            ['https://10.0.0.5/', 'private'],
+            ['https://172.16.0.1/', 'private'],
+            ['https://172.31.255.255/', 'private'],
+            ['https://192.168.1.1/', 'private'],
+            ['https://100.64.0.1/', 'private'],
+            ['https://[fd12:3456::1]/', 'private'],
+            ['https://127.0.0.1/', 'loopback'],
+            ['https://127.1.2.3/', 'loopback'],
+            ['https://0x7f.1/', 'loopback'],
+            ['https://2130706433/', 'loopback'],
+            ['https://[::1]/', 'loopback'],
+            ['https://[::ffff:127.0.0.1]/', 'loopback'],
+            ['https://localhost/', 'loopback'],
+            ['https://app.localhost./', 'loopback'],
+            ['https://169.254.169.254/', 'blocked'],
+            ['https://0.0.0.0/', 'blocked'],
+            ['https://224.0.0.1/', 'blocked'],
+            ['https://255.255.255.255/', 'blocked'],
+            ['https://[::]/', 'blocked'],
+            ['https://[fe80::1]/', 'blocked'],
+            ['https://[ff02::1]/', 'blocked'],
+            ['https://[::ffff:169.254.169.254]/', 'blocked'],
+            ['https://[64:ff9b::a9fe:a9fe]/', 'blocked'],
+            ['https://auth.example.com/', 'public'],
+            ['https://intranet.example.com/', 'private'],
+            ['https://metadata.example.com/', 'blocked'],
+            ['https://mixed.example.com/', 'private'],
+            ['https://unknown.example.com/', undefined],
+        ]
+        for (const [url, scope] of cases) {
+            it(`classifies ${url} as ${scope ?? 'unknown'}`, async () => {
+                expect(await (OAuthClient as any).hostScope(new URL(url).hostname)).to.equal(scope)
+            })
+        }
+
+        it('does not resolve an IP address or a localhost name', async () => {
+            await (OAuthClient as any).hostScope('10.0.0.5')
+            await (OAuthClient as any).hostScope('[::1]')
+            await (OAuthClient as any).hostScope('localhost')
+            expect(lookup.called).to.be.false
+        })
+    })
+
+    describe('assertAllowedTarget()', () => {
+        const cases: [string, string, boolean][] = [
+            // A public MCP server may send the client to public addresses only
+            ['https://mcp.example.com/mcp', 'https://auth.example.com/token', true],
+            ['https://mcp.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.example.com/mcp', 'https://intranet.example.com/token', false],
+            ['https://mcp.example.com/mcp', 'https://mixed.example.com/token', false],
+            ['https://mcp.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.example.com/mcp', 'http://localhost:8080/token', false],
+            ['https://mcp.example.com/mcp', 'https://169.254.169.254/latest/meta-data/', false],
+            ['https://mcp.example.com/mcp', 'https://metadata.example.com/', false],
+            // An MCP server on a private network may also use private addresses
+            ['https://mcp.corp.example.com/mcp', 'https://sso.corp.example.com/token', true],
+            ['https://mcp.corp.example.com/mcp', 'https://auth.example.com/token', true],
+            ['https://mcp.corp.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.corp.example.com/mcp', 'https://169.254.169.254/', false],
+            // An MCP server on this computer may also use loopback addresses
+            ['http://localhost:3000/mcp', 'http://127.0.0.1:8080/token', true],
+            ['http://localhost:3000/mcp', 'https://10.0.0.5/token', true],
+            ['http://localhost:3000/mcp', 'https://[fe80::1]/token', false],
+            // The host that the user chose is allowed
+            ['https://10.9.9.9/mcp', 'https://10.9.9.9:8443/token', true],
+            // The address of the MCP server farthest from this computer decides where it may send the client
+            ['https://mcp.mixed.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.mixed.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.metadata.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.split.example.com/mcp', 'https://10.0.0.5/token', true],
+            ['https://mcp.split.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://169.254.1.1/mcp', 'https://10.0.0.5/token', false],
+        ]
+        for (const [server, target, allowed] of cases) {
+            it(`${allowed ? 'allows' : 'rejects'} ${target} for the MCP server ${server}`, async () => {
+                const check = (OAuthClient as any).assertAllowedTarget(new URL(target), new URL(server), 'endpoint')
+                if (allowed) {
+                    await check
+                } else {
+                    try {
+                        await check
+                        expect.fail('should have thrown')
+                    } catch (e: any) {
+                        expect(e.message).to.match(/^OAuth: endpoint is on a .* address/)
+                    }
+                }
+            })
+        }
+
+        it('rejects a host name that does not resolve, unless it is the host of the MCP server', async () => {
+            try {
+                await (OAuthClient as any).assertAllowedTarget(
+                    new URL('https://unknown.example.com/token'),
+                    publicServer,
+                    'token endpoint'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.equal('OAuth: token endpoint has a host name that could not be resolved')
+            }
+            await (OAuthClient as any).assertAllowedTarget(
+                new URL('https://unknown.example.com/token'),
+                new URL('https://unknown.example.com/mcp'),
+                'token endpoint'
+            )
+        })
+    })
+
+    describe('discoveryFetch()', () => {
+        function redirectTo(location: string) {
+            return {
+                ok: false,
+                status: 302,
+                headers: { get: (name: string) => (name === 'location' ? location : null) },
+            }
+        }
+        const done = { ok: true, status: 200, headers: { get: () => null }, json: async () => ({}) }
+
+        it('follows a redirect itself and checks its target', async () => {
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves(redirectTo('/.well-known/oauth-authorization-server/next'))
+            fetchStub.onSecondCall().resolves(done)
+
+            const response = await (OAuthClient as any).discoveryFetch(
+                'https://auth.example.com/.well-known/oauth-authorization-server',
+                publicServer,
+                'authorization server'
+            )
+
+            expect(response).to.equal(done)
+            expect(fetchStub.secondCall.args[0]).to.equal(
+                'https://auth.example.com/.well-known/oauth-authorization-server/next'
+            )
+            for (const call of fetchStub.getCalls()) {
+                expect(call.args[1].redirect).to.equal('manual')
+            }
+        })
+
+        for (const location of [
+            'http://169.254.169.254/latest/meta-data/',
+            'https://10.0.0.5/internal',
+            'https://metadata.example.com/',
+            'http://auth.example.com/plaintext',
+            'file:///etc/passwd',
+        ]) {
+            it(`does not follow a redirect to ${location}`, async () => {
+                const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').resolves(redirectTo(location))
+                try {
+                    await (OAuthClient as any).discoveryFetch(
+                        'https://auth.example.com/.well-known/openid-configuration',
+                        publicServer,
+                        'authorization server'
+                    )
+                    expect.fail('should have thrown')
+                } catch (e: any) {
+                    expect(e.message).to.include('authorization server')
+                }
+                expect(fetchStub.calledOnce).to.be.true
+            })
+        }
+
+        it('stops after five redirects', async () => {
+            const cancel = sinon.stub().resolves()
+            const fetchStub = sinon
+                .stub(OAuthClient as any, 'fetchCompat')
+                .resolves({ ...redirectTo('https://auth.example.com/again'), body: { cancel } })
+            try {
+                await (OAuthClient as any).discoveryFetch(
+                    'https://auth.example.com/',
+                    publicServer,
+                    'resource metadata'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('too many redirects')
+            }
+            expect(fetchStub.callCount).to.equal(6)
+            // The body of the last redirect response is released too
+            expect(cancel.callCount).to.equal(6)
+        })
+
+        it('releases a Node stream body, as the fallback fetch returns', async () => {
+            const destroy = sinon.stub()
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves({ ...redirectTo('/next'), body: { destroy } })
+            fetchStub.onSecondCall().resolves(done)
+
+            await (OAuthClient as any).discoveryFetch('https://auth.example.com/', publicServer, 'authorization server')
+
+            sinon.assert.calledOnce(destroy)
+        })
+
+        it('releases the body of a redirect response before it follows the redirect', async () => {
+            const cancel = sinon.stub().resolves()
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves({ ...redirectTo('/next'), body: { cancel } })
+            fetchStub.onSecondCall().resolves(done)
+
+            await (OAuthClient as any).discoveryFetch('https://auth.example.com/', publicServer, 'authorization server')
+
+            sinon.assert.calledOnce(cancel)
+            sinon.assert.callOrder(cancel, fetchStub.withArgs('https://auth.example.com/next'))
+        })
+
+        describe('over http, for an MCP server on this computer', () => {
+            const loopbackServer = new URL('http://localhost:3000/mcp')
+
+            it('follows a redirect to a loopback address', async () => {
+                const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+                fetchStub.onFirstCall().resolves(redirectTo('http://127.0.0.1:9/metadata'))
+                fetchStub.onSecondCall().resolves(done)
+
+                const response = await (OAuthClient as any).discoveryFetch(
+                    'http://localhost:3000/.well-known/oauth-protected-resource',
+                    loopbackServer,
+                    'resource metadata'
+                )
+
+                expect(response).to.equal(done)
+                expect(fetchStub.secondCall.args[0]).to.equal('http://127.0.0.1:9/metadata')
+            })
+
+            it('does not follow a redirect over http to another host', async () => {
+                const fetchStub = sinon
+                    .stub(OAuthClient as any, 'fetchCompat')
+                    .resolves(redirectTo('http://other.example.com/metadata'))
+                try {
+                    await (OAuthClient as any).discoveryFetch(
+                        'http://localhost:3000/.well-known/oauth-protected-resource',
+                        loopbackServer,
+                        'resource metadata'
+                    )
+                    expect.fail('should have thrown')
+                } catch (e: any) {
+                    expect(e.message).to.equal(
+                        'OAuth: resource metadata must use HTTPS unless it is a loopback address'
+                    )
+                }
+                expect(fetchStub.calledOnce).to.be.true
+            })
+        })
+    })
+
+    it('sends the client registration once, and fails on a redirect', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').resolves({
+            ok: true,
+            status: 201,
+            json: async () => ({ client_id: 'new_id' }),
+        })
+        sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
+        sinon.stub(fakeWorkspace.fs, 'writeFile').resolves()
+        sinon.stub(fakeWorkspace.fs, 'mkdir').resolves()
+
+        await (OAuthClient as any).obtainClient(
+            {
+                authorization_endpoint: 'https://auth.example.com/authorize',
+                token_endpoint: 'https://auth.example.com/token',
+                registration_endpoint: 'https://auth.example.com/register',
+            },
+            '/tmp/test.json',
+            [],
+            'http://localhost:12345/oauth/callback',
+            publicServer
+        )
+
+        sinon.assert.calledOnce(fetchStub)
+        expect(fetchStub.firstCall.args[1]).to.include({ method: 'POST', redirect: 'error' })
+    })
+
+    it('discovery skips an authorization server on a private address for a public MCP server', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').callsFake(async (url: unknown) => {
+            if (String(url).includes('oauth-protected-resource')) {
+                return { ok: true, status: 200, json: async () => ({ authorization_servers: ['https://10.0.0.5'] }) }
+            }
+            return { ok: false, status: 404, headers: { get: () => null }, text: async () => '' }
+        })
+
+        const meta = await (OAuthClient as any).discoverAS(publicServer)
+
+        expect(fetchStub.getCalls().some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('10.0.0.5'))).to.be.false
+        // Discovery falls through to the endpoints on the MCP server itself
+        expect(meta.token_endpoint).to.equal('https://mcp.example.com/mcp/access_token')
+    })
+
+    it('does not send the client registration to a link-local address', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
+        try {
+            await (OAuthClient as any).obtainClient(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'https://auth.example.com/token',
+                    registration_endpoint: 'https://169.254.169.254/register',
+                },
+                '/tmp/test.json',
+                [],
+                'http://localhost:12345/oauth/callback',
+                publicServer
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('registration endpoint')
+        }
+        expect(fetchStub.called).to.be.false
+    })
+
+    it('does not send the refresh token to a token endpoint on a private address', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        try {
+            await (OAuthClient as any).refreshGrant(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'https://10.0.0.5/token',
+                },
+                { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' },
+                publicServer,
+                'refresh-token'
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('token endpoint')
+        }
+        expect(fetchStub.called).to.be.false
+    })
+
+    it('does not open the browser when the token endpoint is on a loopback address of a public MCP server', async () => {
+        const showDocument = sinon.stub().resolves({ success: true })
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, { window: { showDocument } } as any)
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        try {
+            await (OAuthClient as any).pkceGrant(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'http://127.0.0.1:9/token',
+                },
+                { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' },
+                publicServer,
+                ['openid'],
+                'http://localhost:12345/oauth/callback',
+                new EventEmitter()
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('token endpoint')
+        }
+        expect(showDocument.called).to.be.false
+        expect(fetchStub.called).to.be.false
     })
 })
