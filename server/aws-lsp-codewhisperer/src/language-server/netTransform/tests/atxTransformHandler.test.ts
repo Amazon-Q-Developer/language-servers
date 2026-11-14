@@ -5801,6 +5801,55 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.false
         })
 
+        // Core race: N beam-status-* files appear in ListArtifacts before the beam-map (a
+        // pathless JSON). With the fix, beam-status files are excluded from allCandidates and
+        // the pathless beam-map is sorted to the front, so it is found on the first download.
+        it('finds the beam-map even when beam-status files appear before it in ListArtifacts', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    ...zipArtifacts('carol'),
+                    { artifactId: 'bs-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                    { artifactId: 'bs-2', fileMetadata: { path: 'beam-status-job-1-bob.json' } },
+                    { artifactId: 'bs-3', fileMetadata: { path: 'beam-status-job-1-carol.json' } },
+                    // Pathless beam-map listed last — without the sort it would consume 3 budget
+                    // slots on the beam-status files before reaching it. With the fix it is first.
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [
+                    {
+                        repoName: 'alice',
+                        stepId: 's-alice',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-a',
+                    },
+                    { repoName: 'bob', stepId: 's-bob', generateIntegrationTests: true, originalArtifactId: 'orig-b' },
+                    {
+                        repoName: 'carol',
+                        stepId: 's-carol',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-c',
+                    },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            // All 3 repos found from beam-map, not beam-status
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['alice', 'bob', 'carol'])
+            for (const repo of result) {
+                expect(repo.GenerateIntegrationTests).to.be.true
+                expect(repo.OriginalArtifactId).to.not.be.empty
+            }
+            // The beam-map (beammap-1, pathless) was downloaded first, not the beam-status files
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'beammap-1')).to.be.true
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'bs-1')).to.be.false
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
         it('rejects malformed beam-map entries (no usable repo name)', async () => {
             sendStub.resolves({
                 artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
