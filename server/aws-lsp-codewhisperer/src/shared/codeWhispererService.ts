@@ -653,7 +653,9 @@ export class CodeWhispererServiceToken extends CodeWhispererServiceBase {
             }
 
             const r = this.mapCodeWhispererApiResponseToSuggestion(response, responseContext)
-            const firstSuggestionLogstr = r.suggestions.length > 0 ? `\n${r.suggestions[0].content}` : 'No suggestion'
+            // A suggestion continues the user's file and can repeat secrets from it, so only its length is logged
+            const firstSuggestionLogstr =
+                r.suggestions.length > 0 ? `${r.suggestions[0].content?.length ?? 0} characters` : 'No suggestion'
 
             logstr += `@@response metadata@@
     "requestId": ${responseContext.requestId},
@@ -663,7 +665,7 @@ export class CodeWhispererServiceToken extends CodeWhispererServiceBase {
     "predictionType": ${tokenRequest.predictionTypes?.toString() ?? 'Not specified (COMPLETIONS)'},
     "latency": ${Date.now() - beforeApiCall},
     "response.nextToken": ${response.nextToken},
-    "firstSuggestion": ${firstSuggestionLogstr}`
+    "firstSuggestionLength": ${firstSuggestionLogstr}`
 
             return r
         } catch (e) {

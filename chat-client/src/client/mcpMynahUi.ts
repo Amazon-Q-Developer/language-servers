@@ -34,6 +34,10 @@ export const MCP_IDS = {
     // Permission actions
     PERMISSION_CHANGE: 'mcp-permission-change',
     SAVE_PERMISSION_CHANGE: 'save-permission-change',
+
+    // Registry actions
+    INSTALL_REGISTRY_SERVER: 'install-registry-server',
+    CONFIRM_INSTALL_REGISTRY_SERVER: 'confirm-install-registry-server',
 }
 
 // MCP UI display constants
@@ -535,14 +539,22 @@ export class McpMynahUi {
         return {
             onBackClick: () => this.messager.onListMcpServers(),
             onActionClick: (action: ChatItemButton, item?: DetailedListItem) => {
-                if (action.id === 'install-registry-server') {
-                    this.mynahUi.toggleSplashLoader(true, '**Installing MCP Server**')
+                // Install in the registry list opens the install preview of the server
+                if (action.id === MCP_IDS.INSTALL_REGISTRY_SERVER) {
+                    this.mynahUi.toggleSplashLoader(true, '**Loading MCP Server**')
                     this.messager.onMcpServerClick(action.id, item?.title)
                 }
             },
             onFilterActionClick: (actionParams: McpServerClickResult, filterValues?: Record<string, string>) => {
                 if (actionParams.id === MCP_IDS.CANCEL) {
                     this.messager.onListMcpServers()
+                    return
+                }
+
+                // Install in the install preview installs the server
+                if (actionParams.id === MCP_IDS.CONFIRM_INSTALL_REGISTRY_SERVER) {
+                    this.mynahUi.toggleSplashLoader(true, '**Installing MCP Server**')
+                    this.messager.onMcpServerClick(actionParams.id, serverName)
                     return
                 }
 

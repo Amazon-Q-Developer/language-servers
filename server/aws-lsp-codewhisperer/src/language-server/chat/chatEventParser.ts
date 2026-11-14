@@ -13,6 +13,7 @@ import {
 import { Result } from '../types'
 import { AddMessageEvent } from '../../shared/telemetry/types'
 import { Metric } from '../../shared/telemetry/metric'
+import { isWebUrl } from '../../shared/utils'
 export type ChatResponseStream = ChatResponseStreamCodeWhispererStreaming | ChatResponseStreamQDeveloperStreaming
 
 export type ChatResultWithMetadata = {
@@ -126,11 +127,15 @@ export class ChatEventParser implements ChatResult {
             supplementaryWebLinksEvent.supplementaryWebLinks.length > 0
         ) {
             this.#totalEvents.supplementaryWebLinksEvent += 1
-            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks.map(ChatEventParser.mapRelatedData)
+            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks
+                .filter(link => isWebUrl(link.url))
+                .map(ChatEventParser.mapRelatedData)
 
-            this.relatedContent = {
-                ...this.relatedContent,
-                content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+            if (sourceLinks.length > 0) {
+                this.relatedContent = {
+                    ...this.relatedContent,
+                    content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+                }
             }
         } else if (codeReferenceEvent?.references && codeReferenceEvent.references.length > 0) {
             this.#totalEvents.codeReferenceEvent += 1

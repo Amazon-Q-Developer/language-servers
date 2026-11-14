@@ -7,13 +7,14 @@ import { expect } from 'chai'
 import * as sinon from 'sinon'
 import { McpEventHandler } from './mcpEventHandler'
 import { McpManager } from './mcpManager'
-import { MCPServerConfig, McpServerStatus } from './mcpTypes'
+import { McpRegistryServer, MCPServerConfig, McpServerStatus } from './mcpTypes'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import * as mcpUtils from './mcpUtils'
 import { getGlobalAgentConfigPath } from './mcpUtils'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
 import { ChokidarFileWatcher } from './chokidarFileWatcher'
 import { getFolderApprovalsPath } from './mcpWorkspaceTrust'
+import { fingerprintServerConfig } from './mcpConsentStore'
 
 describe('McpEventHandler error handling', () => {
     // Mock getGlobalAgentConfigPath to return a test path
@@ -662,6 +663,390 @@ describe('McpEventHandler error handling', () => {
                 expect(showMessage.calledOnce).to.be.true
             })
         })
+    })
+
+    describe('installing a registry server', () => {
+        const localServer: McpRegistryServer = {
+            name: 'docs-server',
+            description: 'Searches the team docs',
+            version: '1.2.3',
+            packages: [
+                {
+                    registryType: 'npm',
+                    registryBaseUrl: 'https://npm.example.com',
+                    identifier: '@example/docs-server',
+                    transport: { type: 'stdio' },
+                    runtimeArguments: [{ type: 'positional', value: '--prefer-offline' }],
+                    packageArguments: [{ type: 'positional', value: '--read-only' }],
+                    environmentVariables: [{ name: 'DOCS_REGION', value: 'us-east-1' }],
+                },
+            ],
+        }
+        const localArgs = ['-y', '--prefer-offline', '@example/docs-server@1.2.3', '--read-only']
+        const localEnv = { NPM_CONFIG_REGISTRY: 'https://npm.example.com', DOCS_REGION: 'us-east-1' }
+        const remoteServer: McpRegistryServer = {
+            name: 'remote-docs',
+            description: 'Hosted docs search',
+            version: '2.0.0',
+            remotes: [
+                {
+                    type: 'streamable-http',
+                    url: 'https://mcp.example.com/docs',
+                    headers: [{ name: 'X-Team', value: 'docs' }],
+                },
+            ],
+        }
+        const plainServer: McpRegistryServer = {
+            name: 'plain-server',
+            description: 'A server with no index, variables or headers',
+            version: '0.1.0',
+            packages: [{ registryType: 'pypi', identifier: 'plain-server', transport: { type: 'stdio' } }],
+        }
+        const plainRemoteServer: McpRegistryServer = {
+            name: 'plain-remote',
+            description: 'A remote server with no headers',
+            version: '1.0.0',
+            remotes: [{ type: 'sse', url: 'https://mcp.example.com/sse' }],
+        }
+
+        let addRegistryServer: sinon.SinonStub
+        let recordApproval: sinon.SinonStub
+        let registryServers: Map<string, McpRegistryServer>
+
+        const field = (view: any, id: string) => view.filterOptions.find((option: any) => option.id === id)
+        const rows = (view: any, id: string) => field(view, id).value.map((row: any) => row.value)
+        // The configuration that the status shows in a code span on one line
+        const reviewJson = (view: any) => {
+            const match = /^(`+)([^\n]*)\1$/.exec(view.header.status.description)
+            expect(match, 'the status shows the configuration in a code span on one line').to.not.be.null
+            return JSON.parse(match![2])
+        }
+        const preview = (title: string) => eventHandler.onMcpServerClick({ id: 'install-registry-server', title })
+        const confirm = (title: string) =>
+            eventHandler.onMcpServerClick({ id: 'confirm-install-registry-server', title })
+
+        beforeEach(async () => {
+            sinon.stub(ProfileStatusMonitor, 'getMcpState').returns(true)
+            const mgr = await McpManager.init([], features)
+            registryServers = new Map(
+                [localServer, remoteServer, plainServer, plainRemoteServer].map(server => [
+                    server.name,
+                    JSON.parse(JSON.stringify(server)),
+                ])
+            )
+            sinon.stub(mgr, 'getRegistryService').returns({
+                isRegistryActive: () => true,
+                getInMemoryRegistry: () => ({
+                    servers: [...registryServers.values()],
+                    lastFetched: new Date(),
+                    url: 'https://registry.example.com/registry.json',
+                }),
+                getServerByName: (name: string) => registryServers.get(name),
+            } as any)
+            sinon.stub(mgr, 'getAllServerConfigs').returns(new Map())
+            sinon.stub(mgr, 'getAllToolsWithPermissions').returns([])
+            addRegistryServer = sinon.stub(mgr, 'addRegistryServer').resolves()
+            recordApproval = sinon.stub(mgr, 'recordRegistryServerApproval').resolves()
+        })
+
+        it('shows the command, arguments and environment variables of a local server before installing it', async () => {
+            const view = await preview('docs-server 1.2.3')
+
+            sinon.assert.notCalled(addRegistryServer)
+            expect(view.id).to.equal('add-new-mcp')
+            expect(view.isMcpRegistry).to.be.true
+            expect(view.header.title).to.equal('Install MCP Server')
+            expect(view.header.status).to.include({
+                title: 'Installing this server runs this command on your computer:',
+                status: 'info',
+            })
+            // The status shows the whole configuration as text, so no long value is cut off
+            expect(reviewJson(view)).to.deep.equal({ command: 'npx', args: localArgs, env: localEnv })
+            expect(field(view, 'args').value.every((row: any) => row.persistent === true)).to.be.true
+            expect(field(view, 'name').value).to.equal('docs-server')
+            expect(field(view, 'version').value).to.equal('1.2.3')
+            expect(field(view, 'transport').value).to.equal('stdio')
+            expect(field(view, 'command').value).to.equal('npx')
+            expect(rows(view, 'args')).to.deep.equal(localArgs.map(arg => ({ arg_key: arg })))
+            expect(rows(view, 'env_variables')).to.deep.equal(
+                Object.entries(localEnv).map(([name, value]) => ({ env_var_name: name, env_var_value: value }))
+            )
+            expect(field(view, 'url')).to.be.undefined
+            expect(view.filterOptions.every((option: any) => option.disabled === true)).to.be.true
+            expect(view.filterActions.map((action: any) => action.id)).to.deep.equal([
+                'cancel-mcp',
+                'confirm-install-registry-server',
+            ])
+        })
+
+        it('shows the URL and headers of a remote server before installing it', async () => {
+            const view = await preview('remote-docs 2.0.0')
+
+            sinon.assert.notCalled(addRegistryServer)
+            expect(view.header.title).to.equal('Install MCP Server')
+            expect(view.header.status).to.include({
+                title: 'Installing this server connects Amazon Q to this URL:',
+                status: 'info',
+            })
+            expect(reviewJson(view)).to.deep.equal({
+                url: 'https://mcp.example.com/docs',
+                headers: { 'X-Team': 'docs' },
+            })
+            expect(field(view, 'transport').value).to.equal('http')
+            expect(field(view, 'url').value).to.equal('https://mcp.example.com/docs')
+            expect(rows(view, 'headers')).to.deep.equal([{ key: 'X-Team', value: 'docs' }])
+            expect(field(view, 'command')).to.be.undefined
+            expect(field(view, 'args')).to.be.undefined
+            expect(view.filterOptions.every((option: any) => option.disabled === true)).to.be.true
+        })
+
+        it('leaves out the environment variables and headers when a server has none', async () => {
+            const local = await preview('plain-server 0.1.0')
+            expect(field(local, 'command').value).to.equal('uvx')
+            expect(rows(local, 'args')).to.deep.equal([{ arg_key: 'plain-server@0.1.0' }])
+            expect(field(local, 'env_variables')).to.be.undefined
+
+            const remote = await preview('plain-remote 1.0.0')
+            expect(field(remote, 'url').value).to.equal('https://mcp.example.com/sse')
+            expect(field(remote, 'headers')).to.be.undefined
+        })
+
+        it('shows a long value in full and hidden characters as escapes in the status text', async () => {
+            const longIndex = `https://npm.example.com/${'a'.repeat(300)}`
+            const server = registryServers.get('docs-server')!
+            server.packages![0].registryBaseUrl = longIndex
+            server.packages![0].packageArguments!.push({ type: 'positional', value: 'safe\u202Eexe.txt' })
+
+            const view = await preview('docs-server 1.2.3')
+
+            const description: string = view.header.status.description
+            expect(description).to.include(longIndex)
+            expect(description).to.not.include('\u202E')
+            expect(description).to.include('safe\\u202eexe.txt')
+            expect(reviewJson(view).env.NPM_CONFIG_REGISTRY).to.equal(longIndex)
+        })
+
+        it('keeps backticks, markdown and HTML in a value as text in the code span', async () => {
+            const values = [
+                'a```b',
+                '````',
+                '[docs](https://other.example.com)',
+                '<b>bold</b>',
+                '<span hidden>',
+                'a&quot;, "b',
+            ]
+            registryServers
+                .get('docs-server')!
+                .packages![0].packageArguments!.push(...values.map(value => ({ type: 'positional' as const, value })))
+
+            const view = await preview('docs-server 1.2.3')
+
+            const description: string = view.header.status.description
+            expect(description.startsWith('`````{')).to.be.true
+            expect(description.endsWith('}`````')).to.be.true
+            // The chat client could read these characters as HTML, so the status has them only as escapes
+            expect(description).to.not.match(/[<>&]/)
+            expect(reviewJson(view).args.slice(-values.length)).to.deep.equal(values)
+        })
+
+        it('installs the previewed server when the user confirms, and only once', async () => {
+            await preview('docs-server 1.2.3')
+            const result = await confirm('docs-server')
+
+            sinon.assert.calledOnce(addRegistryServer)
+            const [name, config, agentPath] = addRegistryServer.firstCall.args
+            expect(name).to.equal('docs-server')
+            expect(config).to.deep.equal({ command: 'npx', args: localArgs, env: localEnv, __cachedVersion__: '1.2.3' })
+            expect(agentPath).to.equal(getGlobalAgentConfigPath('/fake/home'))
+            expect(result.id).to.equal('open-mcp-server')
+            expect(result.header.title).to.equal('docs-server')
+
+            // The confirmation is used up: a second Install shows the preview again
+            const again = await confirm('docs-server')
+            sinon.assert.calledOnce(addRegistryServer)
+            expect(again.header.title).to.equal('Install MCP Server')
+        })
+
+        it('ignores form values that the chat client sends with the confirmation', async () => {
+            await preview('docs-server 1.2.3')
+            await eventHandler.onMcpServerClick({
+                id: 'confirm-install-registry-server',
+                title: 'docs-server',
+                optionsValues: {
+                    name: 'other-server',
+                    command: 'sh',
+                    args: [{ arg_key: '-c' }] as any,
+                    env_variables: [{ env_var_name: 'NODE_OPTIONS', env_var_value: '--require x' }] as any,
+                },
+            })
+
+            sinon.assert.calledOnce(addRegistryServer)
+            const [name, config] = addRegistryServer.firstCall.args
+            expect(name).to.equal('docs-server')
+            expect(config).to.deep.equal({ command: 'npx', args: localArgs, env: localEnv, __cachedVersion__: '1.2.3' })
+        })
+
+        it('installs a remote server with the previewed URL and headers', async () => {
+            await preview('remote-docs 2.0.0')
+            await confirm('remote-docs')
+
+            sinon.assert.calledOnce(addRegistryServer)
+            expect(addRegistryServer.firstCall.args[1]).to.deep.equal({
+                url: 'https://mcp.example.com/docs',
+                headers: { 'X-Team': 'docs' },
+                __cachedVersion__: '2.0.0',
+            })
+        })
+
+        it('shows the preview instead of installing a server that the user did not review', async () => {
+            const view = await confirm('docs-server')
+
+            sinon.assert.notCalled(addRegistryServer)
+            expect(view.header.title).to.equal('Install MCP Server')
+            expect(view.header.status).to.include({ status: 'info' })
+            sinon.assert.calledWithMatch(features.logging.info, /it was not the server in the preview/)
+
+            await confirm('docs-server')
+            sinon.assert.calledOnce(addRegistryServer)
+        })
+
+        it('does not install a server when the preview showed another server', async () => {
+            await preview('docs-server 1.2.3')
+            await preview('remote-docs 2.0.0')
+            const view = await confirm('docs-server')
+
+            sinon.assert.notCalled(addRegistryServer)
+            expect(field(view, 'name').value).to.equal('docs-server')
+            expect(view.header.status).to.include({ status: 'info' })
+        })
+
+        const changes: [string, string, (server: McpRegistryServer) => void][] = [
+            [
+                'an argument',
+                'docs-server',
+                server => server.packages![0].packageArguments!.push({ type: 'positional', value: '--allow-write' }),
+            ],
+            [
+                'an environment variable',
+                'docs-server',
+                server => (server.packages![0].environmentVariables![0].value = 'eu-west-1'),
+            ],
+            [
+                'the package registry',
+                'docs-server',
+                server => (server.packages![0].registryBaseUrl = 'https://npm.other.example.com'),
+            ],
+            ['the version', 'docs-server', server => (server.version = '1.2.4')],
+            ['the version of a remote server', 'remote-docs', server => (server.version = '2.0.1')],
+            ['the URL', 'remote-docs', server => (server.remotes![0].url = 'https://mcp.other.example.com/docs')],
+            ['a header', 'remote-docs', server => (server.remotes![0].headers![0].value = 'other')],
+        ]
+        for (const [change, serverName, mutate] of changes) {
+            it(`shows the preview again when the registry changed ${change} after the preview`, async () => {
+                const before = await preview(serverName)
+                mutate(registryServers.get(serverName)!)
+                const after = await confirm(serverName)
+
+                sinon.assert.notCalled(addRegistryServer)
+                expect(after.header.title).to.equal('Install MCP Server')
+                expect(after.header.status).to.include({
+                    title: 'This server changed in the registry. Review it again before you install it.',
+                    status: 'warning',
+                })
+                expect(after.filterOptions).to.not.deep.equal(before.filterOptions)
+                sinon.assert.calledWithMatch(features.logging.info, /its registry entry changed/)
+
+                await confirm(serverName)
+                sinon.assert.calledOnce(addRegistryServer)
+            })
+        }
+
+        it('records the approval of the previewed configuration before it installs the server', async () => {
+            await preview('docs-server 1.2.3')
+            await confirm('docs-server')
+
+            sinon.assert.calledOnce(recordApproval)
+            const [name, config, agentPath] = recordApproval.firstCall.args
+            expect(name).to.equal('docs-server')
+            // The approval covers what the server starts with, so it matches the configuration that is installed
+            expect(fingerprintServerConfig(config)).to.equal(
+                fingerprintServerConfig(addRegistryServer.firstCall.args[1])
+            )
+            expect(agentPath).to.equal(getGlobalAgentConfigPath('/fake/home'))
+            sinon.assert.callOrder(recordApproval, addRegistryServer)
+        })
+
+        it('records no approval when the registry changed the server after the preview', async () => {
+            await preview('docs-server 1.2.3')
+            registryServers.get('docs-server')!.version = '1.2.4'
+            await confirm('docs-server')
+
+            sinon.assert.notCalled(recordApproval)
+            sinon.assert.notCalled(addRegistryServer)
+        })
+
+        const leaveActions: [string, () => Promise<unknown>][] = [
+            ['Cancel or Back, which list the servers', () => eventHandler.onListMcpServers({})],
+            ['another view', () => eventHandler.onMcpServerClick({ id: 'add-new-mcp' })],
+            ['an action on another server', () => eventHandler.onMcpServerClick({ id: 'refresh-mcp-list' })],
+        ]
+        for (const [leave, action] of leaveActions) {
+            it(`does not install a server after the user leaves its preview with ${leave}`, async () => {
+                await preview('docs-server 1.2.3')
+                await action().catch(() => undefined)
+                const view = await confirm('docs-server')
+
+                sinon.assert.notCalled(addRegistryServer)
+                sinon.assert.notCalled(recordApproval)
+                // The server shows the preview again instead
+                expect(view.header.title).to.equal('Install MCP Server')
+                expect(view.header.status).to.include({ status: 'info' })
+            })
+        }
+
+        it('does not install a server that left the registry after the preview', async () => {
+            await preview('docs-server 1.2.3')
+            registryServers.delete('docs-server')
+            const view = await confirm('docs-server')
+
+            sinon.assert.notCalled(addRegistryServer)
+            expect(view.header.title).to.equal('Add MCP Server')
+            sinon.assert.calledWithMatch(features.logging.error, /Registry server not found: docs-server/)
+        })
+
+        it('shows the registry list for a registry entry that cannot be converted', async () => {
+            registryServers.set('broken', { name: 'broken', description: 'No package', version: '1.0.0' })
+            const view = await preview('broken 1.0.0')
+
+            expect(view.header.title).to.equal('Add MCP Server')
+            sinon.assert.calledWithMatch(features.logging.error, /Invalid registry server 'broken'/)
+            await confirm('broken')
+            sinon.assert.notCalled(addRegistryServer)
+        })
+    })
+
+    it('logs the names of the MCP server form fields, not their values', async () => {
+        // The log line comes before the click is handled, so an id that no handler takes is enough here
+        await eventHandler.onMcpServerClick({
+            id: 'unhandled-action',
+            title: 'docs-server',
+            optionsValues: {
+                name: 'docs-server',
+                env_variables: JSON.stringify([{ env_var_name: 'API_TOKEN', env_var_value: 'lsfix-env-secret' }]),
+                headers: JSON.stringify([{ key: 'Authorization', value: 'Bearer lsfix-header-secret' }]),
+            },
+        })
+
+        const logged = (['log', 'info', 'warn', 'error', 'debug'] as const)
+            .flatMap(level =>
+                features.logging[level].getCalls().map((call: sinon.SinonSpyCall) => String(call.args[0]))
+            )
+            .join('\n')
+        expect(logged).to.include(
+            'onMcpServerClick event with params: {"id":"unhandled-action","title":"docs-server","fieldNames":["name","env_variables","headers"]}'
+        )
+        expect(logged).to.not.include('lsfix-env-secret')
+        expect(logged).to.not.include('lsfix-header-secret')
     })
 
     it('handles server click events for fixing failed servers', async () => {

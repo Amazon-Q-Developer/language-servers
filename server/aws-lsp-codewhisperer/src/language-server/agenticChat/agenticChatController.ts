@@ -251,6 +251,7 @@ import {
     onPaidTierLearnMore,
     paidTierManageSubscription,
     PaidTierMode,
+    parseSubscriptionUpgradeUrl,
     qProName,
 } from '../paidTier/paidTier'
 import {
@@ -767,8 +768,9 @@ export class AgenticChatController implements ChatHandlers {
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
             let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            let workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            // Rules live in a workspace folder. With no folder open, the request creates a saved prompt below.
             if (workspaceFolders.length > 0) {
+                const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
                 const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
                 const newFileContent = ''
                 try {
@@ -1064,7 +1066,9 @@ export class AgenticChatController implements ChatHandlers {
                                 },
                             }
 
-                            const response = await client.sendMessage(requestInput)
+                            // The prompt lists workspace file paths. Remove invisible characters, as for the
+                            // other chat requests.
+                            const response = await client.sendMessage(sanitizeRequestInput(requestInput))
 
                             let responseContent = ''
                             const maxResponseSize = 50000 // 50KB limit
@@ -4221,6 +4225,8 @@ export class AgenticChatController implements ChatHandlers {
                 ChatTriggerType.INLINE_CHAT,
                 this.#customizationArn
             )
+            // Remove invisible characters from the whole request, as for the agent loop and compaction requests
+            requestInput = sanitizeRequestInput(requestInput)
 
             if (!this.#serviceManager) {
                 throw new Error('amazonQServiceManager is not initialized')
@@ -4534,7 +4540,10 @@ export class AgenticChatController implements ChatHandlers {
             const contextItems = await localProjectContextController.getContextCommandItems()
             this.#contextCommandsProvider.setFilesAndFoldersPending(false)
             await this.#contextCommandsProvider.processContextCommandUpdate(contextItems)
-            void this.#contextCommandsProvider.maybeUpdateCodeSymbols()
+            // This update runs in the background, so its failure must be handled here, not by the catch below
+            this.#contextCommandsProvider.maybeUpdateCodeSymbols().catch(error => {
+                this.#log('Error updating code symbols for context commands: ' + error)
+            })
         } catch (error) {
             this.#contextCommandsProvider.setFilesAndFoldersFailed(true)
             await this.#contextCommandsProvider.processContextCommandUpdate([])
@@ -4852,9 +4861,8 @@ export class AgenticChatController implements ChatHandlers {
                             ?.getCodewhispererService()
                             .getSubscriptionStatus(true)
                             .then(o => {
-                                this.#log(
-                                    `setPaidTierMode: getSubscriptionStatus: ${o.status} ${o.encodedVerificationUrl}`
-                                )
+                                // Log only the status: the subscription URL contains an activation token
+                                this.#log(`setPaidTierMode: getSubscriptionStatus: ${o.status}`)
                                 this.setPaidTierMode(tabId, o.status !== 'none' ? 'paidtier' : 'freetier')
                             })
                             .catch(err => {
@@ -4922,7 +4930,8 @@ export class AgenticChatController implements ChatHandlers {
             client
                 ?.getSubscriptionStatus()
                 .then(o => {
-                    this.#log(`onManageSubscription: getSubscriptionStatus: ${o.status} ${o.encodedVerificationUrl}`)
+                    // Log only the status: the subscription URL contains an activation token
+                    this.#log(`onManageSubscription: getSubscriptionStatus: ${o.status}`)
 
                     if (o.status !== 'none') {
                         // Paid-tier user: navigate them to the "Manage Subscriptions" AWS console page.
@@ -4937,10 +4946,14 @@ export class AgenticChatController implements ChatHandlers {
                             })
                     } else {
                         // Free-tier user: navigate them to "Upgrade Q" flow in AWS console.
-                        const uri = o.encodedVerificationUrl
+                        // The client opens the URL in the external browser, so it must be on the AWS sign-in host.
+                        const uri = parseSubscriptionUpgradeUrl(o.encodedVerificationUrl)
 
                         if (!uri) {
-                            this.#log('onManageSubscription: missing encodedVerificationUrl in server response')
+                            const reason = o.encodedVerificationUrl
+                                ? 'encodedVerificationUrl in server response is not an https URL on the AWS sign-in host'
+                                : 'missing encodedVerificationUrl in server response'
+                            this.#log(`onManageSubscription: ${reason}`)
                             this.#features.lsp.window
                                 .showMessage({
                                     message: 'Subscription request failed.',
@@ -4949,21 +4962,10 @@ export class AgenticChatController implements ChatHandlers {
                                 .catch(e => {
                                     this.#log(`onManageSubscription: showMessage failed: ${(e as Error).message}`)
                                 })
-                            return 'missing encodedVerificationUrl in server response'
+                            return reason
                         }
 
-                        try {
-                            URI.parse(uri)
-                        } catch (e) {
-                            this.#log(
-                                `onManageSubscription: invalid encodedVerificationUrl: '${uri}': ${(e as Error).message}`
-                            )
-                            return 'invalid encodedVerificationUrl'
-                        }
-
-                        this.#log(
-                            `onManageSubscription: createSubscriptionToken status: ${o.status} encodedVerificationUrl: '${uri}'`
-                        )
+                        this.#log(`onManageSubscription: createSubscriptionToken status: ${o.status}`)
                         // Set UI to "progress" mode.
                         this.setPaidTierMode(tabId, 'upgrade-pending')
 

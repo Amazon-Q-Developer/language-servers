@@ -1981,6 +1981,8 @@ describe('addRegistryServer with additional headers/env', () => {
 
         const storedCfg = (mgr as any).mcpServers.get('httpServer')
         expect(storedCfg.__additionalHeaders__).to.deep.equal(additionalHeaders)
+        // The consent gate checks this mark before the server starts
+        expect(storedCfg.__registryServer__).to.equal(true)
 
         const agentCfg = (mgr as any).agentConfig.mcpServers['httpServer']
         expect(agentCfg.headers).to.deep.equal(additionalHeaders)
@@ -2255,6 +2257,345 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
             await (mgr as any).initOneServerInternal('svc', cfg)
         } catch {}
         expect(recordApprovalStub.calledOnce).to.be.true
+    })
+})
+
+describe('consent gate for MCP registry servers', () => {
+    const fakeHome = '/home/testuser'
+    const globalAgent = mcpUtils.getGlobalAgentConfigPath(fakeHome)
+    // The loader and addRegistryServer mark a configuration that comes from the registry
+    const localCfg = (): MCPServerConfig => ({
+        command: 'npx',
+        args: ['-y', '@example/docs-server@1.2.4'],
+        env: { DOCS_REGION: 'hidden-env-value' },
+        __configPath__: globalAgent,
+        __registryServer__: true,
+    })
+
+    let showMessageStub: sinon.SinonStub
+    let hasApprovalStub: sinon.SinonStub
+    let recordApprovalStub: sinon.SinonStub
+    let setStateSpy: sinon.SinonSpy
+
+    async function buildMgr(): Promise<any> {
+        const consentStore = require('./mcpConsentStore')
+        hasApprovalStub = sinon.stub(consentStore, 'hasApproval').resolves(false)
+        recordApprovalStub = sinon.stub(consentStore, 'recordApproval').resolves()
+
+        showMessageStub = sinon.stub()
+        const featuresWithPrompt = {
+            ...features,
+            workspace: {
+                ...fakeWorkspace,
+                fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome },
+            },
+            lsp: { window: { showMessageRequest: showMessageStub, showDocument: sinon.stub().resolves({}) } },
+        }
+        const mgr = await McpManager.init([], featuresWithPrompt as any)
+        await mgr.setWorkspaceTrust('trusted')
+        setStateSpy = sinon.spy(mgr as any, 'setState')
+        // Stops a start right after the consent gate, so no test starts a real process
+        sinon.stub(mgr as any, 'cleanupExistingServer').rejects(new Error('PASSED_THE_GATE'))
+        return mgr
+    }
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('asks before a registry server starts with a configuration that the user has not allowed', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg = localCfg()
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        expect(showMessageStub.calledOnce).to.be.true
+        const request = showMessageStub.firstCall.args[0]
+        expect(request.message).to.include('Amazon Q — MCP Server from the Registry')
+        expect(request.message).to.include('Server: docs-server\n')
+        expect(request.message).to.include('Command: npx -y @example/docs-server@1.2.4\n')
+        expect(request.message).to.include('Environment variables: DOCS_REGION\n')
+        expect(request.message).to.include('Running this server executes the above command')
+        expect(request.message).to.not.include('hidden-env-value')
+        // The command of a registry server comes from the registry, so its agent config file does not show it
+        expect(request.actions.map((a: { title: string }) => a.title)).to.deep.equal(['Allow for this server', 'Deny'])
+        sinon.assert.calledWith(hasApprovalStub, sinon.match.any, sinon.match.any, 'docs-server', cfg, globalAgent)
+        expect(setStateSpy.calledWith('docs-server', McpServerStatus.DISABLED, 0, 'consent not granted')).to.be.true
+        expect(recordApprovalStub.called).to.be.false
+    })
+
+    it('shows the URL and header names of a remote registry server', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            url: 'https://mcp.example.com/docs',
+            headers: { 'X-Team': 'hidden-header-value' },
+            __configPath__: globalAgent,
+            __registryServer__: true,
+        }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Command: https://mcp.example.com/docs\n')
+        expect(message).to.include('Headers: X-Team\n')
+        expect(message).to.include('Starting this server connects Amazon Q to the above URL')
+        expect(message).to.not.include('hidden-header-value')
+    })
+
+    it('keeps the workspace prompt for a registry server in the agent config of a workspace folder', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const workspaceAgent = '/tmp/ws-a/.amazonq/agents/default.json'
+
+        await (mgr as any).initOneServerInternal('docs-server', { ...localCfg(), __configPath__: workspaceAgent })
+
+        const request = showMessageStub.firstCall.args[0]
+        expect(request.message).to.include('Amazon Q — Untrusted MCP Server')
+        expect(request.message).to.include(`• Source: ${workspaceAgent}`)
+        expect(request.actions.map((a: { title: string }) => a.title)).to.deep.equal([
+            'View full configuration',
+            'Allow for this server',
+            'Deny',
+        ])
+    })
+
+    it('starts a registry server whose configuration the user allowed without asking', async () => {
+        const mgr = await buildMgr()
+        hasApprovalStub.resolves(true)
+
+        let error: Error | undefined
+        try {
+            await (mgr as any).initOneServerInternal('docs-server', localCfg())
+        } catch (e: any) {
+            error = e
+        }
+
+        expect(error?.message).to.equal('PASSED_THE_GATE')
+        expect(showMessageStub.called).to.be.false
+    })
+
+    it('records the approval when the user allows a registry server', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Allow for this server' })
+        const cfg = localCfg()
+
+        try {
+            await (mgr as any).initOneServerInternal('docs-server', cfg)
+        } catch {}
+
+        sinon.assert.calledOnce(recordApprovalStub)
+        sinon.assert.calledWith(recordApprovalStub, sinon.match.any, sinon.match.any, 'docs-server', cfg, globalAgent)
+    })
+
+    it('asks again when the registry changes an allowed configuration in the same session', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        await (mgr as any).initOneServerInternal('docs-server', localCfg())
+
+        showMessageStub.resetHistory()
+        const changed = { ...localCfg(), args: ['-y', '@example/docs-server@1.2.5'] }
+        await (mgr as any).initOneServerInternal('docs-server', changed)
+
+        expect(showMessageStub.calledOnce).to.be.true
+    })
+
+    it('does not ask for a server in the global agent config that is not from the registry', async () => {
+        const mgr = await buildMgr()
+        const cfg: MCPServerConfig = { command: 'sh', args: [], __configPath__: globalAgent }
+
+        try {
+            await (mgr as any).initOneServerInternal('own-server', cfg)
+        } catch {}
+
+        expect(showMessageStub.called).to.be.false
+    })
+
+    it('records an approval from the install preview under the name and path that the server starts with', async () => {
+        const mgr = await buildMgr()
+        const cfg = localCfg()
+
+        await mgr.recordRegistryServerApproval('docs-server', cfg, globalAgent)
+
+        sinon.assert.calledOnce(recordApprovalStub)
+        sinon.assert.calledWith(recordApprovalStub, sinon.match.any, sinon.match.any, 'docs-server', cfg, globalAgent)
+    })
+})
+
+describe('approval of a registry server from the install preview, with the real consent store', () => {
+    const fakeHome = '/home/testuser'
+    const globalAgentUri = require('vscode-uri').URI.file(mcpUtils.getGlobalAgentConfigPath(fakeHome)).toString()
+    // A name that sanitizeName changes, so the test also checks that both sides use the same name
+    const registryName = 'docs.server'
+    const remoteCfg = (): MCPServerConfig => ({
+        url: 'https://mcp.example.com/docs',
+        headers: { 'X-Team': 'docs' },
+        __cachedVersion__: '2.0.0',
+    })
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('starts the approved configuration without asking, and asks again after the registry changes it', async () => {
+        const files = new Map<string, string>()
+        const showMessageRequest = sinon.stub().resolves({ title: 'Deny' })
+        const mgr: any = await McpManager.init([], {
+            ...features,
+            workspace: {
+                ...fakeWorkspace,
+                fs: {
+                    ...fakeWorkspace.fs,
+                    getUserHomeDir: () => fakeHome,
+                    exists: async (p: string) => files.has(p),
+                    readFile: async (p: string) => Buffer.from(files.get(p) ?? ''),
+                    writeFile: async (p: string, data: string) => {
+                        files.set(p, data)
+                    },
+                },
+            },
+            lsp: { window: { showMessageRequest, showDocument: sinon.stub().resolves({}) } },
+        } as any)
+        await mgr.setWorkspaceTrust('trusted')
+        // Stops the start right after the consent gate
+        sinon.stub(mgr, 'cleanupExistingServer').rejects(new Error('PASSED_THE_GATE'))
+
+        await mgr.recordRegistryServerApproval(registryName, remoteCfg(), globalAgentUri)
+        const started = { ...remoteCfg(), __configPath__: globalAgentUri, __registryServer__: true }
+        let error: Error | undefined
+        try {
+            await mgr.initOneServerInternal(mcpUtils.sanitizeName(registryName), started)
+        } catch (e: any) {
+            error = e
+        }
+
+        expect(error?.message).to.equal('PASSED_THE_GATE')
+        sinon.assert.notCalled(showMessageRequest)
+
+        const changed = { ...started, url: 'https://mcp.other.example.com/docs' }
+        await mgr.initOneServerInternal(mcpUtils.sanitizeName(registryName), changed)
+        sinon.assert.calledOnce(showMessageRequest)
+    })
+
+    it('checks a registry server that the loader reads, before discoverAllServers starts it', async () => {
+        // A home folder with a drive on Windows, as a real one has: the loader reads a path without a
+        // drive, such as \home\testuser\..., as the UNC path \\home\testuser\...
+        const home = require('path').resolve('/home/testuser')
+        const globalAgent = mcpUtils.getGlobalAgentConfigPath(home)
+        const files = new Map<string, string>([
+            [
+                globalAgent,
+                JSON.stringify({
+                    name: 'default',
+                    mcpServers: { 'docs-server': { type: 'registry' } },
+                    tools: ['@docs-server'],
+                    allowedTools: [],
+                }),
+            ],
+        ])
+        const showMessageRequest = sinon.stub().resolves({ title: 'Deny' })
+        const mgr: any = await McpManager.init([globalAgent], {
+            ...features,
+            workspace: {
+                fs: {
+                    getUserHomeDir: () => home,
+                    exists: async (p: string) => files.has(p),
+                    readFile: async (p: string) => Buffer.from(files.get(p) ?? ''),
+                    writeFile: async (p: string, data: string) => {
+                        files.set(p, data)
+                    },
+                    mkdir: async () => {},
+                    readdir: async () => [],
+                },
+                getAllWorkspaceFolders: () => [],
+            },
+            lsp: { window: { showMessageRequest, showDocument: sinon.stub().resolves({}) } },
+        } as any)
+        await mgr.setWorkspaceTrust('trusted')
+        const started: string[] = []
+        sinon.stub(mgr, 'cleanupExistingServer').callsFake(async (name: unknown) => {
+            started.push(String(name))
+            throw new Error('PASSED_THE_GATE')
+        })
+        const registry = (url: string) => ({
+            servers: [{ name: 'docs-server', version: '1.0.0', description: 'Docs', remotes: [{ type: 'sse', url }] }],
+            lastFetched: new Date(),
+            url: 'https://registry.example.com/registry.json',
+        })
+        mgr.registryUrlProvided = true
+        mgr.currentRegistry = registry('https://mcp.example.com/v1')
+        // What the install preview records for the configuration that it showed
+        const { McpServerConfigConverter } = require('./mcpServerConfigConverter')
+        const shown = new McpServerConfigConverter().convertRegistryServer(mgr.currentRegistry.servers[0])
+        await mgr.recordRegistryServerApproval('docs-server', shown, globalAgent)
+
+        // The stub above stops the start right after the gate, and that error reaches discoverAllServers
+        await mgr.discoverAllServers().catch(() => undefined)
+
+        expect(mgr.mcpServers.get('docs-server')?.__registryServer__).to.equal(true)
+        sinon.assert.notCalled(showMessageRequest)
+        expect(started).to.deep.equal(['docs-server'])
+
+        // The registry changes the server: the next load asks before it starts the server
+        mgr.currentRegistry = registry('https://mcp.example.com/v2')
+        await mgr.discoverAllServers().catch(() => undefined)
+
+        sinon.assert.calledOnce(showMessageRequest)
+        expect(showMessageRequest.firstCall.args[0].message).to.include('Amazon Q — MCP Server from the Registry')
+        expect(started).to.deep.equal(['docs-server'])
+    })
+})
+
+describe('tool descriptions from an MCP server', () => {
+    const fakeHome = '/home/testuser'
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('removes variation selectors and keeps emoji', async () => {
+        stubAgentConfig()
+        const mgr = await McpManager.init([], {
+            ...features,
+            workspace: { ...fakeWorkspace, fs: { ...fakeWorkspace.fs, getUserHomeDir: () => fakeHome } },
+            lsp: {
+                window: { showMessageRequest: sinon.stub(), showDocument: sinon.stub().resolves({ success: true }) },
+            },
+        } as any)
+        // Loads the stubbed agent config, which has no servers, and sets up tool permissions
+        await mgr.discoverAllServers()
+        await mgr.setWorkspaceTrust('trusted')
+        // The client is not connected to a process, so the stubbed tool list is what the server returns
+        sinon.stub(Client.prototype, 'connect').resolves()
+        sinon.stub(Client.prototype, 'listTools').resolves({
+            tools: [
+                {
+                    name: 'read_notes',
+                    description: 'Reads notes \u26A0\uFE0F\u{E0100}\u{E0158}\u{E01EF}\uFE01',
+                    inputSchema: { type: 'object' },
+                },
+            ],
+        } as any)
+        const cfg: MCPServerConfig = {
+            command: 'node',
+            args: [],
+            __configPath__: mcpUtils.getGlobalMcpConfigPath(fakeHome),
+        }
+
+        await (mgr as any).initOneServerInternal('svc', cfg)
+
+        const tool = mgr.getAllTools().find(t => t.toolName === 'read_notes')
+        expect(tool?.description).to.equal('Reads notes \u26A0\uFE0F')
     })
 })
 

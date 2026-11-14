@@ -550,7 +550,13 @@ export const createMynahUi = (
                 link,
                 eventId,
             }
-            messager.onSourceLinkClick(payload)
+            // A source link comes from the service, so only an http or https URL goes to the IDE.
+            if (classifyChatLink(link).kind === 'link') {
+                messager.onSourceLinkClick(payload)
+                return
+            }
+            messager.onSourceLinkClickTelemetry(payload)
+            notifyUnsupportedLink()
         },
         onInfoLinkClick: (tabId, link, mouseEvent, eventId) => {
             mouseEvent?.preventDefault()

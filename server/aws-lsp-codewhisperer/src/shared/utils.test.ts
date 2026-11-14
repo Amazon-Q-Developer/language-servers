@@ -31,6 +31,7 @@ import {
     isUsingIAMAuth,
     getBearerTokenFromProviderWithType,
     sanitizeLogInput,
+    isWebUrl,
 } from './utils'
 import { promises as fsPromises } from 'fs'
 
@@ -855,6 +856,118 @@ describe('sanitizeInput', () => {
         const result = sanitizeInput(attackString)
         assert.strictEqual(result, '')
     })
+
+    const codePointName = (codePoint: number) => `U+${codePoint.toString(16).toUpperCase().padStart(4, '0')}`
+
+    it('removes every character in the ranges it removed before', () => {
+        const ranges = [
+            [0xe0000, 0xe007f],
+            [0x200b, 0x200f],
+            [0x2028, 0x202f],
+            [0x205f, 0x206f],
+            [0xfff0, 0xffff],
+        ]
+        for (const [first, last] of ranges) {
+            for (let codePoint = first; codePoint <= last; codePoint++) {
+                assert.strictEqual(
+                    sanitizeInput(`a${String.fromCodePoint(codePoint)}b`),
+                    'ab',
+                    codePointName(codePoint)
+                )
+            }
+        }
+    })
+
+    it('removes variation selectors and other default ignorable characters', () => {
+        const codePoints = [
+            0x00ad, // soft hyphen
+            0x034f, // combining grapheme joiner
+            0x061c, // Arabic letter mark
+            0x115f, // Hangul choseong filler
+            0x1160, // Hangul jungseong filler
+            0x17b4, // Khmer vowel inherent AQ
+            0x180b, // Mongolian free variation selector one
+            0x180e, // Mongolian vowel separator
+            0x3164, // Hangul filler
+            0xfe00, // variation selector-1
+            0xfe0e, // variation selector-15, not after an emoji
+            0xfe0f, // variation selector-16, not after an emoji
+            0xfeff, // zero width no-break space
+            0xffa0, // halfwidth Hangul filler
+            0x1bca0, // shorthand format letter overlap
+            0x1d173, // musical symbol begin beam
+            0xe0100, // variation selector-17
+            0xe01ef, // variation selector-256
+            0xe0fff, // unassigned, in the default ignorable range
+        ]
+        for (const codePoint of codePoints) {
+            assert.strictEqual(sanitizeInput(`a${String.fromCodePoint(codePoint)}b`), 'ab', codePointName(codePoint))
+        }
+    })
+
+    it('removes a run of variation selectors after an emoji', () => {
+        assert.strictEqual(
+            sanitizeInput('Thanks \u{1F600}\u{E0100}\u{E0158}\u{E01EF}\uFE01\uFE0D again'),
+            'Thanks \u{1F600} again'
+        )
+    })
+
+    it('keeps one presentation selector after an emoji and removes the rest of a run', () => {
+        assert.strictEqual(sanitizeInput('\u{1F600}\uFE0F\uFE01\uFE02'), '\u{1F600}\uFE0F')
+        assert.strictEqual(sanitizeInput('\u26A0\uFE0F\uFE0F\uFE0E'), '\u26A0\uFE0F')
+    })
+
+    it('keeps emoji presentation, text presentation and keycap sequences', () => {
+        const sequences = [
+            '\u26A0\uFE0F', // warning sign
+            '\u2764\uFE0F', // red heart
+            '\u21A9\uFE0E', // leftwards arrow with hook, text presentation
+            '\u{1F3F3}\uFE0F', // white flag, a surrogate pair before the selector
+            '1\uFE0F\u20E3', // keycap digit one
+            '#\uFE0F\u20E3', // keycap number sign
+        ]
+        for (const sequence of sequences) {
+            assert.strictEqual(sanitizeInput(`see ${sequence} here`), `see ${sequence} here`)
+        }
+    })
+
+    it('removes a presentation selector that does not directly follow an emoji', () => {
+        assert.strictEqual(sanitizeInput('a\uFE0Fb'), 'ab')
+        assert.strictEqual(sanitizeInput('\uFE0Fstart'), 'start')
+        // The selector follows a removed character, not the emoji
+        assert.strictEqual(sanitizeInput('\u{1F600}\u200B\uFE0F'), '\u{1F600}')
+    })
+
+    it('removes a presentation selector after a digit unless it is part of a keycap', () => {
+        assert.strictEqual(sanitizeInput('1\uFE0F2\uFE0E3'), '123')
+        assert.strictEqual(sanitizeInput('1\uFE0E\u20E3'), '1\u20E3')
+        // A keycap needs a digit, '#' or '*' before the selector
+        assert.strictEqual(sanitizeInput('a\uFE0F\u20E3'), 'a\u20E3')
+    })
+
+    it('removes a presentation selector after a regional indicator or a skin tone modifier', () => {
+        // Both are emoji characters, but no presentation sequence starts with them
+        assert.strictEqual(sanitizeInput('\u{1F1FA}\uFE0F\u{1F3FD}\uFE0F'), '\u{1F1FA}\u{1F3FD}')
+    })
+
+    it('keeps the presentation selector of an emoji when HTML is escaped first', () => {
+        assert.strictEqual(sanitizeInput('<b>\u26A0\uFE0F</b>\uFE0F', true), '&lt;b&gt;\u26A0\uFE0F&lt;/b&gt;')
+    })
+
+    it('gives the same result when applied twice', () => {
+        const input = 'a\u00AD\u{1F600}\uFE0F\uFE01\u{E01B8}\u26A0\uFE0F\uFE0F\u200B\uFE0F1\uFE0F\u20E3z'
+        const once = sanitizeInput(input)
+
+        assert.strictEqual(once, 'a\u{1F600}\uFE0F\u26A0\uFE0F1\uFE0F\u20E3z')
+        assert.strictEqual(sanitizeInput(once), once)
+    })
+
+    it('keeps visible text in other scripts and the tab, newline and carriage return characters', () => {
+        const text =
+            'English, 中文, 日本語, 한국어, العربية, עברית, हिन्दी, Ελληνικά, Кириллица, \u{1F680}\u{1F44D}\u{1F3FD}\tline\r\n'
+
+        assert.strictEqual(sanitizeInput(text), text)
+    })
 })
 
 describe('sanitizeRequestInput', () => {
@@ -958,6 +1071,41 @@ describe('sanitizeRequestInput', () => {
         assert.strictEqual(result.conversationState.workspaceId, 'c82cc9f6-bf32-42c6-9e39-464e174c34b2')
         assert.strictEqual(result.conversationState.chatTriggerType, 'MANUAL')
         assert.deepStrictEqual(result.conversationState.currentMessage.userInputMessage.images, [])
+    })
+
+    it('removes variation selectors from the message, context, history, tool results and tool descriptions', () => {
+        const selectors = '\u{E0100}\u{E0158}\u{E01EF}\uFE01'
+        const input = {
+            conversationState: {
+                currentMessage: {
+                    userInputMessage: {
+                        content: `Fix the \u26A0\uFE0F warning \u{1F600}${selectors}`,
+                        userInputMessageContext: {
+                            editorState: {
+                                document: { text: `const a = 1${selectors}` },
+                                relevantDocuments: [{ text: `notes${selectors}` }],
+                            },
+                            toolResults: [{ content: [{ text: `file text\u{1F600}${selectors}` }] }],
+                            tools: [
+                                { toolSpecification: { name: 'mcp_tool', description: `Reads files${selectors}` } },
+                            ],
+                        },
+                    },
+                },
+                history: [{ assistantResponseMessage: { content: `Done \u{1F600}${selectors}` } }],
+            },
+        }
+
+        const result = sanitizeRequestInput(input)
+
+        const message = result.conversationState.currentMessage.userInputMessage
+        const context = message.userInputMessageContext
+        assert.strictEqual(message.content, 'Fix the \u26A0\uFE0F warning \u{1F600}')
+        assert.strictEqual(context.editorState.document.text, 'const a = 1')
+        assert.strictEqual(context.editorState.relevantDocuments[0].text, 'notes')
+        assert.strictEqual(context.toolResults[0].content[0].text, 'file text\u{1F600}')
+        assert.strictEqual(context.tools[0].toolSpecification.description, 'Reads files')
+        assert.strictEqual(result.conversationState.history[0].assistantResponseMessage.content, 'Done \u{1F600}')
     })
 
     it('should sanitize the actual attack from sample request', () => {
@@ -1082,4 +1230,51 @@ describe('sanitizeRequestInput', () => {
             assert.strictEqual(result, input)
         })
     })
+})
+
+describe('isWebUrl', () => {
+    for (const url of [
+        'https://example.com',
+        'https://docs.example.com/guide?a=1#part',
+        'http://example.com:8080/x',
+        'HTTPS://EXAMPLE.COM/',
+        'https://user:pass@example.com/',
+        'https://127.0.0.1/',
+        'https://[::1]/',
+        ' https://example.com/ ',
+    ]) {
+        it(`accepts ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), true)
+        })
+    }
+
+    for (const url of [
+        undefined,
+        '',
+        'javascript:alert(1)',
+        'JavaScript:alert(1)',
+        ' javascript:alert(1)',
+        '\u0000javascript:alert(1)',
+        'java\nscript:alert(1)',
+        'data:text/html,hello',
+        'vbscript:msgbox(1)',
+        'file:///etc/hosts',
+        'file://server/share/x',
+        'vscode://settings/x',
+        'command:workbench.action.reloadWindow',
+        'mailto:someone@example.com',
+        'ftp://example.com/x',
+        'ws://example.com/',
+        'about:blank',
+        'blob:https://example.com/id',
+        'https://',
+        '//example.com/x',
+        '/etc/hosts',
+        'docs/relative.md',
+        'not a url',
+    ]) {
+        it(`rejects ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), false)
+        })
+    }
 })

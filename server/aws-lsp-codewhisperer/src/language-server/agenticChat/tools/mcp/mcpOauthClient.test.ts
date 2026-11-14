@@ -76,6 +76,11 @@ function stubHttpServer(): void {
     })
 }
 
+/** Resolves every host name to a public address, so that the target check of OAuthClient needs no DNS */
+function stubPublicDns(): sinon.SinonStub {
+    return sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
+}
+
 describe('OAuthClient helpers', () => {
     it('computeKey() generates deterministic SHA-256 hex', () => {
         const url = new URL('https://example.com/api')
@@ -129,6 +134,42 @@ describe('OAuthClient helpers', () => {
             })
         }
     })
+
+    describe('validateAuthorizationEndpoint()', () => {
+        const validate = (endpoint: string) => (OAuthClient as any).validateAuthorizationEndpoint(endpoint)
+
+        for (const endpoint of [
+            'https://auth.example.com/authorize',
+            'http://localhost:8080/authorize',
+            'http://127.0.0.1/authorize',
+            'http://[::1]/authorize',
+        ]) {
+            it(`allows ${endpoint}`, () => {
+                expect(() => validate(endpoint)).not.to.throw()
+            })
+        }
+
+        it('returns the parsed URL for a valid endpoint', () => {
+            const url = validate('https://auth.example.com/authorize')
+            expect(url).to.be.instanceOf(URL)
+            expect(url.href).to.equal('https://auth.example.com/authorize')
+        })
+
+        // A hostile MCP server must not be able to push a non-web URI into the OS browser.
+        for (const endpoint of [
+            'javascript:alert(document.domain)',
+            'file:///etc/passwd',
+            'data:text/html,<script>alert(1)</script>',
+            'http://auth.example.com/authorize',
+            'ftp://auth.example.com/authorize',
+            'vscode://extension/evil',
+            'not a url',
+        ]) {
+            it(`rejects ${endpoint}`, () => {
+                expect(() => validate(endpoint)).to.throw()
+            })
+        }
+    })
 })
 
 describe('OAuthClient.refreshGrant()', () => {
@@ -138,6 +179,7 @@ describe('OAuthClient.refreshGrant()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -159,6 +201,56 @@ describe('OAuthClient.refreshGrant()', () => {
         expect(fetchStub.called).to.be.false
     })
 })
+
+describe('OAuthClient.pkceGrant() authorization endpoint', () => {
+    // showDocument rejects loudly: if validation is ever skipped and the browser
+    // is launched, the grant rejects with this marker instead of the validation
+    // error, so the test fails fast rather than waiting on the real PKCE timeout.
+    let showDocument: sinon.SinonStub
+
+    beforeEach(() => {
+        sinon.restore()
+        showDocument = sinon.stub().rejects(new Error('BROWSER_LAUNCHED'))
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, { window: { showDocument } } as any)
+        stubPublicDns()
+    })
+
+    afterEach(() => sinon.restore())
+
+    // The token endpoint is a valid public https URL so the flow reaches the browser step;
+    // only the server-supplied authorization_endpoint is hostile.
+    for (const authorization_endpoint of [
+        'javascript:alert(document.domain)',
+        'file:///etc/passwd',
+        'data:text/html,<script>alert(1)</script>',
+        'http://evil.example.com/authorize',
+        'vscode://extension/evil',
+    ]) {
+        it(`refuses to open ${authorization_endpoint} and never calls showDocument`, async () => {
+            const meta = { authorization_endpoint, token_endpoint: 'https://auth.example.com/token' }
+            const reg = { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' }
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+
+            try {
+                await (OAuthClient as any).pkceGrant(
+                    meta,
+                    reg,
+                    new URL('https://mcp.example.com/mcp'),
+                    ['openid'],
+                    'http://localhost:12345/oauth/callback',
+                    new EventEmitter()
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('authorization endpoint')
+            }
+
+            expect(showDocument.called).to.be.false
+            expect(fetchStub.called).to.be.false
+        })
+    }
+})
+
 describe('OAuthClient.selectAuthMethod()', () => {
     const selectAuthMethod = (reg: any, meta?: any) => (OAuthClient as any).selectAuthMethod(reg, meta)
 
@@ -254,6 +346,7 @@ describe('OAuthClient.discoverAS()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -348,6 +441,102 @@ describe('OAuthClient.discoverAS()', () => {
         const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
         expect(result.scopes_supported).to.deep.equal(['custom:scope'])
     })
+
+    it('ignores a plaintext HTTP authorization server from PRM and never fetches it', async () => {
+        fetchStub.callsFake(async (url: string) => {
+            if (url.includes('.well-known/oauth-protected-resource')) {
+                return { ok: true, json: async () => ({ authorization_servers: ['http://evil.example.com'] }) }
+            }
+            return { ok: false, status: 404, text: async () => '', headers: { get: () => '' } }
+        })
+
+        const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
+
+        // Falls through to synthesized endpoints on the original https server, never the http AS.
+        expect(result.authorization_endpoint).to.equal('https://mcp.example.com/mcp/authorize')
+        const fetchedEvil = fetchStub
+            .getCalls()
+            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('evil.example.com'))
+        expect(fetchedEvil).to.be.false
+    })
+
+    it('ignores a plaintext resource_metadata URL from the WWW-Authenticate header', async () => {
+        fetchStub.callsFake(async (url: string, init?: any) => {
+            if (url.includes('.well-known/oauth-protected-resource')) {
+                return { ok: false, status: 404 } // step 1 (PRM) fails
+            }
+            if (init?.method === 'HEAD') {
+                return {
+                    ok: true,
+                    status: 401,
+                    headers: {
+                        get: (h: string) =>
+                            h.toLowerCase() === 'www-authenticate'
+                                ? 'Bearer resource_metadata="http://169.254.169.254/meta"'
+                                : '',
+                    },
+                }
+            }
+            return { ok: false, status: 404, text: async () => '' } // step 3 well-known fails
+        })
+
+        const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
+
+        // The insecure resource_metadata link is rejected; discovery falls through to synthesized endpoints,
+        // and the internal address is never fetched.
+        expect(result.authorization_endpoint).to.equal('https://mcp.example.com/mcp/authorize')
+        const fetchedMeta = fetchStub
+            .getCalls()
+            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('169.254.169.254'))
+        expect(fetchedMeta).to.be.false
+    })
+})
+
+describe('OAuthClient.fetchASFromResourceMeta()', () => {
+    beforeEach(() => {
+        sinon.restore()
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+        stubPublicDns()
+    })
+
+    afterEach(() => sinon.restore())
+
+    for (const authServer of ['http://auth.example.com', 'ftp://auth.example.com', 'http://169.254.169.254']) {
+        it(`rejects a non-secure authorization server URL (${authServer}) before fetching`, async () => {
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            try {
+                await (OAuthClient as any).fetchASFromResourceMeta(
+                    { authorization_server: authServer },
+                    'https://mcp.example.com/.well-known/oauth-protected-resource',
+                    new URL('https://mcp.example.com/mcp')
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('authorization server')
+            }
+            expect(fetchStub.called).to.be.false
+        })
+    }
+
+    it('allows an https authorization server URL', async () => {
+        const asMeta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://auth.example.com/token',
+        }
+        sinon.stub(OAuthClient as any, 'fetchCompat').callsFake(async (url: unknown) => {
+            if (String(url).includes('.well-known/oauth-authorization-server')) {
+                return { ok: true, json: async () => asMeta }
+            }
+            return { ok: false, status: 404, text: async () => '' }
+        })
+
+        const result = await (OAuthClient as any).fetchASFromResourceMeta(
+            { authorization_server: 'https://auth.example.com' },
+            'https://mcp.example.com/.well-known/oauth-protected-resource',
+            new URL('https://mcp.example.com/mcp')
+        )
+        expect(result.token_endpoint).to.equal('https://auth.example.com/token')
+    })
 })
 
 describe('OAuthClient.obtainClient()', () => {
@@ -357,6 +546,7 @@ describe('OAuthClient.obtainClient()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
         sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
         sinon.stub(fakeWorkspace.fs, 'readFile').resolves(Buffer.from('{}'))
         sinon.stub(fakeWorkspace.fs, 'writeFile').resolves()
@@ -390,7 +580,8 @@ describe('OAuthClient.obtainClient()', () => {
             meta,
             '/tmp/test.registration.json',
             ['mcp:connect'],
-            'http://localhost:12345/oauth/callback'
+            'http://localhost:12345/oauth/callback',
+            new URL('https://mcp.example.com/mcp')
         )
 
         // DCR body should NOT contain token_endpoint_auth_method or scope
@@ -413,12 +604,43 @@ describe('OAuthClient.obtainClient()', () => {
         }
 
         try {
-            await (OAuthClient as any).obtainClient(meta, '/tmp/test.json', [], 'http://localhost:12345/oauth/callback')
+            await (OAuthClient as any).obtainClient(
+                meta,
+                '/tmp/test.json',
+                [],
+                'http://localhost:12345/oauth/callback',
+                new URL('https://mcp.example.com/mcp')
+            )
             expect.fail('should have thrown')
         } catch (e: any) {
             expect(e.message).to.include('does not support dynamic registration')
         }
     })
+
+    for (const registration_endpoint of ['http://evil.example.com/register', 'http://169.254.169.254/register']) {
+        it(`rejects a non-secure registration endpoint (${registration_endpoint}) before sending DCR`, async () => {
+            const meta = {
+                authorization_endpoint: 'https://auth.example.com/authorize',
+                token_endpoint: 'https://auth.example.com/token',
+                registration_endpoint,
+            }
+
+            try {
+                await (OAuthClient as any).obtainClient(
+                    meta,
+                    '/tmp/test.json',
+                    [],
+                    'http://localhost:12345/oauth/callback',
+                    new URL('https://mcp.example.com/mcp')
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('registration endpoint')
+            }
+
+            expect(fetchStub.called).to.be.false
+        })
+    }
 })
 
 describe('OAuthClient.discoverProtectedResourceMetadata()', () => {
@@ -428,6 +650,7 @@ describe('OAuthClient.discoverProtectedResourceMetadata()', () => {
         sinon.restore()
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        stubPublicDns()
     })
 
     afterEach(() => sinon.restore())
@@ -491,6 +714,7 @@ describe('OAuthClient getValidAccessToken()', () => {
         OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
         sinon.stub(OAuthClient as any, 'computeKey').returns('testkey')
         stubHttpServer()
+        stubPublicDns()
         ;(fakeLsp.window.showDocument as sinon.SinonStub).resetHistory()
     })
 
@@ -635,5 +859,668 @@ describe('OAuthClient getValidAccessToken()', () => {
 
         const scopesArg = pkceStub.firstCall.args[3]
         expect(scopesArg).to.deep.equal(['openid', 'offline_access'])
+    })
+
+    it('pins the discovered endpoints to disk after an interactive sign-in', async () => {
+        stubFileSystem()
+        const meta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://auth.example.com/token',
+            registration_endpoint: 'https://auth.example.com/register',
+        }
+        sinon.stub(OAuthClient as any, 'discoverAS').resolves(meta)
+        sinon.stub(OAuthClient as any, 'obtainClient').resolves({
+            client_id: 'cid',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        })
+        sinon.stub(OAuthClient as any, 'pkceGrant').resolves({
+            access_token: 'new_token',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: true,
+        })
+
+        expect(token).to.equal('new_token')
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'expected a .meta.json write').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(meta)
+    })
+
+    it('silent refresh reuses the pinned token endpoint and does not re-discover', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+        const pinnedMeta = {
+            authorization_endpoint: 'https://auth.example.com/authorize',
+            token_endpoint: 'https://pinned.example.com/token',
+        }
+
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            if (String(file).endsWith('.meta.json')) return pinnedMeta
+            return undefined
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves({
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        })
+        const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.called).to.be.false
+        expect(refresh.calledOnce).to.be.true
+        // refreshGrant must receive the pinned endpoints, not freshly discovered ones.
+        expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+        // A valid pin is reused as-is, not rewritten.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'a valid pin must not be rewritten on silent refresh').to.be.undefined
+    })
+
+    it('silent refresh falls back to discovery when no endpoints were pinned', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        }
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            return undefined // legacy token: no pinned meta on disk
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+        sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.calledOnce).to.be.true
+        // A legacy token (no pin) is migrated: the endpoints that just worked get pinned.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'a legacy token should be migrated to a pinned meta').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(discovered)
+    })
+
+    it('silent refresh falls back to discovery and re-pins when the pinned token endpoint is insecure', async () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = { client_id: 'cid', client_secret: 'csecret' }
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+        }
+
+        sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+            if (String(file).endsWith('.token.json')) return expiredToken
+            if (String(file).endsWith('.registration.json')) return cachedReg
+            if (String(file).endsWith('.meta.json')) return { token_endpoint: 'http://evil.example.com/token' }
+            return undefined
+        })
+        const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+        const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+            access_token: 'refreshed_access',
+            expires_in: 3600,
+            obtained_at: Date.now(),
+        })
+        const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+        const token = await OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), {
+            interactive: false,
+        })
+
+        expect(token).to.equal('refreshed_access')
+        expect(discover.calledOnce).to.be.true
+        // The insecure pin must not be forwarded to refreshGrant; the discovered secure endpoints are used.
+        expect(refresh.firstCall.args[0]).to.deep.equal(discovered)
+        // The insecure pin is replaced with the freshly discovered secure endpoints.
+        const metaWrite = write.getCalls().find((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+        expect(metaWrite, 'an insecure pin should be replaced').to.not.be.undefined
+        expect(metaWrite!.args[1]).to.deep.equal(discovered)
+    })
+
+    describe('interactive refresh', () => {
+        const expiredToken = {
+            access_token: 'expired',
+            expires_in: 1,
+            refresh_token: 'refresh-token',
+            obtained_at: now - 10_000,
+        }
+        const cachedReg = {
+            client_id: 'cid',
+            client_secret: 'csecret',
+            redirect_uri: 'http://localhost:12345/oauth/callback',
+        }
+        const pinnedMeta = {
+            authorization_endpoint: 'https://pinned.example.com/authorize',
+            token_endpoint: 'https://pinned.example.com/token',
+        }
+        const discovered = {
+            authorization_endpoint: 'https://discovered.example.com/authorize',
+            token_endpoint: 'https://discovered.example.com/token',
+            registration_endpoint: 'https://discovered.example.com/register',
+        }
+        const browserToken = { access_token: 'browser_access', expires_in: 3600, obtained_at: now }
+
+        function stubDisk(meta: unknown, reg: unknown = cachedReg): void {
+            sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+                if (String(file).endsWith('.token.json')) return expiredToken
+                if (String(file).endsWith('.registration.json')) return reg
+                if (String(file).endsWith('.meta.json')) return meta
+                return undefined
+            })
+        }
+
+        function pinsWritten(write: sinon.SinonStub): unknown[] {
+            return write
+                .getCalls()
+                .filter((c: sinon.SinonSpyCall) => String(c.args[0]).endsWith('.meta.json'))
+                .map((c: sinon.SinonSpyCall) => c.args[1])
+        }
+
+        function signIn(): Promise<string | undefined> {
+            return OAuthClient.getValidAccessToken(new URL('https://api.example.com/mcp'), { interactive: true })
+        }
+
+        it('refreshes with the pinned endpoints, does not run discovery, and keeps the pin', async () => {
+            stubDisk(pinnedMeta)
+            const discover = sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').resolves({
+                access_token: 'refreshed_access',
+                expires_in: 3600,
+                obtained_at: now,
+            })
+            const pkce = sinon.stub(OAuthClient as any, 'pkceGrant')
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('refreshed_access')
+            expect(discover.called).to.be.false
+            expect(pkce.called).to.be.false
+            expect(refresh.calledOnce).to.be.true
+            expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+            expect(refresh.firstCall.args[1]).to.deep.equal(cachedReg)
+            expect(pinsWritten(write)).to.deep.equal([])
+        })
+
+        it('does not send the refresh token when no endpoints were pinned, and pins after the browser sign-in', async () => {
+            stubDisk(undefined)
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant')
+            const pkce = sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(refresh.called).to.be.false
+            expect(pkce.firstCall.args[0]).to.deep.equal(discovered)
+            expect(pinsWritten(write)).to.deep.equal([discovered])
+        })
+
+        it('does not send the refresh token to a pinned token endpoint that is not secure', async () => {
+            stubDisk({ token_endpoint: 'http://evil.example.com/token' })
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(fetchStub.called).to.be.false
+            expect(pinsWritten(write)).to.deep.equal([discovered])
+        })
+
+        it('does not send the refresh token when no client registration is saved', async () => {
+            stubDisk(pinnedMeta, null)
+            sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+            sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+            const refresh = sinon.stub(OAuthClient as any, 'refreshGrant')
+            sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+            sinon.stub(OAuthClient as any, 'write').resolves()
+
+            expect(await signIn()).to.equal('browser_access')
+            expect(refresh.called).to.be.false
+        })
+
+        for (const [failure, outcome] of [
+            ['is rejected', () => Promise.resolve(undefined)],
+            ['throws', () => Promise.reject(new Error('connection reset'))],
+        ] as const) {
+            it(`signs in in the browser and re-pins when the refresh with the pinned endpoints ${failure}`, async () => {
+                stubDisk(pinnedMeta)
+                sinon.stub(OAuthClient as any, 'discoverAS').resolves(discovered)
+                sinon.stub(OAuthClient as any, 'obtainClient').resolves(cachedReg)
+                const refresh = sinon.stub(OAuthClient as any, 'refreshGrant').callsFake(outcome)
+                const pkce = sinon.stub(OAuthClient as any, 'pkceGrant').resolves(browserToken)
+                const write = sinon.stub(OAuthClient as any, 'write').resolves()
+
+                expect(await signIn()).to.equal('browser_access')
+                // The refresh token went to the pinned token endpoint only, never to a discovered one
+                expect(refresh.callCount).to.equal(1)
+                expect(refresh.firstCall.args[0]).to.deep.equal(pinnedMeta)
+                expect(pkce.firstCall.args[0]).to.deep.equal(discovered)
+                expect(pinsWritten(write)).to.deep.equal([discovered])
+            })
+        }
+    })
+})
+
+describe('OAuthClient check of the addresses that an MCP server sends the client to', () => {
+    const publicServer = new URL('https://mcp.example.com/mcp')
+    let lookup: sinon.SinonStub
+
+    beforeEach(() => {
+        sinon.restore()
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, fakeLsp)
+        lookup = sinon.stub(OAuthClient as any, 'lookupHost').callsFake(async (host: unknown) => {
+            const addresses: Record<string, string[]> = {
+                'mcp.example.com': ['93.184.216.34'],
+                'auth.example.com': ['93.184.216.35'],
+                'metadata.example.com': ['169.254.169.254'],
+                'intranet.example.com': ['10.1.2.3'],
+                'mixed.example.com': ['93.184.216.36', '192.168.0.10'],
+                'mcp.corp.example.com': ['10.0.0.2'],
+                'sso.corp.example.com': ['10.0.0.3'],
+                // MCP server names that add addresses close to this computer to a public one
+                'mcp.mixed.example.com': ['93.184.216.34', '127.0.0.1'],
+                'mcp.metadata.example.com': ['93.184.216.34', '169.254.169.254'],
+                'mcp.split.example.com': ['10.0.0.4', '127.0.0.1'],
+            }
+            const found = addresses[String(host)]
+            if (!found) {
+                throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' })
+            }
+            return found.map(address => ({ address, family: 4 }))
+        })
+    })
+
+    afterEach(() => sinon.restore())
+
+    describe('hostScope()', () => {
+        const cases: [string, string | undefined][] = [
+            ['https://93.184.216.34/', 'public'],
+            ['https://[2606:4700::1111]/', 'public'],
+            ['https://172.32.0.1/', 'public'],
+            ['https://100.128.0.1/', 'public'],
+            ['https://10.0.0.5/', 'private'],
+            ['https://172.16.0.1/', 'private'],
+            ['https://172.31.255.255/', 'private'],
+            ['https://192.168.1.1/', 'private'],
+            ['https://100.64.0.1/', 'private'],
+            ['https://[fd12:3456::1]/', 'private'],
+            ['https://127.0.0.1/', 'loopback'],
+            ['https://127.1.2.3/', 'loopback'],
+            ['https://0x7f.1/', 'loopback'],
+            ['https://2130706433/', 'loopback'],
+            ['https://[::1]/', 'loopback'],
+            ['https://[::ffff:127.0.0.1]/', 'loopback'],
+            ['https://localhost/', 'loopback'],
+            ['https://app.localhost./', 'loopback'],
+            ['https://169.254.169.254/', 'blocked'],
+            ['https://0.0.0.0/', 'blocked'],
+            ['https://224.0.0.1/', 'blocked'],
+            ['https://255.255.255.255/', 'blocked'],
+            ['https://[::]/', 'blocked'],
+            ['https://[fe80::1]/', 'blocked'],
+            ['https://[ff02::1]/', 'blocked'],
+            ['https://[::ffff:169.254.169.254]/', 'blocked'],
+            ['https://[64:ff9b::a9fe:a9fe]/', 'blocked'],
+            ['https://auth.example.com/', 'public'],
+            ['https://intranet.example.com/', 'private'],
+            ['https://metadata.example.com/', 'blocked'],
+            ['https://mixed.example.com/', 'private'],
+            ['https://unknown.example.com/', undefined],
+        ]
+        for (const [url, scope] of cases) {
+            it(`classifies ${url} as ${scope ?? 'unknown'}`, async () => {
+                expect(await (OAuthClient as any).hostScope(new URL(url).hostname)).to.equal(scope)
+            })
+        }
+
+        it('does not resolve an IP address or a localhost name', async () => {
+            await (OAuthClient as any).hostScope('10.0.0.5')
+            await (OAuthClient as any).hostScope('[::1]')
+            await (OAuthClient as any).hostScope('localhost')
+            expect(lookup.called).to.be.false
+        })
+    })
+
+    describe('assertAllowedTarget()', () => {
+        const cases: [string, string, boolean][] = [
+            // A public MCP server may send the client to public addresses only
+            ['https://mcp.example.com/mcp', 'https://auth.example.com/token', true],
+            ['https://mcp.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.example.com/mcp', 'https://intranet.example.com/token', false],
+            ['https://mcp.example.com/mcp', 'https://mixed.example.com/token', false],
+            ['https://mcp.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.example.com/mcp', 'http://localhost:8080/token', false],
+            ['https://mcp.example.com/mcp', 'https://169.254.169.254/latest/meta-data/', false],
+            ['https://mcp.example.com/mcp', 'https://metadata.example.com/', false],
+            // An MCP server on a private network may also use private addresses
+            ['https://mcp.corp.example.com/mcp', 'https://sso.corp.example.com/token', true],
+            ['https://mcp.corp.example.com/mcp', 'https://auth.example.com/token', true],
+            ['https://mcp.corp.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.corp.example.com/mcp', 'https://169.254.169.254/', false],
+            // An MCP server on this computer may also use loopback addresses
+            ['http://localhost:3000/mcp', 'http://127.0.0.1:8080/token', true],
+            ['http://localhost:3000/mcp', 'https://10.0.0.5/token', true],
+            ['http://localhost:3000/mcp', 'https://[fe80::1]/token', false],
+            // The host that the user chose is allowed
+            ['https://10.9.9.9/mcp', 'https://10.9.9.9:8443/token', true],
+            // The address of the MCP server farthest from this computer decides where it may send the client
+            ['https://mcp.mixed.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://mcp.mixed.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.metadata.example.com/mcp', 'https://10.0.0.5/token', false],
+            ['https://mcp.split.example.com/mcp', 'https://10.0.0.5/token', true],
+            ['https://mcp.split.example.com/mcp', 'http://127.0.0.1:8080/token', false],
+            ['https://169.254.1.1/mcp', 'https://10.0.0.5/token', false],
+        ]
+        for (const [server, target, allowed] of cases) {
+            it(`${allowed ? 'allows' : 'rejects'} ${target} for the MCP server ${server}`, async () => {
+                const check = (OAuthClient as any).assertAllowedTarget(new URL(target), new URL(server), 'endpoint')
+                if (allowed) {
+                    await check
+                } else {
+                    try {
+                        await check
+                        expect.fail('should have thrown')
+                    } catch (e: any) {
+                        expect(e.message).to.match(/^OAuth: endpoint is on a .* address/)
+                    }
+                }
+            })
+        }
+
+        it('rejects a host name that does not resolve, unless it is the host of the MCP server', async () => {
+            try {
+                await (OAuthClient as any).assertAllowedTarget(
+                    new URL('https://unknown.example.com/token'),
+                    publicServer,
+                    'token endpoint'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.equal('OAuth: token endpoint has a host name that could not be resolved')
+            }
+            await (OAuthClient as any).assertAllowedTarget(
+                new URL('https://unknown.example.com/token'),
+                new URL('https://unknown.example.com/mcp'),
+                'token endpoint'
+            )
+        })
+    })
+
+    describe('discoveryFetch()', () => {
+        function redirectTo(location: string) {
+            return {
+                ok: false,
+                status: 302,
+                headers: { get: (name: string) => (name === 'location' ? location : null) },
+            }
+        }
+        const done = { ok: true, status: 200, headers: { get: () => null }, json: async () => ({}) }
+
+        it('follows a redirect itself and checks its target', async () => {
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves(redirectTo('/.well-known/oauth-authorization-server/next'))
+            fetchStub.onSecondCall().resolves(done)
+
+            const response = await (OAuthClient as any).discoveryFetch(
+                'https://auth.example.com/.well-known/oauth-authorization-server',
+                publicServer,
+                'authorization server'
+            )
+
+            expect(response).to.equal(done)
+            expect(fetchStub.secondCall.args[0]).to.equal(
+                'https://auth.example.com/.well-known/oauth-authorization-server/next'
+            )
+            for (const call of fetchStub.getCalls()) {
+                expect(call.args[1].redirect).to.equal('manual')
+            }
+        })
+
+        for (const location of [
+            'http://169.254.169.254/latest/meta-data/',
+            'https://10.0.0.5/internal',
+            'https://metadata.example.com/',
+            'http://auth.example.com/plaintext',
+            'file:///etc/passwd',
+        ]) {
+            it(`does not follow a redirect to ${location}`, async () => {
+                const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').resolves(redirectTo(location))
+                try {
+                    await (OAuthClient as any).discoveryFetch(
+                        'https://auth.example.com/.well-known/openid-configuration',
+                        publicServer,
+                        'authorization server'
+                    )
+                    expect.fail('should have thrown')
+                } catch (e: any) {
+                    expect(e.message).to.include('authorization server')
+                }
+                expect(fetchStub.calledOnce).to.be.true
+            })
+        }
+
+        it('stops after five redirects', async () => {
+            const cancel = sinon.stub().resolves()
+            const fetchStub = sinon
+                .stub(OAuthClient as any, 'fetchCompat')
+                .resolves({ ...redirectTo('https://auth.example.com/again'), body: { cancel } })
+            try {
+                await (OAuthClient as any).discoveryFetch(
+                    'https://auth.example.com/',
+                    publicServer,
+                    'resource metadata'
+                )
+                expect.fail('should have thrown')
+            } catch (e: any) {
+                expect(e.message).to.include('too many redirects')
+            }
+            expect(fetchStub.callCount).to.equal(6)
+            // The body of the last redirect response is released too
+            expect(cancel.callCount).to.equal(6)
+        })
+
+        it('releases a Node stream body, as the fallback fetch returns', async () => {
+            const destroy = sinon.stub()
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves({ ...redirectTo('/next'), body: { destroy } })
+            fetchStub.onSecondCall().resolves(done)
+
+            await (OAuthClient as any).discoveryFetch('https://auth.example.com/', publicServer, 'authorization server')
+
+            sinon.assert.calledOnce(destroy)
+        })
+
+        it('releases the body of a redirect response before it follows the redirect', async () => {
+            const cancel = sinon.stub().resolves()
+            const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+            fetchStub.onFirstCall().resolves({ ...redirectTo('/next'), body: { cancel } })
+            fetchStub.onSecondCall().resolves(done)
+
+            await (OAuthClient as any).discoveryFetch('https://auth.example.com/', publicServer, 'authorization server')
+
+            sinon.assert.calledOnce(cancel)
+            sinon.assert.callOrder(cancel, fetchStub.withArgs('https://auth.example.com/next'))
+        })
+
+        describe('over http, for an MCP server on this computer', () => {
+            const loopbackServer = new URL('http://localhost:3000/mcp')
+
+            it('follows a redirect to a loopback address', async () => {
+                const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+                fetchStub.onFirstCall().resolves(redirectTo('http://127.0.0.1:9/metadata'))
+                fetchStub.onSecondCall().resolves(done)
+
+                const response = await (OAuthClient as any).discoveryFetch(
+                    'http://localhost:3000/.well-known/oauth-protected-resource',
+                    loopbackServer,
+                    'resource metadata'
+                )
+
+                expect(response).to.equal(done)
+                expect(fetchStub.secondCall.args[0]).to.equal('http://127.0.0.1:9/metadata')
+            })
+
+            it('does not follow a redirect over http to another host', async () => {
+                const fetchStub = sinon
+                    .stub(OAuthClient as any, 'fetchCompat')
+                    .resolves(redirectTo('http://other.example.com/metadata'))
+                try {
+                    await (OAuthClient as any).discoveryFetch(
+                        'http://localhost:3000/.well-known/oauth-protected-resource',
+                        loopbackServer,
+                        'resource metadata'
+                    )
+                    expect.fail('should have thrown')
+                } catch (e: any) {
+                    expect(e.message).to.equal(
+                        'OAuth: resource metadata must use HTTPS unless it is a loopback address'
+                    )
+                }
+                expect(fetchStub.calledOnce).to.be.true
+            })
+        })
+    })
+
+    it('sends the client registration once, and fails on a redirect', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').resolves({
+            ok: true,
+            status: 201,
+            json: async () => ({ client_id: 'new_id' }),
+        })
+        sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
+        sinon.stub(fakeWorkspace.fs, 'writeFile').resolves()
+        sinon.stub(fakeWorkspace.fs, 'mkdir').resolves()
+
+        await (OAuthClient as any).obtainClient(
+            {
+                authorization_endpoint: 'https://auth.example.com/authorize',
+                token_endpoint: 'https://auth.example.com/token',
+                registration_endpoint: 'https://auth.example.com/register',
+            },
+            '/tmp/test.json',
+            [],
+            'http://localhost:12345/oauth/callback',
+            publicServer
+        )
+
+        sinon.assert.calledOnce(fetchStub)
+        expect(fetchStub.firstCall.args[1]).to.include({ method: 'POST', redirect: 'error' })
+    })
+
+    it('discovery skips an authorization server on a private address for a public MCP server', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat').callsFake(async (url: unknown) => {
+            if (String(url).includes('oauth-protected-resource')) {
+                return { ok: true, status: 200, json: async () => ({ authorization_servers: ['https://10.0.0.5'] }) }
+            }
+            return { ok: false, status: 404, headers: { get: () => null }, text: async () => '' }
+        })
+
+        const meta = await (OAuthClient as any).discoverAS(publicServer)
+
+        expect(fetchStub.getCalls().some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('10.0.0.5'))).to.be.false
+        // Discovery falls through to the endpoints on the MCP server itself
+        expect(meta.token_endpoint).to.equal('https://mcp.example.com/mcp/access_token')
+    })
+
+    it('does not send the client registration to a link-local address', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        sinon.stub(fakeWorkspace.fs, 'exists').resolves(false)
+        try {
+            await (OAuthClient as any).obtainClient(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'https://auth.example.com/token',
+                    registration_endpoint: 'https://169.254.169.254/register',
+                },
+                '/tmp/test.json',
+                [],
+                'http://localhost:12345/oauth/callback',
+                publicServer
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('registration endpoint')
+        }
+        expect(fetchStub.called).to.be.false
+    })
+
+    it('does not send the refresh token to a token endpoint on a private address', async () => {
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        try {
+            await (OAuthClient as any).refreshGrant(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'https://10.0.0.5/token',
+                },
+                { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' },
+                publicServer,
+                'refresh-token'
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('token endpoint')
+        }
+        expect(fetchStub.called).to.be.false
+    })
+
+    it('does not open the browser when the token endpoint is on a loopback address of a public MCP server', async () => {
+        const showDocument = sinon.stub().resolves({ success: true })
+        OAuthClient.initialize(fakeWorkspace, fakeLogger as any, { window: { showDocument } } as any)
+        const fetchStub = sinon.stub(OAuthClient as any, 'fetchCompat')
+        try {
+            await (OAuthClient as any).pkceGrant(
+                {
+                    authorization_endpoint: 'https://auth.example.com/authorize',
+                    token_endpoint: 'http://127.0.0.1:9/token',
+                },
+                { client_id: 'cid', redirect_uri: 'http://localhost:12345/oauth/callback' },
+                publicServer,
+                ['openid'],
+                'http://localhost:12345/oauth/callback',
+                new EventEmitter()
+            )
+            expect.fail('should have thrown')
+        } catch (e: any) {
+            expect(e.message).to.include('token endpoint')
+        }
+        expect(showDocument.called).to.be.false
+        expect(fetchStub.called).to.be.false
     })
 })

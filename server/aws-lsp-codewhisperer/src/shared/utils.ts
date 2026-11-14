@@ -642,6 +642,49 @@ export function getFileExtensionName(filepath: string): string {
 }
 
 /**
+ * Characters that can hide content from a person who reads the text. Default_Ignorable_Code_Point is the Unicode
+ * set of characters that renderers ignore by default. It includes the tag characters (U+E0000-U+E007F) used in ASCII
+ * smuggling, the variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF), the zero-width and bidirectional format
+ * characters, the soft hyphen and the Hangul fillers. The explicit ranges also remove the line and paragraph
+ * separators, two spaces (U+202F, U+205F) and the rest of the specials block (U+FFF9-U+FFFF), which includes the
+ * object replacement character and the replacement character.
+ */
+const INVISIBLE_CHARACTERS =
+    /[\p{Default_Ignorable_Code_Point}\u{E0000}-\u{E007F}\u{200B}-\u{200F}\u{2028}-\u{202F}\u{205F}-\u{206F}\u{FFF0}-\u{FFFF}]/gu
+const PICTOGRAPH = /\p{Extended_Pictographic}/u
+const KEYCAP_BASE = /^[0-9#*]$/
+const TEXT_PRESENTATION_SELECTOR = '\uFE0E'
+const EMOJI_PRESENTATION_SELECTOR = '\uFE0F'
+const COMBINING_ENCLOSING_KEYCAP = '\u20E3'
+
+/** The code point that ends just before `offset` in `text`, or an empty string at the start of the text */
+function codePointBefore(text: string, offset: number): string {
+    const low = text.charCodeAt(offset - 1)
+    const high = text.charCodeAt(offset - 2)
+    const isSurrogatePair = low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff
+    return text.slice(Math.max(isSurrogatePair ? offset - 2 : offset - 1, 0), offset)
+}
+
+/**
+ * Whether `char`, at `offset` in `text`, is a presentation selector that belongs to an emoji: directly after a
+ * pictograph, or the U+FE0F of a keycap sequence such as 1 U+FE0F U+20E3.
+ */
+function isPresentationSelectorOfEmoji(char: string, offset: number, text: string): boolean {
+    if (char !== TEXT_PRESENTATION_SELECTOR && char !== EMOJI_PRESENTATION_SELECTOR) {
+        return false
+    }
+    const before = codePointBefore(text, offset)
+    if (PICTOGRAPH.test(before)) {
+        return true
+    }
+    return (
+        char === EMOJI_PRESENTATION_SELECTOR &&
+        KEYCAP_BASE.test(before) &&
+        text[offset + 1] === COMBINING_ENCLOSING_KEYCAP
+    )
+}
+
+/**
  * Sanitizes input by removing dangerous Unicode characters that could be used for ASCII smuggling
  * @param input The input string to sanitize
  * @returns The sanitized string with dangerous characters removed
@@ -654,11 +697,11 @@ export function sanitizeInput(input: string, enableEscapingHTML: boolean = false
         input = escapeHTML(input)
     }
 
-    // Remove Unicode tag characters (U+E0000-U+E007F) used in ASCII smuggling
-    // Remove other invisible/control characters that could hide content
-    return input.replace(
-        /[\u{E0000}-\u{E007F}\u{200B}-\u{200F}\u{2028}-\u{202F}\u{205F}-\u{206F}\u{FFF0}-\u{FFFF}]/gu,
-        ''
+    // The model reads file text in this form, and a file edit must match the file exactly. So a presentation
+    // selector that belongs to an emoji is kept, and an emoji such as the warning sign (U+26A0 U+FE0F) does not
+    // change. In a run of variation selectors, at most the first one can be kept.
+    return input.replace(INVISIBLE_CHARACTERS, (char: string, offset: number, text: string) =>
+        isPresentationSelectorOfEmoji(char, offset, text) ? char : ''
     )
 }
 
@@ -696,4 +739,21 @@ export function sanitizeRequestInput(input: any): any {
         return sanitized
     }
     return input
+}
+
+/**
+ * Whether `url` is an absolute http or https URL with a host name. The chat UI shows the source links of a
+ * response and the IDE opens them, so a source link with any other URL is dropped.
+ */
+export function isWebUrl(url: string | undefined): boolean {
+    if (!url) {
+        return false
+    }
+    try {
+        // `URL` rejects an http or https URL without a host.
+        const { protocol } = new URL(url)
+        return protocol === 'http:' || protocol === 'https:'
+    } catch {
+        return false
+    }
 }

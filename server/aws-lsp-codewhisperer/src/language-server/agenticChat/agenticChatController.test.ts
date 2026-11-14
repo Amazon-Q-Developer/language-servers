@@ -52,7 +52,11 @@ import {
 import { MessageType, Model } from '@aws/language-server-runtimes/protocol'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import * as assert from 'assert'
-import { createIterableResponse, setCredentialsForAmazonQTokenServiceManagerFactory } from '../../shared/testUtils'
+import {
+    createIterableResponse,
+    setCredentialsForAmazonQTokenServiceManagerFactory,
+    unhandledRejectionsDuring,
+} from '../../shared/testUtils'
 import sinon from 'ts-sinon'
 import { AgenticChatController } from './agenticChatController'
 import { ChatSessionManagementService } from '../chat/chatSessionManagementService'
@@ -482,6 +486,115 @@ describe('AgenticChatController', () => {
 
             sinon.assert.calledOnce(getSubscriptionStatusStub)
         })
+
+        it('logs the subscription status without the subscription URL', async () => {
+            getSubscriptionStatusStub.resolves({
+                status: 'none',
+                encodedVerificationUrl: 'https://signin.aws.amazon.com/oauth?activationToken=TOKEN-1234',
+            })
+
+            chatController.onTabAdd({ tabId: mockTabId })
+            await new Promise(resolve => setTimeout(resolve, 0))
+
+            sinon.assert.calledWith(
+                testFeatures.logging.log as sinon.SinonStub,
+                'setPaidTierMode: getSubscriptionStatus: none'
+            )
+            sinon.assert.neverCalledWithMatch(testFeatures.logging.log as sinon.SinonStub, sinon.match('TOKEN-1234'))
+        })
+    })
+
+    describe('onManageSubscription', () => {
+        // The form of the URL that the service returns. The activation token must not reach the log.
+        const activationToken = 'TOKEN-1234'
+        const signInUrl = `https://signin.aws.amazon.com/oauth?redirect_uri=https://us-east-1.console.aws.amazon.com/amazonq/developer/home?hashArgs=%23%2Fsubscriptions%2FbuilderId%3FactivationToken%3D${activationToken}&isauthcode=true&region=us-east-1&response_type=code`
+        let getCodewhispererServiceStub: sinon.SinonStub
+        let getSubscriptionStatusStub: sinon.SinonStub
+        let waitUntilSubscriptionActiveStub: sinon.SinonStub
+
+        const loggedText = () =>
+            (['log', 'info', 'warn', 'error', 'debug'] as const)
+                .flatMap(level => (testFeatures.logging[level] as sinon.SinonStub).args)
+                .map(args => args.join(' '))
+                .join('\n')
+
+        // Runs the "Upgrade Q" flow of a free-tier user whose subscription status response has this URL
+        const manageSubscription = async (encodedVerificationUrl: string | undefined) => {
+            getSubscriptionStatusStub.resolves({ status: 'none', encodedVerificationUrl })
+            await chatController.onManageSubscription(mockTabId)
+            // onManageSubscription handles the status response asynchronously
+            await new Promise(resolve => setTimeout(resolve, 0))
+        }
+
+        const upgradePendingUpdate = sinon.match({ paidTierMode: 'upgrade-pending' })
+
+        const assertRequestFailedMessage = () => {
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.notCalled(waitUntilSubscriptionActiveStub)
+            sinon.assert.neverCalledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showMessage as sinon.SinonStub, {
+                message: 'Subscription request failed.',
+                type: MessageType.Error,
+            })
+        }
+
+        beforeEach(() => {
+            getSubscriptionStatusStub = sinon.stub()
+            waitUntilSubscriptionActiveStub = sinon.stub().resolves(true)
+            getCodewhispererServiceStub = sinon
+                .stub(AmazonQTokenServiceManager.prototype, 'getCodewhispererService')
+                .returns({
+                    getSubscriptionStatus: getSubscriptionStatusStub,
+                    waitUntilSubscriptionActive: waitUntilSubscriptionActiveStub,
+                } as any)
+            ;(testFeatures.lsp.window.showDocument as sinon.SinonStub).resolves({ success: true })
+            testFeatures.lsp.window.showMessage = sinon.stub().resolves()
+        })
+
+        afterEach(() => {
+            getCodewhispererServiceStub.restore()
+        })
+
+        it('opens an https URL on the AWS sign-in host in the external browser without logging it', async () => {
+            await manageSubscription(signInUrl)
+
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                external: true,
+                uri: signInUrl,
+            })
+            sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.calledOnce(waitUntilSubscriptionActiveStub)
+            assert.ok(!loggedText().includes(activationToken))
+        })
+
+        it('opens the URL in its normalized form', async () => {
+            await manageSubscription('HTTPS://SIGNIN.AWS.AMAZON.COM:443/oauth?state=1')
+
+            sinon.assert.calledOnceWithExactly(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                external: true,
+                uri: 'https://signin.aws.amazon.com/oauth?state=1',
+            })
+        })
+
+        for (const uri of [
+            `vscode://publisher.extension/path?activationToken=${activationToken}`,
+            `file:///tmp/file.txt?activationToken=${activationToken}`,
+            `http://signin.aws.amazon.com/oauth?activationToken=${activationToken}`,
+            `https://example.com/oauth?activationToken=${activationToken}`,
+        ]) {
+            it(`does not open ${uri.split('?')[0]} and shows an error without logging the URL`, async () => {
+                await manageSubscription(uri)
+
+                assertRequestFailedMessage()
+                assert.ok(!loggedText().includes(activationToken))
+            })
+        }
+
+        it('shows an error when the response has no URL', async () => {
+            await manageSubscription(undefined)
+
+            assertRequestFailedMessage()
+        })
     })
 
     it('onTabRemove unsets tab id if current tab is removed and emits metrics', () => {
@@ -613,6 +726,27 @@ describe('AgenticChatController', () => {
 
                 assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), false)
             })
+
+            it('removes invisible characters from the file ranking request without escaping HTML', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .callsFake(async (_workspaceFolderUri, rankFiles) => {
+                        await rankFiles('Rank src/a&b\u00AD.ts \u{1F600}\u{E0100}\u{E0158} src/<c>.ts\u{E0041}')
+                        return 'Write the memory bank files'
+                    })
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Create a memory bank' } },
+                    mockCancellationToken
+                )
+
+                sinon.assert.calledOnce(sendMessageStub)
+                const rankingRequest: SendMessageCommandInput = sendMessageStub.firstCall.firstArg
+                assert.strictEqual(
+                    rankingRequest.conversationState?.currentMessage?.userInputMessage?.content,
+                    'Rank src/a&b.ts \u{1F600} src/<c>.ts'
+                )
+            })
         })
 
         it('read all the response streams and return compiled results', async () => {
@@ -661,6 +795,69 @@ describe('AgenticChatController', () => {
 
             const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
             assert.strictEqual(requestInput.conversationState?.conversationId, session.conversationId)
+        })
+
+        it('removes variation selectors from the prompt and keeps emoji', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+
+            await chatController.onChatPrompt(
+                {
+                    tabId: mockTabId,
+                    prompt: { prompt: 'Fix the \u26A0\uFE0F warning \u{1F600}\u{E0100}\u{E0158}\u{E01EF}\uFE01' },
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                'Fix the \u26A0\uFE0F warning \u{1F600}'
+            )
+        })
+
+        it('removes variation selectors from the chat history in the request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt: 'Hello' } }, mockCancellationToken)
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
+        })
+
+        it('removes variation selectors from the chat history in the compaction request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt(
+                { tabId: mockTabId, prompt: { prompt: '', command: '/compact' } },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                constants.COMPACTION_PROMPT
+            )
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
         })
 
         it('invokes IdleWorkspaceManager recordActivityTimestamp', async () => {
@@ -2227,6 +2424,55 @@ describe('AgenticChatController', () => {
 
             sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
         })
+
+        it('creates a saved prompt file when a rule is requested with no workspace folder open', async () => {
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([])
+            const expectedPath = path.join(getUserPromptsDirectory(), `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+        })
+
+        it('creates a rule file in the rules folder of the first workspace folder', async () => {
+            const workspaceFolder = path.join(os.tmpdir(), 'create-rule-workspace')
+            const secondWorkspaceFolder = path.join(os.tmpdir(), 'create-rule-second-workspace')
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([workspaceFolder, secondWorkspaceFolder])
+            const rulesDirectory = path.join(workspaceFolder, '.amazonq', 'rules')
+            const expectedPath = path.join(rulesDirectory, `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledWithExactly(testFeatures.workspace.fs.mkdir as sinon.SinonStub, rulesDirectory, {
+                recursive: true,
+            })
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+            sinon.assert.calledWithMatch(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                uri: URI.file(expectedPath).toString(),
+            })
+        })
+    })
+
+    describe('onReady', () => {
+        it('logs a failed background code symbol update and leaves no unhandled rejection', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            const failure = new Error('code symbols failed')
+            maybeUpdateCodeSymbolsStub.rejects(failure)
+
+            const rejections = await unhandledRejectionsDuring(() => chatController.onReady())
+
+            assert.ok(!rejections.includes(failure), 'the failed update was left as an unhandled rejection')
+            sinon.assert.calledOnce(maybeUpdateCodeSymbolsStub)
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error updating code symbols').and(sinon.match('code symbols failed'))
+            )
+            sinon.assert.neverCalledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error initializing context commands')
+            )
+        })
     })
 
     describe('onInlineChatPrompt', () => {
@@ -2363,6 +2609,26 @@ describe('AgenticChatController', () => {
             )
 
             assert.deepStrictEqual(chatResult, new ResponseError(LSPErrorCodes.RequestFailed, 'invalid state'))
+        })
+
+        it('removes invisible characters from the prompt and the document text without escaping HTML', async () => {
+            testFeatures.openDocument(
+                TextDocument.create('file:///inline.ts', 'typescript', 1, 'const a = 1\u{E0041}\u{E0100}\u{E0158}\n')
+            )
+
+            await chatController.onInlineChatPrompt(
+                {
+                    prompt: { prompt: 'Make a < b \u26A0\uFE0F\u{E0041}\u{E0100}\uFE01' },
+                    textDocument: { uri: 'file:///inline.ts' },
+                    cursorState: [{ position: { line: 0, character: 0 } }],
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const userInputMessage = requestInput.conversationState?.currentMessage?.userInputMessage
+            assert.strictEqual(userInputMessage?.content, 'Make a < b \u26A0\uFE0F')
+            assert.strictEqual(userInputMessage?.userInputMessageContext?.editorState?.document?.text, 'const a = 1\n')
         })
 
         describe('#extractDocumentContext', () => {

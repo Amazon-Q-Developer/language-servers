@@ -121,7 +121,9 @@ for (const implementation of ['native', 'fallback'] as const) {
                 token_endpoint_auth_method: authMethod,
                 redirect_uri: 'http://localhost:12345/oauth/callback',
             }
-            const resource = new URL('https://mcp.example.com/mcp')
+            // The token endpoint is a server on this computer, which an MCP server may send the client to only when
+            // it is on this computer too
+            const resource = new URL('http://localhost:3000/mcp')
             if (grant === 'refresh') {
                 return (OAuthClient as any).refreshGrant(meta, reg, resource, 'test-refresh-token')
             }
@@ -181,6 +183,18 @@ for (const implementation of ['native', 'fallback'] as const) {
             }
         }
 
+        it('does not send the refresh token to a loopback token endpoint of a public MCP server', async () => {
+            sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
+            const refresh = (OAuthClient as any).refreshGrant(
+                { authorization_endpoint: 'https://auth.example.com/authorize', token_endpoint: endpointUrl },
+                { client_id: 'test-client', client_secret: 'test-secret', redirect_uri: 'http://localhost:1/cb' },
+                new URL('https://mcp.example.com/mcp'),
+                'test-refresh-token'
+            )
+            await assert.rejects(refresh, /token endpoint is on a loopback address/)
+            assert.equal(requests.length, 0)
+        })
+
         it('returns no token or cache update after a redirected silent refresh', async () => {
             responseStatus = 307
             sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) =>
@@ -195,7 +209,7 @@ for (const implementation of ['native', 'fallback'] as const) {
             )
             sinon.stub(OAuthClient as any, 'discoverAS').resolves({ token_endpoint: endpointUrl })
             const write = sinon.stub(OAuthClient as any, 'write')
-            const token = await OAuthClient.getValidAccessToken(new URL('https://mcp.example.com/mcp'), {
+            const token = await OAuthClient.getValidAccessToken(new URL('http://localhost:3000/mcp'), {
                 interactive: false,
             })
             assert.equal(token, undefined)

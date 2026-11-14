@@ -29,13 +29,31 @@ export function toolErrorMessage(toolUse: ToolUse, errorMessage: string) {
     \`Error: ${errorMessage}\``
 }
 
+function longestBacktickRun(text: string): number {
+    return (String(text).match(/`+/g) ?? []).reduce((longest, run) => Math.max(longest, run.length), 0)
+}
+
 /**
  * Fence for a markdown code block that holds the text. It is longer than any run of backticks
  * in the text, so no line of the text can end the block.
  */
 export function codeFence(text: string): string {
-    const longestRun = (String(text).match(/`+/g) ?? []).reduce((longest, run) => Math.max(longest, run.length), 0)
-    return '`'.repeat(Math.max(3, longestRun + 1))
+    return '`'.repeat(Math.max(3, longestBacktickRun(text) + 1))
+}
+
+/**
+ * A markdown code span for the text, so markdown makes no links or emphasis in it. Its delimiter is
+ * longer than any run of backticks in the text, so the text cannot end the span. Give the text on
+ * one line: if the text has a line end, a delimiter of three or more backticks could open a fenced
+ * code block, and markdown turns line ends in a code span into spaces anyway. The chat client can
+ * still read <, > and & in a code span as HTML, so escape them first if the text can contain them,
+ * as formatServerConfigForReview does.
+ */
+export function codeSpan(text: string): string {
+    const delimiter = '`'.repeat(longestBacktickRun(text) + 1)
+    // A space separates a backtick at the start or end of the text from the delimiter. Markdown removes it again.
+    const padding = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
+    return `${delimiter}${padding}${text}${padding}${delimiter}`
 }
 
 /** Start of a shell code block that shows the full command, for output to follow */

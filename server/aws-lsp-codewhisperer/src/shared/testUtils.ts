@@ -314,3 +314,25 @@ export const stubCodeWhispererService = <C extends CodeWhispererServiceBase>() =
 
     return service
 }
+
+/**
+ * Runs `action` and waits for the promise that it returns, if any. Then lets pending promise callbacks run, and
+ * returns the rejections that had no handler. A rejection of the promise that `action` returns is thrown, not
+ * returned. Mocha re-emits an unhandled rejection from test code instead of failing on it, so a listener added
+ * here receives it, possibly more than once.
+ *
+ * Background work from other tests can also reject in this window. Check the result for the test's own rejection
+ * reason, not for an empty list.
+ */
+export async function unhandledRejectionsDuring(action: () => unknown): Promise<unknown[]> {
+    const rejections: unknown[] = []
+    const listener = (reason: unknown) => rejections.push(reason)
+    process.on('unhandledRejection', listener)
+    try {
+        await action()
+        await new Promise(resolve => setImmediate(resolve))
+    } finally {
+        process.removeListener('unhandledRejection', listener)
+    }
+    return rejections
+}

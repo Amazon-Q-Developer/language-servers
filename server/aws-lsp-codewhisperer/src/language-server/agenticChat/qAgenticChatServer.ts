@@ -4,8 +4,25 @@
  */
 
 import { InitializeParams, Server } from '@aws/language-server-runtimes/server-interface'
+import {
+    activeEditorChangedNotificationType,
+    createPromptNotificationType,
+    feedbackNotificationType,
+    fileClickNotificationType,
+    followUpClickNotificationType,
+    inlineChatResultNotificationType,
+    insertToCursorPositionNotificationType,
+    onPinnedContextAddNotificationType,
+    onPinnedContextRemoveNotificationType,
+    promptInputOptionChangeNotificationType,
+    readyNotificationType,
+    tabAddNotificationType,
+    tabChangeNotificationType,
+    tabRemoveNotificationType,
+} from '@aws/language-server-runtimes/protocol'
 import { AgenticChatController } from './agenticChatController'
 import { ChatSessionManagementService } from '../chat/chatSessionManagementService'
+import { logNotificationErrors } from '../chat/notificationErrors'
 import { CLEAR_QUICK_ACTION, COMPACT_QUICK_ACTION, HELP_QUICK_ACTION } from '../chat/quickActions'
 import { TelemetryService } from '../../shared/telemetry/telemetryService'
 import { makeUserContextObject } from '../../shared/telemetryUtils'
@@ -131,27 +148,37 @@ export const QAgenticChatServer =
             return chatController.onExecuteCommand(params, token)
         })
 
-        chat.onTabAdd(params => {
-            logging.log(`Adding tab: ${params.tabId}`)
+        // Wrap each chat notification handler in logNotificationErrors. Request handlers need no wrapper, because the
+        // JSON-RPC layer sends an error response when a request handler fails.
+        chat.onTabAdd(
+            logNotificationErrors(logging, tabAddNotificationType.method, params => {
+                logging.log(`Adding tab: ${params.tabId}`)
 
-            return chatController.onTabAdd(params)
-        })
-        chat.onReady(() => {
-            logging.log(`Received ready notification`)
-            return chatController.onReady()
-        })
+                return chatController.onTabAdd(params)
+            })
+        )
+        chat.onReady(
+            logNotificationErrors(logging, readyNotificationType.method, () => {
+                logging.log(`Received ready notification`)
+                return chatController.onReady()
+            })
+        )
 
-        chat.onTabChange(params => {
-            logging.log(`Changing to tab: ${params.tabId}`)
+        chat.onTabChange(
+            logNotificationErrors(logging, tabChangeNotificationType.method, params => {
+                logging.log(`Changing to tab: ${params.tabId}`)
 
-            return chatController.onTabChange(params)
-        })
+                return chatController.onTabChange(params)
+            })
+        )
 
-        chat.onTabRemove(params => {
-            logging.log(`Removing tab: ${params.tabId}`)
+        chat.onTabRemove(
+            logNotificationErrors(logging, tabRemoveNotificationType.method, params => {
+                logging.log(`Removing tab: ${params.tabId}`)
 
-            return chatController.onTabRemove(params)
-        })
+                return chatController.onTabRemove(params)
+            })
+        )
 
         chat.onEndChat((...params) => {
             logging.log('Received end chat request')
@@ -177,13 +204,17 @@ export const QAgenticChatServer =
             return chatController.onQuickAction(...params)
         })
 
-        chat.onSendFeedback(params => {
-            return chatController.onSendFeedback(params)
-        })
+        chat.onSendFeedback(
+            logNotificationErrors(logging, feedbackNotificationType.method, params => {
+                return chatController.onSendFeedback(params)
+            })
+        )
 
-        chat.onCodeInsertToCursorPosition(params => {
-            return chatController.onCodeInsertToCursorPosition(params)
-        })
+        chat.onCodeInsertToCursorPosition(
+            logNotificationErrors(logging, insertToCursorPositionNotificationType.method, params => {
+                return chatController.onCodeInsertToCursorPosition(params)
+            })
+        )
 
         chat.onListConversations(params => {
             return chatController.onListConversations(params)
@@ -209,25 +240,33 @@ export const QAgenticChatServer =
             return chatController.onMcpServerClick(params)
         })
 
-        chat.onCreatePrompt((params) => {
-            return chatController.onCreatePrompt(params)
-        })
+        chat.onCreatePrompt(
+            logNotificationErrors(logging, createPromptNotificationType.method, params => {
+                return chatController.onCreatePrompt(params)
+            })
+        )
 
-        chat.onFileClicked((params) => {
-            return chatController.onFileClicked(params)
-        })
+        chat.onFileClicked(
+            logNotificationErrors(logging, fileClickNotificationType.method, params => {
+                return chatController.onFileClicked(params)
+            })
+        )
 
-        chat.onFollowUpClicked((params) => {
-            return chatController.onFollowUpClicked(params)
-        })
+        chat.onFollowUpClicked(
+            logNotificationErrors(logging, followUpClickNotificationType.method, params => {
+                return chatController.onFollowUpClicked(params)
+            })
+        )
 
         chat.onTabBarAction(params => {
             return chatController.onTabBarAction(params)
         })
 
-        chat.onPromptInputOptionChange(params => {
-            return chatController.onPromptInputOptionChange(params)
-        })
+        chat.onPromptInputOptionChange(
+            logNotificationErrors(logging, promptInputOptionChangeNotificationType.method, params => {
+                return chatController.onPromptInputOptionChange(params)
+            })
+        )
 
         // ;(chat as any).onPromptInputButtonClick((params: any) => {
         //     chatController.setPaidTierMode(params.tabId, 'paidtier')
@@ -237,21 +276,29 @@ export const QAgenticChatServer =
             return chatController.onButtonClick(params)
         })
 
-        chat.onInlineChatResult(params => {
-            return chatController.onInlineChatResult(params)
-        })
+        chat.onInlineChatResult(
+            logNotificationErrors(logging, inlineChatResultNotificationType.method, params => {
+                return chatController.onInlineChatResult(params)
+            })
+        )
 
-        chat.onActiveEditorChanged(params => {
-            return chatController.onActiveEditorChanged(params)
-        })
+        chat.onActiveEditorChanged(
+            logNotificationErrors(logging, activeEditorChangedNotificationType.method, params => {
+                return chatController.onActiveEditorChanged(params)
+            })
+        )
 
-        chat.onPinnedContextAdd(params => {
-            return chatController.onPinnedContextAdd(params)
-        })
+        chat.onPinnedContextAdd(
+            logNotificationErrors(logging, onPinnedContextAddNotificationType.method, params => {
+                return chatController.onPinnedContextAdd(params)
+            })
+        )
 
-        chat.onPinnedContextRemove(params => {
-            return chatController.onPinnedContextRemove(params)
-        })
+        chat.onPinnedContextRemove(
+            logNotificationErrors(logging, onPinnedContextRemoveNotificationType.method, params => {
+                return chatController.onPinnedContextRemove(params)
+            })
+        )
 
         chat.onListAvailableModels(params => {
             return chatController.onListAvailableModels(params)

@@ -74,6 +74,45 @@ export function fingerprintServerConfig(cfg: MCPServerConfig): string {
     return 'sha256:' + createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
+/**
+ * Characters that formatServerConfigForReview writes as \u escapes:
+ * - characters that can hide or reorder text when it is shown: control and format characters (such as bidirectional
+ *   overrides and zero-width characters), line and paragraph separators, and the other default ignorable characters
+ * - spaces other than U+0020, because a reader cannot tell them from U+0020
+ * - <, > and &, because the chat client can read them as HTML even in code. JSON encoders that make text safe to put
+ *   in HTML escape them in the same way.
+ * Line feeds and U+0020 are left alone: JSON.stringify uses them for the layout, it already escapes a line feed in a
+ * string, and U+0020 in a string is shown as it is. The other characters can occur only in strings, where a \u escape
+ * keeps the value.
+ */
+const ESCAPED_CHARACTERS = /(?![\n ])[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}<>&]/gu
+
+/**
+ * The fields of a server config that fingerprintServerConfig covers, as JSON in the format of mcp.json, for a person
+ * to review: the command, arguments and environment variables of a stdio server, or the URL and headers of an HTTP
+ * server. Characters that a reader would not see or could misread, and characters that the chat client can read as
+ * HTML, are written as \u escapes (see ESCAPED_CHARACTERS), so the text shows and parses to the exact values.
+ */
+export function formatServerConfigForReview(cfg: MCPServerConfig): string {
+    const env = effectiveEnv(cfg)
+    const headers = effectiveHeaders(cfg)
+    const args = cfg.args ?? []
+    // As in McpManager, a config with a command starts a stdio server
+    const reviewed = cfg.command
+        ? {
+              command: cfg.command,
+              ...(args.length > 0 ? { args } : {}),
+              ...(Object.keys(env).length > 0 ? { env } : {}),
+          }
+        : { url: cfg.url ?? '', ...(Object.keys(headers).length > 0 ? { headers } : {}) }
+    return JSON.stringify(reviewed, undefined, 1).replace(ESCAPED_CHARACTERS, character =>
+        Array.from(
+            { length: character.length },
+            (_, i) => `\\u${character.charCodeAt(i).toString(16).padStart(4, '0')}`
+        ).join('')
+    )
+}
+
 /** Hash of the workspace path so approval is scoped to (workspace, config).
  *  Normalizes the path to forward slashes for cross-platform consistency. */
 export function fingerprintWorkspace(configPath: string): string {

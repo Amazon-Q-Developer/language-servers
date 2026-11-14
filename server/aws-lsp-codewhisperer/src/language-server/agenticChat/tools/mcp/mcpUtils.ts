@@ -17,9 +17,11 @@ import {
     isRegistryServerConfig,
 } from './mcpTypes'
 import path = require('path')
+import { workspaceUtils } from '@aws/lsp-core'
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
+import { canonicalizeWorkspaceFolders, resolveCanonicalPath } from '../toolShared'
 
 /**
  * Load, validate, and parse MCP server configurations from JSON files.
@@ -315,6 +317,10 @@ export async function loadAgentConfig(
     // declared there, so the entries are stashed here and drained once every server is known.
     const pendingServerTools = new Set<string>()
     const pendingServerAllowedTools = new Set<string>()
+    const pendingServerEntries = { tools: pendingServerTools, allowedTools: pendingServerAllowedTools }
+    // The config files that contributed each server-scoped entry, so that an entry from a workspace
+    // file can be limited to the servers that file defines (see removeUntrustedScopedPermissions).
+    const scopedPermissionSources: ScopedPermissionSources = { tools: new Map(), allowedTools: new Map() }
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -388,27 +394,31 @@ export async function loadAgentConfig(
             }
         }
 
-        // 4) Process permissions (tools and allowedTools)
-        if (Array.isArray(json.tools)) {
-            for (const tool of json.tools) {
-                if (!tool.startsWith('@')) {
-                    if (!agentConfig.tools.includes(tool)) {
-                        agentConfig.tools.push(tool)
-                    }
-                } else {
-                    pendingServerTools.add(tool)
-                }
+        // 4) Process permissions (tools and allowedTools). Anyone who can change the repository can
+        // write a workspace file, so a '*' in its tools enables only the servers that file defines
+        // (step 6), and its other wildcards are ignored.
+        const isWorkspaceFile = fsPath !== globalConfigPath
+        let enablesOwnServers = false
+        for (const key of PERMISSION_KEYS) {
+            if (!Array.isArray(json[key])) {
+                continue
             }
-        }
-
-        if (Array.isArray(json.allowedTools)) {
-            for (const tool of json.allowedTools) {
-                if (!tool.startsWith('@')) {
-                    if (!agentConfig.allowedTools.includes(tool)) {
-                        agentConfig.allowedTools.push(tool)
-                    }
-                } else {
-                    pendingServerAllowedTools.add(tool)
+            for (const tool of json[key]) {
+                if (typeof tool !== 'string') {
+                    logging.warn(`Ignoring a '${key}' entry that is not a string in agent config at ${fsPath}`)
+                } else if (tool.startsWith('@')) {
+                    pendingServerEntries[key].add(tool)
+                    addPermissionSource(scopedPermissionSources[key], tool, fsPath)
+                } else if (isWorkspaceFile && isWildcardPermission(tool)) {
+                    const appliesToOwnServers = key === 'tools' && tool === '*'
+                    enablesOwnServers ||= appliesToOwnServers
+                    logging.warn(
+                        appliesToOwnServers
+                            ? `Limiting wildcard permission '*' in workspace agent config at ${fsPath} to the MCP servers that file defines`
+                            : `Ignoring wildcard permission ${JSON.stringify(tool)} in '${key}' of workspace agent config at ${fsPath}`
+                    )
+                } else if (!agentConfig[key].includes(tool)) {
+                    agentConfig[key].push(tool)
                 }
             }
         }
@@ -516,6 +526,9 @@ export async function loadAgentConfig(
                     try {
                         cfg = converter.convertRegistryServer(registryServer, entry.env)
                         cfg.__configPath__ = fsPath
+                        // The agent config entry below holds the converted fields, so the mark is the only record
+                        // that the configuration comes from the registry
+                        cfg.__registryServer__ = true
 
                         // Apply timeout from registry server config if provided
                         if (typeof entry.timeout === 'number') {
@@ -612,24 +625,19 @@ export async function loadAgentConfig(
                 agentConfig.mcpServers[name] = agentEntry
 
                 // Add MCP server-specific tools and allowedTools after server is successfully added
-                if (Array.isArray(json.tools)) {
-                    for (const tool of json.tools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.tools.includes(tool)
-                        ) {
-                            agentConfig.tools.push(tool)
-                        }
+                for (const key of PERMISSION_KEYS) {
+                    const entries: unknown[] = Array.isArray(json[key]) ? json[key] : []
+                    const serverEntries = entries.filter(
+                        (tool): tool is string => typeof tool === 'string' && isPermissionForServer(tool, name)
+                    )
+                    // A name with a glob character would turn '@name' into a pattern for other servers
+                    if (key === 'tools' && enablesOwnServers && !isWildcardPermission(name)) {
+                        serverEntries.push(`@${name}`)
+                        addPermissionSource(scopedPermissionSources[key], `@${name}`, fsPath)
                     }
-                }
-
-                if (Array.isArray(json.allowedTools)) {
-                    for (const tool of json.allowedTools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.allowedTools.includes(tool)
-                        ) {
-                            agentConfig.allowedTools.push(tool)
+                    for (const tool of serverEntries) {
+                        if (!agentConfig[key].includes(tool)) {
+                            agentConfig[key].push(tool)
                         }
                     }
                 }
@@ -665,6 +673,10 @@ export async function loadAgentConfig(
                 if (!agentConfig.tools.includes(serverPrefix)) {
                     agentConfig.tools.push(serverPrefix)
                 }
+                // The file that defines the server enables it
+                if (mcpConfig.__configPath__) {
+                    addPermissionSource(scopedPermissionSources.tools, serverPrefix, mcpConfig.__configPath__)
+                }
 
                 logging.info(`Loaded MCP server '${originalName}' from legacy MCP config`)
             }
@@ -684,6 +696,14 @@ export async function loadAgentConfig(
     // before the per-server permission pass, so without this their '@server' / '@server/tool'
     // entries were dropped on every load and "Always Allow" reverted to "Ask".
     restoreServerScopedPermissions(agentConfig, serverNameMapping, pendingServerTools, pendingServerAllowedTools)
+    removeUntrustedScopedPermissions(
+        agentConfig,
+        servers,
+        serverNameMapping,
+        scopedPermissionSources,
+        [globalConfigPath, getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())],
+        logging
+    )
 
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
@@ -1029,7 +1049,9 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
     const wsAgentPaths = getWorkspaceAgentConfigPaths(wsUris)
 
     // Migrate global config
-    await migrateConfigToAgent(workspace, logging, globalConfigPath, globalPersonaPath, globalAgentPath, agent, true)
+    await migrateConfigToAgent(workspace, logging, globalConfigPath, globalPersonaPath, globalAgentPath, agent, {
+        kind: 'global',
+    })
 
     // Migrate workspace configs
     for (let i = 0; i < wsUris.length; i++) {
@@ -1044,7 +1066,8 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
                     wsConfigPaths[i],
                     wsPersonaPaths[i],
                     wsAgentPaths[i],
-                    agent
+                    agent,
+                    { kind: 'workspace', folderPath: normalizePathFromUri(wsUris[i], logging) }
                 )
             }
         }
@@ -1052,7 +1075,50 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
 }
 
 /**
+ * Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. A part of the path that
+ * does not exist yet is resolved as written. False if it cannot tell, for example for links that point at each
+ * other or a folder that cannot be read.
+ */
+export async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
+    try {
+        const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
+        return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Which agent config a migration writes: the global agent config, or the agent config of a workspace folder, which
+ * must stay inside that folder after symbolic links are followed. Every caller states which one, so that no caller
+ * can skip the folder check by leaving out the folder.
+ */
+export type AgentConfigLocation = { kind: 'global' } | { kind: 'workspace'; folderPath: string }
+
+/**
+ * Whether a migration may write the agent config at `agentPath`: the global one always, and the one of a workspace
+ * folder only inside that folder, after symbolic links are followed. Logs a warning if not.
+ * workspace.fs.exists() follows links, so a link whose target does not exist yet looks like a missing file, and a
+ * write through a link would change its target, which can be outside the workspace folder.
+ */
+async function mayMigrateAgentConfig(
+    logging: Logger,
+    agentPath: string,
+    location: AgentConfigLocation,
+    action: 'create' | 'update'
+): Promise<boolean> {
+    if (location.kind === 'global' || (await isInsideFolder(location.folderPath, agentPath))) {
+        return true
+    }
+    logging.warn(
+        `Did not ${action} the agent config ${JSON.stringify(agentPath)} because it is not inside the workspace folder, or could not be resolved, after symbolic links are followed`
+    )
+    return false
+}
+
+/**
  * Migrate a specific config and persona to an agent config
+ * @param location The global agent config, or a workspace folder that the agent config must be written in
  */
 async function migrateConfigToAgent(
     workspace: Workspace,
@@ -1061,7 +1127,7 @@ async function migrateConfigToAgent(
     personaPath: string,
     agentPath: string,
     agent: Agent,
-    isGlobalDefault: boolean = false
+    location: AgentConfigLocation
 ): Promise<void> {
     // Normalize all paths to ensure consistent handling
     const normalizedConfigPath = normalizePathFromUri(configPath, logging)
@@ -1075,6 +1141,10 @@ async function migrateConfigToAgent(
     // Only migrate if agent file does not exist
     // If config exists, migrate from it; if not, create default agent config
     if (agentExists) {
+        return
+    }
+
+    if (!(await mayMigrateAgentConfig(logging, agentPath, location, 'create'))) {
         return
     }
 
@@ -1226,17 +1296,39 @@ export async function saveServerSpecificAgentConfig(
     }
 }
 
+/** Updates the existing agent configs of the workspace folders and the global agent config to the CLI format. */
+export async function migrateAgentConfigsToCLIFormat(workspace: Workspace, logging: Logger): Promise<void> {
+    const wsUris = workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+    const agentConfigs: { agentPath: string; location: AgentConfigLocation }[] = [
+        ...getWorkspaceAgentConfigPaths(wsUris).map((agentPath, i) => ({
+            agentPath,
+            location: { kind: 'workspace', folderPath: normalizePathFromUri(wsUris[i], logging) } as const,
+        })),
+        { agentPath: getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()), location: { kind: 'global' } },
+    ]
+    for (const { agentPath, location } of agentConfigs) {
+        const normalizedAgentPath = normalizePathFromUri(agentPath)
+        const exists = await workspace.fs.exists(normalizedAgentPath).catch(() => false)
+        if (exists) {
+            await migrateAgentConfigToCLIFormat(workspace, logging, normalizedAgentPath, location)
+        }
+    }
+}
+
 /**
- * Migrate existing agent config to CLI format
+ * @param location The global agent config, or the workspace folder that the agent config at `configPath` must be
+ * inside
  */
 export async function migrateAgentConfigToCLIFormat(
     workspace: Workspace,
     logging: Logger,
-    configPath: string
+    configPath: string,
+    location: AgentConfigLocation
 ): Promise<void> {
     try {
         const exists = await workspace.fs.exists(configPath)
         if (!exists) return
+        if (!(await mayMigrateAgentConfig(logging, configPath, location, 'update'))) return
 
         const raw = await workspace.fs.readFile(configPath)
         const config = JSON.parse(raw.toString())
@@ -1475,6 +1567,107 @@ export function restoreServerScopedPermissions(
         if (belongsToLoadedServer(entry) && !agentConfig.allowedTools.includes(entry)) {
             agentConfig.allowedTools.push(entry)
         }
+    }
+}
+
+/** The permission lists of an agent config */
+const PERMISSION_KEYS = ['tools', 'allowedTools'] as const
+
+/** For each server-scoped permission entry ('@server', '@server/tool'), the config files that list it */
+type ScopedPermissionSources = Record<(typeof PERMISSION_KEYS)[number], Map<string, Set<string>>>
+
+function addPermissionSource(sources: Map<string, Set<string>>, entry: string, configPath: string): void {
+    const configPaths = sources.get(entry) ?? new Set<string>()
+    configPaths.add(configPath)
+    sources.set(entry, configPaths)
+}
+
+/** True for a permission entry or server name with a glob character, which can match other names */
+function isWildcardPermission(entry: string): boolean {
+    return entry.includes('*') || entry.includes('?')
+}
+
+/**
+ * A config file path in the form used to compare it with another. The file systems of Windows and
+ * macOS usually ignore case, and the same file can arrive with a different drive-letter case (a path
+ * from a workspace URI has a lowercase drive letter).
+ */
+function comparableConfigPath(configPath: string): string {
+    const normalized = path.normalize(configPath)
+    return process.platform === 'win32' || process.platform === 'darwin' ? normalized.toLowerCase() : normalized
+}
+
+/**
+ * Remove server-scoped permission entries ('@server', '@server/tool') that only workspace agent
+ * configs list for a server that the listing file does not define.
+ *
+ * Anyone who can change a repository can write its workspace config, so a workspace file may grant
+ * permissions only for the servers it defines, which the user must approve before they start. It must
+ * not enable or auto-approve a tool on one of the user's own servers. The agent config next to a
+ * legacy `mcp.json` holds the permissions for that file's servers (see McpManager's permission update).
+ * A glob entry, or a server name with a glob character, can also match other servers, so a workspace
+ * file cannot grant either. Entries from the global config files, which only the user writes, are kept.
+ */
+export function removeUntrustedScopedPermissions(
+    agentConfig: AgentConfig,
+    servers: Map<string, MCPServerConfig>,
+    serverNameMapping: Map<string, string>,
+    sources: ScopedPermissionSources,
+    globalConfigPaths: string[],
+    logging: Logger
+): void {
+    // The config files that can grant permissions for each loaded server, by its original name
+    const grantingFiles = new Map<string, string[]>()
+    for (const [sanitizedName, cfg] of servers) {
+        if (!cfg.__configPath__) {
+            continue
+        }
+        // The agent config and the mcp.json of one .amazonq folder have the same author
+        const definingFile = comparableConfigPath(cfg.__configPath__)
+        const files = [definingFile]
+        if (path.basename(definingFile) === 'mcp.json') {
+            files.push(path.join(path.dirname(definingFile), 'agents', 'default.json'))
+        } else if (path.basename(path.dirname(definingFile)) === 'agents') {
+            files.push(path.join(path.dirname(path.dirname(definingFile)), 'mcp.json'))
+        }
+        grantingFiles.set(serverNameMapping.get(sanitizedName) ?? sanitizedName, files)
+    }
+
+    const globalPaths = new Set(globalConfigPaths.map(comparableConfigPath))
+    // Why the config file cannot grant the entry, or undefined when it can
+    const refusal = (entry: string, configPath: string): string | undefined => {
+        const sourceFile = comparableConfigPath(configPath)
+        if (globalPaths.has(sourceFile)) {
+            return undefined
+        }
+        // A server name can contain '/', so a glob such as '@repo/*' also matches the tools of a server
+        // named 'repo/x', and an exact entry can name more than one server; every one must trust it
+        if (isWildcardPermission(entry)) {
+            return 'a workspace config cannot grant a wildcard permission'
+        }
+        const matches = [...grantingFiles].filter(([serverName]) => isPermissionForServer(entry, serverName))
+        if (matches.length === 0) {
+            return 'it names no MCP server loaded from a config file'
+        }
+        const untrusted = matches
+            .filter(([serverName, files]) => isWildcardPermission(serverName) || !files.includes(sourceFile))
+            .map(([serverName]) => serverName)
+        return untrusted.length > 0
+            ? `it applies to MCP servers that the config does not define: ${untrusted.map(name => JSON.stringify(name)).join(', ')}`
+            : undefined
+    }
+
+    for (const key of PERMISSION_KEYS) {
+        agentConfig[key] = agentConfig[key].filter(entry => {
+            const configPaths = [...(sources[key].get(entry) ?? [])]
+            const refusals = configPaths.map(configPath => refusal(entry, configPath))
+            if (configPaths.length === 0 || refusals.includes(undefined)) {
+                return true
+            }
+            // Quote the entry and the server names, so that a newline in them cannot start another log line
+            logging.warn(`Ignoring permission ${JSON.stringify(entry)} in ${configPaths.join(', ')}: ${refusals[0]}`)
+            return false
+        })
     }
 }
 
