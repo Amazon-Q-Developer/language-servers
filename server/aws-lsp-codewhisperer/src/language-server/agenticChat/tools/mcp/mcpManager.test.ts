@@ -2485,7 +2485,9 @@ describe('approval of a registry server from the install preview, with the real 
     })
 
     it('checks a registry server that the loader reads, before discoverAllServers starts it', async () => {
-        const home = '/home/testuser'
+        // A home folder with a drive on Windows, as a real one has: the loader reads a path without a
+        // drive, such as \home\testuser\..., as the UNC path \\home\testuser\...
+        const home = require('path').resolve('/home/testuser')
         const globalAgent = mcpUtils.getGlobalAgentConfigPath(home)
         const files = new Map<string, string>([
             [
