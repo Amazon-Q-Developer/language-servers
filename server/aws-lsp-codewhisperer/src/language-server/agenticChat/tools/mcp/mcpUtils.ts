@@ -309,12 +309,15 @@ export async function loadAgentConfig(
     // Track useLegacyMcpJson value - workspace takes precedence over global
     let useLegacyMcpJsonValue: boolean | undefined
 
-    // Server-scoped permission entries ('@server', '@server/tool') seen in any agent config file.
-    // They are applied immediately when the owning server is declared in the same file's
-    // 'mcpServers' block, but legacy mcp.json servers (and duplicates skipped below) are not
-    // declared there, so the entries are stashed here and drained once every server is known.
-    const pendingServerTools = new Set<string>()
-    const pendingServerAllowedTools = new Set<string>()
+    // Server-scoped permission entries ('@server', '@server/tool'), keyed by entry, with the agent
+    // config files that listed them. Applied once every server is known.
+    const pendingServerTools = new Map<string, Set<string>>()
+    const pendingServerAllowedTools = new Map<string, Set<string>>()
+    const stash = (pending: Map<string, Set<string>>, entry: string, source: string) => {
+        const sources = pending.get(entry) ?? new Set<string>()
+        sources.add(source)
+        pending.set(entry, sources)
+    }
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -396,7 +399,7 @@ export async function loadAgentConfig(
                         agentConfig.tools.push(tool)
                     }
                 } else {
-                    pendingServerTools.add(tool)
+                    stash(pendingServerTools, tool, fsPath)
                 }
             }
         }
@@ -408,7 +411,7 @@ export async function loadAgentConfig(
                         agentConfig.allowedTools.push(tool)
                     }
                 } else {
-                    pendingServerAllowedTools.add(tool)
+                    stash(pendingServerAllowedTools, tool, fsPath)
                 }
             }
         }
@@ -611,29 +614,6 @@ export async function loadAgentConfig(
                 agentEntry.disabled = cfg.disabled
                 agentConfig.mcpServers[name] = agentEntry
 
-                // Add MCP server-specific tools and allowedTools after server is successfully added
-                if (Array.isArray(json.tools)) {
-                    for (const tool of json.tools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.tools.includes(tool)
-                        ) {
-                            agentConfig.tools.push(tool)
-                        }
-                    }
-                }
-
-                if (Array.isArray(json.allowedTools)) {
-                    for (const tool of json.allowedTools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.allowedTools.includes(tool)
-                        ) {
-                            agentConfig.allowedTools.push(tool)
-                        }
-                    }
-                }
-
                 logging.info(
                     `Loaded MCP server with sanitizedName: '${sanitizedName}' and originalName: '${name}' from ${fsPath}`
                 )
@@ -678,12 +658,14 @@ export async function loadAgentConfig(
         logging.info(`Loaded ${mcpResult.servers.size} servers from legacy MCP configs`)
     }
 
-    // Restore server-scoped permissions for every server that loaded, regardless of which file
-    // declared it. Legacy mcp.json servers are deliberately not written into an agent config's
-    // 'mcpServers' block (see saveServerSpecificAgentConfig), and duplicate servers are skipped
-    // before the per-server permission pass, so without this their '@server' / '@server/tool'
-    // entries were dropped on every load and "Always Allow" reverted to "Ask".
-    restoreServerScopedPermissions(agentConfig, serverNameMapping, pendingServerTools, pendingServerAllowedTools)
+    // Apply server-scoped permissions now that the final config of every server is known.
+    restoreServerScopedPermissions(
+        agentConfig,
+        serverNameMapping,
+        servers,
+        pendingServerTools,
+        pendingServerAllowedTools
+    )
 
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
@@ -1433,46 +1415,63 @@ export function isPermissionForServer(entry: string, serverName: string): boolea
 }
 
 /**
- * Re-apply server-scoped permission entries ('@server', '@server/tool') collected from agent
- * config files to every server that actually loaded.
+ * The agent config that holds permissions for servers declared in a legacy `mcp.json`:
+ * the `agents/default.json` in the same folder. Other paths are returned unchanged.
+ */
+export function getAgentConfigPathForMcpConfig(configPath: string): string {
+    const suffix = path.sep + 'mcp.json'
+    return configPath.endsWith(suffix)
+        ? configPath.slice(0, -suffix.length) + path.sep + 'agents' + path.sep + 'default.json'
+        : configPath
+}
+
+/**
+ * Apply server-scoped permission entries ('@server', '@server/tool') collected from agent config
+ * files to the servers that loaded.
  *
- * `loadAgentConfig` applies these entries while iterating a file's own `mcpServers` block, which
- * leaves two gaps: servers that come from a legacy `mcp.json` are never written into an agent
- * config's `mcpServers` block, and duplicate (workspace/global) servers are skipped before the
- * permission pass. Entries for those servers would otherwise be discarded on every load.
- *
- * Only entries belonging to a loaded server are restored, so permissions for servers the user has
- * removed stay dropped. Existing entries are left untouched, preserving the order the per-file
- * pass established.
+ * An entry applies only when it comes from the agent config that McpManager writes that server's
+ * permissions to: the file that declares the server, or for a legacy `mcp.json` server the
+ * `agents/default.json` next to it. Entries for servers that did not load are dropped.
  */
 export function restoreServerScopedPermissions(
     agentConfig: AgentConfig,
     serverNameMapping: Map<string, string>,
-    pendingServerTools: Iterable<string>,
-    pendingServerAllowedTools: Iterable<string>
+    servers: Map<string, MCPServerConfig>,
+    pendingServerTools: Map<string, Set<string>>,
+    pendingServerAllowedTools: Map<string, Set<string>>
 ): void {
-    const serverNames = new Set(serverNameMapping.values())
-    if (serverNames.size === 0) {
-        return
+    // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
+    const key = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
+
+    const permissionFileFor = (cfg: MCPServerConfig | undefined): string | undefined => {
+        const cfgPath = cfg?.__configPath__
+        return cfgPath ? key(getAgentConfigPathForMcpConfig(path.normalize(cfgPath))) : undefined
     }
 
-    const belongsToLoadedServer = (entry: string): boolean => {
-        for (const serverName of serverNames) {
-            if (isPermissionForServer(entry, serverName)) {
-                return true
+    const applies = (entry: string, sources: Set<string>): boolean => {
+        for (const [sanitized, original] of serverNameMapping) {
+            if (!isPermissionForServer(entry, original)) {
+                continue
+            }
+            const owner = permissionFileFor(servers.get(sanitized))
+            for (const source of sources) {
+                const src = key(source)
+                if (src === owner) {
+                    return true
+                }
             }
         }
         return false
     }
 
-    for (const entry of pendingServerTools) {
-        if (belongsToLoadedServer(entry) && !agentConfig.tools.includes(entry)) {
+    for (const [entry, sources] of pendingServerTools) {
+        if (applies(entry, sources) && !agentConfig.tools.includes(entry)) {
             agentConfig.tools.push(entry)
         }
     }
 
-    for (const entry of pendingServerAllowedTools) {
-        if (belongsToLoadedServer(entry) && !agentConfig.allowedTools.includes(entry)) {
+    for (const [entry, sources] of pendingServerAllowedTools) {
+        if (applies(entry, sources) && !agentConfig.allowedTools.includes(entry)) {
             agentConfig.allowedTools.push(entry)
         }
     }
