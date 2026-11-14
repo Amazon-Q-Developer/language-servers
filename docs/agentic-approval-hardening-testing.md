@@ -57,7 +57,7 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 | `type C:\Users\alice\.aws\credentials` | no prompt | requires approval |
 | `dir C:\Users\victim` | no prompt | requires approval |
 | `cat C:/Users/alice/secrets.txt` | requires approval | requires approval |
-| `type C:secrets.txt` (drive-relative, resolves in the cwd) | no prompt | requires approval |
+| `type C:secrets.txt` (drive-relative, resolves in the current folder of drive C) | no prompt | requires approval |
 | `type "C:\Users\alice\secrets.txt"` (quoted) | requires approval | requires approval |
 | `cat project/notes.txt` (in-workspace) | no prompt | no prompt |
 | `ls -la` | no prompt | no prompt |
