@@ -59,10 +59,13 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 
 `executeBash.test.ts` adds a `hasWindowsDrivePath` suite that runs on every platform. It asserts the
 drive forms above are detected and that look-alikes are not flagged: a URI scheme (`https:`), a
-colon after a multi-character token (`npm run test:unit`), and a `key:value` argument. A
-Windows-gated end-to-end case asserts `requiresAcceptance` returns `true` for an unquoted drive
-path; it skips on a non-Windows host because the platform predicate is fixed at module load, which
-matches the repository's existing Windows tests.
+colon after a multi-character token (`npm run test:unit`), and a `key:value` argument. The
+Windows-gated suite "requiresAcceptance on Windows path forms (real filesystem)" asserts that an
+unquoted drive path, and a quoted drive path to a file in the workspace, require approval. Its
+workspace is a real temporary folder that is also the cwd, and its control cases (`type notes.txt`
+and `type app\notes.txt`) run without approval, so a prompt in the other cases comes from the path
+form. The suite skips on a non-Windows host because the platform predicate is fixed at module load,
+which matches the repository's existing Windows tests.
 
 ### How to test
 
@@ -111,8 +114,8 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 
 `executeBash.test.ts` adds a `hasWindowsUncPath` suite that runs on every platform: it detects the
 `\\host\share`, `//host/share`, quoted, and first-token forms, and does not flag a URI authority
-(`https://`) or a double slash inside a token (`a//b`). Two Windows-gated end-to-end cases assert
-that a UNC path and a `%VAR%` argument each require approval; they skip on a non-Windows host.
+(`https://`) or a double slash inside a token (`a//b`). The Windows-gated suite from section 1
+asserts that a UNC path and a `%VAR%` argument each require approval.
 
 ### How to test
 
@@ -200,8 +203,9 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 
 `executeBash.test.ts` adds a `hasWindowsRootedPath` suite that runs on every platform: it detects
 the leading-backslash and UNC forms and does not flag a mid-token backslash (`sub\file`), a `..\`
-traversal, or a forward-slash path. A Windows-gated end-to-end case asserts that a leading-backslash
-path requires approval; it skips on a non-Windows host.
+traversal, or a forward-slash path. The Windows-gated suite from section 1 asserts that a
+leading-backslash path requires approval, and that `type ..\notes.txt` from the workspace root
+requires approval with the out-of-workspace warning.
 
 ### How to test
 

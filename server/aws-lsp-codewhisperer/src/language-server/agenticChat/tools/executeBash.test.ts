@@ -1676,35 +1676,6 @@ describe('hasWindowsDrivePath (Windows drive-letter detection)', () => {
     }
 })
 
-describe('requiresAcceptance fails closed on Windows drive-letter paths', () => {
-    // The drive-path detection only changes the approval decision on Windows, where cmd.exe runs the
-    // raw command. IS_WINDOWS_PLATFORM is fixed at module load, so this end-to-end case runs on a
-    // Windows host only; the detection logic itself is covered on every platform by the suite above.
-    let features: TestFeatures
-
-    before(function () {
-        features = new TestFeatures()
-        features.workspace.getAllWorkspaceFolders = sinon
-            .stub()
-            .returns([{ uri: URI.file('/workspace/folder').toString(), name: 'test' }]) as any
-    })
-
-    afterEach(() => {
-        sinon.restore()
-    })
-
-    it('requires acceptance for an unquoted drive-letter path that cmd.exe would read', async function () {
-        if (process.platform !== 'win32') {
-            return this.skip()
-        }
-        const result = await new ExecuteBash(features).requiresAcceptance({
-            command: 'type C:\\Users\\alice\\.aws\\credentials',
-            cwd: 'C:\\workspace\\folder',
-        })
-        assert.equal(result.requiresAcceptance, true)
-    })
-})
-
 describe('hasWindowsUncPath (Windows UNC detection)', () => {
     // A UNC path is also corrupted by shlex tokenization, so it must be detected in the raw command.
     const uncCommands = [
@@ -1732,46 +1703,6 @@ describe('hasWindowsUncPath (Windows UNC detection)', () => {
             assert.equal(hasWindowsUncPath(command), false)
         })
     }
-})
-
-describe('requiresAcceptance fails closed on Windows UNC and environment-variable arguments', () => {
-    // These forms only change the approval decision on Windows, where cmd.exe runs the raw command.
-    // IS_WINDOWS_PLATFORM is fixed at module load, so these end-to-end cases run on a Windows host
-    // only; the UNC detection logic itself is covered on every platform by the suite above.
-    let features: TestFeatures
-
-    before(function () {
-        features = new TestFeatures()
-        features.workspace.getAllWorkspaceFolders = sinon
-            .stub()
-            .returns([{ uri: URI.file('/workspace/folder').toString(), name: 'test' }]) as any
-    })
-
-    afterEach(() => {
-        sinon.restore()
-    })
-
-    it('requires acceptance for a UNC path that cmd.exe would open as a share', async function () {
-        if (process.platform !== 'win32') {
-            return this.skip()
-        }
-        const result = await new ExecuteBash(features).requiresAcceptance({
-            command: 'dir \\\\host\\share',
-            cwd: 'C:\\workspace\\folder',
-        })
-        assert.equal(result.requiresAcceptance, true)
-    })
-
-    it('requires acceptance for an environment-variable argument cmd.exe would expand', async function () {
-        if (process.platform !== 'win32') {
-            return this.skip()
-        }
-        const result = await new ExecuteBash(features).requiresAcceptance({
-            command: 'type %USERPROFILE%\\secrets.txt',
-            cwd: 'C:\\workspace\\folder',
-        })
-        assert.equal(result.requiresAcceptance, true)
-    })
 })
 
 describe('hasWindowsRootedPath (Windows root-relative backslash detection)', () => {
@@ -1806,32 +1737,84 @@ describe('hasWindowsRootedPath (Windows root-relative backslash detection)', () 
     }
 })
 
-describe('requiresAcceptance fails closed on Windows root-relative backslash paths', () => {
-    // Dropping the drive letter from a drive path leaves a `\...` path that cmd.exe still reads from
-    // the working directory's drive root. IS_WINDOWS_PLATFORM is fixed at module load, so this
-    // end-to-end case runs on a Windows host only; the detection logic is covered on every platform
-    // by the suite above.
+describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
+    // These forms change the approval decision only on Windows, where cmd.exe runs the raw command.
+    // IS_WINDOWS_PLATFORM is fixed at module load, so this suite runs on a Windows host only; the
+    // detection functions are covered on every platform by the suites above. Each case calls
+    // requiresAcceptance only, and no command runs. The workspace is a real temporary folder and the
+    // cwd is the workspace, so the control cases run without approval: a prompt in another case
+    // comes from its path, not from a workspace or cwd that the check cannot find.
     let features: TestFeatures
+    let root: string
+    let ws: string
+
+    const requiresAcceptance = (command: string) =>
+        new ExecuteBash({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getAllWorkspaceFolders: () => [{ uri: URI.file(ws).toString(), name: 'ws' }],
+            },
+        } as any).requiresAcceptance({ command, cwd: ws })
 
     before(function () {
-        features = new TestFeatures()
-        features.workspace.getAllWorkspaceFolders = sinon
-            .stub()
-            .returns([{ uri: URI.file('/workspace/folder').toString(), name: 'test' }]) as any
-    })
-
-    afterEach(() => {
-        sinon.restore()
-    })
-
-    it('requires acceptance for a leading-backslash path that drops the drive letter', async function () {
         if (process.platform !== 'win32') {
             return this.skip()
         }
-        const result = await new ExecuteBash(features).requiresAcceptance({
-            command: 'type \\Users\\alice\\.aws\\credentials',
-            cwd: 'C:\\workspace\\folder',
-        })
+        features = new TestFeatures()
+    })
+
+    beforeEach(() => {
+        mockfs.restore()
+        root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'eb-win-'))
+        ws = path.join(root, 'workspace')
+        fs.mkdirSync(path.join(ws, 'app'), { recursive: true })
+        fs.writeFileSync(path.join(ws, 'notes.txt'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(ws, 'app', 'notes.txt'), 'synthetic fixture only')
+    })
+
+    afterEach(() => {
+        fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    it('does not require acceptance for an ordinary file in the workspace (control)', async () => {
+        assert.equal((await requiresAcceptance('type notes.txt')).requiresAcceptance, false)
+    })
+
+    it('does not require acceptance for a backslash path to an ordinary file in the workspace (control)', async () => {
+        assert.equal((await requiresAcceptance('type app\\notes.txt')).requiresAcceptance, false)
+    })
+
+    it('requires acceptance for an unquoted drive-letter path that cmd.exe would read', async () => {
+        const result = await requiresAcceptance('type C:\\Users\\alice\\.aws\\credentials')
         assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a drive-letter path to a file in the workspace', async () => {
+        // The path checks pass for this file, so the prompt comes from the drive path detection
+        const result = await requiresAcceptance(`type "${path.join(ws, 'notes.txt')}"`)
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a UNC path that cmd.exe would open as a share', async () => {
+        const result = await requiresAcceptance('dir \\\\host.invalid\\share')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for an environment-variable argument cmd.exe would expand', async () => {
+        const result = await requiresAcceptance('type %USERPROFILE%\\secrets.txt')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a leading-backslash path that drops the drive letter', async () => {
+        const result = await requiresAcceptance('type \\Users\\alice\\.aws\\credentials')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a single-hop ..\\ path to a file outside the workspace', async () => {
+        fs.writeFileSync(path.join(root, 'notes.txt'), 'synthetic fixture only')
+        const result = await requiresAcceptance('type ..\\notes.txt')
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, outOfWorkspaceWarningmessage)
     })
 })
