@@ -905,12 +905,25 @@ export class ATXTransformHandler {
             // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
             // beam-status + one plan fetch. stepId isn't resolved here; the IDE keeps the one from full
             // discovery / resolves it at Load.
+            // Sort candidates: pathless (or path-free) entries first, then everything else;
+            // skip beam-status-* JSON files (they never hold the beam-map and waste scan budget).
+            // A multi-repo beam has N beam-status-* files plus one pathless beam-map; without
+            // sorting, the beam-map may be the last candidate and fall outside the 15 s budget.
+            const BEAM_STATUS_RE = /beam-status-/i
             const allCandidates = lightweight
                 ? []
-                : artifacts.filter(a => {
-                      const p = (a.fileMetadata?.path || '').toLowerCase()
-                      return !ZIP_RE.test(p) // keep non-transformed-bundle artifacts (incl. the beam-map zip)
-                  })
+                : artifacts
+                      .filter(a => {
+                          const p = (a.fileMetadata?.path || '').toLowerCase()
+                          return !ZIP_RE.test(p) && !BEAM_STATUS_RE.test(p)
+                      })
+                      .sort((a, b) => {
+                          // Pathless candidates (the beam-map has no path in ListArtifacts)
+                          // before candidates with a path, so the map is tried first.
+                          const aPath = (a.fileMetadata?.path || '').length
+                          const bPath = (b.fileMetadata?.path || '').length
+                          return aPath - bPath
+                      })
             // Bound the scan: each candidate is a serial download+parse, so an artifact-heavy
             // job (logs, metadata) could otherwise stall the IDE's discovery UI. Cap the number
             // scanned and enforce an overall deadline; the beam-map is written early and is
