@@ -403,6 +403,11 @@ export class ExecuteBash {
                     commandCategory: highestCommandCategory,
                 }
             }
+            // On Windows, ask about a cwd with a segment that ends in a period or a space (see
+            // hasWindowsTrailingDotOrSpace): the command runs in the folder without it, which the checks do not find.
+            if (IS_WINDOWS_PLATFORM && params.cwd && hasWindowsTrailingDotOrSpace(params.cwd)) {
+                return { requiresAcceptance: true, commandCategory: highestCommandCategory }
+            }
             // The cwd, when running in it needs approval. An approval of an out-of-workspace prompt
             // allows the cwd for later commands only for a read-only command without shell syntax,
             // and only for a cwd that canAllowCwd accepts: the card does not show the cwd.

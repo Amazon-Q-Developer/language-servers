@@ -1957,6 +1957,25 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
         }
     })
 
+    it('requires acceptance in a cwd with a segment that ends in a period or a space', async () => {
+        // The command runs in the folder without the period or the space: there cmd.exe reads app\.env,
+        // or follows the junction, while the checks of the cwd as written find no such folder
+        fs.writeFileSync(path.join(ws, 'app', '.env'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(outside, 'data.txt'), 'synthetic fixture only')
+        fs.symlinkSync(outside, path.join(ws, 'link'), 'junction')
+        for (const [command, cwd] of [
+            ['type .env', `${path.join(ws, 'app')}.`],
+            ['type data.txt', `${path.join(ws, 'link')}.`],
+            ['dir', `${path.join(ws, 'app')} `],
+        ]) {
+            const result = await requiresAcceptance(command, cwd)
+            assert.equal(result.requiresAcceptance, true, `${command} in ${JSON.stringify(cwd)}`)
+            assert.equal(result.approvalPaths, undefined, cwd)
+        }
+        // Control: the same folder without the period
+        assert.equal((await requiresAcceptance('type notes.txt', path.join(ws, 'app'))).requiresAcceptance, false)
+    })
+
     it('requires acceptance for a UNC path without opening it on disk', async () => {
         // A file system call on a UNC path makes Windows connect to its host. In the last command, only
         // the word after the comma is a UNC path: the shlex token is a name in the workspace.

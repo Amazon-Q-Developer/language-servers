@@ -411,32 +411,38 @@ and spaces at the end of the last segment. So `type .env.` and `type ".env "` re
 `type link.\data.txt` follows the junction `link`. Node.js opens a path as it is written, so the
 checks found no file named `.env.` and did not run the credential check, and `link.` was not a
 junction to them. Such a command ran with no prompt. This applied to the shlex tokens before this
-change and also to the words of section 6.
+change and also to the words of section 6. The model also sends the cwd, and the command runs in
+the folder without the period or the space: in the cwd `C:\ws\app.`, `type .env` read
+`C:\ws\app\.env` with no prompt.
 
 ### How the fix works
 
 On Windows, a word of the command (section 6) with a segment, other than `.` and `..`, that ends in
 a period or a space now requires approval (`hasWindowsTrailingDotOrSpace`). The rule runs with the
 word check, after the loop over the tokens, so it only adds a prompt for a command that would
-otherwise run without one. The prompt has no specific warning.
+otherwise run without one. A cwd with such a segment also requires approval, before any file system
+call on it, and the result has no `approvalPaths`. The prompt has no specific warning.
 
 ### Safe reproduction and expected results
 
-On Windows, use a temporary workspace that contains `.env` and a junction `link` to a temporary
-folder outside the workspace that contains `data.txt`. Use the workspace as the cwd and call
-`requiresAcceptance` only.
+On Windows, use a temporary workspace that contains `.env`, `app\.env` and a junction `link` to a
+temporary folder outside the workspace that contains `data.txt`. Call `requiresAcceptance` only.
+The cwd is the workspace unless the table names another one.
 
 | Command | Before | After |
 | --- | --- | --- |
 | `type .env.` | no prompt | requires approval |
 | `type ".env "` | no prompt | requires approval |
 | `type link.\data.txt` | no prompt | requires approval |
+| `type .env` in the cwd `<workspace>\app.` | no prompt | requires approval |
+| `type data.txt` in the cwd `<workspace>\link.` | no prompt | requires approval |
 | `dir .` and `type ..\notes.txt` | unchanged | unchanged |
 
 ### Tests
 
-`executeBash.test.ts` adds a `hasWindowsTrailingDotOrSpace` suite that runs on every platform, and a
-case in the Windows-gated suite from section 1 for the three commands above.
+`executeBash.test.ts` adds a `hasWindowsTrailingDotOrSpace` suite that runs on every platform, and
+cases in the Windows-gated suite from section 1 for the commands and the cwd forms above, with the
+control `type notes.txt` in the cwd `<workspace>\app`.
 
 ### How to test
 
