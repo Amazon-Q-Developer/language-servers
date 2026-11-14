@@ -663,7 +663,6 @@ export async function loadAgentConfig(
         agentConfig,
         serverNameMapping,
         servers,
-        globalConfigPath,
         pendingServerTools,
         pendingServerAllowedTools
     )
@@ -1416,36 +1415,37 @@ export function isPermissionForServer(entry: string, serverName: string): boolea
 }
 
 /**
+ * The agent config that holds permissions for servers declared in a legacy `mcp.json`:
+ * the `agents/default.json` in the same folder. Other paths are returned unchanged.
+ */
+export function getAgentConfigPathForMcpConfig(configPath: string): string {
+    const suffix = path.sep + 'mcp.json'
+    return configPath.endsWith(suffix)
+        ? configPath.slice(0, -suffix.length) + path.sep + 'agents' + path.sep + 'default.json'
+        : configPath
+}
+
+/**
  * Apply server-scoped permission entries ('@server', '@server/tool') collected from agent config
  * files to the servers that loaded.
  *
- * An entry applies when it comes from the global agent config, or from the agent config that
- * McpManager writes that server's permissions to: the file that declares the server, or for a
- * legacy `mcp.json` server the `agents/default.json` next to it. Entries for servers that did not
- * load are dropped.
+ * An entry applies only when it comes from the agent config that McpManager writes that server's
+ * permissions to: the file that declares the server, or for a legacy `mcp.json` server the
+ * `agents/default.json` next to it. Entries for servers that did not load are dropped.
  */
 export function restoreServerScopedPermissions(
     agentConfig: AgentConfig,
     serverNameMapping: Map<string, string>,
     servers: Map<string, MCPServerConfig>,
-    globalAgentConfigPath: string,
     pendingServerTools: Map<string, Set<string>>,
     pendingServerAllowedTools: Map<string, Set<string>>
 ): void {
     // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
     const key = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
-    const globalPath = key(globalAgentConfigPath)
 
-    // Mirrors the agent path McpManager derives when saving a server's permissions.
     const permissionFileFor = (cfg: MCPServerConfig | undefined): string | undefined => {
         const cfgPath = cfg?.__configPath__
-        if (!cfgPath) {
-            return undefined
-        }
-        const p = path.normalize(cfgPath)
-        return key(
-            p.endsWith(path.sep + 'mcp.json') ? p.slice(0, -'mcp.json'.length) + path.join('agents', 'default.json') : p
-        )
+        return cfgPath ? key(getAgentConfigPathForMcpConfig(path.normalize(cfgPath))) : undefined
     }
 
     const applies = (entry: string, sources: Set<string>): boolean => {
@@ -1456,7 +1456,7 @@ export function restoreServerScopedPermissions(
             const owner = permissionFileFor(servers.get(sanitized))
             for (const source of sources) {
                 const src = key(source)
-                if (src === globalPath || src === owner) {
+                if (src === owner) {
                     return true
                 }
             }

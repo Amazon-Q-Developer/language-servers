@@ -3257,6 +3257,35 @@ describe('Always Allow persists across a restart', () => {
         expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
     })
 
+    it('does not carry global Always Allow over to a workspace server of the same name', async () => {
+        const globalAgent = mcpUtils.getGlobalAgentConfigPath(tmpDir)
+        writeJson(globalAgent, {
+            name: 'q_ide_default',
+            mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            tools: ['@srv'],
+            allowedTools: ['@srv', '@srv/tool1'],
+        })
+        const globalBefore = fs.readFileSync(globalAgent, 'utf8')
+        writeJson(path.join(wsRoot, '.amazonq', 'agents', 'default.json'), {
+            mcpServers: { srv: { command: 'other-mcp', args: [] } },
+            tools: ['@srv'],
+            allowedTools: [],
+        })
+
+        let mgr = await loadManager()
+        expect(mgr.getAllServerConfigs().get('srv')?.command).to.equal('other-mcp')
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.true
+        expect(mgr.getToolPerm('srv', 'tool1')).to.equal(McpPermissionType.ask)
+        await mgr.close()
+
+        // Without the workspace override, the user's global server keeps its Always Allow.
+        fs.rmSync(path.join(wsRoot, '.amazonq'), { recursive: true, force: true })
+        mgr = await loadManager()
+        expect(mgr.getAllServerConfigs().get('srv')?.command).to.equal('srv-mcp')
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+        expect(fs.readFileSync(globalAgent, 'utf8')).to.equal(globalBefore)
+    })
+
     it('for a workspace server that overrides a global server of the same name', async () => {
         writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), {
             name: 'q_ide_default',
