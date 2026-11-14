@@ -240,6 +240,19 @@ export function windowsCommandWords(command: string): string[] | undefined {
 }
 
 /**
+ * True when a segment of a Windows path, other than `.` and `..`, ends in a period or a space, as in
+ * `.env.`, `".env "`, or `app.\.env`. When cmd.exe opens such a path, Windows removes those characters,
+ * so `type .env.` reads `.env`. Node.js opens a path as it is written, so the checks of the same path
+ * find no file and cannot see that it is a credential file or that it passes through a junction.
+ *
+ * The function is platform-independent so it can be unit-tested on any host; the caller applies it
+ * only on Windows.
+ */
+export function hasWindowsTrailingDotOrSpace(windowsPath: string): boolean {
+    return windowsPath.split(/[\\/]/).some(segment => segment !== '.' && segment !== '..' && /[. ]$/.test(segment))
+}
+
+/**
  * True for a UNC or device path (`\\host\share`, `//host/share`, `\\?\C:\...`) that is not in a
  * workspace folder. A file system call on a UNC path makes Windows connect to the host that the path
  * names, which can send the user's credentials to that host, so such a path is not checked on disk. A
@@ -619,7 +632,9 @@ export class ExecuteBash {
      * passes the path checks. cmd.exe reads the words that {@link windowsCommandWords} returns, and
      * shlex can make a different token of the same text: `app\.env` becomes `app.env`,
      * `link\data.txt` becomes `linkdata.txt`, and `notes.txt,.env` stays one token. Only a word that
-     * is not also a token is checked, because the loop over the tokens already checked the others.
+     * is not also a token goes through the path checks, because the loop over the tokens already
+     * checked the others. A word with a segment that ends in a period or a space always needs
+     * approval (see {@link hasWindowsTrailingDotOrSpace}).
      */
     private async windowsWordsApproval(
         command: string,
@@ -633,6 +648,9 @@ export class ExecuteBash {
         }
         const checkedTokens = new Set(tokens)
         for (const word of words) {
+            if (hasWindowsTrailingDotOrSpace(word)) {
+                return { requiresAcceptance: true, commandCategory }
+            }
             if (checkedTokens.has(word)) {
                 continue
             }

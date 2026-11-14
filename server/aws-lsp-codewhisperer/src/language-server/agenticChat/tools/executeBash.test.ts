@@ -12,6 +12,7 @@ import {
     hasWindowsRootedPath,
     windowsCommandWords,
     isRemoteWindowsPath,
+    hasWindowsTrailingDotOrSpace,
 } from './executeBash'
 import { multiplyLinkedFileWarning } from './toolShared'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
@@ -1766,6 +1767,33 @@ describe('windowsCommandWords (the words that cmd.exe reads)', () => {
     })
 })
 
+describe('hasWindowsTrailingDotOrSpace (path segments that Windows changes when cmd.exe opens them)', () => {
+    // Each case is [path, expected]
+    const cases: Array<[string, boolean]> = [
+        ['.env.', true],
+        ['.env ', true],
+        ['.env...', true],
+        ['app.\\.env', true],
+        ['link.\\data.txt', true],
+        ['link./data.txt', true],
+        ['...', true],
+        ['.env', false],
+        ['notes.txt', false],
+        ['.', false],
+        ['..', false],
+        ['.\\notes.txt', false],
+        ['..\\notes.txt', false],
+        ['sub\\', false],
+        ['a..b', false],
+        ['C:\\Users\\alice\\notes.txt', false],
+    ]
+    for (const [windowsPath, expected] of cases) {
+        it(`returns ${expected} for ${JSON.stringify(windowsPath)}`, () => {
+            assert.equal(hasWindowsTrailingDotOrSpace(windowsPath), expected)
+        })
+    }
+})
+
 describe('isRemoteWindowsPath (UNC and device paths that are not checked on disk)', () => {
     // Each case is [path, workspace folders, expected]. Windows path rules apply on every host.
     const share = '\\\\fileserver\\projects\\app'
@@ -1914,6 +1942,17 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
         const result = await requiresAcceptance('type notes.txt,.env')
         assert.equal(result.requiresAcceptance, true)
         assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('requires acceptance for a path with a segment that ends in a period or a space', async () => {
+        // Windows removes the period or the space when cmd.exe opens the path, so cmd.exe reads .env
+        // and follows the junction, while the checks of the path as written find no such file
+        fs.writeFileSync(path.join(ws, '.env'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(outside, 'data.txt'), 'synthetic fixture only')
+        fs.symlinkSync(outside, path.join(ws, 'link'), 'junction')
+        for (const command of ['type .env.', 'type ".env "', 'type link.\\data.txt']) {
+            assert.equal((await requiresAcceptance(command)).requiresAcceptance, true, command)
+        }
     })
 
     it('requires acceptance for a UNC path without opening it on disk', async () => {
