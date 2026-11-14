@@ -381,6 +381,15 @@ export class ExecuteBash {
             const canonicalWorkspaceFolders = await canonicalizeWorkspaceFolders(
                 getWorkspaceFolderPaths(this.workspace)
             )
+            // On Windows, do not check a UNC or device cwd outside the workspace on disk (see
+            // isRemoteWindowsPath): the checks below would make Windows connect to its host.
+            if (IS_WINDOWS_PLATFORM && params.cwd && isRemoteWindowsPath(params.cwd, canonicalWorkspaceFolders)) {
+                return {
+                    requiresAcceptance: true,
+                    warning: outOfWorkspaceWarningmessage,
+                    commandCategory: highestCommandCategory,
+                }
+            }
             // The cwd, when running in it needs approval. An approval of an out-of-workspace prompt
             // allows the cwd for later commands only for a read-only command without shell syntax,
             // and only for a cwd that canAllowCwd accepts: the card does not show the cwd.

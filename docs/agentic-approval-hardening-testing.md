@@ -349,3 +349,42 @@ run checks only `windowsCommandWords`.
   built-in command, in addition to the shlex tokens.
 - A path on a share outside the workspace requires approval each time, also when the user approved
   its folder before, because the approved-path check needs the canonical path from disk.
+
+## 7. A UNC working directory
+
+### What was wrong
+
+The model also sends the `cwd` of a command. `requiresAcceptance` resolves the cwd on disk before it
+checks the command, to find out if the cwd is in the workspace, and it resolves relative path
+arguments against the cwd. On Windows, a cwd such as `\\host\share` or `//host/share` therefore made
+Windows connect to that host while the check ran, before the user approved the command. Section 6
+stops a file system call on a UNC path argument; it does not cover the cwd.
+
+### How the fix works
+
+On Windows, before any file system call on the cwd, `requiresAcceptance` checks the cwd with
+`isRemoteWindowsPath` (section 6). A UNC or device cwd that is not in a workspace folder requires
+approval with the out-of-workspace warning, and the result has no `approvalPaths`, so an approval
+does not allow that cwd for later commands. A cwd in a workspace folder on a share is still checked
+as before.
+
+### Safe reproduction and expected results
+
+On Windows, use a temporary workspace that contains `notes.txt`, and call `requiresAcceptance` only.
+Use `host.invalid`, a name that does not resolve.
+
+| Command | cwd | Before | After |
+| --- | --- | --- | --- |
+| `type notes.txt` | `\\host.invalid\share` | requires approval, after a file system call on the cwd | requires approval, with no file system call |
+| `type notes.txt` | `//host.invalid/share` | requires approval, after a file system call on the cwd | requires approval, with no file system call |
+| `type notes.txt` | the workspace | no prompt | no prompt |
+
+### Tests
+
+The Windows-gated suite from section 1 adds a case that runs `type notes.txt` with each UNC cwd above.
+It asserts that each requires approval with the out-of-workspace warning and no `approvalPaths`, and
+that no file system call gets a path that starts with two slashes or backslashes.
+
+### How to test
+
+Same commands as section 1. The Windows-gated case requires the Windows CI job.

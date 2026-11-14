@@ -1801,14 +1801,31 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
     let ws: string
     let outside: string
 
-    const requiresAcceptance = (command: string) =>
+    const requiresAcceptance = (command: string, cwd = ws) =>
         new ExecuteBash({
             ...features,
             workspace: {
                 ...features.workspace,
                 getAllWorkspaceFolders: () => [{ uri: URI.file(ws).toString(), name: 'ws' }],
             },
-        } as any).requiresAcceptance({ command, cwd: ws })
+        } as any).requiresAcceptance({ command, cwd })
+
+    // Spies on the file system calls of the check. The returned function lists the paths that start
+    // with two slashes or backslashes, which a file system call would open on another host.
+    const spyOnRemotePaths = (): (() => string[]) => {
+        const spies = [
+            sinon.spy(fs.promises, 'lstat'),
+            sinon.spy(fs.promises, 'readlink'),
+            sinon.spy(fs.promises, 'realpath'),
+            sinon.spy(fs, 'existsSync'),
+            sinon.spy(fs, 'statSync'),
+            sinon.spy(fs, 'lstatSync'),
+        ]
+        return () =>
+            spies
+                .flatMap(spy => spy.getCalls().map(call => String(call.args[0])))
+                .filter(calledPath => /^[\\/]{2}/.test(calledPath))
+    }
 
     before(function () {
         if (process.platform !== 'win32') {
@@ -1901,22 +1918,23 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
 
     it('requires acceptance for a UNC path without opening it on disk', async () => {
         // A file system call on a UNC path makes Windows connect to its host
-        const spies = [
-            sinon.spy(fs.promises, 'lstat'),
-            sinon.spy(fs.promises, 'readlink'),
-            sinon.spy(fs.promises, 'realpath'),
-            sinon.spy(fs, 'existsSync'),
-            sinon.spy(fs, 'statSync'),
-            sinon.spy(fs, 'lstatSync'),
-        ]
+        const remotePaths = spyOnRemotePaths()
         for (const command of ['type //host.invalid/share/data.txt', 'dir \\\\host.invalid\\share']) {
             const result = await requiresAcceptance(command)
             assert.equal(result.requiresAcceptance, true, command)
             assert.equal(result.warning, outOfWorkspaceWarningmessage, command)
         }
-        const remotePaths = spies
-            .flatMap(spy => spy.getCalls().map(call => String(call.args[0])))
-            .filter(calledPath => /^[\\/]{2}/.test(calledPath))
-        assert.deepEqual(remotePaths, [])
+        assert.deepEqual(remotePaths(), [])
+    })
+
+    it('requires acceptance for a UNC working directory without opening it on disk', async () => {
+        const remotePaths = spyOnRemotePaths()
+        for (const cwd of ['\\\\host.invalid\\share', '//host.invalid/share']) {
+            const result = await requiresAcceptance('type notes.txt', cwd)
+            assert.equal(result.requiresAcceptance, true, cwd)
+            assert.equal(result.warning, outOfWorkspaceWarningmessage, cwd)
+            assert.equal(result.approvalPaths, undefined, cwd)
+        }
+        assert.deepEqual(remotePaths(), [])
     })
 })
