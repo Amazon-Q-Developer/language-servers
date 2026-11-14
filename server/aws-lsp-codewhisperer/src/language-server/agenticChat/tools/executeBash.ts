@@ -18,7 +18,7 @@ import { CancellationError, processUtils, workspaceUtils } from '@aws/lsp-core'
 import { CancellationToken } from 'vscode-languageserver'
 import { ChildProcess, ChildProcessOptions } from '@aws/lsp-core/out/util/processUtils'
 // eslint-disable-next-line import/no-nodejs-modules
-import { isAbsolute, resolve, extname, join, parse } from 'path' // Safe to import on web since this is part of path-browserify
+import { isAbsolute, resolve, extname, join, parse, win32 } from 'path' // Safe to import on web since this is part of path-browserify
 import { Features } from '../../types'
 import { getWorkspaceFolderPaths } from '@aws/lsp-core/out/util/workspaceUtils'
 // eslint-disable-next-line import/no-nodejs-modules
@@ -188,15 +188,83 @@ export function hasWindowsUncPath(command: string): boolean {
  * from the root of the working directory's drive. Without this, dropping the `C:` from a drive path
  * reproduces the drive-path bypass. Fail closed on any token that begins with a backslash.
  *
- * Only a leading backslash is matched. A mid-token backslash (`sub\file`) stays inside the
- * workspace. A `..\` traversal is left to the traversal checks: the `\..` pre-check catches
- * `..\..\`, and a single-hop `..\name` reaches the workspace check as the token `..name` (shlex
- * deletes the backslash). From the workspace root, that token counts as outside the workspace only
- * because its relative path starts with `..`. The function is platform-independent so it can be
- * unit-tested on any host; the caller applies it only on Windows.
+ * Only a leading backslash is matched. A path with a backslash inside a word (`sub\file`) is relative
+ * to the working directory, but it can still name a credential file or pass through a junction to a
+ * folder outside the workspace, so requiresAcceptance checks it as cmd.exe reads it (see
+ * {@link windowsCommandWords}). A `..\` traversal is left to the traversal checks: the `\..`
+ * pre-check catches `..\..\`, and the checks of the words that cmd.exe reads catch a single-hop
+ * `..\name`. The function is platform-independent so it can be unit-tested on any host; the caller
+ * applies it only on Windows.
  */
 export function hasWindowsRootedPath(command: string): boolean {
     return /(?:^|[\s"'=,;(){}<>|&])\\/.test(command)
+}
+
+/**
+ * Splits a command into the words that cmd.exe gives to a built-in command such as `type` or `dir`.
+ * Whitespace, a comma, or an equals sign outside double quotes ends a word, and the double quotes are
+ * removed. A backslash stays in its word. cmd.exe also splits at a semicolon, but requiresAcceptance
+ * always asks for approval for a command that contains a semicolon.
+ *
+ * shlex reads the same command with POSIX rules, so a token can name a different path than the word
+ * that cmd.exe reads: shlex deletes the backslash in `app\.env` (the token is `app.env`), and it keeps
+ * `notes.txt,.env` as one token. Returns undefined when a double quote is not closed, so the caller
+ * can ask for approval.
+ *
+ * The function is platform-independent so it can be unit-tested on any host; the caller applies it
+ * only on Windows.
+ */
+export function windowsCommandWords(command: string): string[] | undefined {
+    const words: string[] = []
+    let word = ''
+    let isQuoted = false
+    for (const char of command) {
+        if (char === '"') {
+            isQuoted = !isQuoted
+        } else if (!isQuoted && /[\s,=]/.test(char)) {
+            if (word) {
+                words.push(word)
+            }
+            word = ''
+        } else {
+            word += char
+        }
+    }
+    if (isQuoted) {
+        return undefined
+    }
+    if (word) {
+        words.push(word)
+    }
+    return words
+}
+
+/**
+ * True for a UNC or device path (`\\host\share`, `//host/share`, `\\?\C:\...`) that is not in a
+ * workspace folder. A file system call on a UNC path makes Windows connect to the host that the path
+ * names, which can send the user's credentials to that host, so such a path is not checked on disk. A
+ * path in a workspace folder on a share is on a host that the IDE already uses.
+ *
+ * The function uses Windows path rules on every host so it can be unit-tested anywhere; the caller
+ * applies it only on Windows.
+ */
+export function isRemoteWindowsPath(windowsPath: string, workspaceFolders: string[]): boolean {
+    const resolvedPath = win32.resolve(windowsPath)
+    if (!/^[\\/]{2}/.test(resolvedPath)) {
+        return false
+    }
+    return !workspaceFolders.some(folder => {
+        const relativePath = win32.relative(win32.resolve(folder), resolvedPath)
+        return !relativePath.startsWith('..') && !win32.isAbsolute(relativePath)
+    })
+}
+
+/** What the path checks of {@link ExecuteBash.requiresAcceptance} need to know about the command */
+interface PathCheckContext {
+    cwd?: string
+    canonicalWorkspaceFolders: string[]
+    isReadOnlyCommand: boolean
+    approvedPaths?: Map<string, Set<string>>
 }
 
 export class ExecuteBash {
@@ -330,6 +398,13 @@ export class ExecuteBash {
                     ? { approvalPaths: [cwdNeedingApproval] }
                     : {}
 
+            const pathCheck: PathCheckContext = {
+                cwd: params.cwd,
+                canonicalWorkspaceFolders,
+                isReadOnlyCommand,
+                approvedPaths,
+            }
+
             for (const cmdArgs of allCommands) {
                 if (cmdArgs.length === 0) {
                     return { requiresAcceptance: true, commandCategory: highestCommandCategory }
@@ -337,96 +412,9 @@ export class ExecuteBash {
 
                 // For each command, validate arguments for path safety within workspace
                 for (const arg of cmdArgs) {
-                    // looksLikePath catches obvious paths (absolute, ./, ../, ".."
-                    // traversal, Windows drive letters, tilde, ...).
-                    // looksLikeRelativePath additionally catches bare relative
-                    // arguments such as "notes.txt" or "sub/notes.txt" that would
-                    // otherwise bypass the boundary and credential checks. Flags and
-                    // plain-text tokens are intentionally not treated as paths.
-                    if (!this.looksLikePath(arg) && !this.looksLikeRelativePath(arg, params.cwd)) {
-                        continue
-                    }
-
-                    // Special handling for tilde paths in Unix-like systems
-                    if (!IS_WINDOWS_PLATFORM && arg.startsWith('~')) {
-                        // Treat tilde paths as absolute paths (they will be expanded by the shell)
-                        return {
-                            requiresAcceptance: true,
-                            warning: destructiveCommandWarningMessage,
-                            commandCategory: CommandCategory.Destructive,
-                        }
-                    }
-
-                    // Resolve to an absolute path against cwd, then canonicalize it in
-                    // a symlink-aware way (eliminates ".." traversal AND follows a
-                    // symlink whose name is in-workspace but whose target is outside).
-                    let candidate: string
-                    if (!isAbsolute(arg) && params.cwd) {
-                        candidate = resolve(params.cwd, arg)
-                    } else {
-                        candidate = resolve(arg)
-                    }
-                    const fullPath = await resolveSymlinkAwarePath(candidate)
-
-                    // Check if this is a credential or binary file that needs
-                    // protection. The existence / regular-file guard stays on the
-                    // canonical fullPath (as before), but the sensitivity
-                    // heuristic considers BOTH the lexical spelling (candidate)
-                    // and the canonical target (fullPath). Otherwise a symlink
-                    // named ".env" or "tool.exe" whose target is an ordinary file
-                    // would hide a credential/binary name behind an innocuous
-                    // canonical name. This only widens the warning; approval
-                    // (isPathApproved) and the workspace boundary remain
-                    // canonical-only and are unchanged.
-                    try {
-                        if (existsSync(fullPath) && statSync(fullPath).isFile()) {
-                            // Check for credential files by lexical name OR canonical target.
-                            if (this.isLikelyCredentialFile(candidate) || this.isLikelyCredentialFile(fullPath)) {
-                                this.logging.info(`Detected credential file in command: ${fullPath}`)
-                                return {
-                                    requiresAcceptance: true,
-                                    warning: credentialFileWarningMessage,
-                                    commandCategory: CommandCategory.Mutate,
-                                }
-                            }
-
-                            // Check for binary files by lexical name OR canonical target.
-                            if (this.isLikelyBinaryFile(candidate) || this.isLikelyBinaryFile(fullPath)) {
-                                this.logging.info(`Detected binary file in command: ${fullPath}`)
-                                return {
-                                    requiresAcceptance: true,
-                                    warning: binaryFileWarningMessage,
-                                    commandCategory: CommandCategory.Mutate,
-                                }
-                            }
-                        }
-                    } catch (err) {
-                        // Ignore errors for files that don't exist or can't be accessed
-                        this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
-                    }
-
-                    // A file that shares its data with another name on disk, which may be outside the
-                    // workspace, needs approval wherever it is
-                    if (ExecuteBash.hasOtherNames(fullPath)) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: multiplyLinkedFileWarning(isReadOnlyCommand ? 'read' : 'modify'),
-                            commandCategory: highestCommandCategory,
-                        }
-                    }
-
-                    // An approved path skips the workspace check, not the file checks above
-                    if (approvedPaths && this.isApprovedArgument(candidate, fullPath, approvedPaths)) {
-                        continue
-                    }
-
-                    const isInWorkspace = workspaceUtils.isInWorkspace(canonicalWorkspaceFolders, fullPath)
-                    if (!isInWorkspace) {
-                        return {
-                            requiresAcceptance: true,
-                            warning: outOfWorkspaceWarningmessage,
-                            commandCategory: highestCommandCategory,
-                        }
+                    const approval = await this.pathArgumentApproval(arg, pathCheck, highestCommandCategory)
+                    if (approval) {
+                        return approval
                     }
                 }
 
@@ -474,6 +462,21 @@ export class ExecuteBash {
                         }
                 }
             }
+
+            // On Windows, cmd.exe reads the words of the raw command, and a word can name a different
+            // path than the shlex token that the loop above checked. Check those words too.
+            if (IS_WINDOWS_PLATFORM) {
+                const approval = await this.windowsWordsApproval(
+                    params.command,
+                    args,
+                    pathCheck,
+                    highestCommandCategory
+                )
+                if (approval) {
+                    return approval
+                }
+            }
+
             // Finally, check if the cwd is outside the workspace
             if (cwdNeedingApproval) {
                 return {
@@ -490,6 +493,146 @@ export class ExecuteBash {
             this.logging.warn(`Error while checking acceptance: ${(error as Error).message}`)
             return { requiresAcceptance: true, commandCategory: CommandCategory.ReadOnly }
         }
+    }
+
+    /**
+     * The approval that one argument of a command needs, or undefined when the argument is not a
+     * path, or is a path that passes the credential, binary, hard link, and workspace checks
+     */
+    private async pathArgumentApproval(
+        arg: string,
+        context: PathCheckContext,
+        commandCategory: CommandCategory
+    ): Promise<CommandValidation | undefined> {
+        // looksLikePath catches obvious paths (absolute, ./, ../, ".."
+        // traversal, Windows drive letters, tilde, ...).
+        // looksLikeRelativePath additionally catches bare relative
+        // arguments such as "notes.txt" or "sub/notes.txt" that would
+        // otherwise bypass the boundary and credential checks. Flags and
+        // plain-text tokens are intentionally not treated as paths.
+        if (!this.looksLikePath(arg) && !this.looksLikeRelativePath(arg, context.cwd)) {
+            return undefined
+        }
+
+        // Special handling for tilde paths in Unix-like systems
+        if (!IS_WINDOWS_PLATFORM && arg.startsWith('~')) {
+            // Treat tilde paths as absolute paths (they will be expanded by the shell)
+            return {
+                requiresAcceptance: true,
+                warning: destructiveCommandWarningMessage,
+                commandCategory: CommandCategory.Destructive,
+            }
+        }
+
+        // Resolve to an absolute path against cwd, then canonicalize it in
+        // a symlink-aware way (eliminates ".." traversal AND follows a
+        // symlink whose name is in-workspace but whose target is outside).
+        let candidate: string
+        if (!isAbsolute(arg) && context.cwd) {
+            candidate = resolve(context.cwd, arg)
+        } else {
+            candidate = resolve(arg)
+        }
+
+        // On Windows, do not check a UNC or device path outside the workspace on disk (see
+        // isRemoteWindowsPath): the file system call could connect to a host before the user approves.
+        if (IS_WINDOWS_PLATFORM && isRemoteWindowsPath(candidate, context.canonicalWorkspaceFolders)) {
+            return { requiresAcceptance: true, warning: outOfWorkspaceWarningmessage, commandCategory }
+        }
+
+        const fullPath = await resolveSymlinkAwarePath(candidate)
+
+        // Check if this is a credential or binary file that needs
+        // protection. The existence / regular-file guard stays on the
+        // canonical fullPath (as before), but the sensitivity
+        // heuristic considers BOTH the lexical spelling (candidate)
+        // and the canonical target (fullPath). Otherwise a symlink
+        // named ".env" or "tool.exe" whose target is an ordinary file
+        // would hide a credential/binary name behind an innocuous
+        // canonical name. This only widens the warning; approval
+        // (isPathApproved) and the workspace boundary remain
+        // canonical-only and are unchanged.
+        try {
+            if (existsSync(fullPath) && statSync(fullPath).isFile()) {
+                // Check for credential files by lexical name OR canonical target.
+                if (this.isLikelyCredentialFile(candidate) || this.isLikelyCredentialFile(fullPath)) {
+                    this.logging.info(`Detected credential file in command: ${fullPath}`)
+                    return {
+                        requiresAcceptance: true,
+                        warning: credentialFileWarningMessage,
+                        commandCategory: CommandCategory.Mutate,
+                    }
+                }
+
+                // Check for binary files by lexical name OR canonical target.
+                if (this.isLikelyBinaryFile(candidate) || this.isLikelyBinaryFile(fullPath)) {
+                    this.logging.info(`Detected binary file in command: ${fullPath}`)
+                    return {
+                        requiresAcceptance: true,
+                        warning: binaryFileWarningMessage,
+                        commandCategory: CommandCategory.Mutate,
+                    }
+                }
+            }
+        } catch (err) {
+            // Ignore errors for files that don't exist or can't be accessed
+            this.logging.debug(`Error checking file ${fullPath}: ${(err as Error).message}`)
+        }
+
+        // A file that shares its data with another name on disk, which may be outside the
+        // workspace, needs approval wherever it is
+        if (ExecuteBash.hasOtherNames(fullPath)) {
+            return {
+                requiresAcceptance: true,
+                warning: multiplyLinkedFileWarning(context.isReadOnlyCommand ? 'read' : 'modify'),
+                commandCategory,
+            }
+        }
+
+        // An approved path skips the workspace check, not the file checks above
+        if (context.approvedPaths && this.isApprovedArgument(candidate, fullPath, context.approvedPaths)) {
+            return undefined
+        }
+
+        const isInWorkspace = workspaceUtils.isInWorkspace(context.canonicalWorkspaceFolders, fullPath)
+        if (!isInWorkspace) {
+            return {
+                requiresAcceptance: true,
+                warning: outOfWorkspaceWarningmessage,
+                commandCategory,
+            }
+        }
+        return undefined
+    }
+
+    /**
+     * On Windows, the approval that the words of the raw command need, or undefined when every word
+     * passes the path checks. cmd.exe reads the words that {@link windowsCommandWords} returns, and
+     * shlex can make a different token of the same text: `app\.env` becomes `app.env`,
+     * `link\data.txt` becomes `linkdata.txt`, and `notes.txt,.env` stays one token. Only a word that
+     * is not also a token is checked, because the loop over the tokens already checked the others.
+     */
+    private async windowsWordsApproval(
+        command: string,
+        tokens: string[],
+        context: PathCheckContext,
+        commandCategory: CommandCategory
+    ): Promise<CommandValidation | undefined> {
+        const words = windowsCommandWords(command)
+        if (!words) {
+            return { requiresAcceptance: true, commandCategory }
+        }
+        const checkedTokens = new Set(tokens)
+        for (const word of words) {
+            if (checkedTokens.has(word)) {
+                continue
+            }
+            const approval = await this.pathArgumentApproval(word, context, commandCategory)
+            if (approval) {
+                return approval
+            }
+        }
+        return undefined
     }
 
     /**

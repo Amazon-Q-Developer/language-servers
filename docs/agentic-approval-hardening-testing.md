@@ -37,8 +37,10 @@ token boundary keeps a URI scheme such as `https:` from being read as a drive.
 The result is folded into the existing `requiresShellApproval` flag, which is evaluated at the end
 of the check. The per-argument loop still runs first, so when the path is visible as a token (for
 example a quoted path) the loop's more specific credential or out-of-workspace warning still takes
-precedence; only the mangled forms fall through to the raw-command requirement. The change only
-adds approval requirements. It never removes one, so it cannot weaken an existing prompt.
+precedence; only the mangled forms fall through to the raw-command requirement. Section 6 adds a
+check, after that loop, of the words that `cmd.exe` reads, so a mangled form that names a credential
+file or a path outside the workspace also gets that warning. The change only adds approval
+requirements. It never removes one, so it cannot weaken an existing prompt.
 
 ### Safe reproduction and expected results
 
@@ -179,14 +181,15 @@ drive path, two characters shorter.
 
 A third detector, `hasWindowsRootedPath`, matches a backslash at a token boundary and is folded into
 the same fail-closed requirement, so a path that begins with a backslash (including the UNC form, a
-superset) requires approval. It matches only a leading backslash. A backslash later in a token is
-left to other checks on purpose. An in-workspace relative path such as `sub\file` stays inside the
-workspace. A `..\` traversal is left to the existing traversal checks. The `\..` pre-check catches a
+superset) requires approval. It matches only a leading backslash. A path with a backslash later in a
+word, such as `sub\file`, is relative to the working directory, but it can still name a credential
+file or pass through a junction to a folder outside the workspace; section 6 checks it as `cmd.exe`
+reads it. A `..\` traversal is left to the existing traversal checks. The `\..` pre-check catches a
 multi-segment `..\..\` traversal, because its second segment contains a literal `\..`. A single-hop
-`..\name` from the workspace root also requires approval, but only indirectly: shlex deletes the
-backslash, so the workspace check sees the token `..name`, and it counts that token as outside the
-workspace only because its relative path starts with `..`. An explicit Windows `..\` check would
-remove that dependency; it is not part of this change.
+`..\name` from the workspace root also requires approval. shlex deletes the backslash, so the token
+check sees `..name` and counts it as outside the workspace because its relative path starts with
+`..`. The word check of section 6 also reads `..\name` as a path in the parent folder, so the result
+does not depend only on that token.
 
 ### Safe reproduction and expected results
 
@@ -269,3 +272,80 @@ npx ts-mocha --timeout 0 --exit -g "shell command" \
 To see it in the IDE, ask the agent to run `echo` with a right-to-left override in its argument, for
 example by pasting the text from the first row of the table into the prompt. Look at the approval
 card, then choose **Reject**.
+
+## 6. Windows paths with a backslash inside a word
+
+### What was wrong
+
+Sections 1, 2, and 4 handle a backslash at the start of a path. shlex still deleted a backslash
+inside a word, so the path checks saw a different path than `cmd.exe` opens. `type app\.env` reached
+the checks as the token `app.env`, a name in the working directory that does not exist, so the
+credential check did not run and the command ran with no prompt, while `cmd.exe` read `app\.env`.
+In the same way, `type link\data.txt`, where `link` is a junction to a folder outside the
+workspace, reached the checks as `linkdata.txt` inside the workspace, while `cmd.exe` followed the
+junction. A junction needs no privilege on Windows. `cmd.exe` also splits the arguments of a
+built-in command such as `type` at a comma or an equals sign, and shlex does not, so
+`type notes.txt,.env` hid `.env` in the token `notes.txt,.env`.
+
+The code comment of `hasWindowsRootedPath` and section 4 said that a path with a backslash inside a
+word stays inside the workspace.
+
+### How the fix works
+
+On Windows, `requiresAcceptance` also splits the raw command into the words that `cmd.exe` gives to a
+built-in command (`windowsCommandWords`). Whitespace, a comma, or an equals sign outside double quotes
+ends a word, the double quotes are removed, and a backslash stays in its word. After the loop over
+the shlex tokens, each word that is not also a token goes through the same path checks as a token:
+credential file, binary file, hard link, approved path, and workspace boundary. One method,
+`pathArgumentApproval`, now does these checks for tokens and words. A double quote that is not closed
+requires approval. The word check only adds approval requirements.
+
+A UNC or device path outside the workspace is not checked on disk. A file system call on a UNC path
+makes Windows connect to the host that the path names, which can send the user's credentials to
+that host before the user approves the command. On Windows, a token or word that resolves to a path
+that starts with two slashes or backslashes (`\\host\share`, `//host/share`, `\\?\...`) and is not
+in a workspace folder (`isRemoteWindowsPath`) now requires approval with the out-of-workspace
+warning, with no file system call. A path in a workspace folder on a share is still checked on
+disk, because the IDE already uses that host. Before this change, a token such as `//host/share`
+was checked on disk; without this guard, the word check would also check `\\host\share` on disk.
+
+### Safe reproduction and expected results
+
+On Windows, create a temporary workspace that contains `notes.txt`, `.env`, `app\notes.txt`,
+`app\.env`, and a junction `link` to a temporary folder outside the workspace that contains
+`data.txt` (`mklink /J link <folder>`). Use the workspace as the cwd and call `requiresAcceptance`
+only. Do not call `invoke`.
+
+| Command | Before | After |
+| --- | --- | --- |
+| `type app\.env` | no prompt | requires approval (credential warning) |
+| `type link\data.txt` | no prompt | requires approval (out-of-workspace warning) |
+| `type notes.txt,.env` | no prompt | requires approval (credential warning) |
+| `type //host.invalid/share/data.txt` | requires approval, after a file system call on the UNC path | requires approval, with no file system call |
+| `type app\notes.txt` | no prompt | no prompt |
+
+### Tests
+
+`executeBash.test.ts` adds a `windowsCommandWords` suite that runs on every platform: a backslash
+stays in its word, a comma and an equals sign split words, double quotes keep a space in a word and
+are removed, a single quote is an ordinary character, and a double quote that is not closed returns
+`undefined`. An `isRemoteWindowsPath` suite also runs on every platform, with Windows path rules: UNC,
+forward-slash UNC, and device paths are remote, a drive path is not, and a path in a workspace folder
+on a share is not remote unless it leaves that folder or names another host. The Windows-gated suite
+from section 1 adds cases for the credential file `app\.env`, the junction `link\data.txt`,
+`notes.txt,.env`, and two UNC forms. The UNC case also asserts that no file system call gets a path
+that starts with two slashes or backslashes. The control case `type app\notes.txt` still runs
+without approval.
+
+### How to test
+
+Same commands as section 1. The Windows-gated cases require the Windows CI job; a Linux or macOS
+run checks only `windowsCommandWords`.
+
+### Not covered
+
+- An external program, such as `cat.exe` from Git for Windows, splits its own command line with
+  rules that are not the same as those of a built-in command. The word check uses the rules of a
+  built-in command, in addition to the shlex tokens.
+- A path on a share outside the workspace requires approval each time, also when the user approved
+  its folder before, because the approved-path check needs the canonical path from disk.
