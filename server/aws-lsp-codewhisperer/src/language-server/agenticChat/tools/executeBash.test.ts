@@ -7,6 +7,12 @@ import {
     credentialFileWarningMessage,
     binaryFileWarningMessage,
     CommandCategory,
+    hasWindowsDrivePath,
+    hasWindowsUncPath,
+    hasWindowsRootedPath,
+    windowsCommandWords,
+    isRemoteWindowsPath,
+    hasWindowsTrailingDotOrSpace,
 } from './executeBash'
 import { multiplyLinkedFileWarning } from './toolShared'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
@@ -1632,5 +1638,368 @@ describe('ExecuteBash requiresAcceptance ReadOnly path handling (expanded, real 
         const result = await throwing.requiresAcceptance({ command: 'cat report.txt', cwd: ws })
         assert.equal(result.requiresAcceptance, true, 'an internal resolver error must fail closed')
         assert.equal(result.commandCategory, CommandCategory.ReadOnly)
+    })
+})
+
+describe('hasWindowsDrivePath (Windows drive-letter detection)', () => {
+    // On Windows the shell runs the raw command, but requiresAcceptance tokenizes with shlex, which
+    // deletes backslashes. A drive path therefore hides from the token-based path checks, so it must
+    // be detected in the raw command and fail closed. These are the forms that must be detected.
+    const drivePathCommands = [
+        'type C:\\Users\\alice\\.aws\\credentials',
+        'dir C:\\Users\\victim',
+        'cat C:/Users/alice/secrets.txt',
+        'type C:secrets.txt', // bare drive-relative path
+        'more D:\\data\\report.txt',
+        'C:\\tools\\run.bat', // drive path as the first token
+        'copy a:\\notes.txt dest', // single-letter drive after a token boundary
+        'type "C:\\Users\\alice\\secrets.txt"', // quoted drive path
+    ]
+    for (const command of drivePathCommands) {
+        it(`detects the drive path in ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsDrivePath(command), true)
+        })
+    }
+
+    // Look-alikes that must NOT be treated as drive paths, so they do not raise a spurious prompt.
+    const nonDrivePathCommands = [
+        'ls -la',
+        'cat project/notes.txt',
+        'cat ./report.txt',
+        'grep foo bar.txt',
+        'npm run test:unit', // a colon after a multi-character token is not a drive
+        'curl https://example.com', // a URI scheme is not a drive
+        'echo key:value',
+        'git log --oneline',
+    ]
+    for (const command of nonDrivePathCommands) {
+        it(`does not flag ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsDrivePath(command), false)
+        })
+    }
+})
+
+describe('hasWindowsUncPath (Windows UNC detection)', () => {
+    // A UNC path is also corrupted by shlex tokenization, so it must be detected in the raw command.
+    const uncCommands = [
+        'dir \\\\host\\share', // dir \\host\share
+        'type \\\\fileserver\\share\\data.txt', // type \\fileserver\share\data.txt
+        '\\\\host\\share\\file', // UNC path as the first token
+        'dir "\\\\host\\share"', // quoted UNC path
+        'type //host/share', // forward-slash UNC form
+    ]
+    for (const command of uncCommands) {
+        it(`detects the UNC path in ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsUncPath(command), true)
+        })
+    }
+
+    const nonUncCommands = [
+        'ls -la',
+        'cat project/notes.txt',
+        'cat ./report.txt',
+        'curl https://example.com', // a URI authority is not a UNC path
+        'cat a//b', // a double slash inside a token is not a UNC prefix
+    ]
+    for (const command of nonUncCommands) {
+        it(`does not flag ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsUncPath(command), false)
+        })
+    }
+})
+
+describe('hasWindowsRootedPath (Windows root-relative backslash detection)', () => {
+    // A path that begins with a backslash is corrupted by shlex (the leading backslash is deleted),
+    // so it must be detected in the raw command. These forms must be detected.
+    const rootedCommands = [
+        'type \\Users\\alice\\.aws\\credentials', // type \Users\alice\.aws\credentials
+        'dir \\Windows\\System32', // dir \Windows\System32
+        '\\server\\share\\file', // rooted path as the first token
+        'dir \\\\host\\share', // UNC is a superset of a leading backslash
+        'type "\\Users\\alice\\secrets.txt"', // quoted rooted path
+    ]
+    for (const command of rootedCommands) {
+        it(`detects the rooted path in ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsRootedPath(command), true)
+        })
+    }
+
+    // A backslash that is not at the start of a token is intentionally not matched here: requiresAcceptance
+    // checks a path with a backslash inside a word as cmd.exe reads it (windowsCommandWords), and a
+    // `..\` traversal is handled by the traversal checks.
+    const nonRootedCommands = [
+        'ls -la',
+        'cat project/notes.txt',
+        'cat sub\\file.txt', // backslash inside a word
+        'cat ..\\secret', // `..\` traversal is handled separately
+        'curl https://example.com',
+    ]
+    for (const command of nonRootedCommands) {
+        it(`does not flag ${JSON.stringify(command)}`, () => {
+            assert.equal(hasWindowsRootedPath(command), false)
+        })
+    }
+})
+
+describe('windowsCommandWords (the words that cmd.exe reads)', () => {
+    // shlex deletes a backslash inside a word and does not split at a comma or an equals sign, so on
+    // Windows requiresAcceptance also checks these words. Each case is [command, expected words].
+    const cases: Array<[string, string[]]> = [
+        ['type app\\.env', ['type', 'app\\.env']],
+        ['dir sub\\folder', ['dir', 'sub\\folder']],
+        ['type notes.txt,.env', ['type', 'notes.txt', '.env']],
+        ['type a=b.txt', ['type', 'a', 'b.txt']],
+        ['type "my folder\\.env"', ['type', 'my folder\\.env']],
+        ['type "app"\\.env', ['type', 'app\\.env']],
+        ['  dir   sub\\x  ', ['dir', 'sub\\x']],
+        ['type\tapp\\.env', ['type', 'app\\.env']],
+        ['type ""', ['type']],
+        ["type 'app\\.env'", ['type', "'app\\.env'"]], // cmd.exe does not treat a single quote as a quote
+    ]
+    for (const [command, words] of cases) {
+        it(`splits ${JSON.stringify(command)}`, () => {
+            assert.deepEqual(windowsCommandWords(command), words)
+        })
+    }
+
+    it('returns undefined for a double quote that is not closed', () => {
+        assert.equal(windowsCommandWords('type "app\\.env'), undefined)
+    })
+})
+
+describe('hasWindowsTrailingDotOrSpace (path segments that Windows changes when cmd.exe opens them)', () => {
+    // Each case is [path, expected]
+    const cases: Array<[string, boolean]> = [
+        ['.env.', true],
+        ['.env ', true],
+        ['.env...', true],
+        ['app.\\.env', true],
+        ['link.\\data.txt', true],
+        ['link./data.txt', true],
+        ['...', true],
+        ['.env', false],
+        ['notes.txt', false],
+        ['.', false],
+        ['..', false],
+        ['.\\notes.txt', false],
+        ['..\\notes.txt', false],
+        ['sub\\', false],
+        ['a..b', false],
+        ['C:\\Users\\alice\\notes.txt', false],
+    ]
+    for (const [windowsPath, expected] of cases) {
+        it(`returns ${expected} for ${JSON.stringify(windowsPath)}`, () => {
+            assert.equal(hasWindowsTrailingDotOrSpace(windowsPath), expected)
+        })
+    }
+})
+
+describe('isRemoteWindowsPath (UNC and device paths that are not checked on disk)', () => {
+    // Each case is [path, workspace folders, expected]. Windows path rules apply on every host.
+    const share = '\\\\fileserver\\projects\\app'
+    const cases: Array<[string, string[], boolean]> = [
+        ['\\\\host.invalid\\share\\data.txt', [], true],
+        ['//host.invalid/share/data.txt', [], true],
+        ['\\\\?\\C:\\Users\\alice\\secrets.txt', [], true], // device path
+        ['C:\\Users\\alice\\secrets.txt', [], false],
+        ['\\\\host.invalid\\share\\data.txt', ['C:\\workspace'], true],
+        [`${share}\\notes.txt`, [share], false], // a workspace folder on a share
+        ['\\\\FILESERVER\\Projects\\App\\notes.txt', [share], false], // Windows paths ignore case
+        [share, [share], false],
+        ['\\\\fileserver\\projects\\other\\notes.txt', [share], true],
+        [`${share}\\..\\other\\notes.txt`, [share], true],
+        ['\\\\host.invalid\\projects\\app\\notes.txt', [share], true], // same folder names, other host
+    ]
+    for (const [windowsPath, folders, expected] of cases) {
+        it(`returns ${expected} for ${JSON.stringify(windowsPath)} with workspace ${JSON.stringify(folders)}`, () => {
+            assert.equal(isRemoteWindowsPath(windowsPath, folders), expected)
+        })
+    }
+})
+
+describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
+    // These forms change the approval decision only on Windows, where cmd.exe runs the raw command.
+    // IS_WINDOWS_PLATFORM is fixed at module load, so this suite runs on a Windows host only; the
+    // detection functions are covered on every platform by the suites above. Each case calls
+    // requiresAcceptance only, and no command runs. The workspace is a real temporary folder and the
+    // cwd is the workspace, so the control cases run without approval: a prompt in another case
+    // comes from its path, not from a workspace or cwd that the check cannot find.
+    let features: TestFeatures
+    let root: string
+    let ws: string
+    let outside: string
+
+    const requiresAcceptance = (command: string, cwd = ws) =>
+        new ExecuteBash({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getAllWorkspaceFolders: () => [{ uri: URI.file(ws).toString(), name: 'ws' }],
+            },
+        } as any).requiresAcceptance({ command, cwd })
+
+    // Spies on the file system calls of the check. The returned function lists the paths that start
+    // with two slashes or backslashes, which a file system call would open on another host. It fails
+    // when the spies saw no call at all, so the test cannot pass with spies that the check does not use.
+    const spyOnRemotePaths = (): (() => string[]) => {
+        const spies = [
+            sinon.spy(fs.promises, 'lstat'),
+            sinon.spy(fs.promises, 'readlink'),
+            sinon.spy(fs.promises, 'realpath'),
+            sinon.spy(fs, 'existsSync'),
+            sinon.spy(fs, 'statSync'),
+            sinon.spy(fs, 'lstatSync'),
+        ]
+        return () => {
+            const calledPaths = spies.flatMap(spy => spy.getCalls().map(call => String(call.args[0])))
+            assert.ok(calledPaths.length > 0, 'the spies saw no file system call of the check')
+            return calledPaths.filter(calledPath => /^[\\/]{2}/.test(calledPath))
+        }
+    }
+
+    before(function () {
+        if (process.platform !== 'win32') {
+            return this.skip()
+        }
+        features = new TestFeatures()
+    })
+
+    beforeEach(() => {
+        mockfs.restore()
+        root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'eb-win-'))
+        ws = path.join(root, 'workspace')
+        outside = path.join(root, 'outside')
+        fs.mkdirSync(path.join(ws, 'app'), { recursive: true })
+        fs.mkdirSync(outside)
+        fs.writeFileSync(path.join(ws, 'notes.txt'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(ws, 'app', 'notes.txt'), 'synthetic fixture only')
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    it('does not require acceptance for an ordinary file in the workspace (control)', async () => {
+        assert.equal((await requiresAcceptance('type notes.txt')).requiresAcceptance, false)
+    })
+
+    it('does not require acceptance for a backslash path to an ordinary file in the workspace (control)', async () => {
+        assert.equal((await requiresAcceptance('type app\\notes.txt')).requiresAcceptance, false)
+    })
+
+    it('requires acceptance for an unquoted drive-letter path that cmd.exe would read', async () => {
+        const result = await requiresAcceptance('type C:\\Users\\alice\\.aws\\credentials')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a drive-letter path to a file in the workspace', async () => {
+        // The path checks pass for this file, so the prompt comes from the drive path detection
+        const result = await requiresAcceptance(`type "${path.join(ws, 'notes.txt')}"`)
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a UNC path that cmd.exe would open as a share', async () => {
+        const result = await requiresAcceptance('dir \\\\host.invalid\\share')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for an environment-variable argument cmd.exe would expand', async () => {
+        const result = await requiresAcceptance('type %USERPROFILE%\\secrets.txt')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a leading-backslash path that drops the drive letter', async () => {
+        const result = await requiresAcceptance('type \\Users\\alice\\.aws\\credentials')
+        assert.equal(result.requiresAcceptance, true)
+    })
+
+    it('requires acceptance for a single-hop ..\\ path to a file outside the workspace', async () => {
+        fs.writeFileSync(path.join(root, 'notes.txt'), 'synthetic fixture only')
+        const result = await requiresAcceptance('type ..\\notes.txt')
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, outOfWorkspaceWarningmessage)
+    })
+
+    // shlex deletes a backslash inside a word, so these paths reach the token checks as a different
+    // name in the workspace that does not exist. The checks of the words that cmd.exe reads find them.
+    it('requires acceptance for a credential file named with a backslash inside the word', async () => {
+        fs.writeFileSync(path.join(ws, 'app', '.env'), 'synthetic fixture only')
+        const result = await requiresAcceptance('type app\\.env')
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('requires acceptance for a path through a junction to a folder outside the workspace', async () => {
+        // A junction needs no privilege on Windows, unlike a symbolic link
+        fs.writeFileSync(path.join(outside, 'data.txt'), 'synthetic fixture only')
+        fs.symlinkSync(outside, path.join(ws, 'link'), 'junction')
+        const result = await requiresAcceptance('type link\\data.txt')
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, outOfWorkspaceWarningmessage)
+    })
+
+    it('requires acceptance for a credential file after a comma, which cmd.exe reads as another word', async () => {
+        fs.writeFileSync(path.join(ws, '.env'), 'synthetic fixture only')
+        const result = await requiresAcceptance('type notes.txt,.env')
+        assert.equal(result.requiresAcceptance, true)
+        assert.equal(result.warning, credentialFileWarningMessage)
+    })
+
+    it('requires acceptance for a path with a segment that ends in a period or a space', async () => {
+        // Windows removes the period or the space when cmd.exe opens the path, so cmd.exe reads .env
+        // and follows the junction, while the checks of the path as written find no such file
+        fs.writeFileSync(path.join(ws, '.env'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(outside, 'data.txt'), 'synthetic fixture only')
+        fs.symlinkSync(outside, path.join(ws, 'link'), 'junction')
+        for (const command of ['type .env.', 'type ".env "', 'type link.\\data.txt']) {
+            assert.equal((await requiresAcceptance(command)).requiresAcceptance, true, command)
+        }
+    })
+
+    it('requires acceptance in a cwd with a segment that ends in a period or a space', async () => {
+        // The command runs in the folder without the period or the space: there cmd.exe reads app\.env,
+        // or follows the junction, while the checks of the cwd as written find no such folder
+        fs.writeFileSync(path.join(ws, 'app', '.env'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(outside, 'data.txt'), 'synthetic fixture only')
+        fs.symlinkSync(outside, path.join(ws, 'link'), 'junction')
+        for (const [command, cwd] of [
+            ['type .env', `${path.join(ws, 'app')}.`],
+            ['type data.txt', `${path.join(ws, 'link')}.`],
+            ['dir', `${path.join(ws, 'app')} `],
+        ]) {
+            const result = await requiresAcceptance(command, cwd)
+            assert.equal(result.requiresAcceptance, true, `${command} in ${JSON.stringify(cwd)}`)
+            assert.equal(result.approvalPaths, undefined, cwd)
+        }
+        // Control: the same folder without the period
+        assert.equal((await requiresAcceptance('type notes.txt', path.join(ws, 'app'))).requiresAcceptance, false)
+    })
+
+    it('requires acceptance for a UNC path without opening it on disk', async () => {
+        // A file system call on a UNC path makes Windows connect to its host. In the last command, only
+        // the word after the comma is a UNC path: the shlex token is a name in the workspace.
+        const remotePaths = spyOnRemotePaths()
+        for (const command of [
+            'type //host.invalid/share/data.txt',
+            'dir \\\\host.invalid\\share',
+            'type notes.txt,\\\\host.invalid\\share\\x.txt',
+        ]) {
+            const result = await requiresAcceptance(command)
+            assert.equal(result.requiresAcceptance, true, command)
+            assert.equal(result.warning, outOfWorkspaceWarningmessage, command)
+        }
+        assert.deepEqual(remotePaths(), [])
+    })
+
+    it('requires acceptance for a UNC working directory without opening it on disk', async () => {
+        const remotePaths = spyOnRemotePaths()
+        for (const cwd of ['\\\\host.invalid\\share', '//host.invalid/share']) {
+            const result = await requiresAcceptance('type notes.txt', cwd)
+            assert.equal(result.requiresAcceptance, true, cwd)
+            assert.equal(result.warning, outOfWorkspaceWarningmessage, cwd)
+            assert.equal(result.approvalPaths, undefined, cwd)
+        }
+        assert.deepEqual(remotePaths(), [])
     })
 })
