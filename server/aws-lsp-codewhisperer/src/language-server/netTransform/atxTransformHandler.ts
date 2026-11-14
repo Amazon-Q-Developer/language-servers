@@ -793,11 +793,24 @@ export class ATXTransformHandler {
 
     /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob, which says what each answer means). */
     private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | 'unconfirmed' | undefined> {
-        const { repos, beamMapScanned, beamMapUnconfirmed } = await this.discoverBeamedRepos(workspaceId, jobId, false)
+        const { repos, beamMapScanned, beamMapUnconfirmed, scanAborted } = await this.discoverBeamedRepos(
+            workspaceId,
+            jobId,
+            false
+        )
         if (beamMapScanned) {
             return repos.some(r => r.GenerateIntegrationTests)
         }
-        return beamMapUnconfirmed ? 'unconfirmed' : undefined
+        // A scan that was cut short (timed out or throttled during the scan) counts as 'unconfirmed':
+        // it's retried with exponential back-off and eventually gives up after beamMaxReadsThatCannotTell
+        // attempts, rather than retrying flat every 60 s forever. For job 401bf8f4: 8 beam-status-*
+        // artifacts ahead of the pathless beam-map caused a 15 s timeout on every scan attempt because
+        // the old code didn't filter them. With the filter fix they are excluded, so this branch is now
+        // only hit when the beam-map is pathless but the download itself is slow or times out.
+        if (beamMapUnconfirmed || scanAborted) {
+            return 'unconfirmed'
+        }
+        return undefined
     }
 
     /**
@@ -809,7 +822,12 @@ export class ATXTransformHandler {
         workspaceId: string,
         parentJobId: string,
         lightweight: boolean
-    ): Promise<{ repos: BeamedRepoInfo[]; beamMapScanned: boolean; beamMapUnconfirmed: boolean }> {
+    ): Promise<{
+        repos: BeamedRepoInfo[]
+        beamMapScanned: boolean
+        beamMapUnconfirmed: boolean
+        scanAborted: boolean
+    }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -1035,6 +1053,14 @@ export class ATXTransformHandler {
             const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
             const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
             const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
+            // True when the scan hit the time budget (not throttled — throttles are transient infrastructure
+            // hiccups and should NOT count toward the 'unconfirmed' cap). The gate treats a timeout as
+            // 'unconfirmed': retried with exponential back-off, eventually gives up after
+            // beamMaxReadsThatCannotTell attempts, rather than retrying flat every 60 s forever.
+            // For job 401bf8f4: 8 beam-status-* artifacts ahead of the pathless beam-map caused a 15 s
+            // timeout on every scan. After the beam-status filter fix that's no longer possible, so this
+            // path only fires when the beam-map candidate's own download is unusually slow.
+            const scanAborted = !lightweight && scanCutShort
             const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
             if (unreadKey === undefined) {
                 // Only a finished scan with an answer ends the warning; a lightweight, throttled or
@@ -1196,14 +1222,32 @@ export class ATXTransformHandler {
                 this.itGenJobs.rememberBeamOptIn(parentJobId)
             }
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
+            // Single summary line per scan — the most useful line for diagnosing future failures.
+            const scanResultLabel = beamMapOptsIn
+                ? 'found-opted-in'
+                : beamMapUnconfirmed
+                  ? 'unconfirmed'
+                  : scanAborted
+                    ? scanCutShort
+                        ? 'timed-out'
+                        : 'throttled-during-scan'
+                    : scanFinished
+                      ? 'not-opted-in'
+                      : 'no-scan'
+            this.logging.log(
+                `[BEAM-PKG] scan-summary job=${parentJobId} result=${scanResultLabel} ` +
+                    `candidates=${candidates.length} unreadable=${unreadable.length} ` +
+                    `beamMapFound=${beamMaps.length > 0} repos=${beamed.length}`
+            )
             return {
                 repos: beamed,
                 beamMapScanned: scanFinished && !beamMapUnconfirmed,
                 beamMapUnconfirmed,
+                scanAborted,
             }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return { repos: [], beamMapScanned: false, beamMapUnconfirmed: false }
+            return { repos: [], beamMapScanned: false, beamMapUnconfirmed: false, scanAborted: false }
         }
     }
 
