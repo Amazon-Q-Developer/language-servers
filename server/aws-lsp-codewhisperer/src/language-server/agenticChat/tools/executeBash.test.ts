@@ -1839,7 +1839,8 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
         } as any).requiresAcceptance({ command, cwd })
 
     // Spies on the file system calls of the check. The returned function lists the paths that start
-    // with two slashes or backslashes, which a file system call would open on another host.
+    // with two slashes or backslashes, which a file system call would open on another host. It fails
+    // when the spies saw no call at all, so the test cannot pass with spies that the check does not use.
     const spyOnRemotePaths = (): (() => string[]) => {
         const spies = [
             sinon.spy(fs.promises, 'lstat'),
@@ -1849,10 +1850,11 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
             sinon.spy(fs, 'statSync'),
             sinon.spy(fs, 'lstatSync'),
         ]
-        return () =>
-            spies
-                .flatMap(spy => spy.getCalls().map(call => String(call.args[0])))
-                .filter(calledPath => /^[\\/]{2}/.test(calledPath))
+        return () => {
+            const calledPaths = spies.flatMap(spy => spy.getCalls().map(call => String(call.args[0])))
+            assert.ok(calledPaths.length > 0, 'the spies saw no file system call of the check')
+            return calledPaths.filter(calledPath => /^[\\/]{2}/.test(calledPath))
+        }
     }
 
     before(function () {
@@ -1956,9 +1958,14 @@ describe('requiresAcceptance on Windows path forms (real filesystem)', () => {
     })
 
     it('requires acceptance for a UNC path without opening it on disk', async () => {
-        // A file system call on a UNC path makes Windows connect to its host
+        // A file system call on a UNC path makes Windows connect to its host. In the last command, only
+        // the word after the comma is a UNC path: the shlex token is a name in the workspace.
         const remotePaths = spyOnRemotePaths()
-        for (const command of ['type //host.invalid/share/data.txt', 'dir \\\\host.invalid\\share']) {
+        for (const command of [
+            'type //host.invalid/share/data.txt',
+            'dir \\\\host.invalid\\share',
+            'type notes.txt,\\\\host.invalid\\share\\x.txt',
+        ]) {
             const result = await requiresAcceptance(command)
             assert.equal(result.requiresAcceptance, true, command)
             assert.equal(result.warning, outOfWorkspaceWarningmessage, command)

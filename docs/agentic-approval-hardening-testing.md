@@ -313,6 +313,8 @@ in a workspace folder (`isRemoteWindowsPath`) now requires approval with the out
 warning, with no file system call. A path in a workspace folder on a share is still checked on
 disk, because the IDE already uses that host. Before this change, a token such as `//host/share`
 was checked on disk; without this guard, the word check would also check `\\host\share` on disk.
+The guard looks at the path as written. A symbolic link in the workspace whose target is a UNC path
+is still followed when the check opens the path (see Not covered).
 
 ### Safe reproduction and expected results
 
@@ -338,14 +340,15 @@ are removed, a single quote is an ordinary character, and a double quote that is
 forward-slash UNC, and device paths are remote, a drive path is not, and a path in a workspace folder
 on a share is not remote unless it leaves that folder or names another host. The Windows-gated suite
 from section 1 adds cases for the credential file `app\.env`, the junction `link\data.txt`,
-`notes.txt,.env`, and two UNC forms. The UNC case also asserts that no file system call gets a path
-that starts with two slashes or backslashes. The control case `type app\notes.txt` still runs
-without approval.
+`notes.txt,.env`, and three UNC forms; in one of them only the word after a comma is a UNC path. The
+UNC case also asserts that no file system call gets a path that starts with two slashes or
+backslashes, and that the spies saw the file system calls of the check. The control case
+`type app\notes.txt` still runs without approval.
 
 ### How to test
 
 Same commands as section 1. The Windows-gated cases require the Windows CI job; a Linux or macOS
-run checks only `windowsCommandWords`.
+run checks only `windowsCommandWords` and `isRemoteWindowsPath`.
 
 ### Not covered
 
@@ -354,6 +357,10 @@ run checks only `windowsCommandWords`.
   built-in command, in addition to the shlex tokens.
 - A path on a share outside the workspace requires approval each time, also when the user approved
   its folder before, because the approved-path check needs the canonical path from disk.
+- A symbolic link in the workspace whose target is a UNC path. The check follows the link when it
+  opens the path, as other tools that open the path do, and Windows then connects to the host.
+  Creating such a link needs the symbolic link privilege or Developer Mode; a junction cannot point
+  to a network path.
 
 ## 7. A UNC working directory
 
@@ -371,7 +378,8 @@ On Windows, before any file system call on the cwd, `requiresAcceptance` checks 
 `isRemoteWindowsPath` (section 6). A UNC or device cwd that is not in a workspace folder requires
 approval with the out-of-workspace warning, and the result has no `approvalPaths`, so an approval
 does not allow that cwd for later commands. A cwd in a workspace folder on a share is still checked
-as before.
+as before. As in section 6, the check looks at the cwd as written: a cwd that is a symbolic link to
+a UNC path is not covered.
 
 ### Safe reproduction and expected results
 
