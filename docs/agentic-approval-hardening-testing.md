@@ -22,10 +22,15 @@ gap by inspecting the raw command on Windows and failing closed.
 drive path such as `type C:\Users\alice\.aws\credentials` tokenizes to the single token
 `C:Usersalice.awscredentials`: the backslashes are gone, so it no longer looks absolute, it
 resolves inside the working directory, and it passes the workspace and credential checks. The
-command is read-only, so no approval prompt appears, while `cmd.exe` still opens the real file. A
-forward-slash drive path (`C:/Users/alice/...`) and a bare drive-relative path (`C:secrets.txt`)
-behave the same way. Only the unquoted form is affected; a quoted path keeps its backslashes
-through `shlex` and was already checked.
+command is read-only, so no approval prompt appears, while `cmd.exe` still opens the real file. Only
+the unquoted backslash form is affected; a quoted path keeps its backslashes through `shlex` and was
+already checked.
+
+Two other drive forms were not bypasses. A forward-slash drive path (`C:/Users/alice/...`) keeps its
+slashes through `shlex`, so the token looks absolute and the workspace check already required
+approval. A bare drive-relative path (`C:secrets.txt`) also stays as it is, and the check resolves
+it against the current folder of drive C, where `cmd.exe` reads it. The detection below requires
+approval for both forms anyway.
 
 ### How the fix works
 
@@ -51,8 +56,8 @@ Configure a test workspace at `C:\workspace\folder` and call `requiresAcceptance
 | --- | --- | --- |
 | `type C:\Users\alice\.aws\credentials` | no prompt | requires approval |
 | `dir C:\Users\victim` | no prompt | requires approval |
-| `cat C:/Users/alice/secrets.txt` | no prompt | requires approval |
-| `type C:secrets.txt` (drive-relative) | no prompt | requires approval |
+| `cat C:/Users/alice/secrets.txt` | requires approval | requires approval |
+| `type C:secrets.txt` (drive-relative, resolves in the cwd) | no prompt | requires approval |
 | `type "C:\Users\alice\secrets.txt"` (quoted) | requires approval | requires approval |
 | `cat project/notes.txt` (in-workspace) | no prompt | no prompt |
 | `ls -la` | no prompt | no prompt |
