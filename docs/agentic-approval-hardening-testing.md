@@ -206,3 +206,62 @@ path requires approval; it skips on a non-Windows host.
 ### How to test
 
 Same commands as section 1. The Windows-gated case requires the Windows CI job.
+
+## 5. Hidden characters in the command of a shell card
+
+### What was wrong
+
+The approval card of `executeBash`, and the card that shows the command while and after it runs,
+showed the command as the model sent it. A command can hold characters that the card does not show
+as they are: bidirectional overrides and isolates (U+202A–U+202E, U+2066–U+2069) change the order in
+which the text appears, zero-width characters and tag characters (U+E0000–U+E007F) do not appear at
+all, and a carriage return or a line separator can split one line of the command into two lines on
+screen. So the user could approve a command that looked different from the command that runs.
+
+### How the fix works
+
+`shellCommandBlockStart` in `agenticChat/textFormatting.ts`, which every shell card uses (also through
+`shellCommandBlock`), now shows each of these characters as an escape: `\uXXXX`, or `\u{XXXXX}` above
+U+FFFF. It escapes control characters other than line feeds and tabs, format characters, line and
+paragraph separators, spaces other than U+0020, and the other default ignorable characters. Only the
+shown copy changes; the command that runs is the original. An escape has no backticks, so the code
+fence of the shown command is the fence of the original command, and the fence that closes the output
+of a running command still matches.
+
+A command that contains text such as `\u202E` as written looks the same in the card as a command with
+that character. A variation selector after an emoji and a zero-width joiner in an emoji sequence are
+shown as escapes too.
+
+### Safe reproduction and expected results
+
+The Before and After columns show the text of the code block in the card. Do not run these commands.
+
+| Command | Before | After |
+| --- | --- | --- |
+| `echo safe <U+202E># ~ fr- mr` | `echo safe ` followed by `rm -rf ~ #` in right-to-left order | `echo safe \u202E# ~ fr- mr` |
+| `cat <U+200B>notes.txt` | `cat notes.txt` | `cat \u200Bnotes.txt` |
+| `echo a<CR>rm -rf b` | `echo a` and `rm -rf b` on two lines | `echo a\u000Drm -rf b` |
+| `ls -la` | `ls -la` | `ls -la` |
+
+### Tests
+
+`textFormatting.test.ts` adds three cases to the "shell command blocks" suite: hidden characters of
+each kind become escapes in `shellCommandBlock` and `shellCommandBlockStart`; line feeds, tabs,
+spaces, shell syntax and visible non-ASCII text stay as they are; and the fence of the shown command
+equals the fence of the original command when hidden characters sit next to backticks.
+`agenticChatController.test.ts` adds a case to "shell command cards": the approval card shows the
+escapes, and the tool runs with the original command.
+
+### How to test
+
+From `server/aws-lsp-codewhisperer`:
+
+```sh
+npx ts-mocha --timeout 0 --exit -g "shell command" \
+  src/language-server/agenticChat/textFormatting.test.ts \
+  src/language-server/agenticChat/agenticChatController.test.ts
+```
+
+To see it in the IDE, ask the agent to run `echo` with a right-to-left override in its argument, for
+example by pasting the text from the first row of the table into the prompt. Look at the approval
+card, then choose **Reject**.

@@ -4659,6 +4659,55 @@ ${' '.repeat(8)}}
             assert.strictEqual(card.body, `${fence}shell\n${command}\n${fence}`)
         })
 
+        it('shows hidden characters of the command as escapes in the approval card and runs the command unchanged', async () => {
+            const hiddenCommand = 'echo safe \u202E# ~ fr- mr\u200B'
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: 'executeBash', description: 'Run command' } },
+            ])
+            ;(testFeatures.agent.getBuiltInToolNames as sinon.SinonStub).returns(['executeBash'])
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.reset()
+            runToolStub.resolves({ output: { kind: 'json', content: { exitStatus: '0', stdout: '', stderr: '' } } })
+            const chatResultStream = {
+                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+                writeResultBlock: sinon.stub().resolves(1),
+                overwriteResultBlock: sinon.stub().resolves(),
+                removeResultBlock: sinon.stub().resolves(),
+                getMessageBlockId: sinon.stub().returns(undefined),
+                hasMessage: sinon.stub().returns(false),
+                updateOngoingProgressResult: sinon.stub().resolves(),
+                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+                setMessageIdToUpdateForTool: sinon.stub(),
+                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+                addMessageOperation: sinon.stub(),
+                getMessageOperation: sinon.stub().returns(undefined),
+            }
+            const mockSession = {
+                toolUseLookup: new Map(),
+                pairProgrammingMode: true,
+                approvedPaths: new Map(),
+                addApprovedPath: sinon.stub(),
+                getConversationType: sinon.stub().returns('AgenticChat'),
+                setDeferredToolExecution: (_toolUseId: string, resolve: () => void) => resolve(),
+            } as any
+
+            await chatController.processToolUses(
+                [{ toolUseId: 'bash-id', name: 'executeBash', input: { command: hiddenCommand }, stop: true }],
+                chatResultStream as any,
+                mockSession,
+                'tabId',
+                mockCancellationToken
+            )
+
+            const approvalCard = chatResultStream.writeResultBlock
+                .getCalls()
+                .map(call => call.args[0])
+                .find(block => block.messageId === 'bash-id')
+            assert.strictEqual(approvalCard.body, '```shell\necho safe \\u202E# ~ fr- mr\\u200B')
+            sinon.assert.calledOnce(runToolStub)
+            assert.strictEqual(runToolStub.firstCall.args[1].command, hiddenCommand)
+        })
+
         // The stubbed result stream the cards are written to
         const makeStream = () => ({
             removeResultBlockAndUpdateUI: sinon.stub().resolves(),
