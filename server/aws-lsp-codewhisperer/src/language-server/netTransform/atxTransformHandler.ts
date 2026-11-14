@@ -1053,14 +1053,12 @@ export class ATXTransformHandler {
             const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
             const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
             const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
-            // True when the scan hit the time budget (not throttled — throttles are transient infrastructure
-            // hiccups and should NOT count toward the 'unconfirmed' cap). The gate treats a timeout as
-            // 'unconfirmed': retried with exponential back-off, eventually gives up after
-            // beamMaxReadsThatCannotTell attempts, rather than retrying flat every 60 s forever.
-            // For job 401bf8f4: 8 beam-status-* artifacts ahead of the pathless beam-map caused a 15 s
-            // timeout on every scan. After the beam-status filter fix that's no longer possible, so this
-            // path only fires when the beam-map candidate's own download is unusually slow.
-            const scanAborted = !lightweight && scanCutShort
+            // True when the scan ran but was cut short (time budget exhausted or a throttle arrived
+            // mid-scan). The gate treats this as 'unconfirmed': retried with exponential back-off,
+            // eventually gives up after beamMaxReadsThatCannotTell attempts, rather than retrying flat
+            // every 60 s forever. Both causes are included because a throttle mid-scan is just as
+            // incomplete as a budget timeout — the beam-map may not have been reached in either case.
+            const scanAborted = !lightweight && (scanCutShort || throttledDuringScan)
             const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
             if (unreadKey === undefined) {
                 // Only a finished scan with an answer ends the warning; a lightweight, throttled or

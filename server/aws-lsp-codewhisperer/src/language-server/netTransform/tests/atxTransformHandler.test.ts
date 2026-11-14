@@ -5767,9 +5767,9 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             })
         }
 
-        // A throttle that starts during the scan is like the throttle cooldown: the scan didn't finish, so it isn't
-        // counted towards the gate's cap.
-        it("doesn't count a scan throttled part-way as unconfirmed", async () => {
+        // A throttle that starts during the scan also makes the scan incomplete — the beam-map may not
+        // have been reached — so it counts as 'unconfirmed' just like a budget timeout.
+        it('counts a scan throttled part-way as unconfirmed so the gate retries with back-off', async () => {
             sendStub.resolves({
                 artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
             })
@@ -5784,7 +5784,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
                 return null
             }) as any)
 
-            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
         })
 
         it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
