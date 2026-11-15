@@ -227,6 +227,8 @@ const BEAM_THROTTLE_COOLDOWN_MS = 90000
 // The most artifacts whose last CreateArtifactDownloadUrl failure reason is remembered (read by the
 // beam/original-code downloads to tell the IDE WHY; other callers never read it, so bound it).
 const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
+// downloadBeamArtifact's ErrorCode for a destination it refuses (retrying the same path can't help).
+export const BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION = 'InvalidDestination'
 
 /**
  * How CreateArtifactDownloadUrl should react to a failed call:
@@ -236,6 +238,29 @@ const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
  * - 'permanent': not found / access denied / validation / other 4xx, or anything unrecognised —
  *   retrying will not help, so fail now.
  */
+const KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS = [
+    'ResourceNotFoundException',
+    'AccessDeniedException',
+    'ValidationException',
+]
+
+/**
+ * True when classifyDownloadUrlError only called `error` permanent because it didn't recognise it (the
+ * fail-safe default), not because it is a known permanent error or a 4xx.
+ */
+export function isUnrecognizedDownloadUrlError(error: unknown): boolean {
+    const e = error as any
+    const status: number | undefined = e?.$metadata?.httpStatusCode
+    // A plain Error without service metadata is ours (e.g. "ATX client not initialized"), not a service error type.
+    const isServiceError = (!!e?.name && e.name !== 'Error') || e?.$metadata !== undefined
+    return (
+        isServiceError &&
+        classifyDownloadUrlError(error) === 'permanent' &&
+        !KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS.includes(e?.name ?? '') &&
+        !(typeof status === 'number' && status >= 400 && status < 500)
+    )
+}
+
 export function classifyDownloadUrlError(error: unknown): 'throttle' | 'transient' | 'permanent' {
     const e = error as any
     const name: string = e?.name ?? ''
@@ -250,14 +275,17 @@ export function classifyDownloadUrlError(error: unknown): 'throttle' | 'transien
     ) {
         return 'throttle'
     }
-    if (['ResourceNotFoundException', 'AccessDeniedException', 'ValidationException'].includes(name)) {
+    // Any 5xx is transient whatever its name.
+    if (typeof status === 'number' && status >= 500) {
+        return 'transient'
+    }
+    if (KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS.includes(name)) {
         return 'permanent'
     }
     if (typeof status === 'number' && status >= 400 && status < 500) {
         return 'permanent'
     }
     if (
-        (typeof status === 'number' && status >= 500) ||
         ['InternalServerException', 'ServiceUnavailableException', 'TimeoutError', 'NetworkingError'].includes(name) ||
         ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(code) ||
         /ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|unknown error/i.test(msg)
@@ -847,11 +875,17 @@ export class ATXTransformHandler {
 
     /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob, which says what each answer means). */
     private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | 'unconfirmed' | undefined> {
-        const { repos, beamMapScanned, beamMapUnconfirmed, scanAborted } = await this.discoverBeamedRepos(
+        const { repos, beamMapScanned, beamMapUnconfirmed, scanAborted, optInFound } = await this.discoverBeamedRepos(
             workspaceId,
             jobId,
             false
         )
+        // A beam-map read before the scan was cut short that opts a repo in decides: more candidates can't
+        // take the opt-in back. Remembered here, not left to discoverBeamedRepos' side effect.
+        if (optInFound) {
+            this.itGenJobs.rememberBeamOptIn(jobId)
+            return true
+        }
         if (beamMapScanned) {
             return repos.some(r => r.GenerateIntegrationTests)
         }
@@ -881,6 +915,8 @@ export class ATXTransformHandler {
         beamMapScanned: boolean
         beamMapUnconfirmed: boolean
         scanAborted: boolean
+        /** A beam-map that was read opts at least one repo in (even if the scan was cut short afterwards). */
+        optInFound: boolean
     }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
@@ -1296,10 +1332,17 @@ export class ATXTransformHandler {
                 beamMapScanned: scanFinished && !beamMapUnconfirmed,
                 beamMapUnconfirmed,
                 scanAborted,
+                optInFound: beamMapOptsIn,
             }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return { repos: [], beamMapScanned: false, beamMapUnconfirmed: false, scanAborted: false }
+            return {
+                repos: [],
+                beamMapScanned: false,
+                beamMapUnconfirmed: false,
+                scanAborted: false,
+                optInFound: false,
+            }
         }
     }
 
@@ -1547,7 +1590,7 @@ export class ATXTransformHandler {
         parentJobId: string,
         beamArtifactId: string,
         destDir: string
-    ): Promise<{ Success: boolean; ExtractedPath?: string; Error?: string }> {
+    ): Promise<{ Success: boolean; ExtractedPath?: string; Error?: string; ErrorCode?: string }> {
         try {
             this.logging.log(`[BEAM-PKG] downloadBeamArtifact ${beamArtifactId} -> ${destDir}`)
             // destDir must be an absolute path (the IDE passes a resolved workspace path).
@@ -1555,7 +1598,12 @@ export class ATXTransformHandler {
             // location; the zip-slip guard in extractAllEntriesTo then confines each entry
             // within this dir.
             if (!isSafeAbsolutePath(destDir)) {
-                return { Success: false, Error: 'Invalid destination directory for beam artifact' }
+                // ErrorCode lets the IDE tell this apart without matching the (English) message.
+                return {
+                    Success: false,
+                    Error: 'Invalid destination directory for beam artifact',
+                    ErrorCode: BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION,
+                }
             }
             const dl = await this.createArtifactDownloadUrl(workspaceId, parentJobId, beamArtifactId)
             if (!dl?.s3PresignedUrl) {
@@ -2050,20 +2098,26 @@ export class ATXTransformHandler {
     // URL, or the call succeeded). createArtifactDownloadUrl keeps returning null on failure so every
     // existing caller is unchanged; the beam/original-code downloads read the reason from here so the
     // IDE can show WHY instead of a fixed "No presigned URL".
-    private readonly downloadUrlErrorReasons = new Map<string, string>()
+    // missingUrl: the last attempt returned no URL, after an earlier attempt failed with `reason`.
+    private readonly downloadUrlErrorReasons = new Map<string, { reason: string; missingUrl: boolean }>()
+    // Error names already warned about as unrecognised (once each per process).
+    private readonly warnedUnrecognizedDownloadUrlErrors = new Set<string>()
     // Base of the retry backoff (250, 500, 1000ms, jittered). A field so tests can make it ~0.
     private downloadUrlBackoffBaseMs = 250
 
     /** IDE-facing message for a null createArtifactDownloadUrl result. Never includes the URL. */
     private downloadUrlFailureMessage(artifactId: string, what: string): string {
-        const reason = this.downloadUrlErrorReasons.get(artifactId)
+        const entry = this.downloadUrlErrorReasons.get(artifactId)
         this.downloadUrlErrorReasons.delete(artifactId)
-        return reason
-            ? `Could not get a download URL for the ${what} (${reason})`
-            : `The service returned no download URL for the ${what}`
+        if (!entry) {
+            return `The service returned no download URL for the ${what}`
+        }
+        return entry.missingUrl
+            ? `The service returned no download URL for the ${what} (after an earlier error: ${entry.reason})`
+            : `Could not get a download URL for the ${what} (${entry.reason})`
     }
 
-    private setDownloadUrlErrorReason(artifactId: string, reason: string | undefined): void {
+    private setDownloadUrlErrorReason(artifactId: string, reason: string | undefined, missingUrl = false): void {
         this.downloadUrlErrorReasons.delete(artifactId)
         if (reason === undefined) {
             return
@@ -2075,7 +2129,7 @@ export class ATXTransformHandler {
                 this.downloadUrlErrorReasons.delete(oldest)
             }
         }
-        this.downloadUrlErrorReasons.set(artifactId, reason)
+        this.downloadUrlErrorReasons.set(artifactId, { reason, missingUrl })
     }
 
     async createArtifactDownloadUrl(
@@ -2127,6 +2181,7 @@ export class ATXTransformHandler {
                 const result = (await this.atxClient!.send(command)) as any
                 if (result && result.s3PreSignedUrl) {
                     this.logging.log(`ATX: CreateArtifactDownloadUrl completed successfully`)
+                    this.setDownloadUrlErrorReason(artifactId, undefined)
 
                     const normalizedHeaders: Record<string, string> = {}
                     if (result.requestHeaders) {
@@ -2150,7 +2205,11 @@ export class ATXTransformHandler {
                     this.logging.error(
                         `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — NOT a throttle; not retrying`
                     )
-                    this.setDownloadUrlErrorReason(artifactId, undefined)
+                    // Keep the reason of an earlier failed attempt, if any: it's likely why there's no URL.
+                    const earlier = this.downloadUrlErrorReasons.get(artifactId)
+                    if (earlier) {
+                        this.setDownloadUrlErrorReason(artifactId, earlier.reason, true)
+                    }
                     return null
                 }
             } catch (error) {
@@ -2166,6 +2225,16 @@ export class ATXTransformHandler {
                     // Record it regardless of whether we retry: the signal is "the service is
                     // pushing back", which is true on the last attempt as much as the first.
                     this.noteBeamThrottled()
+                }
+                if (isUnrecognizedDownloadUrlError(error)) {
+                    // Permanent is the fail-safe default; say so once per name so a new error type is visible.
+                    const unknownName = name || 'Error'
+                    if (!this.warnedUnrecognizedDownloadUrlErrors.has(unknownName)) {
+                        this.warnedUnrecognizedDownloadUrlErrors.add(unknownName)
+                        this.logging.warn(
+                            `[BEAM-PKG] CreateArtifactDownloadUrl: unrecognized error name=${unknownName} status=${(error as any)?.$metadata?.httpStatusCode ?? 'none'} — treated as permanent`
+                        )
+                    }
                 }
                 this.setDownloadUrlErrorReason(artifactId, describeDownloadUrlError(error))
                 if (retryable && attempt < maxAttempts) {
