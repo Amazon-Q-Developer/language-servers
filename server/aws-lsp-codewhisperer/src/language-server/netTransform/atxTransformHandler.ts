@@ -224,6 +224,60 @@ const BEAM_MAP_UNREADABLE_WARNED_MAX = 200
 // the 30s dashboard/info-bar poll interval: a cooldown shorter than the poll would merely delay calls
 // within one sweep instead of dropping whole sweeps, which is the only thing that reduces our rate.
 const BEAM_THROTTLE_COOLDOWN_MS = 90000
+// The most artifacts whose last CreateArtifactDownloadUrl failure reason is remembered (read by the
+// beam/original-code downloads to tell the IDE WHY; other callers never read it, so bound it).
+const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
+
+/**
+ * How CreateArtifactDownloadUrl should react to a failed call:
+ * - 'throttle': FES pushed back — retry with backoff and record the cooldown.
+ * - 'transient': 5xx / network / "unknown error" (seen alongside a concurrent ListMessages
+ *   "unknown error" from the same IDE) — retry with the same bounded backoff.
+ * - 'permanent': not found / access denied / validation / other 4xx, or anything unrecognised —
+ *   retrying will not help, so fail now.
+ */
+export function classifyDownloadUrlError(error: unknown): 'throttle' | 'transient' | 'permanent' {
+    const e = error as any
+    const name: string = e?.name ?? ''
+    const code: string = e?.code ?? ''
+    const status: number | undefined = e?.$metadata?.httpStatusCode
+    const msg = String(error)
+    if (
+        name === 'ThrottlingException' ||
+        name === 'TooManyRequestsException' ||
+        status === 429 ||
+        /throttl|too many requests|rate exceeded/i.test(msg)
+    ) {
+        return 'throttle'
+    }
+    if (['ResourceNotFoundException', 'AccessDeniedException', 'ValidationException'].includes(name)) {
+        return 'permanent'
+    }
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+        return 'permanent'
+    }
+    if (
+        (typeof status === 'number' && status >= 500) ||
+        ['InternalServerException', 'ServiceUnavailableException', 'TimeoutError', 'NetworkingError'].includes(name) ||
+        ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(code) ||
+        /ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|unknown error/i.test(msg)
+    ) {
+        return 'transient'
+    }
+    return 'permanent'
+}
+
+// A short, URL-free description of a failed call for an IDE-facing message: "<ErrorName>: <message>".
+function describeDownloadUrlError(error: unknown): string {
+    const e = error as any
+    const name: string = e?.name || 'Error'
+    const message = String(e?.message ?? error ?? '')
+        .replace(/https?:\/\/\S+/gi, '<url>')
+        .replace(/\s+/g, ' ')
+        .trim()
+    const short = message.length > 160 ? `${message.slice(0, 157)}...` : message
+    return short ? `${name}: ${short}` : name
+}
 // Cap on the parsed-artifact cache. The two bounds above limit ONE scan; they cannot
 // limit the number of scans, so repeated discovery sweeps re-downloaded the same
 // artifacts indefinitely. The cache is what bounds the total.
@@ -1505,7 +1559,7 @@ export class ATXTransformHandler {
             }
             const dl = await this.createArtifactDownloadUrl(workspaceId, parentJobId, beamArtifactId)
             if (!dl?.s3PresignedUrl) {
-                return { Success: false, Error: 'No presigned URL for beam artifact' }
+                return { Success: false, Error: this.downloadUrlFailureMessage(beamArtifactId, 'beam artifact') }
             }
             // downloadAndExtractArchive both downloads AND unzips into destDir.
             const extractedPath = await Utils.downloadAndExtractArchive(
@@ -1597,7 +1651,10 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: downloadOriginalCode ${codeArtifactId} -> ${originalDir}`)
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, codeArtifactId)
             if (!dl?.s3PresignedUrl) {
-                return { Success: false, Error: 'No presigned URL for original code artifact' }
+                return {
+                    Success: false,
+                    Error: this.downloadUrlFailureMessage(codeArtifactId, 'original code artifact'),
+                }
             }
 
             stagingDir = `${originalDir}.partial-${uuidv4()}`
@@ -1989,18 +2046,66 @@ export class ATXTransformHandler {
     // misleading "No presigned URL") is VISIBLE in the log. Reset only on process restart.
     private _createDownloadUrlCallCount = 0
 
+    // Last CreateArtifactDownloadUrl failure reason per artifactId (absent = the service returned no
+    // URL, or the call succeeded). createArtifactDownloadUrl keeps returning null on failure so every
+    // existing caller is unchanged; the beam/original-code downloads read the reason from here so the
+    // IDE can show WHY instead of a fixed "No presigned URL".
+    private readonly downloadUrlErrorReasons = new Map<string, string>()
+    // Base of the retry backoff (250, 500, 1000ms, jittered). A field so tests can make it ~0.
+    private downloadUrlBackoffBaseMs = 250
+
+    /** IDE-facing message for a null createArtifactDownloadUrl result. Never includes the URL. */
+    private downloadUrlFailureMessage(artifactId: string, what: string): string {
+        const reason = this.downloadUrlErrorReasons.get(artifactId)
+        this.downloadUrlErrorReasons.delete(artifactId)
+        return reason
+            ? `Could not get a download URL for the ${what} (${reason})`
+            : `The service returned no download URL for the ${what}`
+    }
+
+    private setDownloadUrlErrorReason(artifactId: string, reason: string | undefined): void {
+        this.downloadUrlErrorReasons.delete(artifactId)
+        if (reason === undefined) {
+            return
+        }
+        if (this.downloadUrlErrorReasons.size >= DOWNLOAD_URL_ERROR_REASONS_MAX) {
+            // Oldest first (Map insertion order).
+            const oldest = this.downloadUrlErrorReasons.keys().next().value
+            if (oldest !== undefined) {
+                this.downloadUrlErrorReasons.delete(oldest)
+            }
+        }
+        this.downloadUrlErrorReasons.set(artifactId, reason)
+    }
+
     async createArtifactDownloadUrl(
         workspaceId: string,
         jobId: string,
         artifactId: string
     ): Promise<{ s3PresignedUrl: string; requestHeaders?: any } | null> {
-        // Retry on throttling. The get-URL call is throttled by FES under load (a poll storm can
-        // exhaust the quota); a throttled call previously fell straight to null → "No presigned
-        // URL", failing a Load that would have succeeded on retry. Bounded exponential backoff
-        // makes Load resilient to transient throttling without masking a genuine absent-URL (that
-        // still returns null after retries).
+        // Retry on throttling AND on transient errors (5xx, network, "unknown error"). The get-URL
+        // call is throttled by FES under load (a poll storm can exhaust the quota), and a short
+        // service/auth hiccup fails it outright; either previously fell straight to null → "No
+        // presigned URL", failing a Load that would have succeeded on retry (observed: a Load failed
+        // 118ms after start, i.e. NOT a throttle, and the same Load succeeded minutes later).
+        // Bounded exponential backoff makes Load resilient without masking a genuine failure: not
+        // found / access denied / validation / other 4xx fail on the first attempt, and an absent
+        // URL is retried only once (eventual consistency) before returning null.
         const maxAttempts = 4
         let lastErr: any = null
+        let missingUrlRetried = false
+        this.setDownloadUrlErrorReason(artifactId, undefined)
+        const backoff = async (attempt: number, label: string) => {
+            // Exponential base (250, 500, 1000ms) with jitter: under concurrent throttling,
+            // unjittered lockstep retries amplify the thundering herd that caused the throttle.
+            // Randomize to spread the retries out.
+            const base = this.downloadUrlBackoffBaseMs * Math.pow(2, attempt - 1)
+            const backoffMs = Math.round(base * (0.5 + Math.random()))
+            this.logging.log(
+                `ATX: CreateArtifactDownloadUrl ${label} (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`
+            )
+            await new Promise(r => setTimeout(r, backoffMs))
+        }
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 this._createDownloadUrlCallCount++
@@ -2035,41 +2140,43 @@ export class ATXTransformHandler {
                         requestHeaders: normalizedHeaders,
                     }
                 } else {
-                    // Genuine absent URL (not an error) — retrying won't help; return null now.
+                    // A 200 without a URL is not an error; it may be eventual consistency, so give it
+                    // ONE more try, then return null (no reason recorded → "returned no download URL").
+                    if (!missingUrlRetried && attempt < maxAttempts) {
+                        missingUrlRetried = true
+                        await backoff(attempt, 'returned no s3PreSignedUrl, retryable=true')
+                        continue
+                    }
                     this.logging.error(
-                        `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}) — NOT a throttle; not retrying`
+                        `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — NOT a throttle; not retrying`
                     )
+                    this.setDownloadUrlErrorReason(artifactId, undefined)
                     return null
                 }
             } catch (error) {
                 lastErr = error
-                // Distinguish throttling from other errors so the log tells us WHY a Load failed
-                // (was misattributed to "No presigned URL"). Retry only throttling.
+                // Distinguish throttling / transient / permanent so the log tells us WHY a Load
+                // failed (was misattributed to "No presigned URL").
+                const kind = classifyDownloadUrlError(error)
+                const isThrottle = kind === 'throttle'
+                const retryable = kind !== 'permanent'
                 const name = (error as any)?.name ?? ''
                 const msg = String(error)
-                const isThrottle =
-                    name === 'ThrottlingException' ||
-                    name === 'TooManyRequestsException' ||
-                    /throttl|too many requests|rate exceeded/i.test(msg)
                 if (isThrottle) {
                     // Record it regardless of whether we retry: the signal is "the service is
                     // pushing back", which is true on the last attempt as much as the first.
                     this.noteBeamThrottled()
                 }
-                if (isThrottle && attempt < maxAttempts) {
-                    // Exponential base (250, 500, 1000ms) with jitter: under concurrent
-                    // throttling, unjittered lockstep retries amplify the thundering herd that
-                    // caused the throttle. Randomize to spread the retries out.
-                    const base = 250 * Math.pow(2, attempt - 1)
-                    const backoffMs = Math.round(base * (0.5 + Math.random()))
-                    this.logging.log(
-                        `ATX: CreateArtifactDownloadUrl THROTTLED (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`
+                this.setDownloadUrlErrorReason(artifactId, describeDownloadUrlError(error))
+                if (retryable && attempt < maxAttempts) {
+                    await backoff(
+                        attempt,
+                        isThrottle ? 'THROTTLED' : `transient error (name=${name || 'Error'}, retryable=true)`
                     )
-                    await new Promise(r => setTimeout(r, backoffMs))
                     continue
                 }
                 this.logging.error(
-                    `ATX: CreateArtifactDownloadUrl error (artifact=${artifactId}, throttle=${isThrottle}, attempt=${attempt}/${maxAttempts}): ${msg}`
+                    `ATX: CreateArtifactDownloadUrl error (artifact=${artifactId}, name=${name || 'Error'}, throttle=${isThrottle}, retryable=${retryable}, attempt=${attempt}/${maxAttempts}): ${msg}`
                 )
                 return null
             }

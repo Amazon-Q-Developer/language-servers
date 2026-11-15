@@ -9,6 +9,7 @@ import {
     ATXTransformHandler,
     ATX_OBJECTIVE_BROWSER_KEY,
     ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
+    classifyDownloadUrlError,
     objectiveHasIntegrationTests,
 } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
@@ -3614,6 +3615,112 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
 
             expect(result).to.be.null
         })
+
+        describe('retries', () => {
+            const svcError = (name: string, status?: number, message = `${name} happened`) =>
+                Object.assign(new Error(message), {
+                    name,
+                    ...(status !== undefined ? { $metadata: { httpStatusCode: status } } : {}),
+                })
+
+            beforeEach(() => {
+                // Keep the jittered backoff from sleeping for real.
+                ;(handler as any).downloadUrlBackoffBaseMs = 0
+            })
+
+            it('retries a non-throttle 500 and returns the URL from the next attempt', async () => {
+                sendStub.onFirstCall().rejects(svcError('InternalServerException', 500))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('does not retry ResourceNotFoundException', async () => {
+                sendStub.rejects(svcError('ResourceNotFoundException', 404))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+            })
+
+            for (const name of ['AccessDeniedException', 'ValidationException']) {
+                it(`does not retry ${name}`, async () => {
+                    sendStub.rejects(svcError(name, 400))
+
+                    expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                    expect(sendStub.callCount).to.equal(1)
+                })
+            }
+
+            it('gives up after 4 attempts on a repeated network error', async () => {
+                sendStub.rejects(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+
+            it('retries a generic "unknown error"', async () => {
+                sendStub.onFirstCall().rejects(new Error('unknown error'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                expect((await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1'))?.s3PresignedUrl).to.equal(
+                    'https://s3/dl'
+                )
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('retries a response without a URL exactly once', async () => {
+                sendStub.resolves({})
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('still retries throttling and records the cooldown', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('ThrottlingException', 400))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('gives up after 4 attempts on repeated throttling', async () => {
+                sendStub.rejects(svcError('ThrottlingException', 400))
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+        })
+    })
+
+    describe('classifyDownloadUrlError', () => {
+        it('classifies throttle, transient and permanent errors', () => {
+            const err = (props: any, message = 'x') => Object.assign(new Error(message), props)
+            expect(classifyDownloadUrlError(err({ name: 'ThrottlingException' }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 429 } }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 503 } }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ServiceUnavailableException' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'TimeoutError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'NetworkingError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ code: 'ETIMEDOUT' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'getaddrinfo EAI_AGAIN host'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'unknown error'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ResourceNotFoundException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'ValidationException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({}, 'boom'))).to.equal('permanent')
+        })
     })
 
     describe('listHitls', () => {
@@ -5980,6 +6087,45 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
             expect(result.Success).to.be.false
         })
+
+        it('surfaces the error name when no download URL could be created', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.rejects(
+                Object.assign(new Error('denied for https://example.invalid/secret?sig=1'), {
+                    name: 'AccessDeniedException',
+                    $metadata: { httpStatusCode: 403 },
+                })
+            )
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(
+                /^Could not get a download URL for the beam artifact \(AccessDeniedException: /
+            )
+            expect(result.Error).to.not.include('https://')
+            expect(sendStub.callCount).to.equal(1)
+        })
+
+        it('says the service returned no URL when the response has none', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.resolves({})
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.equal('The service returned no download URL for the beam artifact')
+        })
     })
 
     // --- downloadOriginalCode: ITGen original source by artifact id (row 15, contract C6) ---
@@ -6266,7 +6412,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.match(/No presigned URL/)
+            expect(result.Error).to.equal('The service returned no download URL for the original code artifact')
             expect(fs.existsSync(originalDir())).to.be.false
         })
 
