@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.0.134](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.133...lsp-codewhisperer/v0.0.134) (2026-11-12)
+
+
+### Bug Fixes
+
+* address security issues ([#3041](https://github.com/Amazon-Q-Developer/language-servers/issues/3041)) ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+* **amazonq:** stricter checks for chat file links and configuration files ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+
 ## [0.0.133](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.132...lsp-codewhisperer/v0.0.133) (2026-10-28)
 
 

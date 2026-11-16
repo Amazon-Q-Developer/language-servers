@@ -1,6 +1,6 @@
 {
     "name": "@aws/lsp-codewhisperer",
-    "version": "0.0.133",
+    "version": "0.0.134",
     "description": "CodeWhisperer Language Server",
     "main": "out/index.js",
     "repository": {
