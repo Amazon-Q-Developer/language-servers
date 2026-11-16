@@ -30,6 +30,7 @@ import {
     loadAgentConfig,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
+    getAgentConfigPathForMcpConfig,
     sanitizeName,
     getGlobalAgentConfigPath,
     getWorkspaceMcpConfigPaths,
@@ -1341,10 +1342,7 @@ export class McpManager {
                 })
 
                 // Move tool permissions to corresponding agent path
-                const agentPath = configPath.replace(
-                    path.sep + 'mcp.json',
-                    path.sep + 'agents' + path.sep + 'default.json'
-                )
+                const agentPath = getAgentConfigPathForMcpConfig(configPath)
 
                 const serverPrefix = `@${serverName}`
                 let serverTools = this.agentConfig.tools.filter(
@@ -1483,10 +1481,7 @@ export class McpManager {
                 }
             })
 
-            agentPath = cfg.__configPath__.replace(
-                path.sep + 'mcp.json',
-                path.sep + 'agents' + path.sep + 'default.json'
-            )
+            agentPath = getAgentConfigPathForMcpConfig(cfg.__configPath__)
         }
 
         // Remove from agent config (unless skipAgentConfigRemoval is true)
@@ -1770,10 +1765,7 @@ export class McpManager {
             if (isLegacyMcpServer) {
                 // For legacy MCP servers, save permissions to agent config file and update MCP config for enable/disable
                 const mcpConfigPath = serverConfig.__configPath__!
-                const agentPath = mcpConfigPath.replace(
-                    path.sep + 'mcp.json',
-                    path.sep + 'agents' + path.sep + 'default.json'
-                )
+                const agentPath = getAgentConfigPathForMcpConfig(mcpConfigPath)
 
                 // Update MCP config for enable/disable
                 await this.mutateConfigFile(mcpConfigPath, (json: any) => {
