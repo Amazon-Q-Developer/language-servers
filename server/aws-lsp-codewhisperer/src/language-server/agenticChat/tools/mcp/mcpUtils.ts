@@ -938,6 +938,56 @@ export function convertPersonaToAgent(
 }
 
 /**
+ * Log text for starting a stdio MCP server. Argument and env values can hold tokens, so only the
+ * number of arguments and the env variable names are included.
+ */
+export function describeStdioLaunchForLog(command: string, args: string[] | undefined, env: Record<string, string>) {
+    const argCount = (args ?? []).length
+    const argsInfo = argCount > 0 ? ` (${argCount} ${argCount === 1 ? 'argument' : 'arguments'})` : ''
+    const envKeys = Object.keys(env)
+    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
+    return `${command}${argsInfo}${envInfo}`
+}
+
+/** MCP form fields that hold env variable name and value pairs */
+const ENV_FORM_FIELDS = ['env_variables', 'additional_env_variables']
+/** MCP form fields that hold header key and value pairs */
+const HEADER_FORM_FIELDS = ['headers', 'additional_headers']
+
+/**
+ * Copy of the MCP form values for logging. Env variable and header values can hold tokens, so those fields are
+ * reduced to their names. All other fields are kept as they are.
+ */
+export function describeMcpFormValuesForLog(optionsValues: Record<string, any> | undefined): Record<string, any> {
+    const result: Record<string, any> = { ...(optionsValues ?? {}) }
+    const namesOf = (value: any, nameKey: string) =>
+        Array.isArray(value) ? value.map(item => item?.[nameKey]) : '(omitted)'
+    for (const field of ENV_FORM_FIELDS) {
+        if (field in result) {
+            result[field] = namesOf(result[field], 'env_var_name')
+        }
+    }
+    for (const field of HEADER_FORM_FIELDS) {
+        if (field in result) {
+            result[field] = namesOf(result[field], 'key')
+        }
+    }
+    return result
+}
+
+/**
+ * Log text for an MCP server URL. Any part after the host can hold a token, so only the origin is included.
+ */
+export function describeUrlForLog(url: string | undefined): string {
+    try {
+        const parsed = new URL(url ?? '')
+        return parsed.origin
+    } catch {
+        return '(invalid URL)'
+    }
+}
+
+/**
  * Sanitizes a name by:
  * 1. Returning the original if it matches the regex and doesn't contain namespace delimiter(__)
  * 2. Filtering to only allow ascii alphanumeric, underscore characters, and hyphen.

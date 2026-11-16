@@ -32,6 +32,8 @@ import {
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
     sanitizeName,
+    describeStdioLaunchForLog,
+    describeUrlForLog,
     getGlobalAgentConfigPath,
     getWorkspaceMcpConfigPaths,
     getGlobalMcpConfigPath,
@@ -827,10 +829,9 @@ export class McpManager {
                     // Use the folder checked above, so the folder that was trusted is the folder the server starts in
                     const cwd = launchFolder ?? defaultCwd
                     this.stdioLaunchFolders.set(serverName, launchFolder)
-                    const argsStr = (cfg.args ?? []).length > 0 ? ` ${(cfg.args ?? []).join(' ')}` : ''
-                    const envKeys = Object.keys(finalEnv || {})
-                    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
-                    this.features.logging.info(`MCP: Executing command: ${cfg.command}${argsStr}${envInfo}`)
+                    this.features.logging.info(
+                        `MCP: Executing command: ${describeStdioLaunchForLog(cfg.command!, cfg.args, finalEnv || {})}`
+                    )
 
                     transport = new StdioClientTransport({
                         command: cfg.command!,
@@ -951,7 +952,7 @@ export class McpManager {
 
                         const headerKeys = Object.keys(headers)
                         const headerInfo = headerKeys.length > 0 ? ` (headers: ${headerKeys.join(', ')})` : ''
-                        this.features.logging.info(`MCP: Connecting to URL: ${cfg.url}${headerInfo}`)
+                        this.features.logging.info(`MCP: Connecting to URL: ${describeUrlForLog(cfg.url)}${headerInfo}`)
 
                         try {
                             // try streamable http first

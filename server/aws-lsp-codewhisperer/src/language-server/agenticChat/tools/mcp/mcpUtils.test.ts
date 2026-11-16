@@ -24,6 +24,9 @@ import {
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     isEmptyEnv,
+    describeStdioLaunchForLog,
+    describeUrlForLog,
+    describeMcpFormValuesForLog,
     sanitizeName,
     convertPersonaToAgent,
     migrateToAgentConfig,
@@ -840,6 +843,54 @@ describe('getGlobalMcpConfigPath', () => {
         const homePath = path.resolve('home_dir')
         const expected = path.join(homePath, '.aws', 'amazonq', 'mcp.json')
         expect(getGlobalMcpConfigPath(homePath)).to.equal(expected)
+    })
+})
+
+describe('describeStdioLaunchForLog', () => {
+    it('includes the command, the number of arguments and the env names, not their values', () => {
+        const text = describeStdioLaunchForLog('npx', ['-y', 'server', '--api-key', 'arg-value-123'], {
+            API_TOKEN: 'env-value-456',
+        })
+        expect(text).to.equal('npx (4 arguments) (env: API_TOKEN)')
+    })
+
+    it('uses the singular for one argument and omits empty parts', () => {
+        expect(describeStdioLaunchForLog('node', ['server.js'], {})).to.equal('node (1 argument)')
+        expect(describeStdioLaunchForLog('node', undefined, {})).to.equal('node')
+    })
+})
+
+describe('describeMcpFormValuesForLog', () => {
+    it('does not change the values it is given', () => {
+        const values: any = { name: 's', env_variables: [{ env_var_name: 'A', env_var_value: 'v' }] }
+        describeMcpFormValuesForLog(values)
+        expect(values.env_variables[0].env_var_value).to.equal('v')
+    })
+
+    it('omits env and header fields that are not lists', () => {
+        expect(describeMcpFormValuesForLog({ env_variables: 'A=v', headers: 'Authorization: v' } as any)).to.deep.equal(
+            {
+                env_variables: '(omitted)',
+                headers: '(omitted)',
+            }
+        )
+    })
+
+    it('returns an empty object for missing values', () => {
+        expect(describeMcpFormValuesForLog(undefined)).to.deep.equal({})
+    })
+})
+
+describe('describeUrlForLog', () => {
+    it('keeps only the origin', () => {
+        expect(describeUrlForLog('https://user:pass@mcp.example.com:8443/key-123/sse?token=abc#frag')).to.equal(
+            'https://mcp.example.com:8443'
+        )
+    })
+
+    it('does not echo a value that is not a valid URL', () => {
+        expect(describeUrlForLog('not a url with-a-token')).to.equal('(invalid URL)')
+        expect(describeUrlForLog(undefined)).to.equal('(invalid URL)')
     })
 })
 
