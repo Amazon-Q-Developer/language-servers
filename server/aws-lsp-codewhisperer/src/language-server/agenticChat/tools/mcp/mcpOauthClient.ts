@@ -403,8 +403,7 @@ export class OAuthClient {
             state,
         }).toString()
 
-        await this.lsp.window.showDocument({ uri: authz.toString(), external: true })
-
+        // Listen before opening the browser; the client may reply only after the redirect has already arrived.
         const waitForFlow = new Promise<{ code: string; rxState: string; err?: string; errDesc?: string }>(resolve => {
             server.on('request', (req, res) => {
                 const u = new URL(req.url || '/', redirectUri)
@@ -416,6 +415,9 @@ export class OAuthClient {
                 resolve({ code: c, rxState: s, err: e, errDesc: ed })
             })
         })
+
+        await this.lsp.window.showDocument({ uri: authz.toString(), external: true })
+
         const { code, rxState, err, errDesc } = await Promise.race([
             waitForFlow,
             new Promise<never>((_, reject) =>

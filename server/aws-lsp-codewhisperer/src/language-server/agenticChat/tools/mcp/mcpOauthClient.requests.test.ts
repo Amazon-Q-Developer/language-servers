@@ -205,6 +205,20 @@ for (const implementation of ['native', 'fallback'] as const) {
             })
         }
 
+        it('accepts a callback that arrives before showDocument resolves', async () => {
+            showDocument.callsFake(async ({ uri }: { uri: string }) => {
+                const state = new URL(uri).searchParams.get('state')!
+                const response = { writeHead: () => response, end: () => response }
+                callback.emit('request', { url: `/oauth/callback?code=test-code&state=${state}` }, response)
+                return { success: true }
+            })
+
+            const token = await exchange('authorization_code', 'none')
+
+            assert.equal(token.access_token, 'test-access-token')
+            assert.equal(requests[0].body.get('code'), 'test-code')
+        })
+
         it('opens a loopback HTTP authorization endpoint', async () => {
             const token = await exchange('authorization_code', 'none', endpointUrl, 'http://127.0.0.1:9/authorize')
             assert.equal(token.access_token, 'test-access-token')
