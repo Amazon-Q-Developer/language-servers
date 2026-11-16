@@ -348,7 +348,7 @@ export class OAuthClient {
         rs: URL,
         refresh: string
     ): Promise<Token | undefined> {
-        this.validateTokenEndpoint(meta.token_endpoint)
+        this.validateEndpoint(meta.token_endpoint, 'token')
         const formParams: Record<string, string> = {
             grant_type: 'refresh_token',
             refresh_token: refresh,
@@ -383,7 +383,8 @@ export class OAuthClient {
         redirectUri: string,
         server: http.Server
     ): Promise<Token> {
-        this.validateTokenEndpoint(meta.token_endpoint)
+        this.validateEndpoint(meta.token_endpoint, 'token')
+        this.validateEndpoint(meta.authorization_endpoint, 'authorization')
         const DEFAULT_PKCE_TIMEOUT_MS = 90_000
 
         const verifier = this.b64url(crypto.randomBytes(32))
@@ -427,7 +428,7 @@ export class OAuthClient {
         if (!code || rxState !== state) throw new Error('Invalid authorization response (state mismatch)')
 
         // Exchange code for token using the auth method from DCR
-        this.validateTokenEndpoint(meta.token_endpoint)
+        this.validateEndpoint(meta.token_endpoint, 'token')
         const tokenParams: Record<string, string> = {
             grant_type: 'authorization_code',
             code,
@@ -546,15 +547,15 @@ export class OAuthClient {
     }
 
     /**
-     * Token exchanges carry refresh tokens, authorization codes, and potentially client credentials.
+     * Token exchanges carry credentials, and the authorization endpoint is opened in the user's browser.
      * Require HTTPS for remote endpoints while retaining the OAuth loopback exception for local development.
      */
-    private static validateTokenEndpoint(endpoint: string): void {
+    private static validateEndpoint(endpoint: string, kind: 'token' | 'authorization'): void {
         let url: URL
         try {
             url = new URL(endpoint)
         } catch {
-            throw new Error('OAuth: token endpoint is not a valid URL')
+            throw new Error(`OAuth: ${kind} endpoint is not a valid URL`)
         }
 
         if (url.protocol === 'https:') {
@@ -569,7 +570,7 @@ export class OAuthClient {
             return
         }
 
-        throw new Error('OAuth: token endpoint must use HTTPS unless it is a loopback address')
+        throw new Error(`OAuth: ${kind} endpoint must use HTTPS unless it is a loopback address`)
     }
 
     /** Await server.listen() with error rejection for immediate handling. */
