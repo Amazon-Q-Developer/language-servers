@@ -236,7 +236,9 @@ export const BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION = 'InvalidDestination'
  * - 'transient': 5xx / network / "unknown error" (seen alongside a concurrent ListMessages
  *   "unknown error" from the same IDE) — retry with the same bounded backoff.
  * - 'permanent': not found / access denied / validation / other 4xx, or anything unrecognised —
- *   retrying will not help, so fail now.
+ *   retrying will not help, so fail now. Exception: an access denied (or 403) that gives no real
+ *   reason (empty or "UnknownError") is 'throttle' — seen to clear minutes later for the same artifact,
+ *   and a call storm has provoked access denied, so it also starts the scan cooldown.
  */
 const KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS = [
     'ResourceNotFoundException',
@@ -276,6 +278,12 @@ export function classifyDownloadUrlError(error: unknown): 'throttle' | 'transien
         return 'throttle'
     }
     // Any 5xx is transient whatever its name.
+    if (name === 'AccessDeniedException' || status === 403) {
+        const reason = String(e?.message ?? '').trim()
+        if (reason === '' || /unknown\s?error/i.test(reason)) {
+            return 'throttle'
+        }
+    }
     if (typeof status === 'number' && status >= 500) {
         return 'transient'
     }

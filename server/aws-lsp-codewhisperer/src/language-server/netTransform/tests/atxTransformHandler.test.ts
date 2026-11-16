@@ -3657,6 +3657,29 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
                 })
             }
 
+            it('retries an AccessDeniedException that gives no reason (UnknownError) as throttling', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('AccessDeniedException', 403, 'UnknownError'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('does not retry an AccessDeniedException with a real reason', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.rejects(
+                    svcError('AccessDeniedException', 403, 'User is not authorized to perform this action')
+                )
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+                expect(note.called).to.be.false
+            })
+
             it('gives up after 4 attempts on a repeated network error', async () => {
                 sendStub.rejects(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
 
@@ -3761,6 +3784,16 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
             expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.equal('permanent')
             expect(classifyDownloadUrlError(err({ name: 'ValidationException' }))).to.equal('permanent')
             expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'UnknownError'))).to.equal(
+                'throttle'
+            )
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, ''))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }, 'unknownerror'))).to.equal(
+                'throttle'
+            )
+            expect(
+                classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'User is not authorized to do this'))
+            ).to.equal('permanent')
             expect(classifyDownloadUrlError(err({}, 'boom'))).to.equal('permanent')
         })
     })
