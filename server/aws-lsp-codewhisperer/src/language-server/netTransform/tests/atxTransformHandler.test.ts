@@ -9,6 +9,8 @@ import {
     ATXTransformHandler,
     ATX_OBJECTIVE_BROWSER_KEY,
     ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
+    classifyDownloadUrlError,
+    isUnrecognizedDownloadUrlError,
     objectiveHasIntegrationTests,
 } from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
@@ -3365,7 +3367,7 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
         serviceManager.getActiveApplicationUrl = sinon.stub().returns('https://app.example.com')
         serviceManager.getBearerToken = sinon.stub().resolves('token')
         workspace = {} as Workspace
-        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
         runtime = {} as Runtime
 
         handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
@@ -3613,6 +3615,186 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
             const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
 
             expect(result).to.be.null
+        })
+
+        describe('retries', () => {
+            const svcError = (name: string, status?: number, message = `${name} happened`) =>
+                Object.assign(new Error(message), {
+                    name,
+                    ...(status !== undefined ? { $metadata: { httpStatusCode: status } } : {}),
+                })
+
+            beforeEach(() => {
+                // Keep the jittered backoff from sleeping for real.
+                ;(handler as any).downloadUrlBackoffBaseMs = 0
+            })
+
+            it('retries a non-throttle 500 and returns the URL from the next attempt', async () => {
+                sendStub.onFirstCall().rejects(svcError('InternalServerException', 500))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('does not retry ResourceNotFoundException', async () => {
+                sendStub.rejects(svcError('ResourceNotFoundException', 404))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+            })
+
+            for (const name of ['AccessDeniedException', 'ValidationException']) {
+                it(`does not retry ${name}`, async () => {
+                    sendStub.rejects(svcError(name, 400))
+
+                    expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                    expect(sendStub.callCount).to.equal(1)
+                })
+            }
+
+            it('retries an AccessDeniedException that gives no reason (UnknownError) as throttling', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('AccessDeniedException', 403, 'UnknownError'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('does not retry an AccessDeniedException with a real reason', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.rejects(
+                    svcError('AccessDeniedException', 403, 'User is not authorized to perform this action')
+                )
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+                expect(note.called).to.be.false
+            })
+
+            it('gives up after 4 attempts on a repeated network error', async () => {
+                sendStub.rejects(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+
+            it('retries a generic "unknown error"', async () => {
+                sendStub.onFirstCall().rejects(new Error('unknown error'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                expect((await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1'))?.s3PresignedUrl).to.equal(
+                    'https://s3/dl'
+                )
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('retries a response without a URL exactly once', async () => {
+                sendStub.resolves({})
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('still retries throttling and records the cooldown', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('ThrottlingException', 400))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('gives up after 4 attempts on repeated throttling', async () => {
+                sendStub.rejects(svcError('ThrottlingException', 400))
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+        })
+    })
+
+    describe('classifyDownloadUrlError', () => {
+        it('treats any 5xx as transient whatever its name', () => {
+            const err = Object.assign(new Error('x'), {
+                name: 'ValidationException',
+                $metadata: { httpStatusCode: 502 },
+            })
+            expect(classifyDownloadUrlError(err)).to.equal('transient')
+        })
+
+        it('warns once per unrecognized error name and does not retry it', async () => {
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+            sendStub.rejects(Object.assign(new Error('new'), { name: 'BrandNewException' }))
+
+            expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+            expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-2')).to.be.null
+
+            expect(sendStub.callCount).to.equal(2)
+            const unrecognized = warn
+                .getCalls()
+                .filter(c => /unrecognized error name=BrandNewException status=none/.test(String(c.args[0])))
+            expect(unrecognized).to.have.lengthOf(1)
+        })
+
+        it('isUnrecognizedDownloadUrlError: only service errors that fell through to the default', () => {
+            const err = (props: any, message = 'x') => Object.assign(new Error(message), props)
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'BrandNewException' }))).to.be.true
+            expect(isUnrecognizedDownloadUrlError(err({ $metadata: {} }))).to.be.true
+            expect(isUnrecognizedDownloadUrlError(err({}, 'ATX client not initialized'))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'X', $metadata: { httpStatusCode: 404 } }))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'X', $metadata: { httpStatusCode: 503 } }))).to.be.false
+        })
+
+        it('does not warn about known permanent errors', async () => {
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+            sendStub.rejects(Object.assign(new Error('gone'), { name: 'ResourceNotFoundException' }))
+
+            await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+            expect(warn.getCalls().some(c => /unrecognized error/.test(String(c.args[0])))).to.be.false
+        })
+
+        it('classifies throttle, transient and permanent errors', () => {
+            const err = (props: any, message = 'x') => Object.assign(new Error(message), props)
+            expect(classifyDownloadUrlError(err({ name: 'ThrottlingException' }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 429 } }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 503 } }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ServiceUnavailableException' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'TimeoutError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'NetworkingError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ code: 'ETIMEDOUT' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'getaddrinfo EAI_AGAIN host'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'unknown error'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ResourceNotFoundException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'ValidationException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'UnknownError'))).to.equal(
+                'throttle'
+            )
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, ''))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }, 'unknownerror'))).to.equal(
+                'throttle'
+            )
+            expect(
+                classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'User is not authorized to do this'))
+            ).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({}, 'boom'))).to.equal('permanent')
         })
     })
 
@@ -5767,9 +5949,9 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             })
         }
 
-        // A throttle that starts during the scan is like the throttle cooldown: the scan didn't finish, so it isn't
-        // counted towards the gate's cap.
-        it("doesn't count a scan throttled part-way as unconfirmed", async () => {
+        // A throttle that starts during the scan also makes the scan incomplete — the beam-map may not
+        // have been reached — so it counts as 'unconfirmed' just like a budget timeout.
+        it('counts a scan throttled part-way as unconfirmed so the gate retries with back-off', async () => {
             sendStub.resolves({
                 artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
             })
@@ -5784,7 +5966,35 @@ describe('ATXTransformHandler - Beam to IDE', () => {
                 return null
             }) as any)
 
-            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(undefined)
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+        })
+
+        it('says opted in when a beam-map read before the scan was cut short opts in', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                    { artifactId: 'other-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                id: string,
+                onUnreadable?: () => void
+            ) => {
+                if (id === 'beammap-1') {
+                    return { repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }] }
+                }
+                ;(handler as any).noteBeamThrottled() // the scan is cut short after the beam-map was read
+                onUnreadable?.()
+                return null
+            }) as any)
+            // (Before: 'unconfirmed', because the throttle made the scan count as aborted.)
+            const remember = sinon.spy((handler as any).itGenJobs, 'rememberBeamOptIn')
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+            expect(remember.calledWith('job-1')).to.be.true
         })
 
         it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
@@ -5799,6 +6009,109 @@ describe('ATXTransformHandler - Beam to IDE', () => {
 
             expect(result[0].GenerateIntegrationTests).to.equal(false)
             expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.false
+        })
+
+        // Core race: N beam-status-* files appear in ListArtifacts before the beam-map (a
+        // pathless JSON). With the fix, beam-status files are excluded from allCandidates and
+        // the pathless beam-map is sorted to the front, so it is found on the first download.
+        it('finds the beam-map even when beam-status files appear before it in ListArtifacts', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    ...zipArtifacts('carol'),
+                    { artifactId: 'bs-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                    { artifactId: 'bs-2', fileMetadata: { path: 'beam-status-job-1-bob.json' } },
+                    { artifactId: 'bs-3', fileMetadata: { path: 'beam-status-job-1-carol.json' } },
+                    // Pathless beam-map listed last — without the sort it would consume 3 budget
+                    // slots on the beam-status files before reaching it. With the fix it is first.
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [
+                    {
+                        repoName: 'alice',
+                        stepId: 's-alice',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-a',
+                    },
+                    { repoName: 'bob', stepId: 's-bob', generateIntegrationTests: true, originalArtifactId: 'orig-b' },
+                    {
+                        repoName: 'carol',
+                        stepId: 's-carol',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-c',
+                    },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            // All 3 repos found from beam-map, not beam-status
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['alice', 'bob', 'carol'])
+            for (const repo of result) {
+                expect(repo.GenerateIntegrationTests).to.be.true
+                expect(repo.OriginalArtifactId).to.not.be.empty
+            }
+            // The beam-map (beammap-1, pathless) was downloaded first, not the beam-status files
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'beammap-1')).to.be.true
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'bs-1')).to.be.false
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
+        it('never attempts beam-status artifacts and finds beam-map on first download even with 8 beam-status files listed first', async () => {
+            // Job 401bf8f4 shape: 8 beam-status-* files listed before the one pathless beam-map.
+            // Old code (no filter): all 9 were candidates; each download "took" 2 s; the 15 s budget
+            // was exhausted after 7 downloads, the beam-map was never reached.
+            // Fix: beam-status files are excluded, only 1 candidate (the pathless beam-map) remains.
+            const clock = sinon.useFakeTimers({ toFake: ['Date'] })
+            try {
+                sendStub.resolves({
+                    artifacts: [
+                        ...zipArtifacts('alice'), // transformed-source zip so alice has an artifactId
+                        ...Array.from({ length: 8 }, (_, i) => ({
+                            artifactId: `bs-${i}`,
+                            fileMetadata: { path: `beam-status-job-401-repo${i}.json` },
+                        })),
+                        { artifactId: 'beammap-1', fileMetadata: { path: '' } }, // pathless
+                    ],
+                })
+                const mapContent = {
+                    repos: [
+                        {
+                            repoName: 'alice',
+                            stepId: 's-alice',
+                            generateIntegrationTests: true,
+                            originalArtifactId: 'orig-a',
+                        },
+                    ],
+                }
+                const downloadStub = sinon
+                    .stub(handler as any, 'downloadJsonArtifact')
+                    .callsFake(async (...args: unknown[]) => {
+                        clock.tick(2000) // each call "takes" 2 s of wall time
+                        return args[2] === 'beammap-1' ? mapContent : null
+                    })
+
+                const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+                // Beam-map found, alice returned with ITGen fields
+                expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+                expect(result[0].GenerateIntegrationTests).to.be.true
+                expect(downloadStub.calledWith(sinon.match.any, sinon.match.any, 'beammap-1')).to.be.true
+                // No beam-status file was ever a download candidate
+                for (let i = 0; i < 8; i++) {
+                    expect(
+                        downloadStub.calledWith(sinon.match.any, sinon.match.any, `bs-${i}`),
+                        `bs-${i} must not be attempted`
+                    ).to.be.false
+                }
+                // Exactly 1 download (the beam-map) — scan not cut short
+                expect(downloadStub.callCount).to.equal(1)
+            } finally {
+                clock.restore()
+            }
         })
 
         it('rejects malformed beam-map entries (no usable repo name)', async () => {
@@ -5863,6 +6176,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', 'relative/dir')
             expect(result.Success).to.be.false
             expect(result.Error).to.match(/Invalid destination directory/)
+            expect(result.ErrorCode).to.equal('InvalidDestination')
         })
 
         it('rejects a destDir containing ".." traversal', async () => {
@@ -5876,6 +6190,68 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         it('rejects an empty destDir', async () => {
             const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
             expect(result.Success).to.be.false
+        })
+
+        it('surfaces the error name when no download URL could be created', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.rejects(
+                Object.assign(new Error('denied for https://example.invalid/secret?sig=1'), {
+                    name: 'AccessDeniedException',
+                    $metadata: { httpStatusCode: 403 },
+                })
+            )
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(
+                /^Could not get a download URL for the beam artifact \(AccessDeniedException: /
+            )
+            expect(result.Error).to.not.include('https://')
+            expect(sendStub.callCount).to.equal(1)
+        })
+
+        it('keeps an earlier error as the reason when the last attempt returns no URL', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.onFirstCall().rejects(
+                Object.assign(new Error('oops'), {
+                    name: 'InternalServerException',
+                    $metadata: { httpStatusCode: 500 },
+                })
+            )
+            sendStub.resolves({})
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Error).to.equal(
+                'The service returned no download URL for the beam artifact (after an earlier error: InternalServerException: oops)'
+            )
+            expect(result.ErrorCode).to.be.undefined
+        })
+
+        it('says the service returned no URL when the response has none', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.resolves({})
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.equal('The service returned no download URL for the beam artifact')
         })
     })
 
@@ -6163,7 +6539,7 @@ describe('ATXTransformHandler - Beam to IDE', () => {
             const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.match(/No presigned URL/)
+            expect(result.Error).to.equal('The service returned no download URL for the original code artifact')
             expect(fs.existsSync(originalDir())).to.be.false
         })
 
