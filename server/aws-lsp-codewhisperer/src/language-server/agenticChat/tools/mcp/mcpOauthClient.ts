@@ -7,6 +7,7 @@ import * as crypto from 'crypto'
 import * as path from 'path'
 import { URL, URLSearchParams } from 'url'
 import * as http from 'http'
+import { isIPv4 } from 'net'
 import * as os from 'os'
 import { Logger, Workspace, Lsp } from '@aws/language-server-runtimes/server-interface'
 
@@ -347,6 +348,7 @@ export class OAuthClient {
         rs: URL,
         refresh: string
     ): Promise<Token | undefined> {
+        this.validateTokenEndpoint(meta.token_endpoint)
         const formParams: Record<string, string> = {
             grant_type: 'refresh_token',
             refresh_token: refresh,
@@ -359,6 +361,7 @@ export class OAuthClient {
 
         const res = await this.fetchCompat(meta.token_endpoint, {
             method: 'POST',
+            redirect: 'error',
             headers,
             body: new URLSearchParams(formParams),
         })
@@ -380,6 +383,7 @@ export class OAuthClient {
         redirectUri: string,
         server: http.Server
     ): Promise<Token> {
+        this.validateTokenEndpoint(meta.token_endpoint)
         const DEFAULT_PKCE_TIMEOUT_MS = 90_000
 
         const verifier = this.b64url(crypto.randomBytes(32))
@@ -423,6 +427,7 @@ export class OAuthClient {
         if (!code || rxState !== state) throw new Error('Invalid authorization response (state mismatch)')
 
         // Exchange code for token using the auth method from DCR
+        this.validateTokenEndpoint(meta.token_endpoint)
         const tokenParams: Record<string, string> = {
             grant_type: 'authorization_code',
             code,
@@ -437,6 +442,7 @@ export class OAuthClient {
 
         const res2 = await this.fetchCompat(meta.token_endpoint, {
             method: 'POST',
+            redirect: 'error',
             headers: tokenHeaders,
             body: new URLSearchParams(tokenParams),
         })
@@ -537,6 +543,33 @@ export class OAuthClient {
                 params.client_id = reg.client_id
                 break
         }
+    }
+
+    /**
+     * Token exchanges carry refresh tokens, authorization codes, and potentially client credentials.
+     * Require HTTPS for remote endpoints while retaining the OAuth loopback exception for local development.
+     */
+    private static validateTokenEndpoint(endpoint: string): void {
+        let url: URL
+        try {
+            url = new URL(endpoint)
+        } catch {
+            throw new Error('OAuth: token endpoint is not a valid URL')
+        }
+
+        if (url.protocol === 'https:') {
+            return
+        }
+
+        const hostname = url.hostname.toLowerCase()
+        const isLoopbackHttp =
+            url.protocol === 'http:' &&
+            (hostname === 'localhost' || hostname === '[::1]' || (isIPv4(hostname) && hostname.startsWith('127.')))
+        if (isLoopbackHttp) {
+            return
+        }
+
+        throw new Error('OAuth: token endpoint must use HTTPS unless it is a loopback address')
     }
 
     /** Await server.listen() with error rejection for immediate handling. */

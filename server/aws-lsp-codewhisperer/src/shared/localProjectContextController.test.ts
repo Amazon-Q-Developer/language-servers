@@ -91,7 +91,8 @@ describe('LocalProjectContextController', () => {
 
             await controller.init({ vectorLib: vectorLibMock })
 
-            sinonAssert.called(logging.error)
+            // A library that fails to start is reported as a warning
+            sinonAssert.called(logging.warn)
         })
 
         it('should call buildIndex on init', async () => {

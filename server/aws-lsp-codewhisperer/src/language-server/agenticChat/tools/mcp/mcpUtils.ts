@@ -12,6 +12,7 @@ import {
     MCPServerPermission,
     McpPermissionType,
     AgentConfig,
+    AgentResourceSource,
     McpRegistryData,
     isRegistryServerConfig,
 } from './mcpTypes'
@@ -232,6 +233,15 @@ const DEFAULT_PERSONA_RAW = `{
   }
 }`
 
+/** True for a file:// resource with an absolute path, such as file:///abs/path or file://C:/path */
+function isAbsoluteFileResource(resource: string): boolean {
+    if (!resource.startsWith('file://')) {
+        return false
+    }
+    const resourcePath = resource.slice('file://'.length)
+    return path.isAbsolute(resourcePath) || resourcePath.startsWith('/') || /^[a-zA-Z]:/.test(resourcePath)
+}
+
 /**
  * Load, validate, and parse agent configurations from JSON files.
  * - If both global and workspace files are missing, create a default global.
@@ -252,11 +262,14 @@ export async function loadAgentConfig(
     serverNameMapping: Map<string, string>
     errors: Map<string, string>
     agentConfig: AgentConfig
+    /** The agent configs that list each resource in agentConfig.resources */
+    resourceSources?: Map<string, AgentResourceSource>
 }> {
     // Initialize return values similar to loadMcpServerConfigs
     const servers = new Map<string, MCPServerConfig>()
     const serverNameMapping = new Map<string, string>()
     const configErrors = new Map<string, string>()
+    const resourceSources = new Map<string, AgentResourceSource>()
 
     // Create base agent config
     const agentConfig: AgentConfig = {
@@ -295,6 +308,13 @@ export async function loadAgentConfig(
 
     // Track useLegacyMcpJson value - workspace takes precedence over global
     let useLegacyMcpJsonValue: boolean | undefined
+
+    // Server-scoped permission entries ('@server', '@server/tool') seen in any agent config file.
+    // They are applied immediately when the owning server is declared in the same file's
+    // 'mcpServers' block, but legacy mcp.json servers (and duplicates skipped below) are not
+    // declared there, so the entries are stashed here and drained once every server is known.
+    const pendingServerTools = new Set<string>()
+    const pendingServerAllowedTools = new Set<string>()
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -371,16 +391,24 @@ export async function loadAgentConfig(
         // 4) Process permissions (tools and allowedTools)
         if (Array.isArray(json.tools)) {
             for (const tool of json.tools) {
-                if (!tool.startsWith('@') && !agentConfig.tools.includes(tool)) {
-                    agentConfig.tools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.tools.includes(tool)) {
+                        agentConfig.tools.push(tool)
+                    }
+                } else {
+                    pendingServerTools.add(tool)
                 }
             }
         }
 
         if (Array.isArray(json.allowedTools)) {
             for (const tool of json.allowedTools) {
-                if (!tool.startsWith('@') && !agentConfig.allowedTools.includes(tool)) {
-                    agentConfig.allowedTools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.allowedTools.includes(tool)) {
+                        agentConfig.allowedTools.push(tool)
+                    }
+                } else {
+                    pendingServerAllowedTools.add(tool)
                 }
             }
         }
@@ -393,10 +421,27 @@ export async function loadAgentConfig(
             }
         }
 
-        // 5b) Process resources
+        // 5b) Process resources. Files outside the workspace can only come from the global config.
         if (Array.isArray(json.resources)) {
             for (const resource of json.resources) {
-                if (typeof resource === 'string' && !agentConfig.resources!.includes(resource)) {
+                if (typeof resource !== 'string') {
+                    continue
+                }
+                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                    logging.warn(
+                        `Ignoring absolute resource path ${JSON.stringify(resource)} in agent config at ${fsPath}. Add it to the global agent config instead.`
+                    )
+                    continue
+                }
+                // A resource from a workspace folder's agent config applies to that folder only
+                const source = resourceSources.get(resource) ?? { global: false, configPaths: [] }
+                if (fsPath === globalConfigPath) {
+                    source.global = true
+                } else if (!source.configPaths.includes(fsPath)) {
+                    source.configPaths.push(fsPath)
+                }
+                resourceSources.set(resource, source)
+                if (!agentConfig.resources!.includes(resource)) {
                     agentConfig.resources!.push(resource)
                 }
             }
@@ -633,6 +678,13 @@ export async function loadAgentConfig(
         logging.info(`Loaded ${mcpResult.servers.size} servers from legacy MCP configs`)
     }
 
+    // Restore server-scoped permissions for every server that loaded, regardless of which file
+    // declared it. Legacy mcp.json servers are deliberately not written into an agent config's
+    // 'mcpServers' block (see saveServerSpecificAgentConfig), and duplicate servers are skipped
+    // before the per-server permission pass, so without this their '@server' / '@server/tool'
+    // entries were dropped on every load and "Always Allow" reverted to "Ask".
+    restoreServerScopedPermissions(agentConfig, serverNameMapping, pendingServerTools, pendingServerAllowedTools)
+
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
         `Successfully processed ${uniquePaths.length} agent config files and ${agentConfig.useLegacyMcpJson ? 'legacy MCP configs' : 'no legacy MCP configs'}`
@@ -642,6 +694,7 @@ export async function loadAgentConfig(
         serverNameMapping,
         errors: configErrors,
         agentConfig,
+        resourceSources,
     }
 }
 
@@ -1269,17 +1322,28 @@ export function findServerInRegistry(registry: McpRegistryData, serverName: stri
  * Create a namespaced tool name from server and tool names.
  * Handles truncation and conflicts according to specific rules.
  * Also stores the mapping from namespaced name back to original names.
+ *
+ * `reservedNames` holds names an MCP tool must never occupy (the built-in tool
+ * names). Without it an MCP server could advertise e.g. `fsRead` and win the
+ * bare name, so the request would be routed through the built-in permission
+ * branch instead of the MCP one.
  */
 export function createNamespacedToolName(
     serverName: string,
     toolName: string,
     allNamespacedTools: Set<string>,
-    toolNameMapping: Map<string, { serverName: string; toolName: string }>
+    toolNameMapping: Map<string, { serverName: string; toolName: string }>,
+    reservedNames: Set<string>
 ): string {
     // First, check if this server/tool combination already has a mapping
     // If it does, reuse that name to maintain consistency across reinitializations
     for (const [existingName, mapping] of toolNameMapping.entries()) {
         if (mapping.serverName === serverName && mapping.toolName === toolName) {
+            // Never reuse a stale mapping that points at a reserved built-in name.
+            if (reservedNames.has(existingName)) {
+                toolNameMapping.delete(existingName)
+                break
+            }
             // If the name is already in the set, it's already registered
             // If not, add it to the set
             if (!allNamespacedTools.has(existingName)) {
@@ -1292,8 +1356,13 @@ export function createNamespacedToolName(
     // Sanitize the tool name
     const sanitizedToolName = sanitizeName(toolName)
 
-    // First try to use just the tool name if it's not already in use and fits within length limit
-    if (sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(sanitizedToolName)) {
+    // First try to use just the tool name if it's not already in use, is not a
+    // reserved built-in name, and fits within length limit
+    if (
+        sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH &&
+        !allNamespacedTools.has(sanitizedToolName) &&
+        !reservedNames.has(sanitizedToolName)
+    ) {
         allNamespacedTools.add(sanitizedToolName)
         toolNameMapping.set(sanitizedToolName, { serverName, toolName })
         return sanitizedToolName
@@ -1304,7 +1373,7 @@ export function createNamespacedToolName(
     const fullName = `${serverName}${sep}${sanitizedToolName}`
 
     // If the full name fits and is unique, use it
-    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName)) {
+    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName) && !reservedNames.has(fullName)) {
         allNamespacedTools.add(fullName)
         toolNameMapping.set(fullName, { serverName, toolName })
         return fullName
@@ -1317,7 +1386,7 @@ export function createNamespacedToolName(
             const truncatedServer = serverName.substring(0, maxServerLength)
             const namespacedName = `${truncatedServer}${sep}${sanitizedToolName}`
 
-            if (!allNamespacedTools.has(namespacedName)) {
+            if (!allNamespacedTools.has(namespacedName) && !reservedNames.has(namespacedName)) {
                 allNamespacedTools.add(namespacedName)
                 toolNameMapping.set(namespacedName, { serverName, toolName })
                 return namespacedName
@@ -1345,7 +1414,7 @@ export function createNamespacedToolName(
             candidateName = `${truncatedTool}${suffix}`
         }
 
-        if (!allNamespacedTools.has(candidateName)) {
+        if (!allNamespacedTools.has(candidateName) && !reservedNames.has(candidateName)) {
             allNamespacedTools.add(candidateName)
             toolNameMapping.set(candidateName, { serverName, toolName })
             return candidateName
@@ -1353,4 +1422,93 @@ export function createNamespacedToolName(
 
         duplicateNum++
     }
+}
+
+/**
+ * True when a permission entry is scoped to the given MCP server, i.e. it is either the
+ * server-wide prefix ('@server') or a single tool on that server ('@server/tool').
+ */
+export function isPermissionForServer(entry: string, serverName: string): boolean {
+    return entry === `@${serverName}` || entry.startsWith(`@${serverName}/`)
+}
+
+/**
+ * Re-apply server-scoped permission entries ('@server', '@server/tool') collected from agent
+ * config files to every server that actually loaded.
+ *
+ * `loadAgentConfig` applies these entries while iterating a file's own `mcpServers` block, which
+ * leaves two gaps: servers that come from a legacy `mcp.json` are never written into an agent
+ * config's `mcpServers` block, and duplicate (workspace/global) servers are skipped before the
+ * permission pass. Entries for those servers would otherwise be discarded on every load.
+ *
+ * Only entries belonging to a loaded server are restored, so permissions for servers the user has
+ * removed stay dropped. Existing entries are left untouched, preserving the order the per-file
+ * pass established.
+ */
+export function restoreServerScopedPermissions(
+    agentConfig: AgentConfig,
+    serverNameMapping: Map<string, string>,
+    pendingServerTools: Iterable<string>,
+    pendingServerAllowedTools: Iterable<string>
+): void {
+    const serverNames = new Set(serverNameMapping.values())
+    if (serverNames.size === 0) {
+        return
+    }
+
+    const belongsToLoadedServer = (entry: string): boolean => {
+        for (const serverName of serverNames) {
+            if (isPermissionForServer(entry, serverName)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    for (const entry of pendingServerTools) {
+        if (belongsToLoadedServer(entry) && !agentConfig.tools.includes(entry)) {
+            agentConfig.tools.push(entry)
+        }
+    }
+
+    for (const entry of pendingServerAllowedTools) {
+        if (belongsToLoadedServer(entry) && !agentConfig.allowedTools.includes(entry)) {
+            agentConfig.allowedTools.push(entry)
+        }
+    }
+}
+
+/**
+ * Default MCP tool execution timeout, in milliseconds, used when a server config
+ * does not specify one (or specifies an unusable value).
+ */
+export const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
+
+/**
+ * Largest delay that can be handed to `setTimeout` without the runtime clamping it
+ * back to 1ms and firing immediately (2^31 - 1 ms, roughly 24.8 days). The MCP SDK
+ * arms its request deadline with `setTimeout`, so an "unbounded" tool call has to be
+ * expressed as a large finite value rather than `Infinity`/`Number.MAX_SAFE_INTEGER`.
+ */
+export const MAX_TOOL_EXEC_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * A configured timeout is usable when it is a finite, positive number of milliseconds
+ * that `setTimeout` will honour. `0` is handled separately — it means "no timeout".
+ */
+export function isUsableToolExecTimeout(timeout: number | undefined): boolean {
+    return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TOOL_EXEC_TIMEOUT_MS
+}
+
+/**
+ * Resolve the timeout, in milliseconds, to hand to the MCP SDK for a tool call.
+ * - `0` (documented as "no timeout") maps to the maximum timer value, because the SDK
+ *   always applies its own 60s default when no timeout is supplied.
+ * - `undefined`, negative, non-finite, or over-large values fall back to the default.
+ */
+export function resolveMcpRequestTimeoutMs(timeout: number | undefined): number {
+    if (timeout === 0) {
+        return MAX_TOOL_EXEC_TIMEOUT_MS
+    }
+    return isUsableToolExecTimeout(timeout) ? (timeout as number) : DEFAULT_TOOL_EXEC_TIMEOUT_MS
 }
