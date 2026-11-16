@@ -5,19 +5,31 @@
 # by src/scripts/copy-node-assets.ts, to produce the final bundle.
 
 set -eo pipefail
+# Node.js major line to bundle. .github/workflows/bump-bundled-node.yml opens a draft pull request
+# when Node.js publishes a newer release of this line.
+# shellcheck disable=SC2034 # read by update-node-version.sh
 NODE_VERSION="24"
-BASE_URL="https://nodejs.org/download/release/v24.9.0"
+# Exact version to bundle, pinned for reproducible builds.
+NODE_SEMVER="24.22.2"
+BASE_URL="https://nodejs.org/download/release/v$NODE_SEMVER"
 SHASUMS_FILE="SHASUMS256.txt"
 ASSETS_DIR="build/node-assets"
 
-# Download SHASUMS256.txt
-curl -s "$BASE_URL/$SHASUMS_FILE" -o "$SHASUMS_FILE"
+# Prints the SHA-256 of a file. macOS has shasum instead of sha256sum.
+sha256_of() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Download SHASUMS256.txt, and remove it when the script exits, including on failure.
+trap 'rm -f "$SHASUMS_FILE"' EXIT
+curl -fsSL "$BASE_URL/$SHASUMS_FILE" -o "$SHASUMS_FILE"
 
 # Extract exact Node.js version from any entry in SHASUMS256.txt
 # NODE_SEMVER=$(grep -o 'node-v[0-9]*\.[0-9]*\.[0-9]*' SHASUMS256.txt | head -1 | cut -d'v' -f2)
-
-# temporarily lock node.js version to 24.9.0 due to https://github.com/nodejs/node/issues/60176
-NODE_SEMVER="24.9.0"
 
 if [ -z "$NODE_SEMVER" ]; then
     echo "Failed to extract Node.js version from SHASUMS256.txt"
@@ -40,19 +52,26 @@ EXPECTED_FILES=(
     "node-v$NODE_SEMVER-darwin-x64.tar.gz"
 )
 
-# Process each expected file pattern
+# Download each expected file and verify it against SHASUMS256.txt.
+# A missing entry fails the build: a release without every platform cannot be bundled.
 for actual_file in "${EXPECTED_FILES[@]}"; do
-    # Search for the file in SHASUMS256.txt
-    if grep -q "$actual_file" SHASUMS256.txt; then
-        filepath="$ASSETS_DIR/$actual_file"
-        expected_sum=$(grep "$actual_file" SHASUMS256.txt | awk '{print $1}')
-        echo "Found $actual_file with shasum: $expected_sum"
+    expected_sum=$(awk -v name="$actual_file" '$2 == name {print $1}' "$SHASUMS_FILE")
+    if [ -z "$expected_sum" ]; then
+        echo "Error: $actual_file not found in $SHASUMS_FILE" >&2
+        exit 1
+    fi
 
-        echo "Updating $actual_file"
-        mkdir -p "$(dirname "$filepath")"
-        curl -s "$BASE_URL/$actual_file" -o "$filepath"
-    else
-        echo "Warning: $actual_file not found in SHASUMS256.txt"
+    filepath="$ASSETS_DIR/$actual_file"
+    echo "Found $actual_file with shasum: $expected_sum"
+
+    echo "Updating $actual_file"
+    mkdir -p "$(dirname "$filepath")"
+    curl -fsSL "$BASE_URL/$actual_file" -o "$filepath"
+
+    actual_sum=$(sha256_of "$filepath")
+    if [ "$actual_sum" != "$expected_sum" ]; then
+        echo "Error: SHA-256 mismatch for $actual_file (expected $expected_sum, got $actual_sum)" >&2
+        exit 1
     fi
 done
 
@@ -61,7 +80,7 @@ LICENSE_URL="https://raw.githubusercontent.com/nodejs/node/v${NODE_SEMVER}/LICEN
 LICENSE_FILE="$ASSETS_DIR/LICENSE"
 
 echo "Fetching Node.js license from $LICENSE_URL"
-curl -s "$LICENSE_URL" -o "$LICENSE_FILE"
+curl -fsSL "$LICENSE_URL" -o "$LICENSE_FILE"
 
 # Verify the license file was downloaded successfully
 if [ ! -s "$LICENSE_FILE" ]; then
