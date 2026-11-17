@@ -233,6 +233,11 @@ const BEAM_THROTTLE_COOLDOWN_MS = 90000
 // The most artifacts whose last CreateArtifactDownloadUrl failure reason is remembered (read by the
 // beam/original-code downloads to tell the IDE WHY; other callers never read it, so bound it).
 const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
+// downloadArtifactToPath: how many times one artifact is downloaded before the failure is returned.
+// Each attempt asks for a new signed URL, so a URL that expired during a slow attempt is not reused.
+const ARTIFACT_DOWNLOAD_MAX_ATTEMPTS = 3
+// downloadArtifactToPath does not retry these: the disk or the save folder is the problem, not the link.
+const ARTIFACT_DOWNLOAD_LOCAL_ERROR_CODES = ['ENOSPC', 'EACCES', 'EPERM', 'EROFS', 'ENOENT', 'ENOTDIR', 'EISDIR']
 // downloadBeamArtifact's ErrorCode for a destination it refuses (retrying the same path can't help).
 export const BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION = 'InvalidDestination'
 
@@ -2249,6 +2254,10 @@ export class ATXTransformHandler {
     private readonly warnedUnrecognizedDownloadUrlErrors = new Set<string>()
     // Base of the retry backoff (250, 500, 1000ms, jittered). A field so tests can make it ~0.
     private downloadUrlBackoffBaseMs = 250
+    // downloadArtifactToPath: wait before attempt 2 (1x) and attempt 3 (2x), and between tries of the
+    // rename that gives a finished download its real name. Fields so tests can make them 0.
+    private artifactDownloadRetryBaseMs = 1000
+    private artifactDownloadRenameRetryMs = 100
 
     /** IDE-facing message for a null createArtifactDownloadUrl result. Never includes the URL. */
     private downloadUrlFailureMessage(artifactId: string, what: string): string {
@@ -6746,58 +6755,118 @@ export class ATXTransformHandler {
         savePath: string,
         artifactName?: string
     ): Promise<{ Success: boolean; FilePath?: string; Error?: string }> {
-        // Tracked outside the try so a mid-download failure can report how far it got
-        // (distinguishes a stalled connection from a never-started one).
-        let downloadedBytes = 0
-        try {
-            const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
-            if (!downloadInfo) {
-                const msg = `Failed to get download URL for artifact=${artifactId} (job=${jobId})`
-                this.logging.error(`ATX: downloadArtifactToPath ${msg}`)
-                return { Success: false, Error: msg }
+        let lastError = ''
+        for (let attempt = 1; attempt <= ARTIFACT_DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+            // Tracked outside the try so a mid-download failure can report how far it got
+            // (distinguishes a stalled connection from a never-started one).
+            let downloadedBytes = 0
+            // Each attempt writes to its own name beside the target. The file gets its real name only
+            // when it is whole, so a download that stops partway leaves no cut file for the IDE to
+            // open, a failed re-download does not destroy the copy already on disk, and two downloads
+            // of the same artifact do not truncate each other's file.
+            let tempPath: string | undefined
+            try {
+                // A new signed URL for every attempt: the one from a slow or stalled attempt may have expired.
+                const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
+                if (!downloadInfo) {
+                    const msg = `Failed to get download URL for artifact=${artifactId} (job=${jobId})`
+                    this.logging.error(`ATX: downloadArtifactToPath ${msg}`)
+                    return { Success: false, Error: msg }
+                }
+
+                await Utils.directoryExists(savePath)
+                const fileName = artifactName ? path.basename(artifactName) : 'artifact.zip'
+                const filePath = path.join(savePath, fileName)
+                tempPath = `${filePath}.${uuidv4().substring(0, 8)}.part`
+
+                // Stream the artifact straight to disk instead of buffering the entire file in memory.
+                // Large artifacts (e.g. Transformation_Report.html) previously failed here: the old
+                // `timeout: { request: 30000 }` caps the WHOLE request — including receiving the full
+                // body — so a large-but-healthy download would abort with a TimeoutError, which was
+                // then swallowed and surfaced to the user as a generic "could not download" error.
+                // `responseType: 'buffer'` also held the full file (plus a copy) in memory. Streaming
+                // with inactivity-based timeouts (time-to-headers + socket idle) removes the size
+                // ceiling while still failing fast on a genuinely stalled connection.
+                this.logging.log(
+                    `ATX: downloadArtifactToPath streaming artifact=${artifactId} to ${filePath} (attempt=${attempt}/${ARTIFACT_DOWNLOAD_MAX_ATTEMPTS})`
+                )
+                const downloadStream = got.stream(downloadInfo.s3PresignedUrl, {
+                    headers: downloadInfo.requestHeaders || {},
+                    timeout: { response: 30000, socket: 60000 },
+                })
+
+                // The size the server promised. Not used with a Content-Encoding: Content-Length then
+                // counts the encoded bytes and got writes the decoded ones.
+                let expectedBytes: number | undefined
+                downloadStream.on('response', (response: any) => {
+                    const contentLength = Number(response?.headers?.['content-length'])
+                    if (!response?.headers?.['content-encoding'] && Number.isInteger(contentLength)) {
+                        expectedBytes = contentLength
+                    }
+                })
+                downloadStream.on('downloadProgress', ({ transferred }) => {
+                    downloadedBytes = transferred
+                })
+
+                await pipeline(downloadStream, fs.createWriteStream(tempPath))
+
+                const writtenBytes = (await fs.promises.stat(tempPath)).size
+                if (expectedBytes !== undefined && writtenBytes !== expectedBytes) {
+                    throw new Error(`Incomplete download: wrote ${writtenBytes} of ${expectedBytes} bytes`)
+                }
+                await this.moveDownloadedArtifact(tempPath, filePath)
+
+                this.logging.log(`ATX: downloadArtifactToPath completed artifact=${artifactId}, bytes=${writtenBytes}`)
+                return { Success: true, FilePath: savePath }
+            } catch (error) {
+                if (tempPath) {
+                    await fs.promises.rm(tempPath, { force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {})
+                }
+                // Log every failure with enough context to diagnose without a repro: the got error
+                // `code` (ETIMEDOUT/ECONNRESET/...), the timeout phase for a TimeoutError, the HTTP
+                // status for an HTTPError, bytes received before the failure, and the full stack.
+                const err = error as any
+                const diagnostics: string[] = []
+                if (err?.code) diagnostics.push(`code=${err.code}`)
+                if (err?.event) diagnostics.push(`timeoutPhase=${err.event}`)
+                if (err?.response?.statusCode) diagnostics.push(`httpStatus=${err.response.statusCode}`)
+                const suffix = diagnostics.length ? ` [${diagnostics.join(', ')}]` : ''
+                this.logging.error(
+                    `ATX: downloadArtifactToPath failed artifact=${artifactId} (job=${jobId}, attempt=${attempt}/${ARTIFACT_DOWNLOAD_MAX_ATTEMPTS}) after ${downloadedBytes} bytes: ${String(err?.stack ?? error)}${suffix}`
+                )
+                lastError = `${String(err?.message ?? error)}${suffix}`
+                if (
+                    attempt >= ARTIFACT_DOWNLOAD_MAX_ATTEMPTS ||
+                    ARTIFACT_DOWNLOAD_LOCAL_ERROR_CODES.includes(err?.code)
+                ) {
+                    break
+                }
+                await Utils.sleep(this.artifactDownloadRetryBaseMs * attempt)
             }
-
-            await Utils.directoryExists(savePath)
-            const fileName = artifactName ? path.basename(artifactName) : 'artifact.zip'
-            const filePath = path.join(savePath, fileName)
-
-            // Stream the artifact straight to disk instead of buffering the entire file in memory.
-            // Large artifacts (e.g. Transformation_Report.html) previously failed here: the old
-            // `timeout: { request: 30000 }` caps the WHOLE request — including receiving the full
-            // body — so a large-but-healthy download would abort with a TimeoutError, which was
-            // then swallowed and surfaced to the user as a generic "could not download" error.
-            // `responseType: 'buffer'` also held the full file (plus a copy) in memory. Streaming
-            // with inactivity-based timeouts (time-to-headers + socket idle) removes the size
-            // ceiling while still failing fast on a genuinely stalled connection.
-            this.logging.log(`ATX: downloadArtifactToPath streaming artifact=${artifactId} to ${filePath}`)
-            const downloadStream = got.stream(downloadInfo.s3PresignedUrl, {
-                headers: downloadInfo.requestHeaders || {},
-                timeout: { response: 30000, socket: 60000 },
-            })
-
-            downloadStream.on('downloadProgress', ({ transferred }) => {
-                downloadedBytes = transferred
-            })
-
-            await pipeline(downloadStream, fs.createWriteStream(filePath))
-
-            this.logging.log(`ATX: downloadArtifactToPath completed artifact=${artifactId}, bytes=${downloadedBytes}`)
-            return { Success: true, FilePath: savePath }
-        } catch (error) {
-            // Log every failure with enough context to diagnose without a repro: the got error
-            // `code` (ETIMEDOUT/ECONNRESET/...), the timeout phase for a TimeoutError, the HTTP
-            // status for an HTTPError, bytes received before the failure, and the full stack.
-            const err = error as any
-            const diagnostics: string[] = []
-            if (err?.code) diagnostics.push(`code=${err.code}`)
-            if (err?.event) diagnostics.push(`timeoutPhase=${err.event}`)
-            if (err?.response?.statusCode) diagnostics.push(`httpStatus=${err.response.statusCode}`)
-            const suffix = diagnostics.length ? ` [${diagnostics.join(', ')}]` : ''
-            this.logging.error(
-                `ATX: downloadArtifactToPath failed artifact=${artifactId} (job=${jobId}) after ${downloadedBytes} bytes: ${String(err?.stack ?? error)}${suffix}`
-            )
-            return { Success: false, Error: `${String(err?.message ?? error)}${suffix}` }
         }
+        return { Success: false, Error: lastError }
+    }
+
+    /**
+     * Gives a finished download its real name. rename replaces an older copy in one step. Windows
+     * refuses the rename while another program holds the older copy open, so after a few tries the
+     * finished file is copied over it instead, which is what the direct write did before.
+     */
+    private async moveDownloadedArtifact(tempPath: string, filePath: string): Promise<void> {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await fs.promises.rename(tempPath, filePath)
+                return
+            } catch (error) {
+                const code = (error as any)?.code
+                if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+                    throw error
+                }
+                await Utils.sleep(this.artifactDownloadRenameRetryMs * attempt)
+            }
+        }
+        await fs.promises.copyFile(tempPath, filePath)
+        await fs.promises.rm(tempPath, { force: true })
     }
 
     /**
