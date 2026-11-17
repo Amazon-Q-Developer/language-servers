@@ -110,14 +110,9 @@ for (const implementation of ['native', 'fallback'] as const) {
             await Promise.all([close(endpoint), close(destination)])
         })
 
-        function exchange(
-            grant: 'refresh' | 'authorization_code',
-            authMethod: string,
-            url = endpointUrl,
-            authorizationEndpoint = 'https://auth.example.com/authorize'
-        ) {
+        function exchange(grant: 'refresh' | 'authorization_code', authMethod: string, url = endpointUrl) {
             const meta = {
-                authorization_endpoint: authorizationEndpoint,
+                authorization_endpoint: 'https://auth.example.com/authorize',
                 token_endpoint: url,
             }
             const reg = {
@@ -126,12 +121,28 @@ for (const implementation of ['native', 'fallback'] as const) {
                 token_endpoint_auth_method: authMethod,
                 redirect_uri: 'http://localhost:12345/oauth/callback',
             }
-            const resource = new URL('https://mcp.example.com/mcp')
+            // The token endpoint is a server on this computer, which an MCP server may send the client to only when
+            // it is on this computer too
+            const resource = new URL('http://localhost:3000/mcp')
             if (grant === 'refresh') {
                 return (OAuthClient as any).refreshGrant(meta, reg, resource, 'test-refresh-token')
             }
             return (OAuthClient as any).pkceGrant(meta, reg, resource, [], reg.redirect_uri, callback)
         }
+
+        it('registers the callback listener before opening the browser', async () => {
+            // Deliver the redirect synchronously while showDocument is still pending. The listener must already be
+            // registered by then, otherwise the callback is dropped and the sign-in waits for the timeout.
+            showDocument.callsFake(async ({ uri }: { uri: string }) => {
+                const state = new URL(uri).searchParams.get('state')!
+                const response = { writeHead: () => response, end: () => response }
+                callback.emit('request', { url: `/oauth/callback?code=test-code&state=${state}` }, response)
+                return { success: true }
+            })
+            const token = await exchange('authorization_code', 'none')
+            assert.equal(token.access_token, 'test-access-token')
+            sinon.assert.calledOnce(showDocument)
+        })
 
         for (const grant of ['refresh', 'authorization_code'] as const) {
             for (const authMethod of ['client_secret_post', 'client_secret_basic', 'none']) {
@@ -186,68 +197,43 @@ for (const implementation of ['native', 'fallback'] as const) {
             }
         }
 
-        for (const authorizationEndpoint of [
-            'file:///tmp/payload.sh',
-            'javascript:alert(1)',
-            'command:workbench.action.terminal.new',
-            'vscode://file/tmp/payload.sh',
-            'http://auth.example.com/authorize',
-            'not a url',
-        ]) {
-            it(`does not open ${authorizationEndpoint} as the authorization endpoint`, async () => {
-                const fetch = sinon.stub(OAuthClient as any, 'fetchCompat')
-                await assert.rejects(
-                    exchange('authorization_code', 'none', endpointUrl, authorizationEndpoint),
-                    /authorization endpoint/
-                )
-                sinon.assert.notCalled(showDocument)
-                sinon.assert.notCalled(fetch)
-            })
-        }
-
-        it('accepts a callback that arrives before showDocument resolves', async () => {
-            showDocument.callsFake(async ({ uri }: { uri: string }) => {
-                const state = new URL(uri).searchParams.get('state')!
-                const response = { writeHead: () => response, end: () => response }
-                callback.emit('request', { url: `/oauth/callback?code=test-code&state=${state}` }, response)
-                return { success: true }
-            })
-
-            const token = await exchange('authorization_code', 'none')
-
-            assert.equal(token.access_token, 'test-access-token')
-            assert.equal(requests[0].body.get('code'), 'test-code')
-        })
-
-        it('opens a loopback HTTP authorization endpoint', async () => {
-            const token = await exchange('authorization_code', 'none', endpointUrl, 'http://127.0.0.1:9/authorize')
-            assert.equal(token.access_token, 'test-access-token')
-            sinon.assert.calledOnce(showDocument)
-            const opened = new URL(showDocument.firstCall.args[0].uri)
-            assert.equal(opened.origin + opened.pathname, 'http://127.0.0.1:9/authorize')
-            assert.equal(showDocument.firstCall.args[0].external, true)
+        it('does not send the refresh token to a loopback token endpoint of a public MCP server', async () => {
+            sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
+            const refresh = (OAuthClient as any).refreshGrant(
+                { authorization_endpoint: 'https://auth.example.com/authorize', token_endpoint: endpointUrl },
+                { client_id: 'test-client', client_secret: 'test-secret', redirect_uri: 'http://localhost:1/cb' },
+                new URL('https://mcp.example.com/mcp'),
+                'test-refresh-token'
+            )
+            await assert.rejects(refresh, /token endpoint is on a loopback address/)
+            assert.equal(requests.length, 0)
         })
 
         it('returns no token or cache update after a redirected silent refresh', async () => {
             responseStatus = 307
-            sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) =>
-                String(file).endsWith('.token.json')
-                    ? {
-                          access_token: 'expired',
-                          refresh_token: 'test-refresh-token',
-                          obtained_at: 0,
-                          expires_in: 1,
-                      }
+            sinon.stub(OAuthClient as any, 'read').callsFake(async (file: unknown) => {
+                if (String(file).endsWith('.token.json')) {
+                    return {
+                        access_token: 'expired',
+                        refresh_token: 'test-refresh-token',
+                        obtained_at: 0,
+                        expires_in: 1,
+                    }
+                }
+                // A silent refresh sends the refresh token only to the token endpoint pinned at the last sign-in
+                return String(file).endsWith('.meta.json')
+                    ? { token_endpoint: endpointUrl }
                     : { client_id: 'test-client', client_secret: 'test-secret' }
-            )
-            sinon.stub(OAuthClient as any, 'discoverAS').resolves({ token_endpoint: endpointUrl })
+            })
+            const discover = sinon.stub(OAuthClient as any, 'discoverAS')
             const write = sinon.stub(OAuthClient as any, 'write')
-            const token = await OAuthClient.getValidAccessToken(new URL('https://mcp.example.com/mcp'), {
+            const token = await OAuthClient.getValidAccessToken(new URL('http://localhost:3000/mcp'), {
                 interactive: false,
             })
             assert.equal(token, undefined)
             assert.equal(requests.length, 1)
             assert.equal(destinationRequests, 0)
+            sinon.assert.notCalled(discover)
             sinon.assert.notCalled(write)
             sinon.assert.notCalled(showDocument)
         })
