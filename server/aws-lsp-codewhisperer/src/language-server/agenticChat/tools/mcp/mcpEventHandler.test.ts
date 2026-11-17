@@ -100,6 +100,48 @@ describe('McpEventHandler error handling', () => {
         } catch {}
     })
 
+    it('logs MCP form values except env variable and header values', async () => {
+        await eventHandler.onMcpServerClick({
+            id: 'unhandled-action',
+            title: 'docs-server',
+            optionsValues: {
+                name: 'docs-server',
+                transport: 'stdio',
+                command: 'npx',
+                args: [{ arg_key: '-y' }, { arg_key: '@docs/server' }],
+                timeout: '60',
+                scope: 'global',
+                env_variables: [{ env_var_name: 'API_TOKEN', env_var_value: 'env-value-123' }],
+                headers: [{ key: 'Authorization', value: 'Bearer header-value-456' }],
+                additional_env_variables: [{ env_var_name: 'EXTRA_TOKEN', env_var_value: 'env-value-789' }],
+                additional_headers: [{ key: 'X-Api-Key', value: 'header-value-012' }],
+            } as any,
+        })
+
+        const logged = features.logging.log
+            .getCalls()
+            .map((c: sinon.SinonSpyCall) => c.args[0])
+            .join('\n')
+        expect(logged).to.include(
+            'onMcpServerClick event with params: {"id":"unhandled-action","title":"docs-server","optionsValues":{' +
+                '"name":"docs-server","transport":"stdio","command":"npx",' +
+                '"args":[{"arg_key":"-y"},{"arg_key":"@docs/server"}],"timeout":"60","scope":"global",' +
+                '"env_variables":["API_TOKEN"],"headers":["Authorization"],' +
+                '"additional_env_variables":["EXTRA_TOKEN"],"additional_headers":["X-Api-Key"]}}'
+        )
+        for (const value of ['env-value-123', 'header-value-456', 'env-value-789', 'header-value-012']) {
+            expect(logged).to.not.include(value)
+        }
+    })
+
+    it('logs the click params unchanged when there are no env variables or headers', async () => {
+        const params = { id: 'unhandled-action', title: 'docs-server', optionsValues: { search: 'alwaysAllow' } }
+        await eventHandler.onMcpServerClick(params as any)
+
+        const logged = features.logging.log.getCalls().map((c: sinon.SinonSpyCall) => c.args[0])
+        expect(logged).to.include(`onMcpServerClick event with params: ${JSON.stringify(params)}`)
+    })
+
     it('displays config load errors in the header status', async () => {
         // Create mock errors
         const mockErrors = new Map<string, string>([

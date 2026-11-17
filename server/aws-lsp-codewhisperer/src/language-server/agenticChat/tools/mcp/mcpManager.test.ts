@@ -2260,6 +2260,47 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         } catch {}
         expect(recordApprovalStub.calledOnce).to.be.true
     })
+
+    it('logs the stdio launch without argument or env values', async () => {
+        const mgr = await buildMgr()
+        sinon.stub(Client.prototype, 'connect').rejects(new Error('not connected in tests'))
+        const infoSpy = sinon.spy(fakeLogging, 'info') as unknown as sinon.SinonSpy<[string], void>
+        const cfg: MCPServerConfig = {
+            command: 'npx',
+            args: ['server', '--api-key', 'arg-value-123'],
+            env: { API_TOKEN: 'env-value-456' },
+            __configPath__: globalMcp,
+        }
+        try {
+            await (mgr as any).initOneServerInternal('svc', cfg)
+        } catch {}
+
+        const logged = infoSpy.getCalls().map(c => String(c.args[0]))
+        expect(logged).to.include('MCP: Executing command: npx (3 arguments) (env: API_TOKEN)')
+        expect(logged.join('\n')).to.not.include('arg-value-123')
+        expect(logged.join('\n')).to.not.include('env-value-456')
+    })
+
+    it('logs the server URL without its path, query or header values', async () => {
+        const mgr = await buildMgr()
+        sinon.stub(Client.prototype, 'connect').rejects(new Error('not connected in tests'))
+        sinon.stub(globalThis, 'fetch').rejects(new Error('no network in tests'))
+        const infoSpy = sinon.spy(fakeLogging, 'info') as unknown as sinon.SinonSpy<[string], void>
+        const cfg: MCPServerConfig = {
+            url: 'https://mcp.example.com/path-key-123/mcp?token=query-value-456',
+            headers: { Authorization: 'Bearer header-value-789' },
+            __configPath__: globalMcp,
+        }
+        try {
+            await (mgr as any).initOneServerInternal('svc', cfg)
+        } catch {}
+
+        const logged = infoSpy.getCalls().map(c => String(c.args[0]))
+        expect(logged).to.include('MCP: Connecting to URL: https://mcp.example.com (headers: Authorization)')
+        for (const value of ['path-key-123', 'query-value-456', 'header-value-789']) {
+            expect(logged.join('\n')).to.not.include(value)
+        }
+    })
 })
 
 describe('workspace trust for stdio MCP servers', () => {
