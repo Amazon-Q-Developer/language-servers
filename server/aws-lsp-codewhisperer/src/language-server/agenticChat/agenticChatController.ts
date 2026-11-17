@@ -129,6 +129,7 @@ import {
     isNullish,
     getOriginFromClientInfo,
     getClientName,
+    restorePropertyNames,
     sanitizeInput,
     sanitizeRequestInput,
 } from '../../shared/utils'
@@ -2374,6 +2375,14 @@ export class AgenticChatController implements ChatHandlers {
                         }
 
                         if (originalNames) {
+                            // The request gives the model the property names of the tool's input schema in their
+                            // sanitized form (sanitizeRequestInput). The tool runs with the names of its schema.
+                            const inputSchema = this.#features.agent
+                                .getTools({ format: 'bedrock' })
+                                .find(tool => tool.toolSpecification.name === toolUse.name)?.toolSpecification
+                                .inputSchema?.json
+                            executionInput = restorePropertyNames(toolUse.input as object, inputSchema)
+
                             const { serverName, toolName } = originalNames
                             let def
                             try {

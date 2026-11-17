@@ -5617,6 +5617,37 @@ ${' '.repeat(8)}}
         })
     })
 
+    // A result stream and a session for the processToolUses tests below
+    function makeStream() {
+        return {
+            removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+            writeResultBlock: sinon.stub().resolves(1),
+            overwriteResultBlock: sinon.stub().resolves(),
+            removeResultBlock: sinon.stub().resolves(),
+            getMessageBlockId: sinon.stub().returns(undefined),
+            hasMessage: sinon.stub().returns(false),
+            updateOngoingProgressResult: sinon.stub().resolves(),
+            getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+            setMessageIdToUpdateForTool: sinon.stub(),
+            getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+            addMessageOperation: sinon.stub(),
+            getMessageOperation: sinon.stub().returns(undefined),
+        }
+    }
+
+    function makeSession() {
+        const session: any = {
+            toolUseLookup: new Map(),
+            pairProgrammingMode: true,
+            approvedPaths: new Set(),
+            conversationId: 'conv',
+            modelId: undefined,
+            getConversationType: () => 'AgenticChat',
+            setDeferredToolExecution: sinon.stub(),
+        }
+        return session
+    }
+
     describe('processToolUses with an MCP tool named after a built-in tool', () => {
         // An MCP server advertises a tool called `fsRead`. Registration namespaces it
         // to `probe___fsRead`, but the controller still receives the server's
@@ -5638,36 +5669,6 @@ ${' '.repeat(8)}}
                 getToolNameMapping: () => new Map([[REGISTERED, { serverName: SERVER, toolName: ORIGINAL }]]),
                 ...overrides,
             }
-        }
-
-        function makeStream() {
-            return {
-                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
-                writeResultBlock: sinon.stub().resolves(1),
-                overwriteResultBlock: sinon.stub().resolves(),
-                removeResultBlock: sinon.stub().resolves(),
-                getMessageBlockId: sinon.stub().returns(undefined),
-                hasMessage: sinon.stub().returns(false),
-                updateOngoingProgressResult: sinon.stub().resolves(),
-                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
-                setMessageIdToUpdateForTool: sinon.stub(),
-                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
-                addMessageOperation: sinon.stub(),
-                getMessageOperation: sinon.stub().returns(undefined),
-            }
-        }
-
-        function makeSession() {
-            const session: any = {
-                toolUseLookup: new Map(),
-                pairProgrammingMode: true,
-                approvedPaths: new Set(),
-                conversationId: 'conv',
-                modelId: undefined,
-                getConversationType: () => 'AgenticChat',
-                setDeferredToolExecution: sinon.stub(),
-            }
-            return session
         }
 
         // Cards written to the stream, excluding the `explanation` directive that
@@ -5836,6 +5837,73 @@ ${' '.repeat(8)}}
             // The MCP card is keyed by the plain toolUseId, not the shell tool's id scheme.
             const confirmation = toolCards(stream.writeResultBlock)[0]
             assert.strictEqual(confirmation.messageId, shellLike.toolUseId)
+        })
+    })
+
+    describe('processToolUses with an MCP tool whose property names have invisible characters', () => {
+        const SERVER = 'notes'
+        const TOOL = 'save_note'
+        const REGISTERED = `${SERVER}___${TOOL}`
+        // U+200C is part of the name, as in words of some scripts. The request gives the model "notetitle".
+        const PROPERTY = 'note\u200Ctitle'
+        const inputSchema = {
+            type: 'object',
+            properties: {
+                [PROPERTY]: { type: 'string' },
+                explanation: { type: 'string', description: 'One sentence explanation' },
+            },
+            required: [PROPERTY],
+        }
+
+        beforeEach(() => {
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                {
+                    toolSpecification: {
+                        name: REGISTERED,
+                        description: 'Saves a note',
+                        inputSchema: { json: inputSchema },
+                    },
+                },
+            ])
+            mcpInstanceStub.get(() => ({
+                getAllTools: () => [{ serverName: SERVER, toolName: TOOL, description: 'Saves a note', inputSchema }],
+                getOriginalToolNames: (name: string) =>
+                    name === REGISTERED ? { serverName: SERVER, toolName: TOOL } : undefined,
+                requiresApproval: () => false,
+                clearToolNameMapping: () => {},
+                setToolNameMapping: () => {},
+                getToolNameMapping: () => new Map([[REGISTERED, { serverName: SERVER, toolName: TOOL }]]),
+            }))
+        })
+
+        it('runs the tool with the property names of its input schema', async () => {
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+            const toolUse = {
+                toolUseId: 'note-id',
+                name: REGISTERED,
+                input: { notetitle: 'Plan', explanation: 'Save the plan' },
+                stop: true,
+            }
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                makeStream() as any,
+                makeSession(),
+                'tabId',
+                mockCancellationToken
+            )
+
+            assert.deepStrictEqual(
+                results.filter(result => result.status === ToolResultStatus.ERROR),
+                [],
+                'no tool result is an error'
+            )
+            sinon.assert.calledOnce(runToolStub)
+            assert.strictEqual(runToolStub.firstCall.args[0], REGISTERED)
+            assert.deepStrictEqual(runToolStub.firstCall.args[1], { [PROPERTY]: 'Plan' })
+            // The conversation keeps the input as the model wrote it
+            assert.deepStrictEqual(toolUse.input, { notetitle: 'Plan' })
         })
     })
 

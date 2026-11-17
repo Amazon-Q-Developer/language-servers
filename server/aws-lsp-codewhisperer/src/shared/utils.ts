@@ -767,3 +767,148 @@ export function sanitizeRequestInput(input: any): any {
     }
     return input
 }
+
+type JsonObject = Record<string, unknown>
+
+/** The most schemas that restorePropertyNames applies to one value */
+const MAX_SCHEMAS_PER_VALUE = 64
+
+function isJsonObject(value: unknown): value is JsonObject {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * `input` with each key changed back to the property name in `schema` that it stands for, after
+ * sanitizeRequestInput gave the model the property names of `schema` in their sanitized form. Use it for the input
+ * of a tool, with the input schema that the request sent for the tool.
+ *
+ * It follows properties, additionalProperties, items, prefixItems, allOf, anyOf, oneOf and $ref pointers within
+ * `schema`. A key stays as it is when it stands for no property name or for more than one, or when another key of the
+ * same object already has that property name. Returns `input` itself when no key changes.
+ */
+export function restorePropertyNames<T>(input: T, schema: unknown): T {
+    return restoreNames(input, [schema], schema) as T
+}
+
+function restoreNames(value: unknown, schemas: unknown[], root: unknown): unknown {
+    const applicable = applicableSchemas(schemas, root)
+    if (applicable.length === 0) {
+        return value
+    }
+    if (Array.isArray(value)) {
+        let changed = false
+        const items = value.map((item, index) => {
+            const restored = restoreNames(
+                item,
+                applicable.flatMap(schema => itemSchemas(schema, index)),
+                root
+            )
+            changed ||= restored !== item
+            return restored
+        })
+        return changed ? items : value
+    }
+    if (!isJsonObject(value)) {
+        return value
+    }
+
+    // For each key that the model can use: the property names that it can stand for, with their schemas
+    const namesByKey = new Map<string, Map<string, unknown[]>>()
+    for (const schema of applicable) {
+        const properties = schema.properties
+        if (!isJsonObject(properties)) {
+            continue
+        }
+        const names = Object.keys(properties)
+        sanitizeKeys(names).forEach((key, i) => {
+            const schemasByName = namesByKey.get(key) ?? new Map<string, unknown[]>()
+            schemasByName.set(names[i], [...(schemasByName.get(names[i]) ?? []), properties[names[i]]])
+            namesByKey.set(key, schemasByName)
+        })
+    }
+    const additionalProperties = applicable.map(schema => schema.additionalProperties)
+
+    // The keys of the input, and the property names that it gets: a value never replaces another one
+    const usedNames = new Set(Object.keys(value))
+    let changed = false
+    const entries = Object.entries(value).map(([key, item]) => {
+        const schemasByName = namesByKey.get(key)
+        let name = key
+        if (schemasByName?.size === 1) {
+            const [onlyName] = schemasByName.keys()
+            if (!usedNames.has(onlyName)) {
+                name = onlyName
+                usedNames.add(name)
+            }
+        }
+        const restored = restoreNames(
+            item,
+            schemasByName ? (schemasByName.get(name) ?? []) : additionalProperties,
+            root
+        )
+        changed ||= name !== key || restored !== item
+        return [name, restored] as const
+    })
+    // Object.fromEntries defines each key as a property, also a key such as __proto__
+    return changed ? Object.fromEntries(entries) : value
+}
+
+/** `schemas`, the members of their allOf, anyOf and oneOf, and the schemas that their $ref pointers name */
+function applicableSchemas(schemas: unknown[], root: unknown): JsonObject[] {
+    const applicable: JsonObject[] = []
+    const pending = [...schemas]
+    while (pending.length > 0 && applicable.length < MAX_SCHEMAS_PER_VALUE) {
+        const schema = pending.shift()
+        if (!isJsonObject(schema) || applicable.includes(schema)) {
+            continue
+        }
+        applicable.push(schema)
+        if (typeof schema.$ref === 'string') {
+            pending.push(resolveSchemaPointer(schema.$ref, root))
+        }
+        for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
+            const members = schema[keyword]
+            if (Array.isArray(members)) {
+                pending.push(...members)
+            }
+        }
+    }
+    return applicable
+}
+
+/** The schemas of the item at `index` of an array that `schema` describes */
+function itemSchemas(schema: JsonObject, index: number): unknown[] {
+    const { items, prefixItems, additionalItems } = schema
+    if (Array.isArray(prefixItems)) {
+        return [index < prefixItems.length ? prefixItems[index] : items]
+    }
+    if (Array.isArray(items)) {
+        return [index < items.length ? items[index] : additionalItems]
+    }
+    return [items]
+}
+
+/** The value that a $ref such as #/$defs/Item names within `root`, or undefined for another kind of reference */
+function resolveSchemaPointer(ref: string, root: unknown): unknown {
+    if (!ref.startsWith('#')) {
+        return undefined
+    }
+    let pointer: string
+    try {
+        pointer = decodeURIComponent(ref.slice(1))
+    } catch {
+        return undefined
+    }
+    if (pointer !== '' && !pointer.startsWith('/')) {
+        return undefined
+    }
+    let node = root
+    for (const token of pointer.split('/').slice(1)) {
+        const key = token.replace(/~1/g, '/').replace(/~0/g, '~')
+        if (typeof node !== 'object' || node === null || !Object.prototype.hasOwnProperty.call(node, key)) {
+            return undefined
+        }
+        node = (node as JsonObject)[key]
+    }
+    return node
+}
