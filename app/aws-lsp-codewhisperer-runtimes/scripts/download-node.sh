@@ -10,7 +10,7 @@ set -eo pipefail
 # shellcheck disable=SC2034 # read by update-node-version.sh
 NODE_VERSION="24"
 # Exact version to bundle, pinned for reproducible builds.
-NODE_SEMVER="24.22.2"
+NODE_SEMVER="24.22.3"
 BASE_URL="https://nodejs.org/download/release/v$NODE_SEMVER"
 SHASUMS_FILE="SHASUMS256.txt"
 ASSETS_DIR="build/node-assets"
