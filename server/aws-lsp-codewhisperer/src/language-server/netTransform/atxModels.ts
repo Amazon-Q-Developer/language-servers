@@ -454,13 +454,15 @@ export interface AtxAppLaunchApp {
     healthCheckPaths?: string[]
     // Default 120
     startTimeoutSeconds?: number
-    // Build configuration to build and start in, e.g. 'Debug - SQLite'. Matched against the ones the
-    // project declares without case, and the project's own spelling is built: MSBuild compares a
-    // condition's $(Configuration) without case but substitutes it verbatim into bin\$(Configuration).
-    // Left out when the project declares one configuration, and Debug is then built. The agent sends it
-    // once it has asked the customer which to use, which it does when a project declares several: the
-    // configuration can decide how the app behaves, not just how it is compiled (mojoPortal picks its
-    // database provider that way, so the wrong one starts an app with no database)
+    // Since 1.2; absent means Debug is built. Build configuration to build and start in, e.g.
+    // 'Debug - SQLite'. Matched without case against the ones the solution and the project name, and the
+    // known spelling is built: MSBuild compares a condition's $(Configuration) without case but
+    // substitutes it verbatim into bin\$(Configuration). One neither of them names is still built, with a
+    // warning in the startup log, never refused: what a configuration does can live in a project the
+    // launchable one only references. The agent sends it once it has asked the customer which to use,
+    // which it does when more than Debug/Release are available: the configuration can decide how the app
+    // behaves, not just how it is compiled (mojoPortal picks its database provider that way, in
+    // mojoPortal.Business.csproj, so the wrong one starts an app with no database)
     configuration?: string
 }
 
@@ -504,7 +506,7 @@ export interface AtxAppLaunchResult {
     }
     error?: string
     logFile?: string
-    // The configuration the IDE built, in the project's own spelling: what the request asked for, or
+    // Since 1.2. The configuration the IDE built, in the known spelling: what the request asked for, or
     // Debug when it asked for none. Absent when the IDE started nothing
     configuration?: string
     durationSeconds: number
