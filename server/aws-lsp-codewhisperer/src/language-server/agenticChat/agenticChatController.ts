@@ -767,8 +767,9 @@ export class AgenticChatController implements ChatHandlers {
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
             let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            let workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            // Rules live in a workspace folder. With no folder open, the request creates a saved prompt below.
             if (workspaceFolders.length > 0) {
+                const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
                 const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
                 const newFileContent = ''
                 try {
@@ -4534,7 +4535,10 @@ export class AgenticChatController implements ChatHandlers {
             const contextItems = await localProjectContextController.getContextCommandItems()
             this.#contextCommandsProvider.setFilesAndFoldersPending(false)
             await this.#contextCommandsProvider.processContextCommandUpdate(contextItems)
-            void this.#contextCommandsProvider.maybeUpdateCodeSymbols()
+            // This update runs in the background, so its failure must be handled here, not by the catch below
+            this.#contextCommandsProvider.maybeUpdateCodeSymbols().catch(error => {
+                this.#log('Error updating code symbols for context commands: ' + error)
+            })
         } catch (error) {
             this.#contextCommandsProvider.setFilesAndFoldersFailed(true)
             await this.#contextCommandsProvider.processContextCommandUpdate([])

@@ -52,7 +52,11 @@ import {
 import { MessageType, Model } from '@aws/language-server-runtimes/protocol'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import * as assert from 'assert'
-import { createIterableResponse, setCredentialsForAmazonQTokenServiceManagerFactory } from '../../shared/testUtils'
+import {
+    createIterableResponse,
+    setCredentialsForAmazonQTokenServiceManagerFactory,
+    unhandledRejectionsDuring,
+} from '../../shared/testUtils'
 import sinon from 'ts-sinon'
 import { AgenticChatController } from './agenticChatController'
 import { ChatSessionManagementService } from '../chat/chatSessionManagementService'
@@ -2226,6 +2230,55 @@ describe('AgenticChatController', () => {
             await chatController.onCreatePrompt({ promptName: '' })
 
             sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+        })
+
+        it('creates a saved prompt file when a rule is requested with no workspace folder open', async () => {
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([])
+            const expectedPath = path.join(getUserPromptsDirectory(), `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+        })
+
+        it('creates a rule file in the rules folder of the first workspace folder', async () => {
+            const workspaceFolder = path.join(os.tmpdir(), 'create-rule-workspace')
+            const secondWorkspaceFolder = path.join(os.tmpdir(), 'create-rule-second-workspace')
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([workspaceFolder, secondWorkspaceFolder])
+            const rulesDirectory = path.join(workspaceFolder, '.amazonq', 'rules')
+            const expectedPath = path.join(rulesDirectory, `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledWithExactly(testFeatures.workspace.fs.mkdir as sinon.SinonStub, rulesDirectory, {
+                recursive: true,
+            })
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+            sinon.assert.calledWithMatch(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                uri: URI.file(expectedPath).toString(),
+            })
+        })
+    })
+
+    describe('onReady', () => {
+        it('logs a failed background code symbol update and leaves no unhandled rejection', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            const failure = new Error('code symbols failed')
+            maybeUpdateCodeSymbolsStub.rejects(failure)
+
+            const rejections = await unhandledRejectionsDuring(() => chatController.onReady())
+
+            assert.ok(!rejections.includes(failure), 'the failed update was left as an unhandled rejection')
+            sinon.assert.calledOnce(maybeUpdateCodeSymbolsStub)
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error updating code symbols').and(sinon.match('code symbols failed'))
+            )
+            sinon.assert.neverCalledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error initializing context commands')
+            )
         })
     })
 
