@@ -25,6 +25,7 @@ import {
     saveServerSpecificAgentConfig,
     isEmptyEnv,
     describeStdioLaunchForLog,
+    describeArgsForLog,
     describeUrlForLog,
     describeMcpFormValuesForLog,
     sanitizeName,
@@ -846,16 +847,43 @@ describe('getGlobalMcpConfigPath', () => {
     })
 })
 
+describe('describeArgsForLog', () => {
+    it('keeps flag names and counts every other argument', () => {
+        expect(
+            describeArgsForLog(['-y', '@docs/server', '--api-key', 'arg-value-123', '--token=arg-value-456'])
+        ).to.equal('-y --api-key --token (2 values hidden)')
+    })
+
+    it('hides short flags with attached values and a lone dash', () => {
+        expect(describeArgsForLog(['-pvalue', '-', '--', '-v'])).to.equal('-- -v (2 values hidden)')
+    })
+
+    it('hides a flag typed together with its value in one argument', () => {
+        expect(describeArgsForLog(['--api-key arg-value-123', '--token:arg-value-456', '--key=a b'])).to.equal(
+            '--key (2 values hidden)'
+        )
+    })
+
+    it('skips empty arguments', () => {
+        expect(describeArgsForLog(['', '-y', ''])).to.equal('-y')
+    })
+
+    it('returns an empty string for no arguments', () => {
+        expect(describeArgsForLog([])).to.equal('')
+        expect(describeArgsForLog(undefined)).to.equal('')
+    })
+})
+
 describe('describeStdioLaunchForLog', () => {
-    it('includes the command, the number of arguments and the env names, not their values', () => {
+    it('includes the command, the flag names and the env names, not their values', () => {
         const text = describeStdioLaunchForLog('npx', ['-y', 'server', '--api-key', 'arg-value-123'], {
             API_TOKEN: 'env-value-456',
         })
-        expect(text).to.equal('npx (4 arguments) (env: API_TOKEN)')
+        expect(text).to.equal('npx -y --api-key (2 values hidden) (env: API_TOKEN)')
     })
 
-    it('uses the singular for one argument and omits empty parts', () => {
-        expect(describeStdioLaunchForLog('node', ['server.js'], {})).to.equal('node (1 argument)')
+    it('omits empty parts', () => {
+        expect(describeStdioLaunchForLog('node', ['server.js'], {})).to.equal('node (1 value hidden)')
         expect(describeStdioLaunchForLog('node', undefined, {})).to.equal('node')
     })
 })
@@ -867,13 +895,32 @@ describe('describeMcpFormValuesForLog', () => {
         expect(values.env_variables[0].env_var_value).to.equal('v')
     })
 
-    it('omits env and header fields that are not lists', () => {
-        expect(describeMcpFormValuesForLog({ env_variables: 'A=v', headers: 'Authorization: v' } as any)).to.deep.equal(
-            {
-                env_variables: '(omitted)',
-                headers: '(omitted)',
-            }
-        )
+    it('hides list fields that are not lists and values of unknown fields', () => {
+        expect(
+            describeMcpFormValuesForLog({
+                env_variables: 'A=v',
+                headers: 'Authorization: v',
+                args: '--api-key v',
+                url: 42,
+                extra: 'v',
+                nested: { token: 'v' },
+            } as any)
+        ).to.deep.equal({
+            env_variables: '(hidden)',
+            headers: '(hidden)',
+            args: '(hidden)',
+            url: '(invalid URL)',
+            extra: '(hidden)',
+            nested: '(hidden)',
+        })
+    })
+
+    it('keeps tool permission choices', () => {
+        expect(describeMcpFormValuesForLog({ search: 'alwaysAllow', fetch: 'deny', read: 'ask' })).to.deep.equal({
+            search: 'alwaysAllow',
+            fetch: 'deny',
+            read: 'ask',
+        })
     })
 
     it('returns an empty object for missing values', () => {

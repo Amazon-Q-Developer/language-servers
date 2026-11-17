@@ -937,42 +937,81 @@ export function convertPersonaToAgent(
     return agent
 }
 
-/**
- * Log text for starting a stdio MCP server. Argument and env values can hold tokens, so only the
- * number of arguments and the env variable names are included.
- */
-export function describeStdioLaunchForLog(command: string, args: string[] | undefined, env: Record<string, string>) {
-    const argCount = (args ?? []).length
-    const argsInfo = argCount > 0 ? ` (${argCount} ${argCount === 1 ? 'argument' : 'arguments'})` : ''
-    const envKeys = Object.keys(env)
-    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
-    return `${command}${argsInfo}${envInfo}`
-}
-
+/** MCP form fields whose values are logged as they are */
+const PLAIN_FORM_FIELDS = ['name', 'transport', 'scope', 'timeout', 'command']
 /** MCP form fields that hold env variable name and value pairs */
 const ENV_FORM_FIELDS = ['env_variables', 'additional_env_variables']
 /** MCP form fields that hold header key and value pairs */
 const HEADER_FORM_FIELDS = ['headers', 'additional_headers']
+const PERMISSION_VALUES: string[] = Object.values(McpPermissionType)
 
 /**
- * Copy of the MCP form values for logging. Env variable and header values can hold tokens, so those fields are
- * reduced to their names. All other fields are kept as they are.
+ * Log text for MCP server arguments. An argument that is only a flag name is kept, and `--name=value` keeps only
+ * `--name`. Every other argument can be or contain a value, such as a token, so it is counted instead of logged.
+ * Empty arguments are skipped.
  */
-export function describeMcpFormValuesForLog(optionsValues: Record<string, any> | undefined): Record<string, any> {
-    const result: Record<string, any> = { ...(optionsValues ?? {}) }
-    const namesOf = (value: any, nameKey: string) =>
-        Array.isArray(value) ? value.map(item => item?.[nameKey]) : '(omitted)'
-    for (const field of ENV_FORM_FIELDS) {
-        if (field in result) {
-            result[field] = namesOf(result[field], 'env_var_name')
+export function describeArgsForLog(args: string[] | undefined): string {
+    const kept: string[] = []
+    let hidden = 0
+    for (const arg of args ?? []) {
+        const text = String(arg)
+        const flagName = text.split('=')[0]
+        if (text === '') {
+            continue
+        } else if (/^--[A-Za-z0-9][A-Za-z0-9._-]*$/.test(flagName)) {
+            kept.push(flagName)
+        } else if (/^-[A-Za-z]$/.test(text) || text === '--') {
+            kept.push(text)
+        } else {
+            hidden++
         }
     }
-    for (const field of HEADER_FORM_FIELDS) {
-        if (field in result) {
-            result[field] = namesOf(result[field], 'key')
+    if (hidden > 0) {
+        kept.push(`(${hidden} ${hidden === 1 ? 'value' : 'values'} hidden)`)
+    }
+    return kept.join(' ')
+}
+
+/**
+ * Copy of the MCP form values for logging. A field's value is logged only when the field is known not to hold a
+ * token. The URL keeps only its origin, arguments keep only flag names, env variables and headers keep only their
+ * names, and the value of any other field is hidden.
+ */
+export function describeMcpFormValuesForLog(optionsValues: Record<string, any> | undefined): Record<string, any> {
+    const result: Record<string, any> = {}
+    const namesOf = (value: any, nameKey: string) =>
+        Array.isArray(value) ? value.map(item => item?.[nameKey]) : '(hidden)'
+    for (const [field, value] of Object.entries(optionsValues ?? {})) {
+        if (PLAIN_FORM_FIELDS.includes(field)) {
+            result[field] = value
+        } else if (field === 'url') {
+            result[field] = describeUrlForLog(typeof value === 'string' ? value : undefined)
+        } else if (field === 'args') {
+            result[field] = Array.isArray(value)
+                ? describeArgsForLog(value.map(item => item?.arg_key ?? ''))
+                : '(hidden)'
+        } else if (ENV_FORM_FIELDS.includes(field)) {
+            result[field] = namesOf(value, 'env_var_name')
+        } else if (HEADER_FORM_FIELDS.includes(field)) {
+            result[field] = namesOf(value, 'key')
+        } else if (typeof value === 'string' && PERMISSION_VALUES.includes(value)) {
+            // Tool permission choices from the permission settings
+            result[field] = value
+        } else {
+            result[field] = '(hidden)'
         }
     }
     return result
+}
+
+/**
+ * Log text for starting a stdio MCP server: the command, the argument flag names and the env variable names.
+ */
+export function describeStdioLaunchForLog(command: string, args: string[] | undefined, env: Record<string, string>) {
+    const argsText = describeArgsForLog(args)
+    const envKeys = Object.keys(env)
+    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
+    return `${command}${argsText ? ` ${argsText}` : ''}${envInfo}`
 }
 
 /**
