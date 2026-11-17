@@ -64,6 +64,7 @@ import { OAuthClient } from './mcpOauthClient'
 import { AgentPermissionManager } from './agentPermissionManager'
 import { McpRegistryService } from './mcpRegistryService'
 import { McpRegistryData } from './mcpTypes'
+import { MCP_REGISTRY_CONSTANTS } from './mcpRegistryConstants'
 import {
     WorkspaceTrustState,
     isFolderApproved,
@@ -92,6 +93,27 @@ function formatConsentPreview(value: string): string {
     return value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
         ? `${value.slice(0, MCP_CONSENT_PREVIEW_MAX_LENGTH)}${MCP_CONSENT_TRUNCATION_CUE}`
         : value
+}
+
+/** The environment variables that set the package index of an npx or uvx server */
+const PACKAGE_INDEX_ENV_VARS = [MCP_REGISTRY_CONSTANTS.NPM.ENV_VAR, MCP_REGISTRY_CONSTANTS.PYPI.ENV_VAR]
+
+/**
+ * The user name and password of a URL in a text, with the scheme of the URL in group 1. The scheme has at most
+ * 64 characters. A URL with a backslash before its '@' is left as it is.
+ */
+const URL_CREDENTIALS = /\b([a-z][a-z\d+.-]{0,63}:\/\/)[^\s/\\?#]*@/gi
+
+/** A URL without its user name and password, or a placeholder when the text is not a URL */
+function urlWithoutCredentials(text: string): string {
+    try {
+        const url = new URL(text)
+        url.username = ''
+        url.password = ''
+        return url.toString()
+    } catch {
+        return '(not a URL)'
+    }
 }
 
 /**
@@ -643,6 +665,155 @@ export class McpManager {
         })
     }
 
+    /**
+     * Whether a server needs the consent of the user before it starts, and which prompt it gets. Returns undefined
+     * when no consent is needed.
+     *
+     * Workspace-scoped configs live in a folder the user opened and may contain configuration that the user did not
+     * write. Global configs (~/.aws/amazonq/...) are user-authored and trusted implicitly.
+     *
+     * A registry server runs what the MCP registry lists. The install preview records the approval of the
+     * configuration that it showed (recordRegistryServerApproval). Any other configuration of a registry server
+     * needs approval before the server starts: after a version change in the registry, when the language server
+     * loads the configuration again, or after Save in the edit view. A registry server in the agent config of a
+     * workspace folder keeps the workspace prompt, because that file can add environment variables and headers.
+     */
+    private consentScope(
+        cfg: MCPServerConfig
+    ): { configPath: string; isWorkspaceScoped: boolean; kind: 'workspace-scoped' | 'registry' } | undefined {
+        const configPath = cfg.__configPath__
+            ? normalizePathFromUri(cfg.__configPath__, this.features.logging)
+            : undefined
+        if (!configPath) {
+            return undefined
+        }
+        const home = this.features.workspace.fs.getUserHomeDir()
+        const globalPaths = [
+            getGlobalMcpConfigPath(home),
+            getGlobalAgentConfigPath(home),
+            getGlobalPersonaConfigPath(home),
+        ]
+        const isWorkspaceScoped = !globalPaths.includes(configPath)
+        if (!isWorkspaceScoped && cfg.__registryServer__ !== true) {
+            return undefined
+        }
+        return { configPath, isWorkspaceScoped, kind: isWorkspaceScoped ? 'workspace-scoped' : 'registry' }
+    }
+
+    /**
+     * Asks the user to allow this configuration of a server. Returns 'approved' without a prompt when the consent
+     * store has an approval of the configuration, and 'denied' when the user denied it earlier in this session.
+     * Returns 'allowed' when the user allows it now; the caller records the approval. Returns 'denied' when the user
+     * denies it or closes the prompt, and then remembers the denial for the session. Returns 'failed' when the prompt
+     * cannot be shown.
+     */
+    private async askForServerConsent(
+        serverName: string,
+        cfg: MCPServerConfig,
+        scope: { configPath: string; isWorkspaceScoped: boolean; kind: string }
+    ): Promise<'approved' | 'allowed' | 'denied' | 'failed'> {
+        const { configPath, isWorkspaceScoped } = scope
+        const denyKey = `${serverName}|${configPath}|${fingerprintServerConfig(cfg)}`
+        if (this.sessionDeniedConsent.has(denyKey)) {
+            return 'denied'
+        }
+        if (await hasApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)) {
+            return 'approved'
+        }
+
+        // A URL in the command, such as the package index of a PyPI server, is shown without a user name or password
+        const cmdLine = formatConsentPreview(
+            [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').replace(URL_CREDENTIALS, '$1')
+        )
+        // Surface the environment variables and headers the server will actually be
+        // launched with. Names only, never values: a config may legitimately hold
+        // tokens, and this string is shown in a dialog and written to logs. Values are
+        // covered by the fingerprint, so any value change re-prompts.
+        const env = effectiveEnv(cfg)
+        const envKeys = Object.keys(env)
+        const headerNames = Object.keys(effectiveHeaders(cfg))
+        const envLine =
+            envKeys.length > 0
+                ? `Environment variables: ${formatConsentPreview(envKeys.join(', '))}\n`
+                : `Environment variables: (none)\n`
+        const headerLine = headerNames.length > 0 ? `Headers: ${formatConsentPreview(headerNames.join(', '))}\n` : ''
+        // The exception is a package index, whose URL is shown without a user name or password.
+        const packageIndexes = PACKAGE_INDEX_ENV_VARS.map(name => env[name]).filter(value => !!value)
+        const packageIndexLine =
+            packageIndexes.length > 0
+                ? `Package index: ${formatConsentPreview(packageIndexes.map(urlWithoutCredentials).join(', '))}\n`
+                : ''
+        const allowBtn = { title: 'Allow for this server' }
+        const denyBtn = { title: 'Deny' }
+        const reviewBtn = { title: 'View full configuration' }
+        const message = !isWorkspaceScoped
+            ? `Amazon Q — MCP Server from the Registry\n\n` +
+              `The MCP registry lists this server with a configuration that you have not allowed yet, ` +
+              `for example after the registry changed the server to a new version.\n` +
+              `Server: ${serverName}\n` +
+              `Command: ${cmdLine}\n` +
+              envLine +
+              packageIndexLine +
+              headerLine +
+              `\n` +
+              (cfg.command
+                  ? `Running this server executes the above command on your machine, ` +
+                    `with the environment variables listed above. ` +
+                    `Variables such as NODE_OPTIONS can cause additional code to run. `
+                  : `Starting this server connects Amazon Q to the above URL, with the headers listed above. `) +
+              `Only allow if you expect this server and this configuration from your MCP registry.\n\n` +
+              `If you allow, you won't be asked again unless the registry changes the server configuration.`
+            : `Amazon Q — Untrusted MCP Server\n\n` +
+              `A workspace configuration file wants to start an MCP server.\n` +
+              `Server: ${serverName}\n` +
+              `Command: ${cmdLine}\n` +
+              envLine +
+              packageIndexLine +
+              headerLine +
+              `• Source: ${configPath}\n\n` +
+              `Running this server executes the above command on your machine, ` +
+              `with the environment variables listed above. ` +
+              `Use View full configuration to inspect the source before allowing. ` +
+              `Variables such as NODE_OPTIONS can cause additional code to run. ` +
+              `Only allow if you trust the authors of this workspace.\n\n` +
+              `Your choice will be remembered for this workspace. ` +
+              `If you allow, you won't be asked again unless the server configuration changes.`
+
+        while (true) {
+            let choice: { title: string } | null | undefined
+            try {
+                choice = await this.features.lsp.window.showMessageRequest({
+                    type: MessageType.Warning,
+                    message,
+                    // The command of a registry server comes from the registry, not from its agent config file
+                    actions: isWorkspaceScoped ? [reviewBtn, allowBtn, denyBtn] : [allowBtn, denyBtn],
+                })
+            } catch (e: any) {
+                this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
+                return 'failed'
+            }
+            if (choice?.title === reviewBtn.title) {
+                try {
+                    await this.features.lsp.window.showDocument({
+                        uri: URI.file(configPath).toString(),
+                        takeFocus: true,
+                    })
+                } catch (e: any) {
+                    this.features.logging.warn(`MCP: failed to open configuration for '${serverName}': ${e?.message}`)
+                }
+                continue
+            }
+            if (choice?.title !== allowBtn.title) {
+                this.features.logging.info(
+                    `MCP: user declined consent for ${scope.kind} server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
+                )
+                this.sessionDeniedConsent.add(denyKey)
+                return 'denied'
+            }
+            return 'allowed'
+        }
+    }
+
     private async initOneServerInternal(
         serverName: string,
         cfg: MCPServerConfig,
@@ -664,103 +835,27 @@ export class McpManager {
         }
         this.releaseTrustHold(serverName)
 
-        // Consent gate for workspace-scoped MCP configs (P417451767).
-        // Workspace-scoped configs live in a folder the user opened and may be attacker-controlled.
-        // Global configs (~/.aws/amazonq/...) are user-authored and trusted implicitly.
-        const home = this.features.workspace.fs.getUserHomeDir()
-        const configPath = cfg.__configPath__
-            ? normalizePathFromUri(cfg.__configPath__, this.features.logging)
-            : undefined
-        const globalMcp = getGlobalMcpConfigPath(home)
-        const globalAgent = getGlobalAgentConfigPath(home)
-        const globalPersona = getGlobalPersonaConfigPath(home)
-        const isWorkspaceScoped =
-            !!configPath && configPath !== globalMcp && configPath !== globalAgent && configPath !== globalPersona
-        if (isWorkspaceScoped && configPath) {
-            const denyKey = `${serverName}|${configPath}|${fingerprintServerConfig(cfg)}`
-            if (this.sessionDeniedConsent.has(denyKey)) {
+        // Consent gate for workspace-scoped MCP configs and for registry servers (see consentScope)
+        const consentScope = this.consentScope(cfg)
+        if (consentScope) {
+            const consent = await this.askForServerConsent(serverName, cfg, consentScope)
+            if (consent === 'failed') {
+                this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
+                return
+            }
+            if (consent === 'denied') {
                 this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
                 return
             }
-            const approved = await hasApproval(
-                this.features.workspace,
-                this.features.logging,
-                serverName,
-                cfg,
-                configPath
-            )
-            if (!approved) {
-                const cmdLine = formatConsentPreview(
-                    [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ')
+            if (consent === 'allowed') {
+                await recordApproval(
+                    this.features.workspace,
+                    this.features.logging,
+                    serverName,
+                    cfg,
+                    consentScope.configPath
                 )
-                // Surface the environment variables and headers the server will actually be
-                // launched with. Names only, never values: a config may legitimately hold
-                // tokens, and this string is shown in a dialog and written to logs. Values are
-                // covered by the fingerprint, so any value change re-prompts.
-                const envKeys = Object.keys(effectiveEnv(cfg))
-                const headerNames = Object.keys(effectiveHeaders(cfg))
-                const envLine =
-                    envKeys.length > 0
-                        ? `Environment variables: ${formatConsentPreview(envKeys.join(', '))}\n`
-                        : `Environment variables: (none)\n`
-                const headerLine =
-                    headerNames.length > 0 ? `Headers: ${formatConsentPreview(headerNames.join(', '))}\n` : ''
-                const allowBtn = { title: 'Allow for this server' }
-                const denyBtn = { title: 'Deny' }
-                const reviewBtn = { title: 'View full configuration' }
-
-                while (true) {
-                    let choice: { title: string } | null | undefined
-                    try {
-                        choice = await this.features.lsp.window.showMessageRequest({
-                            type: MessageType.Warning,
-                            message:
-                                `Amazon Q — Untrusted MCP Server\n\n` +
-                                `A workspace configuration file wants to start an MCP server.\n` +
-                                `Server: ${serverName}\n` +
-                                `Command: ${cmdLine}\n` +
-                                envLine +
-                                headerLine +
-                                `• Source: ${configPath}\n\n` +
-                                `Running this server executes the above command on your machine, ` +
-                                `with the environment variables listed above. ` +
-                                `Use View full configuration to inspect the source before allowing. ` +
-                                `Variables such as NODE_OPTIONS can cause additional code to run. ` +
-                                `Only allow if you trust the authors of this workspace.\n\n` +
-                                `Your choice will be remembered for this workspace. ` +
-                                `If you allow, you won't be asked again unless the server configuration changes.`,
-                            actions: [reviewBtn, allowBtn, denyBtn],
-                        })
-                    } catch (e: any) {
-                        this.features.logging.warn(`MCP: consent prompt failed for '${serverName}': ${e?.message}`)
-                        this.setState(serverName, McpServerStatus.FAILED, 0, 'consent prompt failed')
-                        return
-                    }
-                    if (choice?.title === reviewBtn.title) {
-                        try {
-                            await this.features.lsp.window.showDocument({
-                                uri: URI.file(configPath).toString(),
-                                takeFocus: true,
-                            })
-                        } catch (e: any) {
-                            this.features.logging.warn(
-                                `MCP: failed to open configuration for '${serverName}': ${e?.message}`
-                            )
-                        }
-                        continue
-                    }
-                    if (choice?.title !== allowBtn.title) {
-                        this.features.logging.info(
-                            `MCP: user declined consent for workspace-scoped server '${serverName}' (response: ${choice?.title ?? 'dismissed'})`
-                        )
-                        this.sessionDeniedConsent.add(denyKey)
-                        this.setState(serverName, McpServerStatus.DISABLED, 0, 'consent not granted')
-                        return
-                    }
-                    await recordApproval(this.features.workspace, this.features.logging, serverName, cfg, configPath)
-                    this.features.logging.info(`MCP: recorded consent for workspace-scoped server '${serverName}'`)
-                    break
-                }
+                this.features.logging.info(`MCP: recorded consent for ${consentScope.kind} server '${serverName}'`)
             }
         }
 
@@ -1026,16 +1121,7 @@ export class McpManager {
             }
 
             // Cache version for registry servers
-            if (this.currentRegistry) {
-                const unsanitizedName = this.serverNameMapping.get(serverName) || serverName
-                const registryServer = this.currentRegistry.servers.find(s => s.name === unsanitizedName)
-                if (registryServer) {
-                    cfg.__cachedVersion__ = registryServer.version
-                    this.features.logging.debug(
-                        `MCP Registry: Cached version ${registryServer.version} for server '${unsanitizedName}'`
-                    )
-                }
-            }
+            this.cacheRegistryVersion(serverName, cfg)
 
             this.setState(serverName, McpServerStatus.ENABLED, resp.tools.length)
             this.emitToolsChanged(serverName)
@@ -1230,6 +1316,24 @@ export class McpManager {
     }
 
     /**
+     * Records that the user approved this configuration of a registry server, as the install preview showed it, so
+     * that the server starts without the consent prompt. A different configuration needs approval again.
+     */
+    public async recordRegistryServerApproval(
+        serverName: string,
+        cfg: MCPServerConfig,
+        configPath: string
+    ): Promise<void> {
+        await recordApproval(
+            this.features.workspace,
+            this.features.logging,
+            sanitizeName(serverName),
+            cfg,
+            normalizePathFromUri(configPath, this.features.logging)
+        )
+    }
+
+    /**
      * Add a registry server: persist config, register in memory, and initialize.
      */
     public async addRegistryServer(
@@ -1286,7 +1390,7 @@ export class McpManager {
         )
 
         // Store additional headers/env separately and merge for runtime
-        const newCfg: MCPServerConfig = { ...cfg, __configPath__: configPath }
+        const newCfg: MCPServerConfig = { ...cfg, __configPath__: configPath, __registryServer__: true }
         if (additionalHeaders && Object.keys(additionalHeaders).length > 0) {
             newCfg.__additionalHeaders__ = additionalHeaders
         }
@@ -1296,7 +1400,39 @@ export class McpManager {
         this.mcpServers.set(sanitizedName, newCfg)
         this.serverNameMapping.set(sanitizedName, serverName)
 
+        // The user asks for this server now (Install in the preview, Save in the edit view), so a denial earlier in
+        // the session does not keep it off without a question
+        this.forgetSessionDenials(sanitizedName, configPath)
         await this.initOneServer(sanitizedName, newCfg, AuthIntent.Interactive)
+    }
+
+    /** Forgets the consent denials of this session for a server from one config file */
+    private forgetSessionDenials(serverName: string, configPath: string): void {
+        const prefix = `${serverName}|${normalizePathFromUri(configPath, this.features.logging)}|`
+        for (const key of [...this.sessionDeniedConsent]) {
+            if (key.startsWith(prefix)) {
+                this.sessionDeniedConsent.delete(key)
+            }
+        }
+    }
+
+    /**
+     * Records which registry version the configuration of a started server was built from. A configuration keeps the
+     * version that it has: after the user denies a new version in the registry sync, the server runs its approved
+     * configuration of the earlier version, and the next sync must still find the new version.
+     */
+    private cacheRegistryVersion(serverName: string, cfg: MCPServerConfig): void {
+        if (!this.currentRegistry || cfg.__cachedVersion__) {
+            return
+        }
+        const unsanitizedName = this.serverNameMapping.get(serverName) || serverName
+        const registryServer = this.currentRegistry.servers.find(s => s.name === unsanitizedName)
+        if (registryServer) {
+            cfg.__cachedVersion__ = registryServer.version
+            this.features.logging.debug(
+                `MCP Registry: Cached version ${registryServer.version} for server '${unsanitizedName}'`
+            )
+        }
     }
 
     /**
@@ -2597,14 +2733,13 @@ export class McpManager {
         const registryVersion = registryServer.version
 
         if (cachedVersion && cachedVersion !== registryVersion) {
-            const msg = `MCP Registry: Server '${unsanitizedName}' version changed from ${cachedVersion} to ${registryVersion} - reinstalling`
+            const msg = `MCP Registry: Server '${unsanitizedName}' version changed from ${cachedVersion} to ${registryVersion} - reinstalling after approval`
             this.features.logging.warn(msg)
             if (this.isPeriodicSync) {
                 this.features.logging.warn(`WARNING: ${msg}`)
             }
             try {
-                await this.reinstallServer(sanitizedName, unsanitizedName, registryServer)
-                return true
+                return await this.reinstallServer(sanitizedName, unsanitizedName, registryServer)
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : String(error)
                 this.features.logging.error(
@@ -2617,22 +2752,70 @@ export class McpManager {
     }
 
     /**
-     * Reinstall server with new version
+     * Reinstall server with new version. The new configuration needs approval before the running server is
+     * removed, so that a denial keeps the server at the configuration that the user approved.
+     * @returns true when the server was reinstalled, false when it kept its configuration
      */
-    private async reinstallServer(sanitizedName: string, unsanitizedName: string, registryServer: any): Promise<void> {
+    private async reinstallServer(
+        sanitizedName: string,
+        unsanitizedName: string,
+        registryServer: any
+    ): Promise<boolean> {
+        const running = this.mcpServers.get(sanitizedName)
+        // A reinstall starts the server, so it would turn on a server that the user turned off
+        if (this.isServerDisabled(sanitizedName)) {
+            this.features.logging.info(
+                `MCP Registry: Server '${unsanitizedName}' is disabled; not reinstalling it with version ${registryServer.version}`
+            )
+            return false
+        }
+        const configPath =
+            running?.__configPath__ || getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())
+
+        const converter = new (await import('./mcpServerConfigConverter')).McpServerConfigConverter()
+        // The version of the entry that the prompt asks about, not the one in a registry that a later sync loads
+        const newConfig: MCPServerConfig = {
+            ...converter.convertRegistryServer(registryServer),
+            __cachedVersion__: registryServer.version,
+        }
+
+        // The configuration that addRegistryServer starts the server with
+        const candidate: MCPServerConfig = { ...newConfig, __configPath__: configPath, __registryServer__: true }
+        const scope = this.consentScope(candidate)
+        // The sync waits for the answer before it checks the next server
+        const consent = scope ? await this.askForServerConsent(sanitizedName, candidate, scope) : 'approved'
+        if (consent === 'denied' || consent === 'failed') {
+            this.features.logging.info(
+                `MCP Registry: Kept server '${unsanitizedName}' at its approved configuration; version ${registryServer.version} from the registry was not allowed`
+            )
+            return false
+        }
+        // The user can save, remove, turn off or reinstall the server while the prompt is open. Replace only the
+        // server that the prompt asked about.
+        if (this.mcpServers.get(sanitizedName) !== running || this.isServerDisabled(sanitizedName)) {
+            this.features.logging.info(
+                `MCP Registry: Server '${unsanitizedName}' changed while the approval prompt was open; not reinstalling it`
+            )
+            return false
+        }
+
         this.features.logging.info(
             `MCP Registry: Reinstalling server '${unsanitizedName}' with version ${registryServer.version}`
         )
-
-        const configPath =
-            this.mcpServers.get(sanitizedName)?.__configPath__ ||
-            getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())
-
         await this.removeServer(sanitizedName)
 
-        const converter = new (await import('./mcpServerConfigConverter')).McpServerConfigConverter()
-        const newConfig = converter.convertRegistryServer(registryServer)
-
+        // removeServer also removes the approvals of the server. Record the new configuration, which the user
+        // approved before or allowed now, so that the server starts without a second prompt.
+        if (scope) {
+            await recordApproval(
+                this.features.workspace,
+                this.features.logging,
+                sanitizedName,
+                candidate,
+                scope.configPath
+            )
+        }
         await this.addRegistryServer(unsanitizedName, newConfig, configPath)
+        return true
     }
 }
