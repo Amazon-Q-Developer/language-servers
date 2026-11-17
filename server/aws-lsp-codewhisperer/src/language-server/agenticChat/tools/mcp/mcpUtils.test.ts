@@ -32,6 +32,7 @@ import {
     convertPersonaToAgent,
     migrateToAgentConfig,
     restoreServerScopedPermissions,
+    removeUntrustedPermissionSources,
     getAgentConfigPathForMcpConfig,
     isPermissionForServer,
     DEFAULT_TOOL_EXEC_TIMEOUT_MS,
@@ -40,8 +41,9 @@ import {
     resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
 import { getReservedBuiltInToolNames, STATIC_BUILT_IN_TOOL_NAMES } from '../../constants/toolConstants'
-import type { MCPServerConfig } from './mcpTypes'
+import type { AgentConfig, MCPServerConfig } from './mcpTypes'
 import { McpPermissionType } from './mcpTypes'
+import { AgentPermissionManager } from './agentPermissionManager'
 import { pathToFileURL } from 'url'
 import * as sinon from 'sinon'
 import { URI } from 'vscode-uri'
@@ -1665,6 +1667,446 @@ describe('loadAgentConfig server-scoped permission restore', () => {
             expect(result.servers.has('srv')).to.be.true
             expect(result.agentConfig.allowedTools).to.include('@srv/tool')
         })
+    })
+})
+
+describe('loadAgentConfig permission entries from a workspace agent config', () => {
+    let tmpDir: string
+    let workspace: any
+    let logger: any
+    let wsAgentPath: string
+    let globalAgentPath: string
+
+    const writeJson = async (p: string, value: unknown) => {
+        await workspace.fs.mkdir(path.dirname(p), { recursive: true })
+        await workspace.fs.writeFile(p, JSON.stringify(value))
+    }
+    const load = () => loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+    const permissions = (agentConfig: AgentConfig) => new AgentPermissionManager(agentConfig)
+
+    beforeEach(async () => {
+        sinon.restore()
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsAgentPermTest-'))
+        workspace = {
+            fs: {
+                exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
+                mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
+                getUserHomeDir: () => tmpDir,
+            },
+            getAllWorkspaceFolders: () => [],
+        }
+        logger = { warn: sinon.spy(), info: () => {}, error: () => {}, debug: () => {} }
+        wsAgentPath = path.join(tmpDir, 'ws', '.amazonq', 'agents', 'default.json')
+        globalAgentPath = getGlobalAgentConfigPath(tmpDir)
+        // The user's own global server, with one tool enabled. A tool the user denied has no entry.
+        await writeJson(globalAgentPath, {
+            mcpServers: { demo: { command: 'demo-mcp', args: [] } },
+            tools: ['@demo/allowed_tool'],
+            allowedTools: [],
+        })
+    })
+
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('does not let a workspace "*" re-enable a tool the user denied on a global server', async () => {
+        await writeJson(wsAgentPath, { tools: ['*'] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.not.include('*')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+        expect(permissions(agentConfig).isToolEnabled('demo', 'allowed_tool')).to.be.true
+        sinon.assert.calledWithMatch(logger.warn, /Limiting wildcard permission '\*'/)
+    })
+
+    it('does not let a workspace config grant a tool on a global server', async () => {
+        await writeJson(wsAgentPath, { tools: ['@demo/denied_tool'], allowedTools: ['@demo/denied_tool'] })
+
+        const { agentConfig } = await load()
+
+        // McpManager.requiresApproval asks unless allowedTools lists the tool exactly
+        expect(agentConfig.allowedTools).to.not.include('@demo/denied_tool')
+        expect(agentConfig.tools).to.not.include('@demo/denied_tool')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+        expect(agentConfig.tools).to.include('@demo/allowed_tool')
+        sinon.assert.calledWithMatch(
+            logger.warn,
+            /Ignoring permission "@demo\/denied_tool" .*MCP servers that the config does not define: "demo"$/
+        )
+    })
+
+    it('logs each ignored permission entry and server name quoted, on a single line', async () => {
+        const serverName = 'demo\nsecond line'
+        const entry = `@${serverName}/tool`
+        const wildcard = 'fs*\nsecond line'
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { [serverName]: { command: 'x-mcp', args: [] } },
+        })
+        await writeJson(wsAgentPath, { tools: [entry, wildcard], allowedTools: [entry] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.allowedTools).to.not.include(entry)
+        const lines: string[] = logger.warn.args.map((args: unknown[]) => String(args[0]))
+        expect(lines.some(line => line.includes(`Ignoring permission ${JSON.stringify(entry)} in `))).to.be.true
+        expect(lines.some(line => line.endsWith(`does not define: ${JSON.stringify(serverName)}`))).to.be.true
+        expect(lines.some(line => line.includes(`Ignoring wildcard permission ${JSON.stringify(wildcard)} in `))).to.be
+            .true
+        expect(lines.filter(line => line.includes('\n'))).to.deep.equal([])
+    })
+
+    it('keeps the enablement of a global mcp.json server whose name extends a workspace server', async () => {
+        // The global mcp.json is the user's file
+        await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { 'repo/x': { command: 'x-mcp', args: [] } } })
+        await writeJson(wsAgentPath, { mcpServers: { repo: { command: 'repo-mcp', args: [] } }, tools: ['@repo'] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include('@repo/x')
+        expect(agentConfig.tools).to.include('@repo')
+    })
+
+    it("names the user's server when a workspace server's entry also applies to it", async () => {
+        await writeJson(globalAgentPath, {
+            mcpServers: { repo: { command: 'user-mcp', args: [] } },
+            tools: ['@repo'],
+            allowedTools: [],
+        })
+        await writeJson(wsAgentPath, {
+            mcpServers: { 'repo/x': { command: 'x-mcp', args: [] } },
+            tools: ['@repo/x'],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.not.include('@repo/x')
+        sinon.assert.calledWithMatch(logger.warn, /MCP servers that the config does not define: "repo"$/)
+    })
+
+    it('does not apply a workspace grant to a legacy global server that has the same name', async () => {
+        await writeJson(globalAgentPath, { mcpServers: {}, tools: [], allowedTools: [] })
+        await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { demo: { command: 'demo-mcp', args: [] } } })
+        await writeJson(wsAgentPath, {
+            mcpServers: { demo: { command: 'workspace-mcp', args: [] } },
+            allowedTools: ['@demo/anytool'],
+        })
+
+        const { servers, agentConfig } = await load()
+
+        expect(servers.get('demo')?.command).to.equal('demo-mcp')
+        expect(agentConfig.allowedTools).to.not.include('@demo/anytool')
+    })
+
+    it('keeps workspace grants for a server that the workspace defines', async () => {
+        await writeJson(wsAgentPath, {
+            mcpServers: { repo: { command: 'repo-mcp', args: [] } },
+            tools: ['@repo'],
+            allowedTools: ['@repo/read_tool'],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include('@repo')
+        expect(agentConfig.allowedTools).to.include('@repo/read_tool')
+    })
+
+    it('keeps grants for a workspace mcp.json server that its agent config next to it lists', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+        await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+            mcpServers: { local: { command: 'local-mcp', args: [] } },
+        })
+        await writeJson(wsAgentPath, { tools: ['@local'], allowedTools: ['@local/read_tool'] })
+
+        const { servers, agentConfig } = await load()
+
+        expect(servers.has('local')).to.be.true
+        expect(agentConfig.tools).to.include('@local')
+        expect(agentConfig.allowedTools).to.include('@local/read_tool')
+    })
+
+    it('does not load a workspace server whose name has a glob character', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+        await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+            mcpServers: { 'd?mo': { command: 'pattern-mcp', args: [] } },
+        })
+        await writeJson(wsAgentPath, {
+            mcpServers: { 'd*': { command: 'pattern-mcp', args: [] } },
+            tools: ['*', '@d*'],
+        })
+
+        const { servers, agentConfig, errors } = await load()
+
+        expect([...servers.keys()]).to.deep.equal(['demo'])
+        expect(errors.get('d*')).to.match(/a workspace server name cannot contain/)
+        expect(errors.get('d?mo')).to.match(/a workspace server name cannot contain/)
+        expect(agentConfig.tools).to.not.include('@d*')
+        expect(agentConfig.tools).to.not.include('@d?mo')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+    })
+
+    it('still loads a server with a glob character in its name from the global mcp.json', async () => {
+        await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { 'd*': { command: 'user-mcp', args: [] } } })
+
+        const { servers } = await load()
+
+        expect(servers.has(sanitizeName('d*'))).to.be.true
+    })
+
+    it('does not let the default enablement of a workspace mcp.json server reach a global server', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        const wsMcpPath = path.join(wsRoot, '.amazonq', 'mcp.json')
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+        await writeJson(wsMcpPath, { mcpServers: { 'demo/denied_tool': { command: 'x-mcp', args: [] } } })
+
+        const { servers, agentConfig } = await load()
+
+        expect(servers.has(sanitizeName('demo/denied_tool'))).to.be.true
+        expect(agentConfig.tools).to.not.include('@demo/denied_tool')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+        const lines: string[] = logger.warn.args.map((args: unknown[]) => String(args[0]))
+        expect(lines.some(line => line.startsWith(`Ignoring permission "@demo/denied_tool" in `))).to.be.true
+        // The server reads this path from the workspace folder URI, which gives a lowercase drive letter on Windows
+        const loggedPath = path.normalize(URI.file(wsMcpPath).fsPath)
+        expect(lines.some(line => line.includes(loggedPath))).to.be.true
+    })
+
+    it('does not let a workspace "*" enable a server that the global mcp.json replaces', async () => {
+        await writeJson(globalAgentPath, { mcpServers: {}, tools: [], allowedTools: [] })
+        await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { demo: { command: 'demo-mcp', args: [] } } })
+        await writeJson(wsAgentPath, { mcpServers: { demo: { command: 'workspace-mcp', args: [] } }, tools: ['*'] })
+
+        const { servers, agentConfig } = await load()
+
+        // The user's own mcp.json enables its server; the workspace "*" does not count for it
+        expect(servers.get('demo')?.command).to.equal('demo-mcp')
+        expect(agentConfig.tools).to.include('@demo')
+        sinon.assert.calledWithMatch(
+            logger.warn,
+            /Ignoring permission "@demo" in .*MCP servers that the config does not define: "demo"$/
+        )
+    })
+
+    it('does not let a workspace server whose name contains "/" grant a tool on a global server', async () => {
+        await writeJson(wsAgentPath, {
+            mcpServers: { 'demo/denied_tool': { command: 'slash-mcp', args: [] } },
+            allowedTools: ['@demo/denied_tool'],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.allowedTools).to.not.include('@demo/denied_tool')
+    })
+
+    it('ignores other wildcard patterns in a workspace config', async () => {
+        await writeJson(wsAgentPath, { tools: ['*_tool', '?demo/denied_tool'] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.not.include('*_tool')
+        expect(agentConfig.tools).to.not.include('?demo/denied_tool')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+    })
+
+    it('does not let a glob entry for a workspace server reach a global server whose name extends it', async () => {
+        await writeJson(globalAgentPath, {
+            mcpServers: { 'repo/x': { command: 'user-mcp', args: [] } },
+            tools: ['@repo/x/allowed_tool'],
+            allowedTools: [],
+        })
+        await writeJson(wsAgentPath, {
+            mcpServers: { repo: { command: 'repo-mcp', args: [] } },
+            tools: ['@repo', '@repo/*'],
+            allowedTools: ['@repo/*'],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.not.include('@repo/*')
+        expect(agentConfig.allowedTools).to.not.include('@repo/*')
+        expect(permissions(agentConfig).isToolEnabled('repo/x', 'denied_tool')).to.be.false
+        expect(permissions(agentConfig).isToolEnabled('repo', 'any_tool')).to.be.true
+    })
+
+    it('keeps the default enablement of a global mcp.json server whose name extends another server', async () => {
+        await writeJson(globalAgentPath, {
+            mcpServers: { repo: { command: 'repo-mcp', args: [] } },
+            tools: ['@repo'],
+            allowedTools: [],
+        })
+        await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { 'repo/x': { command: 'x-mcp', args: [] } } })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include.members(['@repo', '@repo/x'])
+        sinon.assert.neverCalledWithMatch(logger.warn, /Ignoring permission/)
+    })
+
+    it('keeps the default enablement of a workspace mcp.json server whose name extends a workspace server', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+        await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+            mcpServers: { 'local/x': { command: 'x-mcp', args: [] } },
+        })
+        await writeJson(wsAgentPath, { mcpServers: { local: { command: 'local-mcp', args: [] } }, tools: ['@local'] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include.members(['@local', '@local/x'])
+    })
+
+    it('ignores a workspace wildcard in allowedTools, which the approval check never matches', async () => {
+        await writeJson(wsAgentPath, {
+            mcpServers: { repo: { command: 'repo-mcp', args: [] } },
+            allowedTools: ['*'],
+        })
+
+        const { agentConfig } = await load()
+
+        // Shown as "Always allow", the tools would still ask: McpManager.requiresApproval is an exact match
+        expect(agentConfig.allowedTools).to.not.include('*')
+        expect(agentConfig.allowedTools).to.not.include('@repo')
+        expect(permissions(agentConfig).isToolAlwaysAllowed('demo', 'allowed_tool')).to.be.false
+        expect(permissions(agentConfig).isToolAlwaysAllowed('repo', 'any_tool')).to.be.false
+    })
+
+    it('applies a workspace "*" to the servers that the same file defines', async () => {
+        await writeJson(wsAgentPath, {
+            mcpServers: { repo: { command: 'repo-mcp', args: [] } },
+            tools: ['*'],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include('@repo')
+        expect(permissions(agentConfig).isToolEnabled('repo', 'any_tool')).to.be.true
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+    })
+
+    it('keeps exact tool names and skips entries that are not strings', async () => {
+        await writeJson(wsAgentPath, { tools: ['fs_read', 42, null], allowedTools: [{}, 'fs_read'] })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include('fs_read')
+        expect(agentConfig.allowedTools).to.include('fs_read')
+        const entries: unknown[] = [...agentConfig.tools, ...agentConfig.allowedTools]
+        expect(entries.filter(tool => typeof tool !== 'string')).to.deep.equal([])
+        sinon.assert.calledWithMatch(logger.warn, /Ignoring a 'tools' entry that is not a string/)
+        sinon.assert.calledWithMatch(logger.warn, /Ignoring a 'allowedTools' entry that is not a string/)
+    })
+
+    it('still honors a wildcard in the global config', async () => {
+        await writeJson(globalAgentPath, {
+            mcpServers: { demo: { command: 'demo-mcp', args: [] } },
+            tools: ['*'],
+            allowedTools: [],
+        })
+
+        const { agentConfig } = await load()
+
+        expect(agentConfig.tools).to.include('*')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.true
+    })
+})
+
+describe('removeUntrustedPermissionSources()', () => {
+    const originalPlatform = process.platform
+    const globalAgent = '/home/u/.aws/amazonq/agents/default.json'
+    const globalPaths = [globalAgent, '/home/u/.aws/amazonq/mcp.json']
+    const wsAgent = '/work/ws/.amazonq/agents/default.json'
+    let logger: any
+
+    beforeEach(() => {
+        logger = { warn: sinon.spy(), info: () => {}, error: () => {}, debug: () => {} }
+    })
+
+    afterEach(() => {
+        Object.defineProperty(process, 'platform', { value: originalPlatform })
+    })
+
+    const servers = (entries: Record<string, string>) =>
+        new Map(
+            Object.entries(entries).map(
+                ([name, configPath]) =>
+                    [name, { command: `${name}-mcp`, __configPath__: configPath } as MCPServerConfig] as const
+            )
+        )
+    const mappingFor = (serverMap: Map<string, MCPServerConfig>) => new Map([...serverMap.keys()].map(n => [n, n]))
+    const remaining = (pending: Map<string, Set<string>>) =>
+        Object.fromEntries([...pending].map(([entry, sources]) => [entry, [...sources]]))
+
+    // A workspace URI gives a lowercase drive letter on Windows, while other sources keep the case. The
+    // spellings below differ in case from the file that defines the server and from the global config path.
+    const removeWithCaseVariantPaths = () => {
+        const loaded = servers({ local: '/Work/ws/.amazonq/mcp.json', user: globalAgent })
+        const pending = new Map([
+            ['@local/read_tool', new Set(['/work/WS/.amazonq/agents/default.json'])],
+            ['@user/tool', new Set(['/HOME/u/.aws/amazonq/agents/default.json'])],
+        ])
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        return remaining(pending)
+    }
+
+    it('compares config file paths without case on Windows', () => {
+        Object.defineProperty(process, 'platform', { value: 'win32' })
+
+        expect(removeWithCaseVariantPaths()).to.deep.equal({
+            '@local/read_tool': ['/work/WS/.amazonq/agents/default.json'],
+            '@user/tool': ['/HOME/u/.aws/amazonq/agents/default.json'],
+        })
+        sinon.assert.notCalled(logger.warn)
+    })
+
+    for (const platform of ['linux', 'darwin']) {
+        it(`compares config file paths with case on ${platform}, as restoreServerScopedPermissions does`, () => {
+            Object.defineProperty(process, 'platform', { value: platform })
+
+            expect(removeWithCaseVariantPaths()).to.deep.equal({})
+            sinon.assert.calledTwice(logger.warn)
+        })
+    }
+
+    it('removes only the workspace source of an entry that a global config also lists', () => {
+        const loaded = servers({ user: globalAgent })
+        const pending = new Map([['@user/tool', new Set([wsAgent, globalAgent])]])
+
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+
+        expect(remaining(pending)).to.deep.equal({ '@user/tool': [globalAgent] })
+        sinon.assert.calledOnceWithExactly(
+            logger.warn,
+            `Ignoring permission "@user/tool" in ${wsAgent}: it applies to MCP servers that the config does not define: "user"`
+        )
+    })
+
+    it('keeps the default enablement of a workspace mcp.json server and names that file when it drops one', () => {
+        const wsMcp = '/work/ws/.amazonq/mcp.json'
+        const loaded = servers({ local: wsMcp, 'user/x': wsMcp, user: globalAgent })
+        const pending = new Map([
+            ['@local', new Set([wsMcp])],
+            ['@user/x', new Set([wsMcp])],
+        ])
+
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+
+        expect(remaining(pending)).to.deep.equal({ '@local': [wsMcp] })
+        sinon.assert.calledOnceWithMatch(logger.warn, `Ignoring permission "@user/x" in ${wsMcp}:`)
+    })
+
+    it('leaves an entry that names no loaded server, which restoreServerScopedPermissions drops', () => {
+        const loaded = servers({ user: globalAgent })
+        const pending = new Map([['@removed/tool', new Set([wsAgent])]])
+
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+
+        expect(remaining(pending)).to.deep.equal({ '@removed/tool': [wsAgent] })
+        sinon.assert.notCalled(logger.warn)
     })
 })
 
