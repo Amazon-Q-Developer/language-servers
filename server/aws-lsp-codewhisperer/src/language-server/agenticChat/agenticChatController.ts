@@ -251,6 +251,7 @@ import {
     onPaidTierLearnMore,
     paidTierManageSubscription,
     PaidTierMode,
+    parseSubscriptionUpgradeUrl,
     qProName,
 } from '../paidTier/paidTier'
 import {
@@ -4852,9 +4853,8 @@ export class AgenticChatController implements ChatHandlers {
                             ?.getCodewhispererService()
                             .getSubscriptionStatus(true)
                             .then(o => {
-                                this.#log(
-                                    `setPaidTierMode: getSubscriptionStatus: ${o.status} ${o.encodedVerificationUrl}`
-                                )
+                                // Log only the status: the subscription URL contains an activation token
+                                this.#log(`setPaidTierMode: getSubscriptionStatus: ${o.status}`)
                                 this.setPaidTierMode(tabId, o.status !== 'none' ? 'paidtier' : 'freetier')
                             })
                             .catch(err => {
@@ -4922,7 +4922,8 @@ export class AgenticChatController implements ChatHandlers {
             client
                 ?.getSubscriptionStatus()
                 .then(o => {
-                    this.#log(`onManageSubscription: getSubscriptionStatus: ${o.status} ${o.encodedVerificationUrl}`)
+                    // Log only the status: the subscription URL contains an activation token
+                    this.#log(`onManageSubscription: getSubscriptionStatus: ${o.status}`)
 
                     if (o.status !== 'none') {
                         // Paid-tier user: navigate them to the "Manage Subscriptions" AWS console page.
@@ -4937,10 +4938,14 @@ export class AgenticChatController implements ChatHandlers {
                             })
                     } else {
                         // Free-tier user: navigate them to "Upgrade Q" flow in AWS console.
-                        const uri = o.encodedVerificationUrl
+                        // The client opens the URL in the external browser, so it must be on the AWS sign-in host.
+                        const uri = parseSubscriptionUpgradeUrl(o.encodedVerificationUrl)
 
                         if (!uri) {
-                            this.#log('onManageSubscription: missing encodedVerificationUrl in server response')
+                            const reason = o.encodedVerificationUrl
+                                ? 'encodedVerificationUrl in server response is not an https URL on the AWS sign-in host'
+                                : 'missing encodedVerificationUrl in server response'
+                            this.#log(`onManageSubscription: ${reason}`)
                             this.#features.lsp.window
                                 .showMessage({
                                     message: 'Subscription request failed.',
@@ -4949,21 +4954,10 @@ export class AgenticChatController implements ChatHandlers {
                                 .catch(e => {
                                     this.#log(`onManageSubscription: showMessage failed: ${(e as Error).message}`)
                                 })
-                            return 'missing encodedVerificationUrl in server response'
+                            return reason
                         }
 
-                        try {
-                            URI.parse(uri)
-                        } catch (e) {
-                            this.#log(
-                                `onManageSubscription: invalid encodedVerificationUrl: '${uri}': ${(e as Error).message}`
-                            )
-                            return 'invalid encodedVerificationUrl'
-                        }
-
-                        this.#log(
-                            `onManageSubscription: createSubscriptionToken status: ${o.status} encodedVerificationUrl: '${uri}'`
-                        )
+                        this.#log(`onManageSubscription: createSubscriptionToken status: ${o.status}`)
                         // Set UI to "progress" mode.
                         this.setPaidTierMode(tabId, 'upgrade-pending')
 
