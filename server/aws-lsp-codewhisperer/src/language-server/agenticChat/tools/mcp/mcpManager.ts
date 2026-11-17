@@ -31,6 +31,7 @@ import {
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
+    writeOwnerOnlyConfigFile,
     sanitizeName,
     describeStdioLaunchForLog,
     describeUrlForLog,
@@ -2053,7 +2054,12 @@ export class McpManager {
                 const dir = path.dirname(fsPath)
                 await this.features.workspace.fs.mkdir(dir, { recursive: true })
 
-                await this.features.workspace.fs.writeFile(fsPath, JSON.stringify(json, null, 2))
+                await writeOwnerOnlyConfigFile(
+                    this.features.workspace,
+                    this.features.logging,
+                    fsPath,
+                    JSON.stringify(json, null, 2)
+                )
                 this.features.logging.debug(`MCP config file write complete: ${configPath}`)
             })
             .catch((e: any) => {
