@@ -1064,7 +1064,9 @@ export class AgenticChatController implements ChatHandlers {
                                 },
                             }
 
-                            const response = await client.sendMessage(requestInput)
+                            // The prompt lists workspace file paths. Remove invisible characters, as for the
+                            // other chat requests.
+                            const response = await client.sendMessage(sanitizeRequestInput(requestInput))
 
                             let responseContent = ''
                             const maxResponseSize = 50000 // 50KB limit
@@ -4221,6 +4223,8 @@ export class AgenticChatController implements ChatHandlers {
                 ChatTriggerType.INLINE_CHAT,
                 this.#customizationArn
             )
+            // Remove invisible characters from the whole request, as for the agent loop and compaction requests
+            requestInput = sanitizeRequestInput(requestInput)
 
             if (!this.#serviceManager) {
                 throw new Error('amazonQServiceManager is not initialized')

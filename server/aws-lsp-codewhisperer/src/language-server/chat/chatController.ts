@@ -41,7 +41,14 @@ import { createAuthFollowUpResult, getAuthFollowUpType, getDefaultChatResponse }
 import { ChatSessionManagementService } from './chatSessionManagementService'
 import { ChatTelemetryController } from './telemetry/chatTelemetryController'
 import { QuickAction } from './quickActions'
-import { getErrorId, getErrorMessage, isNullish, isObject, isServiceException } from '../../shared/utils'
+import {
+    getErrorId,
+    getErrorMessage,
+    isNullish,
+    isObject,
+    isServiceException,
+    sanitizeRequestInput,
+} from '../../shared/utils'
 import { Metric } from '../../shared/telemetry/metric'
 import { QChatTriggerContext, TriggerContext } from './contexts/triggerContext'
 import { HELP_MESSAGE } from './constants'
@@ -161,11 +168,14 @@ export class ChatController implements ChatHandlers {
         const conversationIdentifier = session?.conversationId ?? 'New conversation'
         try {
             this.#log('Request for conversation id:', conversationIdentifier)
-            requestInput = this.#triggerContext.getChatParamsFromTrigger(
-                params,
-                triggerContext,
-                ChatTriggerType.MANUAL,
-                this.#customizationArn
+            // Remove invisible characters from the whole request, as the agentic chat server does
+            requestInput = sanitizeRequestInput(
+                this.#triggerContext.getChatParamsFromTrigger(
+                    params,
+                    triggerContext,
+                    ChatTriggerType.MANUAL,
+                    this.#customizationArn
+                )
             )
 
             metric.recordStart()
@@ -280,11 +290,14 @@ export class ChatController implements ChatHandlers {
         let requestInput: SendMessageCommandInput
 
         try {
-            requestInput = this.#triggerContext.getChatParamsFromTrigger(
-                params,
-                triggerContext,
-                ChatTriggerType.INLINE_CHAT,
-                this.#customizationArn
+            // Remove invisible characters from the whole request, as the agentic chat server does
+            requestInput = sanitizeRequestInput(
+                this.#triggerContext.getChatParamsFromTrigger(
+                    params,
+                    triggerContext,
+                    ChatTriggerType.INLINE_CHAT,
+                    this.#customizationArn
+                )
             )
 
             this.#inlineChatRequestStartTime = Date.now()

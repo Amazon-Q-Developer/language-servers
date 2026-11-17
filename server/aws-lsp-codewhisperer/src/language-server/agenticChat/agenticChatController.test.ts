@@ -613,6 +613,27 @@ describe('AgenticChatController', () => {
 
                 assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), false)
             })
+
+            it('removes invisible characters from the file ranking request without escaping HTML', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .callsFake(async (_workspaceFolderUri, rankFiles) => {
+                        await rankFiles('Rank src/a&b\u00AD.ts \u{1F600}\u{E0100}\u{E0158} src/<c>.ts\u{E0041}')
+                        return 'Write the memory bank files'
+                    })
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Create a memory bank' } },
+                    mockCancellationToken
+                )
+
+                sinon.assert.calledOnce(sendMessageStub)
+                const rankingRequest: SendMessageCommandInput = sendMessageStub.firstCall.firstArg
+                assert.strictEqual(
+                    rankingRequest.conversationState?.currentMessage?.userInputMessage?.content,
+                    'Rank src/a&b.ts \u{1F600} src/<c>.ts'
+                )
+            })
         })
 
         it('read all the response streams and return compiled results', async () => {
@@ -661,6 +682,69 @@ describe('AgenticChatController', () => {
 
             const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
             assert.strictEqual(requestInput.conversationState?.conversationId, session.conversationId)
+        })
+
+        it('removes variation selectors from the prompt and keeps emoji', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+
+            await chatController.onChatPrompt(
+                {
+                    tabId: mockTabId,
+                    prompt: { prompt: 'Fix the \u26A0\uFE0F warning \u{1F600}\u{E0100}\u{E0158}\u{E01EF}\uFE01' },
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                'Fix the \u26A0\uFE0F warning \u{1F600}'
+            )
+        })
+
+        it('removes variation selectors from the chat history in the request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt: 'Hello' } }, mockCancellationToken)
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
+        })
+
+        it('removes variation selectors from the chat history in the compaction request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt(
+                { tabId: mockTabId, prompt: { prompt: '', command: '/compact' } },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                constants.COMPACTION_PROMPT
+            )
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
         })
 
         it('invokes IdleWorkspaceManager recordActivityTimestamp', async () => {
@@ -2363,6 +2447,26 @@ describe('AgenticChatController', () => {
             )
 
             assert.deepStrictEqual(chatResult, new ResponseError(LSPErrorCodes.RequestFailed, 'invalid state'))
+        })
+
+        it('removes invisible characters from the prompt and the document text without escaping HTML', async () => {
+            testFeatures.openDocument(
+                TextDocument.create('file:///inline.ts', 'typescript', 1, 'const a = 1\u{E0041}\u{E0100}\u{E0158}\n')
+            )
+
+            await chatController.onInlineChatPrompt(
+                {
+                    prompt: { prompt: 'Make a < b \u26A0\uFE0F\u{E0041}\u{E0100}\uFE01' },
+                    textDocument: { uri: 'file:///inline.ts' },
+                    cursorState: [{ position: { line: 0, character: 0 } }],
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const userInputMessage = requestInput.conversationState?.currentMessage?.userInputMessage
+            assert.strictEqual(userInputMessage?.content, 'Make a < b \u26A0\uFE0F')
+            assert.strictEqual(userInputMessage?.userInputMessageContext?.editorState?.document?.text, 'const a = 1\n')
         })
 
         describe('#extractDocumentContext', () => {
