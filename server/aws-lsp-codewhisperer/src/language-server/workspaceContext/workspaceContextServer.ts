@@ -432,7 +432,7 @@ export const WorkspaceContextServer = (): Server => features => {
                 if (isDir && isEmptyDirectory(file.uri)) {
                     continue
                 } else if (isDir) {
-                    filesMetadata = await artifactManager.addNewDirectories([URI.parse(file.uri)])
+                    filesMetadata = await artifactManager.addNewDirectories([URI.parse(file.uri)], workspaceFolder)
                 } else {
                     filesMetadata = [await artifactManager.processNewFile(workspaceFolder, file.uri)]
                 }

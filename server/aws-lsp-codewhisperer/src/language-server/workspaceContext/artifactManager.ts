@@ -94,7 +94,11 @@ export class ArtifactManager {
         return zipFileMetadata
     }
 
-    async addNewDirectories(newDirectories: URI[]): Promise<FileMetadata[]> {
+    /**
+     * Processes the files of new directories as part of `workspaceFolder`, the workspace folder that the file event
+     * handler found for them
+     */
+    async addNewDirectories(newDirectories: URI[], workspaceFolder: WorkspaceFolder): Promise<FileMetadata[]> {
         let zipFileMetadata: FileMetadata[] = []
         const fileSizeDetails: FileSizeDetails = {
             includedFileCount: 0,
@@ -104,13 +108,6 @@ export class ArtifactManager {
         }
 
         for (const directory of newDirectories) {
-            const workspaceFolder = this.workspaceFolders.find(ws => directory.path.startsWith(URI.parse(ws.uri).path))
-
-            if (!workspaceFolder) {
-                // No workspace folder found for directory, it will not be processed
-                continue
-            }
-
             try {
                 const workspacePath = URI.parse(workspaceFolder.uri).path
                 const relativePath = path.relative(workspacePath, directory.path)
@@ -317,7 +314,7 @@ export class ArtifactManager {
         let filesMetadata: FileMetadata[] = []
         if (isDirectory(newUri)) {
             if (!isEmptyDirectory(newUri)) {
-                filesMetadata = await this.addNewDirectories([URI.parse(newUri)])
+                filesMetadata = await this.addNewDirectories([URI.parse(newUri)], workspaceFolder)
             }
         } else {
             filesMetadata = [await this.processNewFile(workspaceFolder, newUri)]
