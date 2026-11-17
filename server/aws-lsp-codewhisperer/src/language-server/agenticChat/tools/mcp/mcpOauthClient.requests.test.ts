@@ -110,9 +110,14 @@ for (const implementation of ['native', 'fallback'] as const) {
             await Promise.all([close(endpoint), close(destination)])
         })
 
-        function exchange(grant: 'refresh' | 'authorization_code', authMethod: string, url = endpointUrl) {
+        function exchange(
+            grant: 'refresh' | 'authorization_code',
+            authMethod: string,
+            url = endpointUrl,
+            authorizationEndpoint = 'https://auth.example.com/authorize'
+        ) {
             const meta = {
-                authorization_endpoint: 'https://auth.example.com/authorize',
+                authorization_endpoint: authorizationEndpoint,
                 token_endpoint: url,
             }
             const reg = {
@@ -180,6 +185,48 @@ for (const implementation of ['native', 'fallback'] as const) {
                 })
             }
         }
+
+        for (const authorizationEndpoint of [
+            'file:///tmp/payload.sh',
+            'javascript:alert(1)',
+            'command:workbench.action.terminal.new',
+            'vscode://file/tmp/payload.sh',
+            'http://auth.example.com/authorize',
+            'not a url',
+        ]) {
+            it(`does not open ${authorizationEndpoint} as the authorization endpoint`, async () => {
+                const fetch = sinon.stub(OAuthClient as any, 'fetchCompat')
+                await assert.rejects(
+                    exchange('authorization_code', 'none', endpointUrl, authorizationEndpoint),
+                    /authorization endpoint/
+                )
+                sinon.assert.notCalled(showDocument)
+                sinon.assert.notCalled(fetch)
+            })
+        }
+
+        it('accepts a callback that arrives before showDocument resolves', async () => {
+            showDocument.callsFake(async ({ uri }: { uri: string }) => {
+                const state = new URL(uri).searchParams.get('state')!
+                const response = { writeHead: () => response, end: () => response }
+                callback.emit('request', { url: `/oauth/callback?code=test-code&state=${state}` }, response)
+                return { success: true }
+            })
+
+            const token = await exchange('authorization_code', 'none')
+
+            assert.equal(token.access_token, 'test-access-token')
+            assert.equal(requests[0].body.get('code'), 'test-code')
+        })
+
+        it('opens a loopback HTTP authorization endpoint', async () => {
+            const token = await exchange('authorization_code', 'none', endpointUrl, 'http://127.0.0.1:9/authorize')
+            assert.equal(token.access_token, 'test-access-token')
+            sinon.assert.calledOnce(showDocument)
+            const opened = new URL(showDocument.firstCall.args[0].uri)
+            assert.equal(opened.origin + opened.pathname, 'http://127.0.0.1:9/authorize')
+            assert.equal(showDocument.firstCall.args[0].external, true)
+        })
 
         it('returns no token or cache update after a redirected silent refresh', async () => {
             responseStatus = 307

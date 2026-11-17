@@ -93,8 +93,8 @@ describe('OAuthClient helpers', () => {
         expect(actual).to.equal('aGVsbG8')
     })
 
-    describe('validateTokenEndpoint()', () => {
-        const validate = (endpoint: string) => (OAuthClient as any).validateTokenEndpoint(endpoint)
+    describe('validateEndpoint()', () => {
+        const validate = (endpoint: string) => (OAuthClient as any).validateEndpoint(endpoint, 'token')
 
         for (const endpoint of [
             'https://auth.example.com/token',
@@ -122,12 +122,22 @@ describe('OAuthClient helpers', () => {
             'http://[::]/token',
             'http://127.0.0.1@auth.example.com/token',
             'ftp://auth.example.com/token',
+            'file:///tmp/token',
+            'javascript:alert(1)',
+            'command:workbench.action.terminal.new',
+            'vscode://file/tmp/token',
             'not a url',
         ]) {
             it(`rejects ${endpoint}`, () => {
                 expect(() => validate(endpoint)).to.throw()
             })
         }
+
+        it('names the endpoint kind in the error', () => {
+            expect(() => (OAuthClient as any).validateEndpoint('file:///tmp/x', 'authorization')).to.throw(
+                'OAuth: authorization endpoint must use HTTPS unless it is a loopback address'
+            )
+        })
     })
 })
 
