@@ -17,9 +17,11 @@ import {
     isRegistryServerConfig,
 } from './mcpTypes'
 import path = require('path')
+import { workspaceUtils } from '@aws/lsp-core'
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
+import { canonicalizeWorkspaceFolders, resolveCanonicalPath } from '../toolShared'
 
 /**
  * Load, validate, and parse MCP server configurations from JSON files.
@@ -1100,7 +1102,9 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
     const wsAgentPaths = getWorkspaceAgentConfigPaths(wsUris)
 
     // Migrate global config
-    await migrateConfigToAgent(workspace, logging, globalConfigPath, globalPersonaPath, globalAgentPath, agent, true)
+    await migrateConfigToAgent(workspace, logging, globalConfigPath, globalPersonaPath, globalAgentPath, agent, {
+        kind: 'global',
+    })
 
     // Migrate workspace configs
     for (let i = 0; i < wsUris.length; i++) {
@@ -1115,7 +1119,8 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
                     wsConfigPaths[i],
                     wsPersonaPaths[i],
                     wsAgentPaths[i],
-                    agent
+                    agent,
+                    { kind: 'workspace', folderPath: normalizePathFromUri(wsUris[i], logging) }
                 )
             }
         }
@@ -1123,7 +1128,48 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
 }
 
 /**
+ * Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. A part of the path that
+ * does not exist yet is resolved as written. False if it cannot tell, for example for links that point at each
+ * other or a folder that cannot be read.
+ */
+export async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
+    try {
+        const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
+        return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Which agent config a migration writes: the global agent config, or the agent config of a workspace folder, which
+ * must stay inside that folder after symbolic links are followed. Every caller states which one, so that no caller
+ * can skip the folder check by leaving out the folder.
+ */
+export type AgentConfigLocation = { kind: 'global' } | { kind: 'workspace'; folderPath: string }
+
+/**
+ * Whether a migration may write the agent config at `agentPath`: the global one always, and the one of a workspace
+ * folder only inside that folder, after symbolic links are followed. Logs a warning if not.
+ */
+async function mayMigrateAgentConfig(
+    logging: Logger,
+    agentPath: string,
+    location: AgentConfigLocation,
+    action: 'create' | 'update'
+): Promise<boolean> {
+    if (location.kind === 'global' || (await isInsideFolder(location.folderPath, agentPath))) {
+        return true
+    }
+    logging.warn(
+        `Did not ${action} the agent config ${JSON.stringify(agentPath)} because it is not inside the workspace folder, or could not be resolved, after symbolic links are followed`
+    )
+    return false
+}
+
+/**
  * Migrate a specific config and persona to an agent config
+ * @param location The global agent config, or a workspace folder that the agent config must be written in
  */
 async function migrateConfigToAgent(
     workspace: Workspace,
@@ -1132,7 +1178,7 @@ async function migrateConfigToAgent(
     personaPath: string,
     agentPath: string,
     agent: Agent,
-    isGlobalDefault: boolean = false
+    location: AgentConfigLocation
 ): Promise<void> {
     // Normalize all paths to ensure consistent handling
     const normalizedConfigPath = normalizePathFromUri(configPath, logging)
@@ -1146,6 +1192,10 @@ async function migrateConfigToAgent(
     // Only migrate if agent file does not exist
     // If config exists, migrate from it; if not, create default agent config
     if (agentExists) {
+        return
+    }
+
+    if (!(await mayMigrateAgentConfig(logging, agentPath, location, 'create'))) {
         return
     }
 
@@ -1297,17 +1347,39 @@ export async function saveServerSpecificAgentConfig(
     }
 }
 
+/** Updates the existing agent configs of the workspace folders and the global agent config to the CLI format. */
+export async function migrateAgentConfigsToCLIFormat(workspace: Workspace, logging: Logger): Promise<void> {
+    const wsUris = workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+    const agentConfigs: { agentPath: string; location: AgentConfigLocation }[] = [
+        ...getWorkspaceAgentConfigPaths(wsUris).map((agentPath, i) => ({
+            agentPath,
+            location: { kind: 'workspace', folderPath: normalizePathFromUri(wsUris[i], logging) } as const,
+        })),
+        { agentPath: getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()), location: { kind: 'global' } },
+    ]
+    for (const { agentPath, location } of agentConfigs) {
+        const normalizedAgentPath = normalizePathFromUri(agentPath)
+        const exists = await workspace.fs.exists(normalizedAgentPath).catch(() => false)
+        if (exists) {
+            await migrateAgentConfigToCLIFormat(workspace, logging, normalizedAgentPath, location)
+        }
+    }
+}
+
 /**
- * Migrate existing agent config to CLI format
+ * @param location The global agent config, or the workspace folder that the agent config at `configPath` must be
+ * inside
  */
 export async function migrateAgentConfigToCLIFormat(
     workspace: Workspace,
     logging: Logger,
-    configPath: string
+    configPath: string,
+    location: AgentConfigLocation
 ): Promise<void> {
     try {
         const exists = await workspace.fs.exists(configPath)
         if (!exists) return
+        if (!(await mayMigrateAgentConfig(logging, configPath, location, 'update'))) return
 
         const raw = await workspace.fs.readFile(configPath)
         const config = JSON.parse(raw.toString())
