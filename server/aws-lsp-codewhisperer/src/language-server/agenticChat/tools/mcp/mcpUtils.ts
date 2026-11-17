@@ -99,8 +99,18 @@ export async function loadMcpServerConfigs(
         }
 
         // 4) dedupe and validate
+        const isWorkspaceFile = permissionPathKey(fsPath) !== permissionPathKey(globalConfigPath)
         for (const [name, entryRaw] of Object.entries(json.mcpServers)) {
             const entry = entryRaw as any
+
+            // A workspace file does not load a server whose name has a glob character. This runs before the
+            // duplicate check, so such a server does not replace a global server either.
+            if (isWorkspaceFile && isWildcardPermission(name)) {
+                const errorMsg = `Ignoring MCP server ${JSON.stringify(name)} in ${fsPath}: a workspace server name cannot contain '*' or '?'`
+                logging.warn(errorMsg)
+                configErrors.set(name, errorMsg)
+                continue
+            }
 
             const hasCmd = typeof entry.command === 'string' && entry.command.trim() !== ''
             const hasUrl = typeof entry.url === 'string' && entry.url.trim() !== ''
@@ -644,8 +654,7 @@ export async function loadAgentConfig(
     // Legacy MCP configs are always manual servers, so skip them when registry is active
     if (agentConfig.useLegacyMcpJson && !registryActive) {
         const wsUris = workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
-        const globalMcpPath = getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())
-        const mcpPaths = [...getWorkspaceMcpConfigPaths(wsUris), globalMcpPath]
+        const mcpPaths = [...getWorkspaceMcpConfigPaths(wsUris), getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())]
 
         const mcpResult = await loadMcpServerConfigs(workspace, logging, mcpPaths)
 
@@ -654,25 +663,13 @@ export async function loadAgentConfig(
         for (const [sanitizedName, mcpConfig] of mcpResult.servers) {
             const originalName = mcpResult.serverNameMapping.get(sanitizedName)
             if (originalName) {
-                const isWorkspaceServer =
-                    !mcpConfig.__configPath__ ||
-                    permissionPathKey(mcpConfig.__configPath__) !== permissionPathKey(globalMcpPath)
-                if (isWorkspaceServer && isWildcardPermission(originalName)) {
-                    const errorMsg = `Ignoring MCP server ${JSON.stringify(originalName)} in ${mcpConfig.__configPath__}: a workspace server name cannot contain '*' or '?'`
-                    logging.warn(errorMsg)
-                    configErrors.set(originalName, errorMsg)
-                    continue
-                }
                 servers.set(sanitizedName, mcpConfig)
                 serverNameMapping.set(sanitizedName, originalName)
 
                 // Add MCP server tools to agent config for permission management. The file that defines the
                 // server enables it, so the entry goes through the same checks as one that the file lists.
-                const serverPrefix = `@${originalName}`
                 if (mcpConfig.__configPath__) {
-                    stash(pendingServerTools, serverPrefix, mcpConfig.__configPath__)
-                } else if (!agentConfig.tools.includes(serverPrefix)) {
-                    agentConfig.tools.push(serverPrefix)
+                    stash(pendingServerTools, `@${originalName}`, mcpConfig.__configPath__)
                 }
 
                 logging.info(`Loaded MCP server '${originalName}' from legacy MCP config`)

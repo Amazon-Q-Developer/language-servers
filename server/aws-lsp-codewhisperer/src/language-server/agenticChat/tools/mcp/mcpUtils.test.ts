@@ -1844,7 +1844,7 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
 
         expect([...servers.keys()]).to.deep.equal(['demo'])
         expect(errors.get('d*')).to.match(/a workspace server name cannot contain/)
-        expect(errors.get('d?mo')).to.match(/a workspace server name cannot contain/)
+        expect(errors.get('mcp_d?mo')).to.match(/a workspace server name cannot contain/)
         expect(agentConfig.tools).to.not.include('@d*')
         expect(agentConfig.tools).to.not.include('@d?mo')
         expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
@@ -1856,6 +1856,83 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
         const { servers } = await load()
 
         expect(servers.has(sanitizeName('d*'))).to.be.true
+    })
+
+    it('keeps a global mcp.json server when a workspace mcp.json server with a glob character has the same key', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsRoot).toString(), name: 'ws' }]
+        // sanitizeName removes '*' and '?', so 'tracker*' has the key of 'tracker'
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { 'd*': { command: 'user-pattern-mcp', args: [] }, tracker: { command: 'user-mcp', args: [] } },
+        })
+        await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+            mcpServers: {
+                'd*': { command: 'pattern-mcp', args: [] },
+                'tracker*': { command: 'pattern-mcp', args: [] },
+            },
+        })
+
+        const { servers, serverNameMapping, agentConfig, errors } = await load()
+
+        expect(servers.get(sanitizeName('d*'))?.command).to.equal('user-pattern-mcp')
+        expect(servers.get('tracker')?.command).to.equal('user-mcp')
+        expect(serverNameMapping.get('tracker')).to.equal('tracker')
+        expect(agentConfig.tools).to.include.members(['@d*', '@tracker'])
+        expect(errors.get('mcp_d*')).to.match(/a workspace server name cannot contain/)
+        expect(errors.get('mcp_tracker*')).to.match(/a workspace server name cannot contain/)
+    })
+
+    it('does not let one workspace folder grant permissions on the servers of another folder', async () => {
+        const ownRoot = path.join(tmpDir, 'own')
+        const otherRoot = path.join(tmpDir, 'other')
+        const otherAgentPath = path.join(otherRoot, '.amazonq', 'agents', 'default.json')
+        const otherMcpPath = path.join(otherRoot, '.amazonq', 'mcp.json')
+        // The user's project defines 'local' and enables one of its tools
+        await writeJson(path.join(ownRoot, '.amazonq', 'agents', 'default.json'), {
+            mcpServers: { local: { command: 'local-mcp', args: [] } },
+            tools: ['@local/allowed_tool'],
+            allowedTools: [],
+        })
+        await writeJson(otherMcpPath, { mcpServers: { 'local/denied_tool': { command: 'other-mcp', args: [] } } })
+        await writeJson(otherAgentPath, {
+            mcpServers: { helper: { command: 'helper-mcp', args: [] } },
+            tools: ['*', '@local/denied_tool'],
+            allowedTools: ['@local', '@local/allowed_tool', '@helper/read_tool'],
+        })
+
+        for (const roots of [
+            [ownRoot, otherRoot],
+            [otherRoot, ownRoot],
+        ]) {
+            logger.warn.resetHistory()
+            workspace.getAllWorkspaceFolders = () => roots.map(root => ({ uri: URI.file(root).toString(), name: root }))
+            const agentPaths = roots.map(root => path.join(root, '.amazonq', 'agents', 'default.json'))
+
+            const { servers, agentConfig } = await loadAgentConfig(
+                workspace,
+                logger,
+                [...agentPaths, globalAgentPath],
+                null,
+                false
+            )
+
+            expect(servers.get('local')?.command).to.equal('local-mcp')
+            expect(permissions(agentConfig).isToolEnabled('local', 'allowed_tool')).to.be.true
+            expect(permissions(agentConfig).isToolEnabled('local', 'denied_tool')).to.be.false
+            expect(permissions(agentConfig).isToolAlwaysAllowed('local', 'allowed_tool')).to.be.false
+            expect(agentConfig.allowedTools).to.not.include('@local')
+            expect(agentConfig.allowedTools).to.not.include('@local/allowed_tool')
+            // The other folder still grants the server that it defines
+            expect(agentConfig.tools).to.include('@helper')
+            expect(agentConfig.allowedTools).to.include('@helper/read_tool')
+            const lines: string[] = logger.warn.args.map((args: unknown[]) => String(args[0]))
+            const ignored = (entry: string, file: string) =>
+                lines.some(line => line.startsWith(`Ignoring permission ${JSON.stringify(entry)} in ${file}:`))
+            for (const entry of ['@local/denied_tool', '@local', '@local/allowed_tool']) {
+                expect(ignored(entry, otherAgentPath), entry).to.be.true
+            }
+            expect(ignored('@local/denied_tool', path.normalize(URI.file(otherMcpPath).fsPath))).to.be.true
+        }
     })
 
     it('does not let the default enablement of a workspace mcp.json server reach a global server', async () => {
@@ -2108,6 +2185,16 @@ describe('removeUntrustedPermissionSources()', () => {
         expect(remaining(pending)).to.deep.equal({ '@removed/tool': [wsAgent] })
         sinon.assert.notCalled(logger.warn)
     })
+
+    it('uses the key of a server that the name mapping does not list as its name', () => {
+        const loaded = servers({ user: globalAgent })
+        const pending = new Map([['@user/tool', new Set([wsAgent])]])
+
+        removeUntrustedPermissionSources(pending, loaded, new Map(), globalPaths, logger)
+
+        expect(remaining(pending)).to.deep.equal({})
+        sinon.assert.calledOnceWithMatch(logger.warn, /does not define: "user"$/)
+    })
 })
 
 describe('restoreServerScopedPermissions()', () => {
@@ -2146,6 +2233,21 @@ describe('restoreServerScopedPermissions()', () => {
 
         expect(agentConfig.tools).to.deep.equal(['@srv', '@srv/tool'])
         expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('applies no entry to a server whose config file is not known', () => {
+        const agentConfig = baseAgentConfig()
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            new Map([['srv', 'srv']]),
+            new Map([['srv', { command: 'x' } as MCPServerConfig]]),
+            fromFile(globalAgentPath, '@srv'),
+            fromFile(globalAgentPath, '@srv/tool')
+        )
+
+        expect(agentConfig.tools).to.be.empty
+        expect(agentConfig.allowedTools).to.be.empty
     })
 
     it('matches on the original (unsanitized) server name', () => {
