@@ -6,7 +6,9 @@ import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { TextDocument, Workspace } from '@aws/language-server-runtimes/server-interface'
 import { testFolder } from '@aws/lsp-core'
 import { StubbedInstance } from 'ts-sinon'
+import { ChatSessionService } from '../../chat/chatSessionService'
 import { withCheckedFileOperations, checkedTarget } from './checkedFileFixtures.test'
+import { URI } from 'vscode-uri'
 
 describe('FsRead Tool', () => {
     let features: TestFeatures
@@ -166,6 +168,144 @@ describe('FsRead Tool', () => {
             'Reading a file that is also named outside the workspace should be confirmed by the user'
         )
         assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
+    })
+
+    describe('files in the workspace that share their data with another name on disk', () => {
+        let workspaceDir: string
+        let makeFsRead: () => FsRead
+
+        // A file in the workspace with a second name outside it
+        const sharedFile = async (name: string) => {
+            const outsideTarget = path.join(tempFolder.path, `outside-${name}`)
+            await fs.writeFile(outsideTarget, 'synthetic fixture only')
+            const filePath = path.join(workspaceDir, name)
+            await fs.link(outsideTarget, filePath)
+            return filePath
+        }
+
+        beforeEach(async () => {
+            workspaceDir = path.join(tempFolder.path, 'workspace')
+            await fs.mkdir(workspaceDir)
+            makeFsRead = () =>
+                new FsRead({
+                    ...features,
+                    workspace: {
+                        ...features.workspace,
+                        getTextDocument: async s => ({}) as TextDocument,
+                        getAllWorkspaceFolders: () => [{ uri: URI.file(workspaceDir).toString(), name: 'workspace' }],
+                    },
+                })
+        })
+
+        it("shows each path's warning in a multi-path read", async () => {
+            const secretDir = path.join(tempFolder.path, 'secret')
+            await fs.mkdir(secretDir)
+            const outsidePath = path.join(secretDir, 'notes.txt')
+            await fs.writeFile(outsidePath, 'synthetic fixture only')
+
+            const result = await makeFsRead().requiresAcceptance({ paths: [await sharedFile('a.txt'), outsidePath] })
+
+            assert.equal(result.requiresAcceptance, true)
+            assert.ok(result.warning?.includes('another name on disk'), result.warning)
+            assert.ok(result.warning?.includes('sensitive system files'), result.warning)
+            // Not every path is in the workspace, so the prompt keeps the outside-the-workspace wording
+            assert.equal(result.acceptanceReason, undefined)
+        })
+
+        it('keeps the shared-file wording when that is why every path of a multi-path read needs approval', async () => {
+            const result = await makeFsRead().requiresAcceptance({
+                paths: [await sharedFile('a.txt'), await sharedFile('b.txt')],
+            })
+
+            assert.equal(result.requiresAcceptance, true)
+            assert.equal(result.acceptanceReason, 'multiplyLinkedFile')
+            assert.equal(result.warning?.split('another name on disk').length, 2, 'the warning appears once')
+        })
+
+        it('does not ask again about such a file that the user approved, until it changes', async () => {
+            const filePath = await sharedFile('a.txt')
+            const first = await makeFsRead().requiresAcceptance({ paths: [filePath] })
+            assert.equal(first.requiresAcceptance, true)
+
+            // Mirrors how the controller records a granted approval
+            const session = new ChatSessionService()
+            for (const target of first.checkedTargets ?? []) {
+                session.addApprovedPath(target.path, 'fsRead', target)
+            }
+            const readAgain = () =>
+                makeFsRead().requiresAcceptance(
+                    { paths: [filePath] },
+                    session.approvedPaths,
+                    session.approvedLinkedFiles
+                )
+
+            // Windows captures no file identity, so the user is asked each time there
+            assert.equal((await readAgain()).requiresAcceptance, process.platform === 'win32')
+
+            const replacement = path.join(tempFolder.path, 'replacement.txt')
+            await fs.writeFile(replacement, 'synthetic fixture only')
+            await fs.rm(filePath)
+            await fs.link(replacement, filePath)
+            assert.equal((await readAgain()).requiresAcceptance, true)
+        })
+    })
+
+    it('does not ask again for paths the user already approved in a multi-path read', async () => {
+        // Regression: fsRead takes a `paths` array, and an approval recorded
+        // from a singular `path` never matched a later read of the same file.
+        const outsideDir = path.join(tempFolder.path, 'outside')
+        await fs.mkdir(outsideDir, { recursive: true })
+        const firstPath = path.join(outsideDir, 'first.txt')
+        const secondPath = path.join(outsideDir, 'second.txt')
+        const unapprovedPath = path.join(outsideDir, 'third.txt')
+        await fs.writeFile(firstPath, 'first')
+        await fs.writeFile(secondPath, 'second')
+        await fs.writeFile(unapprovedPath, 'third')
+
+        const fsRead = new FsRead({
+            ...features,
+            workspace: {
+                ...features.workspace,
+                getTextDocument: async s => ({}) as TextDocument,
+                getAllWorkspaceFolders: () => [
+                    { uri: `file://${path.join(tempFolder.path, 'workspace')}`, name: 'ws' },
+                ],
+            },
+        })
+
+        const toolUseInput = { paths: [firstPath, secondPath] }
+
+        // Both paths are outside the workspace, so the user is asked.
+        const first = await fsRead.requiresAcceptance(toolUseInput)
+        assert.equal(first.requiresAcceptance, true)
+        assert.equal(first.canonicalPaths?.length, 2, 'Every requested path is checked')
+
+        // Mirrors how the controller records a granted approval: every
+        // canonical path the acceptance check evaluated.
+        const session = new ChatSessionService()
+        for (const checkedPath of first.canonicalPaths ?? []) {
+            session.addApprovedPath(checkedPath, 'fsRead')
+        }
+
+        assert.equal(
+            (await fsRead.requiresAcceptance(toolUseInput, session.approvedPaths)).requiresAcceptance,
+            false,
+            'The same read should not be asked about twice'
+        )
+        for (const approvedPath of [firstPath, secondPath]) {
+            assert.equal(
+                (await fsRead.requiresAcceptance({ paths: [approvedPath] }, session.approvedPaths)).requiresAcceptance,
+                false,
+                `Reading ${approvedPath} on its own should not be asked about again`
+            )
+        }
+
+        // An approval does not spread to a file the user was not shown.
+        assert.equal(
+            (await fsRead.requiresAcceptance({ paths: [unapprovedPath] }, session.approvedPaths)).requiresAcceptance,
+            true,
+            'A path outside the approved set still requires acceptance'
+        )
     })
 })
 

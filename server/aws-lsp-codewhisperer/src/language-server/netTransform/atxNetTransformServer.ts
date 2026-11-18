@@ -8,6 +8,7 @@ import {
 import { AtxTokenServiceManager } from '../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { ATXTransformHandler } from './atxTransformHandler'
 import { AtxTransformHandlerLegacy } from './atxTransformHandlerLegacy'
+import { getAtxErrorInfo } from './atxErrorInfo'
 import {
     AtxListOrCreateWorkspaceRequest,
     AtxListJobsRequest,
@@ -50,6 +51,8 @@ const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
 // Beam to IDE
 const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
 const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
+// Read-only session check used to validate IAM sign-in
+export const AtxValidateSessionCommand = 'aws/atxTransform/validateSession'
 
 export const AtxNetTransformServerToken =
     (): Server =>
@@ -65,6 +68,9 @@ export const AtxNetTransformServerToken =
                         const request = params as AtxListOrCreateWorkspaceRequest
                         const result = await atxTransformHandler.listOrCreateWorkspace(request)
                         return result
+                    }
+                    case AtxValidateSessionCommand: {
+                        return await atxTransformHandler.validateSession()
                     }
                     case AtxListJobsCommand: {
                         const { WorkspaceId } = params as AtxListJobsRequest
@@ -311,7 +317,9 @@ export const AtxNetTransformServerToken =
                 }
             } catch (e: any) {
                 logging.error(`ATXTransformServer: Error executing command: ${String(e)}`)
-                return { error: true, message: e.message }
+                // errorCode and statusCode let the IDE act on the failure (e.g. stop polling on AccessDenied)
+                // without reading the message.
+                return { error: true, message: e.message, ...getAtxErrorInfo(e) }
             }
         }
 
@@ -349,6 +357,7 @@ export const AtxNetTransformServerToken =
                             AtxLoadOlderWorklogsCommand,
                             AtxListBeamedReposCommand,
                             AtxDownloadBeamArtifactCommand,
+                            AtxValidateSessionCommand,
                         ],
                     },
                 },

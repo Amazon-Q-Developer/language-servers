@@ -1141,6 +1141,8 @@ describe('AmazonQTokenServiceManager', () => {
 
         it('should return endpoint override when configured', () => {
             const endpointOverride = 'https://custom-endpoint.com'
+            // Sets its own client params, so the params with the override are set after it
+            setupServiceManager()
             features.setClientParams({
                 processId: 0,
                 rootUri: 'test',
@@ -1158,13 +1160,12 @@ describe('AmazonQTokenServiceManager', () => {
                 },
             })
 
-            setupServiceManager()
-
             assert.strictEqual(amazonQTokenServiceManager.endpointOverride(), endpointOverride)
         })
 
         it('should handle empty string profile ARN', async () => {
-            setupServiceManager()
+            // A profile ARN is only read when developer profiles are enabled
+            setupServiceManager(true)
 
             await assert.rejects(
                 amazonQTokenServiceManager.handleOnUpdateConfiguration(
@@ -1174,8 +1175,10 @@ describe('AmazonQTokenServiceManager', () => {
                     },
                     {} as CancellationToken
                 ),
-                /Received invalid Profile ARN \(empty string\)/
+                /Failed to update configuration/
             )
+            // The reason is logged, not returned to the client
+            sinon.assert.calledWith(features.logging.log, sinon.match(/Received invalid Profile ARN \(empty string\)/))
         })
 
         it('should handle profile update cancellation', async () => {
@@ -1191,7 +1194,8 @@ describe('AmazonQTokenServiceManager', () => {
         })
 
         it('should validate profile ARN format', async () => {
-            setupServiceManager()
+            // A profile ARN is only read when developer profiles are enabled
+            setupServiceManager(true)
 
             await assert.rejects(
                 amazonQTokenServiceManager.handleOnUpdateConfiguration(
@@ -1201,8 +1205,10 @@ describe('AmazonQTokenServiceManager', () => {
                     },
                     {} as CancellationToken
                 ),
-                /Invalid Profile ARN format/
+                /Failed to update configuration/
             )
+            // The reason is logged, not returned to the client
+            sinon.assert.calledWith(features.logging.log, sinon.match(/Malformed ARN/))
         })
     })
 })
