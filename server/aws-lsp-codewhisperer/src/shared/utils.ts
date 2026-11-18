@@ -685,9 +685,11 @@ function isPresentationSelectorOfEmoji(char: string, offset: number, text: strin
 }
 
 /**
- * Sanitizes input by removing dangerous Unicode characters that could be used for ASCII smuggling
+ * Removes the characters that do not show in text: the Unicode Default_Ignorable_Code_Point characters, the tag
+ * characters and the other ranges that it removed before. A presentation selector that belongs to an emoji stays.
  * @param input The input string to sanitize
- * @returns The sanitized string with dangerous characters removed
+ * @param enableEscapingHTML Whether to escape HTML in the input first
+ * @returns The input without those characters
  */
 export function sanitizeInput(input: string, enableEscapingHTML: boolean = false): string {
     if (!input) {
@@ -718,6 +720,9 @@ function replaceInvisibleCharacters(text: string, replacement: (char: string) =>
  */
 function sanitizeKeys(keys: string[]): string[] {
     const sanitized = keys.map(key => sanitizeInput(key))
+    if (sanitized.every((key, i) => key === keys[i])) {
+        return keys
+    }
     const counts = new Map<string, number>()
     for (const key of sanitized) {
         counts.set(key, (counts.get(key) ?? 0) + 1)
@@ -772,6 +777,8 @@ type JsonObject = Record<string, unknown>
 
 /** The most schemas that restorePropertyNames applies to one value */
 const MAX_SCHEMAS_PER_VALUE = 64
+/** The most schema entries that restorePropertyNames looks at for one value, repeated and non-schema ones included */
+const MAX_SCHEMA_ENTRIES_PER_VALUE = 16 * MAX_SCHEMAS_PER_VALUE
 
 function isJsonObject(value: unknown): value is JsonObject {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -856,20 +863,25 @@ function restoreNames(value: unknown, schemas: unknown[], root: unknown): unknow
 /** `schemas`, the members of their allOf, anyOf and oneOf, and the schemas that their $ref pointers name */
 function applicableSchemas(schemas: unknown[], root: unknown): JsonObject[] {
     const applicable: JsonObject[] = []
-    const pending = [...schemas]
-    while (pending.length > 0 && applicable.length < MAX_SCHEMAS_PER_VALUE) {
-        const schema = pending.shift()
+    const pending = schemas.slice(0, MAX_SCHEMA_ENTRIES_PER_VALUE)
+    const add = (entry: unknown) => {
+        if (pending.length < MAX_SCHEMA_ENTRIES_PER_VALUE) {
+            pending.push(entry)
+        }
+    }
+    for (let next = 0; next < pending.length && applicable.length < MAX_SCHEMAS_PER_VALUE; next++) {
+        const schema = pending[next]
         if (!isJsonObject(schema) || applicable.includes(schema)) {
             continue
         }
         applicable.push(schema)
         if (typeof schema.$ref === 'string') {
-            pending.push(resolveSchemaPointer(schema.$ref, root))
+            add(resolveSchemaPointer(schema.$ref, root))
         }
         for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
             const members = schema[keyword]
             if (Array.isArray(members)) {
-                pending.push(...members)
+                members.slice(0, MAX_SCHEMA_ENTRIES_PER_VALUE).forEach(add)
             }
         }
     }

@@ -1398,4 +1398,24 @@ describe('restorePropertyNames', () => {
         assert.strictEqual(restorePropertyNames(input, { $ref: 'https://example.com/schema.json' }), input)
         assert.strictEqual(restorePropertyNames('text', { properties: { 'te\u200Cxt': {} } }), 'text')
     })
+
+    it('applies at most 64 schemas to one value', () => {
+        const others = Array.from({ length: 64 }, (_, i) => ({ properties: { [`other${i}`]: {} } }))
+        const input = { name: 'n' }
+
+        const schema = { anyOf: [...others, { properties: { 'na\u200Cme': {} } }] }
+
+        assert.strictEqual(restorePropertyNames(input, schema), input)
+        assert.deepStrictEqual(restorePropertyNames(input, { anyOf: [others[0], schema.anyOf[64]] }), {
+            'na\u200Cme': 'n',
+        })
+    })
+
+    it('looks at a bounded number of schema entries, also repeated ones', () => {
+        const repeated = { properties: { other: {} } }
+        const input = { name: 'n' }
+        const schema = { anyOf: [...Array(200_000).fill(repeated), 1, { properties: { 'na\u200Cme': {} } }] }
+
+        assert.strictEqual(restorePropertyNames(input, schema), input)
+    })
 })
