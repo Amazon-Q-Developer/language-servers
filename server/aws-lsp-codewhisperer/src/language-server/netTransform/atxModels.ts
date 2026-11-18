@@ -162,10 +162,21 @@ export interface AtxGetTransformInfoResponse {
     MissingPackageJsonPath?: string | null
     DiffApplyFailed?: boolean
     DiffApplyFailedStepIds?: string[]
+    // Checkpoint entries that were not applied because their path is not allowed (outside the solution folder,
+    // a symlink, or in the job data folder), with the step that holds them. The rest of each step was applied.
+    SkippedCheckpointEntries?: AtxSkippedCheckpointEntry[]
     // Interactive mode as resolved from the backend job objective (interactive_mode).
     // Surfaced so the IDE can restore the correct mode instead of relying on its local
     // settings store, which may be missing/stale (e.g. cold restart on another machine).
     InteractiveMode?: InteractiveMode
+}
+
+/**
+ * A checkpoint entry that was not applied: a path from the step's metadata, or "<before> -> <after>" for a move.
+ */
+export interface AtxSkippedCheckpointEntry {
+    StepId: string
+    Entry: string
 }
 
 /**

@@ -766,6 +766,20 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.DiffApplyFailedStepIds).to.deep.equal(['step-x'])
     })
 
+    it('should list the checkpoint entries that were not applied', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'EXECUTING' } })
+        getTransformationPlanStub.callsFake(async () => {
+            ;(handler as any).recordSkippedEntries('step-x', ['../Outside.cs'])
+            return { Root: { Children: [] } }
+        })
+        listHitlsStub.resolves([])
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.SkippedCheckpointEntries).to.deep.equal([{ StepId: 'step-x', Entry: '../Outside.cs' }])
+        expect(result?.DiffApplyFailed).to.be.undefined
+    })
+
     it('should clear diff context after the call (no leak across calls)', async () => {
         getJobStub.resolves({ statusDetails: { status: 'COMPLETED' } })
         downloadFinalArtifactStub.resolves('path')
@@ -1525,6 +1539,410 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.error).to.be.a('string')
         })
 
+        it('should only apply entries inside the solution folder', async () => {
+            const otherFolder = path.join(tmpRoot, 'other')
+            fs.mkdirSync(otherFolder)
+            for (const name of ['removed.cs', 'updated.cs', 'moved.cs']) {
+                fs.writeFileSync(path.join(otherFolder, name), '// other')
+            }
+            // Sources that entries leaving after/ would read from
+            fs.mkdirSync(path.join(checkpointFolder, 'other'))
+            fs.writeFileSync(path.join(checkpointFolder, 'other', 'added.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(checkpointFolder, 'other', 'updated.cs'), '// checkpoint')
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'Inside.cs'), '// inside')
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            writeMetadata({
+                filesAdded: ['../other/added.cs', 'Inside.cs'],
+                filesRemoved: ['../other/removed.cs'],
+                filesUpdated: ['../other/updated.cs'],
+                movedFilesMap: [
+                    { before: '../other/moved.cs', after: 'Moved.cs' },
+                    { before: 'Source.cs', after: 'src/../../other/Target.cs' },
+                ],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.addedFiles).to.deep.equal(['Inside.cs'])
+            expect(result.filesRemoved).to.equal(0)
+            expect(result.filesUpdated).to.equal(0)
+            expect(result.filesMoved).to.equal(0)
+            expect(result.skippedEntries).to.deep.equal([
+                '../other/added.cs',
+                '../other/removed.cs',
+                '../other/updated.cs',
+                '../other/moved.cs -> Moved.cs',
+                'Source.cs -> src/../../other/Target.cs',
+            ])
+            expect(fs.readdirSync(otherFolder).sort()).to.deep.equal(['moved.cs', 'removed.cs', 'updated.cs'])
+            expect(fs.readFileSync(path.join(otherFolder, 'updated.cs'), 'utf-8')).to.equal('// other')
+            expect(fs.readdirSync(tmpRoot).sort()).to.deep.equal(['checkpoint', 'other', 'sln'])
+            expect(fs.existsSync(path.join(solutionRoot, 'Source.cs'))).to.be.true
+            expect(fs.existsSync(path.join(solutionRoot, 'Moved.cs'))).to.be.false
+            const errors = (logging.error as sinon.SinonStub).args.map(args => String(args[0]))
+            for (const entry of [
+                '../other/added.cs',
+                '../other/removed.cs',
+                '../other/updated.cs',
+                '../other/moved.cs',
+                'src/../../other/Target.cs',
+            ]) {
+                expect(
+                    errors.some(message => message.includes(entry)),
+                    entry
+                ).to.be.true
+            }
+        })
+
+        it('should check the source and the destination of added and updated files separately', async () => {
+            // In the checkpoint folder, but the solution path is outside the solution folder
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'Up.cs'), '// checkpoint')
+            // Outside the checkpoint folder, but the solution path is inside the solution folder
+            const outsideEntry = (name: string) => `../../${path.basename(tmpRoot)}/sln/${name}`
+            const outsideSource = path.join(tmpRoot, path.basename(tmpRoot), 'sln')
+            fs.mkdirSync(outsideSource, { recursive: true })
+            fs.writeFileSync(path.join(outsideSource, 'New.cs'), '// outside')
+            fs.writeFileSync(path.join(outsideSource, 'Down.cs'), '// outside')
+            fs.writeFileSync(path.join(solutionRoot, 'Down.cs'), '// solution')
+            writeMetadata({
+                filesAdded: ['../after/Up.cs', outsideEntry('New.cs')],
+                filesUpdated: ['../after/Up.cs', outsideEntry('Down.cs')],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.filesAdded).to.equal(0)
+            expect(result.filesUpdated).to.equal(0)
+            expect(fs.existsSync(path.join(tmpRoot, 'after'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'New.cs'))).to.be.false
+            expect(fs.readFileSync(path.join(solutionRoot, 'Down.cs'), 'utf-8')).to.equal('// solution')
+        })
+
+        // Creates a symlink, or returns false where the user may not create one (Windows without the privilege)
+        const trySymlink = (target: string, linkPath: string, type: 'file' | 'junction') => {
+            try {
+                fs.symlinkSync(target, linkPath, type)
+                return true
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+                    return false
+                }
+                throw error
+            }
+        }
+
+        it('should not apply entries through a symlink that leads out of the solution folder', async function () {
+            const otherFolder = path.join(tmpRoot, 'other')
+            fs.mkdirSync(otherFolder)
+            for (const name of ['real.cs', 'updated.cs', 'removed.cs', 'moved.cs']) {
+                fs.writeFileSync(path.join(otherFolder, name), '// other')
+            }
+            const jobCheckpoints = path.join(solutionRoot, workspaceFolderName, 'job-1', 'checkpoints')
+            fs.mkdirSync(jobCheckpoints, { recursive: true })
+            fs.writeFileSync(path.join(jobCheckpoints, 'source-files.json'), '{}')
+            fs.mkdirSync(path.join(solutionRoot, 'src'))
+            if (
+                !trySymlink(otherFolder, path.join(solutionRoot, 'link'), 'junction') ||
+                !trySymlink(jobCheckpoints, path.join(solutionRoot, 'shed'), 'junction') ||
+                !trySymlink(path.join(solutionRoot, 'src'), path.join(solutionRoot, 'alias'), 'junction') ||
+                !trySymlink(path.join(otherFolder, 'real.cs'), path.join(solutionRoot, 'link.cs'), 'file') ||
+                !trySymlink(path.join(otherFolder, 'missing.cs'), path.join(solutionRoot, 'dangling.cs'), 'file') ||
+                !trySymlink(path.join(solutionRoot, 'src', 'Real.cs'), path.join(solutionRoot, 'inside.cs'), 'file')
+            ) {
+                this.skip()
+            }
+            for (const name of [
+                'link/added.cs',
+                'link/updated.cs',
+                'link.cs',
+                'shed/source-files.json',
+                'alias/A.cs',
+                'dangling.cs',
+                'inside.cs',
+            ]) {
+                fs.mkdirSync(path.dirname(path.join(checkpointFolder, 'after', name)), { recursive: true })
+                fs.writeFileSync(path.join(checkpointFolder, 'after', name), '// checkpoint')
+            }
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            fs.writeFileSync(path.join(solutionRoot, 'src', 'Real.cs'), '// real')
+            writeMetadata({
+                filesAdded: ['link/added.cs', 'alias/A.cs', 'dangling.cs'],
+                filesUpdated: ['link/updated.cs', 'link.cs', 'shed/source-files.json', 'inside.cs'],
+                filesRemoved: ['link/removed.cs', 'link.cs'],
+                movedFilesMap: [
+                    { before: 'link/moved.cs', after: 'Moved.cs' },
+                    { before: 'Source.cs', after: 'link/Target.cs' },
+                ],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            // A symlink to a folder inside the solution folder still works
+            expect(result.addedFiles).to.deep.equal(['alias/A.cs'])
+            expect(fs.readFileSync(path.join(solutionRoot, 'src', 'A.cs'), 'utf-8')).to.equal('// checkpoint')
+            expect([result.filesUpdated, result.filesRemoved, result.filesMoved]).to.deep.equal([0, 0, 0])
+            expect(fs.readdirSync(otherFolder).sort()).to.deep.equal([
+                'moved.cs',
+                'real.cs',
+                'removed.cs',
+                'updated.cs',
+            ])
+            for (const name of fs.readdirSync(otherFolder)) {
+                expect(fs.readFileSync(path.join(otherFolder, name), 'utf-8'), name).to.equal('// other')
+            }
+            expect(fs.readFileSync(path.join(jobCheckpoints, 'source-files.json'), 'utf-8')).to.equal('{}')
+            expect(fs.lstatSync(path.join(solutionRoot, 'link.cs')).isSymbolicLink()).to.be.true
+            // An entry that is itself a symlink is skipped, even one to a file inside the solution folder
+            expect(fs.readFileSync(path.join(solutionRoot, 'src', 'Real.cs'), 'utf-8')).to.equal('// real')
+            expect(fs.existsSync(path.join(otherFolder, 'missing.cs'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'Source.cs'))).to.be.true
+            expect(fs.existsSync(path.join(solutionRoot, 'Moved.cs'))).to.be.false
+        })
+
+        it('should apply entries when the path of the solution folder goes through a symlink', async function () {
+            const realFolder = path.join(tmpRoot, 'real')
+            fs.mkdirSync(path.join(realFolder, 'sln'), { recursive: true })
+            if (!trySymlink(realFolder, path.join(tmpRoot, 'link'), 'junction')) {
+                this.skip()
+            }
+            const linkedSolutionRoot = path.join(tmpRoot, 'link', 'sln')
+            const siblingFolder = path.join(realFolder, 'sibling')
+            fs.mkdirSync(siblingFolder)
+            for (const name of ['Listed.cs', 'Unlisted.cs']) {
+                fs.writeFileSync(path.join(siblingFolder, name), '// sibling')
+            }
+            // The source files are listed under the real path of the folder
+            const jobCheckpoints = path.join(realFolder, 'sln', workspaceFolderName, 'job-1', 'checkpoints')
+            fs.mkdirSync(jobCheckpoints, { recursive: true })
+            fs.writeFileSync(
+                path.join(jobCheckpoints, 'source-files.json'),
+                JSON.stringify({ sourceFiles: [path.join(fs.realpathSync.native(siblingFolder), 'Listed.cs')] })
+            )
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'Inside.cs'), '// checkpoint')
+            fs.mkdirSync(path.join(checkpointFolder, 'sibling'))
+            for (const name of ['Listed.cs', 'Unlisted.cs']) {
+                fs.writeFileSync(path.join(checkpointFolder, 'sibling', name), '// checkpoint')
+            }
+            const jobDataEntry = `${workspaceFolderName}/job-1/checkpoints/source-files.json`
+            fs.mkdirSync(path.dirname(path.join(checkpointFolder, 'after', jobDataEntry)), { recursive: true })
+            fs.writeFileSync(path.join(checkpointFolder, 'after', jobDataEntry), '{"sourceFiles":[]}')
+            const manifestBefore = fs.readFileSync(path.join(jobCheckpoints, 'source-files.json'), 'utf-8')
+            writeMetadata({
+                filesAdded: ['Inside.cs'],
+                filesUpdated: ['../sibling/Listed.cs', '../sibling/Unlisted.cs', jobDataEntry],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, linkedSolutionRoot, 'job-1')
+
+            expect([result.filesAdded, result.filesUpdated]).to.deep.equal([1, 1])
+            expect(fs.readFileSync(path.join(realFolder, 'sln', 'Inside.cs'), 'utf-8')).to.equal('// checkpoint')
+            expect(fs.readFileSync(path.join(siblingFolder, 'Listed.cs'), 'utf-8')).to.equal('// checkpoint')
+            expect(fs.readFileSync(path.join(siblingFolder, 'Unlisted.cs'), 'utf-8')).to.equal('// sibling')
+            expect(fs.readFileSync(path.join(jobCheckpoints, 'source-files.json'), 'utf-8')).to.equal(manifestBefore)
+        })
+
+        it('should not write to a file that has more than one hard link', async function () {
+            const otherFolder = path.join(tmpRoot, 'other')
+            fs.mkdirSync(otherFolder)
+            for (const name of ['added.cs', 'updated.cs', 'target.cs', 'removed.cs']) {
+                fs.writeFileSync(path.join(otherFolder, name), '// other')
+            }
+            try {
+                fs.linkSync(path.join(otherFolder, 'added.cs'), path.join(solutionRoot, 'Added.cs'))
+                fs.linkSync(path.join(otherFolder, 'updated.cs'), path.join(solutionRoot, 'Updated.cs'))
+                fs.linkSync(path.join(otherFolder, 'target.cs'), path.join(solutionRoot, 'Target.cs'))
+                fs.linkSync(path.join(otherFolder, 'removed.cs'), path.join(solutionRoot, 'Removed.cs'))
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+                    this.skip()
+                }
+                throw error
+            }
+            fs.writeFileSync(path.join(solutionRoot, 'Plain.cs'), '// plain')
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            for (const name of ['Added.cs', 'Updated.cs', 'Plain.cs']) {
+                fs.writeFileSync(path.join(checkpointFolder, 'after', name), '// checkpoint')
+            }
+            writeMetadata({
+                filesAdded: ['Added.cs'],
+                filesUpdated: ['Updated.cs', 'Plain.cs'],
+                filesRemoved: ['Removed.cs'],
+                movedFilesMap: [{ before: 'Source.cs', after: 'Target.cs' }],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect([result.filesAdded, result.filesUpdated, result.filesRemoved, result.filesMoved]).to.deep.equal([
+                0, 1, 1, 0,
+            ])
+            expect(result.skippedEntries).to.deep.equal(['Added.cs', 'Updated.cs', 'Source.cs -> Target.cs'])
+            expect(fs.readFileSync(path.join(solutionRoot, 'Plain.cs'), 'utf-8')).to.equal('// checkpoint')
+            // Removing one of the paths of a file leaves its other paths
+            expect(fs.existsSync(path.join(solutionRoot, 'Removed.cs'))).to.be.false
+            expect(fs.readdirSync(otherFolder).sort()).to.deep.equal([
+                'added.cs',
+                'removed.cs',
+                'target.cs',
+                'updated.cs',
+            ])
+            for (const name of fs.readdirSync(otherFolder)) {
+                expect(fs.readFileSync(path.join(otherFolder, name), 'utf-8'), name).to.equal('// other')
+            }
+            expect(fs.readFileSync(path.join(solutionRoot, 'Source.cs'), 'utf-8')).to.equal('// source')
+        })
+
+        it('should apply entries outside the solution folder only to the source files of the job', async () => {
+            const siblingFolder = path.join(tmpRoot, 'sibling')
+            fs.mkdirSync(siblingFolder)
+            for (const name of ['Listed.cs', 'Unlisted.cs', 'ListedRemoved.cs', 'UnlistedRemoved.cs']) {
+                fs.writeFileSync(path.join(siblingFolder, name), '// sibling')
+            }
+            const jobCheckpoints = path.join(solutionRoot, workspaceFolderName, 'job-1', 'checkpoints')
+            fs.mkdirSync(jobCheckpoints, { recursive: true })
+            fs.writeFileSync(
+                path.join(jobCheckpoints, 'source-files.json'),
+                JSON.stringify({
+                    sourceFiles: [
+                        path.join(siblingFolder, 'Listed.cs'),
+                        path.join(siblingFolder, 'ListedRemoved.cs'),
+                        path.join(solutionRoot, 'src', 'A.cs'),
+                        // Only absolute paths count; from the working folder below, this one names a sibling file
+                        path.join('sibling', 'Unlisted.cs'),
+                    ],
+                })
+            )
+            // The new content of ../sibling/<name> is at after/../sibling/<name> in the checkpoint folder
+            fs.mkdirSync(path.join(checkpointFolder, 'sibling'))
+            for (const name of ['Listed.cs', 'Unlisted.cs', 'New.cs']) {
+                fs.writeFileSync(path.join(checkpointFolder, 'sibling', name), '// checkpoint')
+            }
+            writeMetadata({
+                filesAdded: ['../sibling/New.cs'],
+                filesUpdated: ['../sibling/Listed.cs', '../sibling/Unlisted.cs'],
+                filesRemoved: ['../sibling/ListedRemoved.cs', '../sibling/UnlistedRemoved.cs'],
+            })
+
+            const workingFolder = process.cwd()
+            process.chdir(tmpRoot)
+            let result: any
+            try {
+                // A job ID that is not a folder name does not name a source-files.json
+                for (const [jobId, manifestFolder] of [
+                    ['../other-job', path.join(solutionRoot, 'other-job', 'checkpoints')],
+                    ['..', path.join(solutionRoot, 'checkpoints')],
+                    ['.', path.join(solutionRoot, workspaceFolderName, 'checkpoints')],
+                ]) {
+                    fs.mkdirSync(manifestFolder, { recursive: true })
+                    fs.copyFileSync(
+                        path.join(jobCheckpoints, 'source-files.json'),
+                        path.join(manifestFolder, 'source-files.json')
+                    )
+                    const otherJobResult = await (handler as any).applyChanges(checkpointFolder, solutionRoot, jobId)
+                    expect([otherJobResult.filesUpdated, otherJobResult.filesRemoved], jobId).to.deep.equal([0, 0])
+                }
+
+                result = await (handler as any).applyChanges(checkpointFolder, solutionRoot, 'job-1')
+            } finally {
+                process.chdir(workingFolder)
+            }
+
+            expect(result.success).to.be.true
+            expect([result.filesAdded, result.filesUpdated, result.filesRemoved]).to.deep.equal([0, 1, 1])
+            expect(fs.readdirSync(siblingFolder).sort()).to.deep.equal([
+                'Listed.cs',
+                'Unlisted.cs',
+                'UnlistedRemoved.cs',
+            ])
+            expect(fs.readFileSync(path.join(siblingFolder, 'Listed.cs'), 'utf-8')).to.equal('// checkpoint')
+            expect(fs.readFileSync(path.join(siblingFolder, 'Unlisted.cs'), 'utf-8')).to.equal('// sibling')
+        })
+
+        it('should not apply entries in the job data folder', async () => {
+            const jobFolder = path.join(solutionRoot, workspaceFolderName, 'job-1')
+            const manifest = path.join(jobFolder, 'checkpoints', 'source-files.json')
+            const applied = path.join(jobFolder, 'checkpoints', 'checkpoints-applied.json')
+            fs.mkdirSync(path.dirname(manifest), { recursive: true })
+            fs.writeFileSync(manifest, '{}')
+            fs.writeFileSync(applied, '{}')
+            const afterJobFolder = path.join(checkpointFolder, 'after', workspaceFolderName, 'job-1')
+            fs.mkdirSync(path.join(afterJobFolder, 'checkpoints'), { recursive: true })
+            fs.writeFileSync(path.join(afterJobFolder, 'checkpoints', 'source-files.json'), '{"sourceFiles":[]}')
+            fs.writeFileSync(path.join(afterJobFolder, 'New.json'), '{}')
+            fs.writeFileSync(path.join(solutionRoot, 'Source.cs'), '// source')
+            writeMetadata({
+                filesAdded: [`./${workspaceFolderName}/job-1/New.json`],
+                filesUpdated: [`${workspaceFolderName}/job-1/checkpoints/source-files.json`],
+                filesRemoved: [`src/../${workspaceFolderName}/job-1/checkpoints/checkpoints-applied.json`],
+                movedFilesMap: [
+                    { before: `${workspaceFolderName}/job-1/checkpoints/source-files.json`, after: 'Moved.json' },
+                    { before: 'Source.cs', after: `${workspaceFolderName}/job-1/Source.cs` },
+                ],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect([result.filesAdded, result.filesUpdated, result.filesRemoved, result.filesMoved]).to.deep.equal([
+                0, 0, 0, 0,
+            ])
+            expect(fs.readFileSync(manifest, 'utf-8')).to.equal('{}')
+            expect(fs.existsSync(applied)).to.be.true
+            expect(fs.existsSync(path.join(jobFolder, 'New.json'))).to.be.false
+            expect(fs.existsSync(path.join(jobFolder, 'Source.cs'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'Moved.json'))).to.be.false
+            expect(fs.existsSync(path.join(solutionRoot, 'Source.cs'))).to.be.true
+        })
+
+        it('should only resolve checkpoint entries that are paths inside the folder', () => {
+            const entryPath = (entry: unknown) => (handler as any).checkpointEntryPath(solutionRoot, entry)
+
+            expect(entryPath('src/File.cs')).to.equal(path.join(solutionRoot, 'src', 'File.cs'))
+            expect(entryPath('..File.cs')).to.equal(path.join(solutionRoot, '..File.cs'))
+            const outside: unknown[] = ['', '.', '..', '../File.cs', 'src/../../File.cs', undefined, 1, {}]
+            if (path.sep === '\\') {
+                outside.push('..\\File.cs', 'src\\..\\..\\File.cs', 'C:File.cs', 'src\\File.cs:stream')
+            }
+            for (const entry of outside) {
+                expect(entryPath(entry), String(entry)).to.be.undefined
+            }
+        })
+
+        it('should only resolve solution entries that are outside the job data folder', () => {
+            const entryPath = (entry: unknown) => (handler as any).solutionEntryPath(solutionRoot, entry)
+
+            expect(entryPath('src/File.cs')).to.equal(path.join(solutionRoot, 'src', 'File.cs'))
+            expect(entryPath(`src/${workspaceFolderName}/File.cs`)).to.equal(
+                path.join(solutionRoot, 'src', workspaceFolderName, 'File.cs')
+            )
+            expect(entryPath(`${workspaceFolderName}2/File.cs`)).to.equal(
+                path.join(solutionRoot, `${workspaceFolderName}2`, 'File.cs')
+            )
+            const outsideJobData: unknown[] = [
+                workspaceFolderName,
+                `${workspaceFolderName}/job/File.cs`,
+                `./${workspaceFolderName.toUpperCase()}/job/File.cs`,
+                `src/../${workspaceFolderName}/File.cs`,
+                '../File.cs',
+                // Windows trims a trailing dot or space from a path segment
+                `${workspaceFolderName}./job/File.cs`,
+                `${workspaceFolderName} /job/File.cs`,
+            ]
+            if (path.sep === '\\') {
+                outsideJobData.push(
+                    `${workspaceFolderName}\\job\\File.cs`,
+                    `${workspaceFolderName}.\\job\\File.cs`,
+                    `${workspaceFolderName}::$INDEX_ALLOCATION\\job\\File.cs`
+                )
+            }
+            for (const entry of outsideJobData) {
+                expect(entryPath(entry), String(entry)).to.be.undefined
+            }
+        })
+
         // --- DealerFx P452432920: preserve customer edits instead of clobbering them ---
 
         const JOB_ID = 'job-dealerfx'
@@ -1571,6 +1989,36 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             const backupRoot = path.join(solutionRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'conflict-backups')
             const backup = path.join(backupRoot, relPath)
             expect(fs.existsSync(backup)).to.be.true
+            expect(fs.readFileSync(backup, 'utf-8')).to.equal('// USER EDIT')
+        })
+
+        it('backs up a user-modified source file outside the solution folder inside the backup folder', async () => {
+            const relPath = '../sibling/Edited.cs'
+            const dest = path.join(solutionRoot, relPath)
+            fs.mkdirSync(path.dirname(dest), { recursive: true })
+            fs.writeFileSync(dest, '// USER EDIT')
+            writeMetadata({ filesRemoved: [relPath] })
+
+            const watermark = Date.now() - 10_000
+            seedManifest([relPath], watermark)
+            touchAfter(dest, watermark)
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot, JOB_ID)
+
+            expect(result.success).to.be.true
+            expect(result.filesRemoved).to.equal(0)
+            expect(fs.readFileSync(dest, 'utf-8')).to.equal('// USER EDIT')
+            const checkpointsDir = path.join(solutionRoot, workspaceFolderName, JOB_ID, 'checkpoints')
+            expect(fs.readdirSync(checkpointsDir).sort()).to.deep.equal(['conflict-backups', 'source-files.json'])
+            const absolutePath = path.resolve(dest)
+            const { root } = path.parse(absolutePath)
+            const backup = path.join(
+                checkpointsDir,
+                'conflict-backups',
+                'outside-solution',
+                root.replace(/[\\/:]+/g, ''),
+                absolutePath.slice(root.length)
+            )
             expect(fs.readFileSync(backup, 'utf-8')).to.equal('// USER EDIT')
         })
 
@@ -2730,6 +3178,49 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             expect(result?.TransformationJobId).to.equal('job-1')
             expect(result?.ArtifactPath).to.equal('C:/zip.zip')
             expect(result?.UploadId).to.equal('upload-1')
+        })
+
+        it('should write the source files manifest for jobs in every mode', async () => {
+            sinon.stub(handler, 'createJob').resolves({ jobId: 'job-1', status: 'CREATED' })
+            sinon.stub(handler, 'createZip').resolves('C:/zip.zip')
+            sinon.stub(handler, 'createArtifactUploadUrl').resolves({
+                uploadId: 'u',
+                uploadUrl: 'https://s3',
+                requestHeaders: {},
+            } as any)
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true })
+            sinon.stub(handler, 'startJob').resolves({ success: true })
+
+            for (const interactiveMode of [undefined, 'Autonomous', 'Interactive'] as const) {
+                const solutionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-manifest-'))
+                try {
+                    const sourceFile = path.join(path.dirname(solutionRoot), 'sibling', 'Lib.cs')
+                    await handler.startTransform({
+                        workspaceId: 'ws-1',
+                        interactiveMode,
+                        startTransformRequest: {
+                            SolutionRootPath: solutionRoot,
+                            ProjectMetadata: [{ SourceCodeFilePaths: [sourceFile] }],
+                        },
+                    })
+
+                    const manifest = path.join(
+                        solutionRoot,
+                        workspaceFolderName,
+                        'job-1',
+                        'checkpoints',
+                        'source-files.json'
+                    )
+                    expect(
+                        JSON.parse(fs.readFileSync(manifest, 'utf-8')).sourceFiles,
+                        String(interactiveMode)
+                    ).to.deep.equal([sourceFile])
+                } finally {
+                    fs.rmSync(solutionRoot, { recursive: true, force: true })
+                }
+            }
         })
 
         it('should cache interactive mode from request', async () => {
@@ -4043,6 +4534,14 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             ])
         })
 
+        it('should not write source-files.json for a job ID that is not a folder name', () => {
+            ;(handler as any).writeSourceFilesManifest(tmpRoot, '..', {
+                ProjectMetadata: [{ SourceCodeFilePaths: ['C:/sln/A.cs'] }],
+            })
+
+            expect(fs.existsSync(path.join(tmpRoot, 'checkpoints'))).to.be.false
+        })
+
         it('should append new files to existing manifest', () => {
             ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [{ SourceCodeFilePaths: ['C:/sln/A.cs'] }],
@@ -4239,6 +4738,103 @@ describe('ATXTransformHandler - final coverage push', () => {
             const result = await (handler as any).downloadCompletedStepArtifacts('ws-1', 'job-1', tmpRoot, buildPlan())
 
             expect(result).to.be.false
+        })
+
+        it('should not download or apply a completed step whose ID is not a folder name', async () => {
+            // Metadata that a step ID of "." would read from the checkpoints folder itself
+            const checkpoints = path.join(tmpRoot, workspaceFolderName, 'job-1', 'checkpoints')
+            fs.mkdirSync(path.join(checkpoints, 'after'), { recursive: true })
+            fs.writeFileSync(path.join(checkpoints, 'metadata.json'), JSON.stringify({ filesAdded: ['Added.cs'] }))
+            fs.writeFileSync(path.join(checkpoints, 'after', 'Added.cs'), '// checkpoint')
+            const download = sinon.stub(handler as any, 'downloadCompletedStepArtifact').resolves(undefined)
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            for (const stepId of ['.', '..', 'a/b']) {
+                const plan = buildPlan()
+                plan.Root.Children[0].Children[0].StepId = stepId
+                const result = await (handler as any).downloadCompletedStepArtifacts('ws-1', 'job-1', tmpRoot, plan)
+                expect(result, stepId).to.be.true
+            }
+
+            sinon.assert.notCalled(download)
+            expect(fs.existsSync(path.join(tmpRoot, 'Added.cs'))).to.be.false
+            expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal(['.', '..', 'a/b'])
+        })
+
+        it('should not download or apply completed steps when the job ID is not a folder name', async () => {
+            const download = sinon.stub(handler as any, 'downloadCompletedStepArtifact').resolves(undefined)
+            const apply = sinon.spy(handler as any, 'applyChanges')
+
+            const result = await (handler as any).downloadCompletedStepArtifacts('ws-1', '..', tmpRoot, buildPlan())
+
+            expect(result).to.be.true
+            sinon.assert.notCalled(download)
+            sinon.assert.notCalled(apply)
+        })
+
+        it('should record the entries of a step that were not applied and still mark the step applied', async () => {
+            const stepFolder = path.join(tmpRoot, workspaceFolderName, 'job-1', 'checkpoints', 'g1')
+            fs.mkdirSync(path.join(stepFolder, 'after'), { recursive: true })
+            fs.writeFileSync(path.join(stepFolder, 'after', 'Inside.cs'), '// checkpoint')
+            fs.writeFileSync(
+                path.join(stepFolder, 'metadata.json'),
+                JSON.stringify({
+                    filesAdded: ['Inside.cs', '../Outside.cs'],
+                    movedFilesMap: [{ before: 'Inside.cs', after: '../Moved.cs' }],
+                })
+            )
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [], skippedEntries: [] }
+
+            const result = await (handler as any).downloadCompletedStepArtifacts('ws-1', 'job-1', tmpRoot, buildPlan())
+
+            expect(result).to.be.false
+            expect(fs.readFileSync(path.join(tmpRoot, 'Inside.cs'), 'utf-8')).to.equal('// checkpoint')
+            expect((handler as any)._currentDiffContext.skippedEntries).to.deep.equal([
+                { StepId: 'g1', Entry: '../Outside.cs' },
+                { StepId: 'g1', Entry: 'Inside.cs -> ../Moved.cs' },
+            ])
+            expect((handler as any).loadAppliedCheckpoints(tmpRoot, 'job-1')).to.deep.equal(['g1'])
+        })
+
+        it('should record the entries of a downloaded checkpoint that were not applied', async () => {
+            sinon
+                .stub(handler as any, 'createArtifactDownloadUrl')
+                .resolves({ s3PresignedUrl: 'url', requestHeaders: {} })
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'downloadAndExtractArchive').callsFake(async (...args: unknown[]) => {
+                const folder = args[2] as string
+                fs.mkdirSync(path.join(folder, 'after'), { recursive: true })
+                fs.writeFileSync(path.join(folder, 'after', 'Inside.cs'), '// checkpoint')
+                fs.writeFileSync(
+                    path.join(folder, 'metadata.json'),
+                    JSON.stringify({ filesAdded: ['Inside.cs'], filesRemoved: ['../Outside.cs'] })
+                )
+            })
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [], skippedEntries: [] }
+
+            const result = await (handler as any).downloadDiffArtifact('ws-1', 'job-1', 'diff-1', tmpRoot, 'step-1')
+
+            expect(result).to.equal(path.join(tmpRoot, workspaceFolderName, 'job-1', 'checkpoints', 'step-1'))
+            expect((handler as any)._currentDiffContext.skippedEntries).to.deep.equal([
+                { StepId: 'step-1', Entry: '../Outside.cs' },
+            ])
+        })
+
+        it('should not download a checkpoint whose job or step ID is not a folder name', async () => {
+            const downloadUrl = sinon.stub(handler as any, 'createArtifactDownloadUrl').resolves(null)
+
+            for (const [jobId, stepId] of [
+                ['job-1', '.'],
+                ['job-1', ''],
+                ['job-1', '..'],
+                ['job-1', 'a/b'],
+                ['..', 'step-1'],
+            ]) {
+                const result = await (handler as any).downloadDiffArtifact('ws-1', jobId, 'diff-1', tmpRoot, stepId)
+                expect(result, `${jobId} ${stepId}`).to.equal('')
+            }
+
+            sinon.assert.notCalled(downloadUrl)
         })
 
         it('should record failure into diff context', async () => {
