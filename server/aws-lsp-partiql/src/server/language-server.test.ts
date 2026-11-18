@@ -1,4 +1,4 @@
-import { Server } from '@aws/language-server-runtimes/server-interface'
+import { DiagnosticSeverity, Server } from '@aws/language-server-runtimes/server-interface'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import { TextDocumentItem, Hover, SignatureHelp, CompletionList } from 'vscode-languageserver-types'
@@ -333,5 +333,53 @@ describe('PartiQL Server - Completion Functionality', () => {
                 isIncomplete: false,
             })
         )
+    })
+})
+
+describe('PartiQL Server validation errors and parse limits', () => {
+    let features: TestFeatures
+    let service: ReturnType<typeof createPartiQLLanguageService>
+
+    beforeEach(async () => {
+        service = createPartiQLLanguageService()
+        features = new TestFeatures()
+        await features.start(PartiQLServerFactory(service))
+    })
+
+    afterEach(() => {
+        jest.restoreAllMocks()
+        features.dispose()
+    })
+
+    // The notification handlers are not awaited by the caller, so let them finish
+    const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+
+    it('should log a validation error instead of throwing it', async () => {
+        jest.spyOn(service, 'doValidation').mockImplementation(() => {
+            throw new Error('validation failed')
+        })
+        const errorSpy = jest.spyOn(features.logging, 'error')
+
+        await features.doOpenTextDocument({
+            textDocument: TextDocumentItem.create('file:///error.partiql', 'partiql', 1, 'SELECT a FROM t'),
+        })
+        await settle()
+
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('validation failed'))
+        expect(features.lsp.publishDiagnostics.callCount).toBe(0)
+    })
+
+    it('should publish a note instead of syntax errors for a deeply nested document', async () => {
+        const text = 'SELECT ' + '('.repeat(1000) + '1' + ')'.repeat(1000)
+
+        await features.doOpenTextDocument({
+            textDocument: TextDocumentItem.create('file:///nested.partiql', 'partiql', 1, text),
+        })
+        await settle()
+
+        expect(features.lsp.publishDiagnostics.callCount).toBe(1)
+        expect(features.lsp.publishDiagnostics.firstCall.args[0].diagnostics).toEqual([
+            expect.objectContaining({ severity: DiagnosticSeverity.Information }),
+        ])
     })
 })
