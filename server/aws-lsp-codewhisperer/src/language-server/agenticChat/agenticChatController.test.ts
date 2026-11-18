@@ -2280,6 +2280,33 @@ describe('AgenticChatController', () => {
                 sinon.match('Error initializing context commands')
             )
         })
+
+        it('logs a failed background code symbol update whose reason has no string form', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            maybeUpdateCodeSymbolsStub.rejects(Object.create(null))
+
+            await unhandledRejectionsDuring(() => chatController.onReady())
+
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error updating code symbols')
+            )
+        })
+
+        it('leaves no unhandled rejection when a failed background code symbol update cannot be logged', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            // JSON serialization, which formatErr uses, throws a TypeError on a bigint
+            maybeUpdateCodeSymbolsStub.rejects(10n)
+
+            const rejections = await unhandledRejectionsDuring(() => chatController.onReady())
+
+            assert.ok(
+                !rejections.some(reason => reason instanceof TypeError && reason.message.includes('BigInt')),
+                'the failure to log the update was left as an unhandled rejection'
+            )
+        })
     })
 
     describe('onInlineChatPrompt', () => {

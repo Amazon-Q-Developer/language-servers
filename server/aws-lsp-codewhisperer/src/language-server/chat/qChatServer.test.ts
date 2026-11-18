@@ -176,23 +176,26 @@ describe('QChatServer', () => {
             )
         })
 
-        it('logs an insert notification whose code is not a string', async () => {
+        it('logs a failure of the controller insert handler with the method name', async () => {
+            const failure = new Error('document read failed')
+            testFeatures.workspace.getTextDocument = sinon.stub()
+            testFeatures.workspace.getTextDocument.rejects(failure)
             const handler = testFeatures.chat.onCodeInsertToCursorPosition.firstCall.firstArg
 
-            handler({
-                tabId: mockTabId,
-                textDocument: { uri: 'file:///insert-check.ts' },
-                cursorPosition: { line: 0, character: 0 },
-                code: 123,
+            const rejections = await unhandledRejectionsDuring(async () => {
+                handler({
+                    tabId: mockTabId,
+                    textDocument: { uri: 'file:///insert-check.ts' },
+                    cursorPosition: { line: 0, character: 0 },
+                    code: 'const a = 1',
+                })
+                await new Promise(resolve => setImmediate(resolve))
             })
-            await new Promise(resolve => setImmediate(resolve))
 
+            assert.ok(!rejections.includes(failure), 'the insert failure was left as an unhandled rejection')
             sinon.assert.calledWithMatch(
                 testFeatures.logging.error as sinon.SinonStub,
-                sinon
-                    .match(insertToCursorPositionNotificationType.method)
-                    .and(sinon.match('TypeError'))
-                    .and(sinon.match('is not a function'))
+                sinon.match(insertToCursorPositionNotificationType.method).and(sinon.match('document read failed'))
             )
         })
     })
