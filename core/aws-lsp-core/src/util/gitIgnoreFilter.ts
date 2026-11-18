@@ -32,7 +32,8 @@ export class GitIgnoreFilter {
             const fileContent = await workspace.fs.readFile(file)
             const gitIgnoreAcceptor = parser.compile(fileContent)
 
-            // As in Git, the patterns of a .gitignore file apply relative to the folder that contains it.
+            // As in Git, the patterns of a .gitignore file apply relative to the folder that contains it. Unlike Git, a
+            // pattern in a nested file cannot include again a file that a .gitignore file above it excludes.
             acceptors.push({
                 folderPath: path.dirname(file),
                 acceptor: gitIgnoreAcceptor,
