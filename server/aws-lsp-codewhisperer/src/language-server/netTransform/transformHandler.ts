@@ -32,6 +32,21 @@ import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/A
 
 import { Utils, workspaceFolderName } from './utils'
 
+// The job ID names the folder that the result archive is extracted to, so it must be a single file name
+function checkTransformationJobId(exportId: string) {
+    const hasControlCharacter = [...exportId].some(c => c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f)
+    if (
+        !exportId ||
+        exportId === '.' ||
+        exportId === '..' ||
+        path.basename(exportId) !== exportId ||
+        hasControlCharacter ||
+        Buffer.byteLength(exportId) > 255
+    ) {
+        throw new Error('Invalid transformation job ID')
+    }
+}
+
 export class TransformHandler {
     private serviceManager: AmazonQTokenServiceManager
     private workspace: Workspace
@@ -364,6 +379,7 @@ export class TransformHandler {
     async downloadExportResultArchive(exportId: string, saveToDir: string) {
         let result
         try {
+            checkTransformationJobId(exportId)
             result = await this.serviceManager.getStreamingClient().exportResultArchive({
                 exportId,
                 exportIntent: ExportIntent.TRANSFORMATION,
@@ -404,27 +420,12 @@ export class TransformHandler {
     }
 
     async extractAllEntriesTo(pathContainingArchive: string, zipEntries: AdmZip.IZipEntry[]) {
-        for (const entry of zipEntries) {
-            try {
-                const entryPath = path.join(pathContainingArchive, entry.entryName)
-                if (entry.isDirectory) {
-                    await fs.promises.mkdir(entryPath, { recursive: true })
-                } else {
-                    const parentDir = path.dirname(entryPath)
-                    await fs.promises.mkdir(parentDir, { recursive: true })
-                    await fs.promises.writeFile(entryPath, entry.getData())
-                }
-            } catch (extractError: any) {
-                if (extractError instanceof Error && 'code' in extractError && extractError.code === 'ENOENT') {
-                    this.logging.log(`Attempted to extract a file that does not exist : ${entry.entryName}`)
-                } else {
-                    throw extractError
-                }
-            }
-        }
+        // Skips any entry that would be written outside pathContainingArchive
+        await Utils.extractAllEntriesTo(pathContainingArchive, zipEntries, this.logging)
     }
 
     async archivePathGenerator(exportId: string, buffer: Uint8Array[], saveToDir: string) {
+        checkTransformationJobId(exportId)
         try {
             const tempDir = path.join(saveToDir, exportId)
             const pathToArchive = path.join(tempDir, 'ExportResultsArchive.zip')
