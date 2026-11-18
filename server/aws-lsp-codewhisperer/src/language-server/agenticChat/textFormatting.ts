@@ -41,9 +41,12 @@ export function codeFence(text: string): string {
 /**
  * Characters that a command card shows as escapes: control characters other than line feeds and tabs, format
  * characters (such as bidirectional overrides and isolates, zero-width characters and tag characters), line and
- * paragraph separators, spaces other than U+0020, and the other default ignorable characters.
+ * paragraph separators, spaces other than U+0020, the braille blank U+2800, which also shows as a space, the other
+ * default ignorable characters, private use and unassigned code points, whose look depends on the font, and lone
+ * surrogates.
  */
-const HIDDEN_COMMAND_CHARACTERS = /(?![\n\t ])[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/gu
+const HIDDEN_COMMAND_CHARACTERS =
+    /(?![\n\t ])[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Co}\p{Cn}\p{Cs}\u2800]/gu
 
 /**
  * The command as a card shows it, with each hidden character written as \uXXXX, or as \u{XXXXX} above U+FFFF. Only

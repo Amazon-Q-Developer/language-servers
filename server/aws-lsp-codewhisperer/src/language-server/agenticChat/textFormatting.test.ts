@@ -42,6 +42,9 @@ describe('textFormatting', () => {
                 ['ls ./build\u00A0x \u3000y', 'ls ./build\\u00A0x \\u3000y'],
                 ['echo \u001B[2Jdone\u0007\u0000', 'echo \\u001B[2Jdone\\u0007\\u0000'],
                 ['echo \u3164 \u115F \uFE0F', 'echo \\u3164 \\u115F \\uFE0F'],
+                // The braille blank, which shows as a space, private use and unassigned code points, whose look
+                // depends on the font, and a lone surrogate
+                ['echo a\u2800b \uE000 \u{F0000} \u0378 \uD800', 'echo a\\u2800b \\uE000 \\u{F0000} \\u0378 \\uD800'],
             ]
             for (const [command, shown] of cases) {
                 assert.strictEqual(shellCommandBlock(command), '```shell\n' + shown + '\n```')
