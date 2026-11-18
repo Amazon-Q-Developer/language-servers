@@ -462,6 +462,8 @@ export class AdditionalContextProvider {
          * Sent in GenerateAssistantResponse request: First message in conversationState.history
          */
         const pinnedContextCommands: ContextCommandItem[] = []
+        // The workspace rules among the pinned context, which stay whatever the index ignore patterns are
+        let ruleContextCommands: ContextCommandItem[] = []
 
         const workspaceRules = await this.collectWorkspaceRules(tabId)
         let workspaceFolderPath = triggerContext.workspaceFolder?.uri
@@ -496,6 +498,7 @@ export class AdditionalContextProvider {
 
             // Add the filtered rules to pinned context
             pinnedContextCommands.push(...rulesToInclude)
+            ruleContextCommands = rulesToInclude
         }
 
         // Merge pinned context with context added to prompt, avoiding duplicates
@@ -617,7 +620,10 @@ export class AdditionalContextProvider {
         try {
             const localProjectContextController = await LocalProjectContextController.getInstance()
             promptContextPrompts = await localProjectContextController.getContextCommandPrompt(promptContextCommands)
-            pinnedContextPrompts = await localProjectContextController.getContextCommandPrompt(pinnedContextCommands)
+            pinnedContextPrompts = await localProjectContextController.getContextCommandPrompt(
+                pinnedContextCommands,
+                ruleContextCommands
+            )
         } catch (error) {
             this.features.logging.info(
                 `LocalProjectContextController unavailable, using filesystem fallback for context: ${error}`
