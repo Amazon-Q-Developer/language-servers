@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.0.135](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.134...lsp-codewhisperer/v0.0.135) (2026-11-18)
+
+
+### Features
+
+* **amazonq:** ITGen — language-server support for integration-test generation and validation ([#3074](https://github.com/Amazon-Q-Developer/language-servers/issues/3074)) ([9f595e6](https://github.com/Amazon-Q-Developer/language-servers/commit/9f595e649c93f0b7024149ded95d75d5af916f83))
+
+
+### Bug Fixes
+
+* **amazonq:** stricter checks for chat file links and configuration files ([9f595e6](https://github.com/Amazon-Q-Developer/language-servers/commit/9f595e649c93f0b7024149ded95d75d5af916f83))
+* mcp permissions and file indexing ([#3078](https://github.com/Amazon-Q-Developer/language-servers/issues/3078)) ([50f3019](https://github.com/Amazon-Q-Developer/language-servers/commit/50f30198086acb86592ed798a1e171f418687f2d))
+
 ## [0.0.134](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.133...lsp-codewhisperer/v0.0.134) (2026-11-12)
 
 

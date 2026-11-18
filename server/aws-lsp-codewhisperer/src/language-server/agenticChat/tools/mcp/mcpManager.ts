@@ -30,7 +30,10 @@ import {
     loadAgentConfig,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
+    getAgentConfigPathForMcpConfig,
     sanitizeName,
+    describeStdioLaunchForLog,
+    describeUrlForLog,
     getGlobalAgentConfigPath,
     getWorkspaceMcpConfigPaths,
     getGlobalMcpConfigPath,
@@ -826,10 +829,9 @@ export class McpManager {
                     // Use the folder checked above, so the folder that was trusted is the folder the server starts in
                     const cwd = launchFolder ?? defaultCwd
                     this.stdioLaunchFolders.set(serverName, launchFolder)
-                    const argsStr = (cfg.args ?? []).length > 0 ? ` ${(cfg.args ?? []).join(' ')}` : ''
-                    const envKeys = Object.keys(finalEnv || {})
-                    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
-                    this.features.logging.info(`MCP: Executing command: ${cfg.command}${argsStr}${envInfo}`)
+                    this.features.logging.info(
+                        `MCP: Executing command: ${describeStdioLaunchForLog(cfg.command!, cfg.args, finalEnv || {})}`
+                    )
 
                     transport = new StdioClientTransport({
                         command: cfg.command!,
@@ -950,7 +952,7 @@ export class McpManager {
 
                         const headerKeys = Object.keys(headers)
                         const headerInfo = headerKeys.length > 0 ? ` (headers: ${headerKeys.join(', ')})` : ''
-                        this.features.logging.info(`MCP: Connecting to URL: ${cfg.url}${headerInfo}`)
+                        this.features.logging.info(`MCP: Connecting to URL: ${describeUrlForLog(cfg.url)}${headerInfo}`)
 
                         try {
                             // try streamable http first
@@ -1341,10 +1343,7 @@ export class McpManager {
                 })
 
                 // Move tool permissions to corresponding agent path
-                const agentPath = configPath.replace(
-                    path.sep + 'mcp.json',
-                    path.sep + 'agents' + path.sep + 'default.json'
-                )
+                const agentPath = getAgentConfigPathForMcpConfig(configPath)
 
                 const serverPrefix = `@${serverName}`
                 let serverTools = this.agentConfig.tools.filter(
@@ -1483,10 +1482,7 @@ export class McpManager {
                 }
             })
 
-            agentPath = cfg.__configPath__.replace(
-                path.sep + 'mcp.json',
-                path.sep + 'agents' + path.sep + 'default.json'
-            )
+            agentPath = getAgentConfigPathForMcpConfig(cfg.__configPath__)
         }
 
         // Remove from agent config (unless skipAgentConfigRemoval is true)
@@ -1770,10 +1766,7 @@ export class McpManager {
             if (isLegacyMcpServer) {
                 // For legacy MCP servers, save permissions to agent config file and update MCP config for enable/disable
                 const mcpConfigPath = serverConfig.__configPath__!
-                const agentPath = mcpConfigPath.replace(
-                    path.sep + 'mcp.json',
-                    path.sep + 'agents' + path.sep + 'default.json'
-                )
+                const agentPath = getAgentConfigPathForMcpConfig(mcpConfigPath)
 
                 // Update MCP config for enable/disable
                 await this.mutateConfigFile(mcpConfigPath, (json: any) => {
