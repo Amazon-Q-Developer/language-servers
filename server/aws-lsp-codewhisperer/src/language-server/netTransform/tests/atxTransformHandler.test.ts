@@ -4635,6 +4635,342 @@ describe('ATXTransformHandler - upload flows, polling, and small wrappers', () =
                 fs.rmSync(saveDir, { recursive: true, force: true })
             }
         })
+
+        // The whole artifact is in place once the copy returns, so a temp file that cannot be removed
+        // (antivirus or the indexer holds it) is not a failed download.
+        it('reports success when the temp file cannot be removed after the copy', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                ;(handler as any).artifactDownloadRenameRetryMs = 0
+                const target = path.join(saveDir, 'Modernization_Plan.md')
+                fs.writeFileSync(target, 'older whole copy')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/plan',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() => fakeDownload([Buffer.from('newer whole copy')])) as any)
+                sinon
+                    .stub(fs.promises, 'rename')
+                    .rejects(Object.assign(new Error('operation not permitted'), { code: 'EPERM' }))
+                sinon
+                    .stub(fs.promises, 'rm')
+                    .rejects(Object.assign(new Error('resource busy or locked'), { code: 'EBUSY' }))
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Modernization_Plan.md'
+                )
+
+                expect(result.Success).to.be.true
+                expect(streamStub.callCount).to.equal(1)
+                expect(fs.readFileSync(target, 'utf8')).to.equal('newer whole copy')
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The copy writes into the older copy's file, so a copy that comes out short is a cut file
+        // under the real name. It has to be an error, and the download has to run again.
+        it('fails the attempt when the copy over the older copy comes out short', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                ;(handler as any).artifactDownloadRenameRetryMs = 0
+                const target = path.join(saveDir, 'Modernization_Plan.md')
+                fs.writeFileSync(target, 'older whole copy')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/plan',
+                    requestHeaders: {},
+                } as any)
+                const payload = Buffer.from('newer whole copy')
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => fakeDownload([payload])) as any)
+                sinon
+                    .stub(fs.promises, 'rename')
+                    .rejects(Object.assign(new Error('operation not permitted'), { code: 'EPERM' }))
+                const copyStub = sinon.stub(fs.promises, 'copyFile').callsFake((async (_from: string, to: string) => {
+                    fs.writeFileSync(to, payload.subarray(0, 5))
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Modernization_Plan.md'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('5 of 16 bytes')
+                expect((logging.error as sinon.SinonStub).calledWithMatch('5 of 16 bytes')).to.be.true
+                expect(streamStub.callCount).to.equal(3)
+                expect(copyStub.callCount).to.equal(3)
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['Modernization_Plan.md'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The fs.rm documentation says maxRetries and retryDelay are ignored unless recursive is set.
+        it('removes the temp file of a failed attempt with the options fs.rm documents for retries', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+                const rmSpy = sinon.spy(fs.promises, 'rm')
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(rmSpy.callCount).to.equal(3)
+                for (const call of rmSpy.getCalls()) {
+                    expect(call.args[0]).to.match(/artifact\.zip\.[0-9a-f]{8}\.part$/)
+                    expect(call.args[1]).to.deep.equal({
+                        force: true,
+                        recursive: true,
+                        maxRetries: 3,
+                        retryDelay: 100,
+                    })
+                }
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The IDE waits for this call inside its poll loop, so the attempts share one time budget. An
+        // attempt on a link that went silent ends at the 60 second socket limit: the first one still
+        // gets its retry, and the second one ends past the budget.
+        it('starts no third attempt when two stalled attempts have used the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => {
+                    now += 61000
+                    const stalled = new Error("Timeout awaiting 'socket' for 60000ms")
+                    return fakeDownload(
+                        [Buffer.alloc(1000, 'a')],
+                        undefined,
+                        Object.assign(stalled, { code: 'ETIMEDOUT', event: 'socket' })
+                    )
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('timeoutPhase=socket')
+                expect(streamStub.callCount).to.equal(2)
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('starts no second attempt when the first one alone used the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => {
+                    now += 10 * 60 * 1000
+                    return fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+                expect(streamStub.callCount).to.equal(1)
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('starts no further attempt when the wait before it runs past the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                const utilsModule = require('../utils')
+                sinon.stub(utilsModule.Utils, 'sleep').callsFake(async () => {
+                    now += 10 * 60 * 1000
+                })
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+                expect(streamStub.callCount).to.equal(1)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // identity means no encoding, so Content-Length is still the number of bytes on disk.
+        it('compares sizes when the Content-Encoding is identity', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() =>
+                    fakeDownload([Buffer.alloc(1113423, 'a')], {
+                        'content-length': '4386914',
+                        'content-encoding': 'identity',
+                    })) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'transformation_report.html'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('Incomplete download: wrote 1113423 of 4386914 bytes')
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('keeps the download error when a later attempt gets no download URL', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+                urlStub
+                    .onCall(0)
+                    .resolves({ s3PresignedUrl: 'https://s3.example.com/first', requestHeaders: {} } as any)
+                urlStub.onCall(1).resolves(null)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.equal(
+                    'Failed to get download URL for artifact=art-1 (job=job-1); last download error: socket hang up'
+                )
+                expect(urlStub.callCount).to.equal(2)
+                expect(streamStub.callCount).to.equal(1)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // A process that goes away mid-download leaves its temp file, and every attempt has its own
+        // name, so they add up. A young one is kept: another download may be writing it.
+        it('removes its own temp files that are over an hour old before it downloads, and nothing else', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+                for (const name of [
+                    'Transformation_Report.html.0a1b2c3d.part',
+                    'artifact.zip.89abcdef.part',
+                    'notes.part',
+                    'Modernization_Plan.md',
+                ]) {
+                    fs.writeFileSync(path.join(saveDir, name), 'left by an earlier run')
+                    fs.utimesSync(path.join(saveDir, name), twoHoursAgo, twoHoursAgo)
+                }
+                fs.writeFileSync(path.join(saveDir, 'Transformation_Report.html.11223344.part'), 'being written')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() => fakeDownload([Buffer.from('whole report')])) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                expect(fs.readdirSync(saveDir).sort()).to.deep.equal([
+                    'Modernization_Plan.md',
+                    'Transformation_Report.html',
+                    'Transformation_Report.html.11223344.part',
+                    'notes.part',
+                ])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('downloads when an old temp file cannot be removed', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                const stale = path.join(saveDir, 'Transformation_Report.html.0a1b2c3d.part')
+                const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+                fs.writeFileSync(stale, 'left by an earlier run')
+                fs.utimesSync(stale, twoHoursAgo, twoHoursAgo)
+                const unlinkStub = sinon
+                    .stub(fs.promises, 'unlink')
+                    .rejects(Object.assign(new Error('resource busy or locked'), { code: 'EBUSY' }))
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() => fakeDownload([Buffer.from('whole report')])) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                expect(unlinkStub.calledOnceWith(stale)).to.be.true
+                expect(fs.readFileSync(path.join(saveDir, 'Transformation_Report.html'), 'utf8')).to.equal(
+                    'whole report'
+                )
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
     })
 
     describe('getJobReport', () => {

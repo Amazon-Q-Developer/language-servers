@@ -238,6 +238,14 @@ const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
 const ARTIFACT_DOWNLOAD_MAX_ATTEMPTS = 3
 // downloadArtifactToPath does not retry these: the disk or the save folder is the problem, not the link.
 const ARTIFACT_DOWNLOAD_LOCAL_ERROR_CODES = ['ENOSPC', 'EACCES', 'EPERM', 'EROFS', 'ENOENT', 'ENOTDIR', 'EISDIR']
+// downloadArtifactToPath starts no attempt once this much time has passed since the call began: the IDE
+// waits for the call inside its poll loop. An attempt on a link that went silent ends 60 seconds after
+// its last byte (the socket limit), so a first attempt that stalls early still gets its retry, and two
+// stalled attempts end past the budget, so no third is started. A running attempt is never cut.
+const ARTIFACT_DOWNLOAD_BUDGET_MS = 90000
+// downloadArtifactToPath removes the temp files of earlier downloads from the save folder once they are
+// this old. A younger one may belong to a download that is running now.
+const ARTIFACT_DOWNLOAD_STALE_TEMP_MS = 60 * 60 * 1000
 // downloadBeamArtifact's ErrorCode for a destination it refuses (retrying the same path can't help).
 export const BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION = 'InvalidDestination'
 
@@ -6755,6 +6763,8 @@ export class ATXTransformHandler {
         savePath: string,
         artifactName?: string
     ): Promise<{ Success: boolean; FilePath?: string; Error?: string }> {
+        const deadline = Date.now() + ARTIFACT_DOWNLOAD_BUDGET_MS
+        await this.removeStaleDownloadTempFiles(savePath)
         let lastError = ''
         for (let attempt = 1; attempt <= ARTIFACT_DOWNLOAD_MAX_ATTEMPTS; attempt++) {
             // Tracked outside the try so a mid-download failure can report how far it got
@@ -6771,7 +6781,9 @@ export class ATXTransformHandler {
                 if (!downloadInfo) {
                     const msg = `Failed to get download URL for artifact=${artifactId} (job=${jobId})`
                     this.logging.error(`ATX: downloadArtifactToPath ${msg}`)
-                    return { Success: false, Error: msg }
+                    // On a later attempt, keep why the earlier one failed: it is the reason this URL was asked for.
+                    lastError = lastError ? `${msg}; last download error: ${lastError}` : msg
+                    break
                 }
 
                 await Utils.directoryExists(savePath)
@@ -6795,12 +6807,14 @@ export class ATXTransformHandler {
                     timeout: { response: 30000, socket: 60000 },
                 })
 
-                // The size the server promised. Not used with a Content-Encoding: Content-Length then
-                // counts the encoded bytes and got writes the decoded ones.
+                // The size the server promised. Not used with a Content-Encoding other than identity
+                // (which means no encoding): Content-Length then counts the encoded bytes and got
+                // writes the decoded ones.
                 let expectedBytes: number | undefined
                 downloadStream.on('response', (response: any) => {
+                    const contentEncoding = response?.headers?.['content-encoding']
                     const contentLength = Number(response?.headers?.['content-length'])
-                    if (!response?.headers?.['content-encoding'] && Number.isInteger(contentLength)) {
+                    if ((!contentEncoding || contentEncoding === 'identity') && Number.isInteger(contentLength)) {
                         expectedBytes = contentLength
                     }
                 })
@@ -6820,7 +6834,10 @@ export class ATXTransformHandler {
                 return { Success: true, FilePath: savePath }
             } catch (error) {
                 if (tempPath) {
-                    await fs.promises.rm(tempPath, { force: true, maxRetries: 3, retryDelay: 100 }).catch(() => {})
+                    // recursive: the fs.rm documentation says maxRetries and retryDelay are ignored without it.
+                    await fs.promises
+                        .rm(tempPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 })
+                        .catch(() => {})
                 }
                 // Log every failure with enough context to diagnose without a repro: the got error
                 // `code` (ETIMEDOUT/ECONNRESET/...), the timeout phase for a TimeoutError, the HTTP
@@ -6841,16 +6858,56 @@ export class ATXTransformHandler {
                 ) {
                     break
                 }
-                await Utils.sleep(this.artifactDownloadRetryBaseMs * attempt)
+                // No attempt starts after the time budget of the call is spent, also when the wait ran long.
+                const retryDelayMs = this.artifactDownloadRetryBaseMs * attempt
+                let budgetSpent = Date.now() + retryDelayMs >= deadline
+                if (!budgetSpent) {
+                    await Utils.sleep(retryDelayMs)
+                    budgetSpent = Date.now() >= deadline
+                }
+                if (budgetSpent) {
+                    this.logging.log(
+                        `ATX: downloadArtifactToPath starts no attempt ${attempt + 1} for artifact=${artifactId}: the ${ARTIFACT_DOWNLOAD_BUDGET_MS}ms budget of the call is spent`
+                    )
+                    break
+                }
             }
         }
         return { Success: false, Error: lastError }
     }
 
     /**
+     * Removes the temp files that earlier calls of downloadArtifactToPath left in the save folder. A
+     * process that goes away mid-download leaves its temp file, and every attempt has its own name, so
+     * they would add up. Only names of the form "<name>.<8 hex>.part" are removed, and only when the
+     * file was last written over an hour ago. Nothing here fails the download.
+     */
+    private async removeStaleDownloadTempFiles(savePath: string): Promise<void> {
+        const names = await fs.promises.readdir(savePath).catch(() => [] as string[])
+        const cutoff = Date.now() - ARTIFACT_DOWNLOAD_STALE_TEMP_MS
+        for (const name of names) {
+            if (!/\.[0-9a-f]{8}\.part$/.test(name)) {
+                continue
+            }
+            const stalePath = path.join(savePath, name)
+            try {
+                const stats = await fs.promises.lstat(stalePath)
+                if (stats.isFile() && stats.mtimeMs < cutoff) {
+                    await fs.promises.unlink(stalePath)
+                    this.logging.log(`ATX: downloadArtifactToPath removed old temp file ${stalePath}`)
+                }
+            } catch {
+                // Held open or already gone. The next download tries again.
+            }
+        }
+    }
+
+    /**
      * Gives a finished download its real name. rename replaces an older copy in one step. Windows
      * refuses the rename while another program holds the older copy open, so after a few tries the
-     * finished file is copied over it instead, which is what the direct write did before.
+     * finished file is copied over it instead, which is what the direct write did before. The copy
+     * writes into the older copy's file, so that copy cannot be kept when the copy goes wrong: a
+     * short result is an error here, and the caller downloads again.
      */
     private async moveDownloadedArtifact(tempPath: string, filePath: string): Promise<void> {
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -6866,7 +6923,14 @@ export class ATXTransformHandler {
             }
         }
         await fs.promises.copyFile(tempPath, filePath)
-        await fs.promises.rm(tempPath, { force: true })
+        const tempBytes = (await fs.promises.stat(tempPath)).size
+        const copiedBytes = (await fs.promises.stat(filePath)).size
+        if (copiedBytes !== tempBytes) {
+            throw new Error(`Incomplete copy: ${filePath} has ${copiedBytes} of ${tempBytes} bytes and is cut`)
+        }
+        // The artifact is in place, so a temp file that cannot be removed now (a scanner holds it) is
+        // not a failed download. removeStaleDownloadTempFiles removes it on a later call.
+        await fs.promises.rm(tempPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 }).catch(() => {})
     }
 
     /**
