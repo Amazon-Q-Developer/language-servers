@@ -1165,6 +1165,62 @@ describe('migrateToAgentConfig', () => {
             await migrateToAgentConfig(workspace, logger, mockAgent)
 
             expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+            // Neither link was replaced by a written file, and nothing else was written next to them
+            expect(fs.lstatSync(path.join(agentsDir, 'default.json')).isSymbolicLink()).to.be.true
+            expect(fs.lstatSync(path.join(agentsDir, 'loop.json')).isSymbolicLink()).to.be.true
+            expect(fs.readdirSync(agentsDir).sort()).to.deep.equal(['default.json', 'loop.json'])
+        })
+
+        it('checks each workspace folder against its own agent config', async () => {
+            // The first folder's agents folder links out; the second folder has no links
+            const otherDir = path.join(tmpDir, 'other-repo')
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+            writeRepoMcpConfig(path.join(otherDir, '.amazonq'))
+            workspace.getAllWorkspaceFolders = () => [
+                { uri: URI.file(wsDir).toString(), name: 'repo' },
+                { uri: URI.file(otherDir).toString(), name: 'other-repo' },
+            ]
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+            const written = JSON.parse(
+                fs.readFileSync(path.join(otherDir, '.amazonq', 'agents', 'default.json'), 'utf-8')
+            )
+            expect(written.mcpServers).to.have.property('repoServer')
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+        })
+
+        it('writes the global agent config through a linked global agents folder, as before', async () => {
+            // The link target is outside the home folder too, so any folder check on the global path would refuse it
+            const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'migrateGlobal-'))
+            try {
+                const globalDir = path.join(tmpDir, '.aws', 'amazonq')
+                fs.mkdirSync(globalDir, { recursive: true })
+                fs.writeFileSync(
+                    path.join(globalDir, 'mcp.json'),
+                    JSON.stringify({ mcpServers: { userServer: { command: 'user-cmd' } } })
+                )
+                linkFolder(elsewhere, path.join(globalDir, 'agents'))
+
+                await migrateToAgentConfig(workspace, logger, mockAgent)
+
+                const written = JSON.parse(fs.readFileSync(path.join(elsewhere, 'default.json'), 'utf-8'))
+                expect(written.mcpServers).to.have.property('userServer')
+                expect(warnings.filter(warning => warning.includes(refusal))).to.deep.equal([])
+
+                fs.writeFileSync(path.join(elsewhere, 'default.json'), legacyAgentConfig)
+                await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+                expect(JSON.parse(fs.readFileSync(path.join(elsewhere, 'default.json'), 'utf-8'))).to.include({
+                    name: 'q_ide_default',
+                    useLegacyMcpJson: true,
+                })
+                expect(warnings.filter(warning => warning.includes(updateRefusal))).to.deep.equal([])
+            } finally {
+                fs.rmSync(elsewhere, { recursive: true, force: true })
+            }
         })
 
         it('does not write into an agents folder that links out of the workspace', async () => {
