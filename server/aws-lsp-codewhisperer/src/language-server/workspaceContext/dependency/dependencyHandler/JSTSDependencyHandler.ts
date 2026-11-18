@@ -1,12 +1,28 @@
 import { BaseDependencyInfo, Dependency, LanguageDependencyHandler } from './LanguageDependencyHandler'
 import * as path from 'path'
 import * as fs from 'fs'
+import { URI } from 'vscode-uri'
 import { WorkspaceFolder } from '@aws/language-server-runtimes/server-interface'
 import { DependencyWatcher } from './DependencyWatcher'
+import { resolvePathInside } from '../../util'
 
 interface JSTSDependencyInfo extends BaseDependencyInfo {
     packageJsonPath: string
     nodeModulesPath: string
+}
+
+/**
+ * Whether a package.json dependency key is an npm package name ("name" or "@scope/name"), so joining it
+ * to node_modules cannot reach a different directory.
+ */
+export function isPackageName(name: string): boolean {
+    const segments = name.split('/')
+    if (segments.length > 2 || (segments.length === 2 && !segments[0].startsWith('@'))) {
+        return false
+    }
+    return segments.every(
+        segment => /^[^\\:]+$/.test(segment) && segment !== '.' && segment !== '..' && segment !== '@'
+    )
 }
 
 /*
@@ -105,10 +121,14 @@ export class JSTSDependencyHandler extends LanguageDependencyHandler<JSTSDepende
 
         // process each dependency
         for (const [name, declaredVersion] of Object.entries(allDependencies)) {
+            if (!isPackageName(name)) {
+                this.logging.warn(`Skipping dependency with an invalid package name: ${name}`)
+                continue
+            }
             // Handle scoped packages (@scope/package) by splitting on '/' for cross-platform compatibility
             const dependencyPath = path.join(nodeModulesPath, ...name.split('/'))
             // Check if dependency exists in node_modules
-            if (fs.existsSync(dependencyPath)) {
+            if (fs.existsSync(dependencyPath) && this.isInsideWorkspaceFolder(dependencyPath, jstsDependencyInfo)) {
                 // Read the actual version from the dependency's package.json
                 const depPackageJsonPath = path.join(dependencyPath, 'package.json')
                 let actualVersion: string = typeof declaredVersion === 'string' ? declaredVersion : 'unknown'
@@ -142,6 +162,7 @@ export class JSTSDependencyHandler extends LanguageDependencyHandler<JSTSDepende
 
                 const itemPath = path.join(nodeModulesPath, item)
                 if (!fs.statSync(itemPath).isDirectory()) continue
+                if (!this.isInsideWorkspaceFolder(itemPath, jstsDependencyInfo)) continue
 
                 // If not already in dependencyMap, add it
                 if (!dependencyMap.has(item)) {
@@ -211,6 +232,16 @@ export class JSTSDependencyHandler extends LanguageDependencyHandler<JSTSDepende
     // JS and TS are not using LSP to sync dependencies
     override updateDependencyMapBasedOnLSP(paths: string[], workspaceFolder?: WorkspaceFolder): Dependency[] {
         return []
+    }
+
+    // node_modules entries are often links (workspaces, pnpm), so judge where the link resolves
+    private isInsideWorkspaceFolder(dependencyPath: string, jstsDependencyInfo: JSTSDependencyInfo): boolean {
+        const workspaceFolderPath = URI.parse(jstsDependencyInfo.workspaceFolder.uri).fsPath
+        if (resolvePathInside(dependencyPath, workspaceFolderPath) !== undefined) {
+            return true
+        }
+        this.logging.warn(`Skipping dependency outside the workspace folder: ${dependencyPath}`)
+        return false
     }
     override transformPathToDependency(
         dependencyName: string,
