@@ -935,6 +935,16 @@ describe('McpEventHandler error handling', () => {
             expect(again.header.title).to.equal('Install MCP Server')
         })
 
+        it('does not install the server when its approval cannot be recorded', async () => {
+            recordApproval.rejects(new Error('store write failed'))
+            await preview('docs-server 1.2.3')
+
+            await confirm('docs-server')
+
+            sinon.assert.calledOnce(recordApproval)
+            sinon.assert.notCalled(addRegistryServer)
+        })
+
         it('ignores form values that the chat client sends with the confirmation', async () => {
             await preview('docs-server 1.2.3')
             await eventHandler.onMcpServerClick({

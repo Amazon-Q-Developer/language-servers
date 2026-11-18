@@ -57,6 +57,7 @@ import {
     fingerprintServerConfig,
     effectiveEnv,
     effectiveHeaders,
+    showHiddenCharacters,
 } from './mcpConsentStore'
 import { sanitizeInput } from '../../../../shared/utils'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
@@ -90,9 +91,10 @@ const MCP_CONSENT_PREVIEW_MAX_LENGTH = 200
 const MCP_CONSENT_TRUNCATION_CUE = ' { ... }'
 
 function formatConsentPreview(value: string): string {
-    return value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
-        ? `${value.slice(0, MCP_CONSENT_PREVIEW_MAX_LENGTH)}${MCP_CONSENT_TRUNCATION_CUE}`
-        : value
+    const truncated = value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
+    // A line break or a bidirectional override in a value must not change how the rest of the prompt reads
+    const shown = showHiddenCharacters(truncated ? value.slice(0, MCP_CONSENT_PREVIEW_MAX_LENGTH) : value)
+    return truncated ? `${shown}${MCP_CONSENT_TRUNCATION_CUE}` : shown
 }
 
 /** The environment variables that set the package index of an npx or uvx server */
@@ -762,7 +764,7 @@ export class McpManager {
                     `Variables such as NODE_OPTIONS can cause additional code to run. `
                   : `Starting this server connects Amazon Q to the above URL, with the headers listed above. `) +
               `Only allow if you expect this server and this configuration from your MCP registry.\n\n` +
-              `If you allow, you won't be asked again unless the registry changes the server configuration.`
+              `If you allow, you won't be asked again for this configuration until you save or reinstall the server.`
             : `Amazon Q — Untrusted MCP Server\n\n` +
               `A workspace configuration file wants to start an MCP server.\n` +
               `Server: ${serverName}\n` +

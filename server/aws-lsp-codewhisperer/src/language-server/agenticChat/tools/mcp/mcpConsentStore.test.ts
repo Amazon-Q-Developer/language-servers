@@ -16,6 +16,7 @@ import {
     hasApproval,
     recordApproval,
     removeApproval,
+    showHiddenCharacters,
 } from './mcpConsentStore'
 import type { MCPServerConfig } from './mcpTypes'
 
@@ -273,6 +274,31 @@ describe('mcpConsentStore', () => {
             expect(text).to.include('"Größe"')
             expect(text).to.include('"データ"')
             expect(text).to.include('"✓"')
+        })
+
+        it('writes the braille blank, private use and unassigned code points as escapes', () => {
+            const args = ['a\u2800b', 'a\uE000b', 'a\u0378b']
+
+            const text = formatServerConfigForReview({ command: 'npx', args })
+
+            expect(text).to.include('"a\\u2800b"')
+            expect(text).to.include('"a\\ue000b"')
+            expect(text).to.include('"a\\u0378b"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args })
+        })
+    })
+
+    describe('showHiddenCharacters', () => {
+        it('writes line breaks, bidirectional overrides and other hidden characters as escapes', () => {
+            const text = showHiddenCharacters('a\nb\r\tc\u202Ed\u200Be\u00A0f\u2800g\u2028h\uE000i\uD800j')
+
+            expect(text).to.equal('a\\u000ab\\u000d\\u0009c\\u202ed\\u200be\\u00a0f\\u2800g\\u2028h\\ue000i\\ud800j')
+        })
+
+        it('keeps U+0020, <, > and & and visible non-ASCII characters', () => {
+            const text = 'npx -y @scope/pkg --url https://example.com/?a=1&b=<2> Größe データ ✓'
+
+            expect(showHiddenCharacters(text)).to.equal(text)
         })
     })
 

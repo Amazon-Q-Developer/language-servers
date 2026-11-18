@@ -1889,7 +1889,8 @@ describe('Registry Synchronization', () => {
                 args: ['-y', '@test/server@1.0.0'],
                 disabled: false,
                 __cachedVersion__: '1.0.0',
-                __configPath__: '/test/config.json',
+                // A registry server lives in the global agent config, so the reinstall asks with the registry prompt
+                __configPath__: mcpUtils.getGlobalAgentConfigPath(mockFeatures.workspace.fs.getUserHomeDir()),
             })
             ;(mgr as any).serverNameMapping.set('test-server', 'test-server')
             ;(mgr as any).agentConfig = {
@@ -1936,6 +1937,7 @@ describe('Registry Synchronization', () => {
             await mgr.updateRegistryUrl('https://example.com/registry.json', true)
 
             sinon.assert.calledOnce(showMessageRequest)
+            expect(showMessageRequest.firstCall.args[0].message).to.include('Amazon Q — MCP Server from the Registry')
             sinon.assert.calledOnce(recordApprovalStub)
             expect(removeServerStub.called).to.be.true
             expect(addRegistryServerStub.called).to.be.true
@@ -2379,6 +2381,25 @@ describe('consent gate for MCP registry servers', () => {
         sinon.assert.calledWith(hasApprovalStub, sinon.match.any, sinon.match.any, 'docs-server', cfg, globalAgent)
         expect(setStateSpy.calledWith('docs-server', McpServerStatus.DISABLED, 0, 'consent not granted')).to.be.true
         expect(recordApprovalStub.called).to.be.false
+    })
+
+    it('shows hidden characters of the command and the names in the prompt as escapes', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            ...localCfg(),
+            args: ['-y', '@example/docs-server@1.2.4', 'a\u202Eb', 'first\nsecond'],
+            env: { 'DOCS\u200BREGION': 'hidden-env-value' },
+        }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message: string = showMessageStub.firstCall.args[0].message
+        expect(message).to.include('Command: npx -y @example/docs-server@1.2.4 a\\u202eb first\\u000asecond\n')
+        expect(message).to.include('Environment variables: DOCS\\u200bREGION\n')
+        expect(message).to.not.include('\u202E')
+        expect(message).to.not.include('\u200B')
+        expect(message).to.not.include('first\nsecond')
     })
 
     it('shows the URL and header names of a remote registry server', async () => {
