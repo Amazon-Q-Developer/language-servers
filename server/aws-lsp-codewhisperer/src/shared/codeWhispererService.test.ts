@@ -400,15 +400,10 @@ describe('CodeWhispererService', function () {
                 assert.strictEqual(withProfileArnStub.calledOnceWith(mockRequest), true)
             })
 
-            it('logs the length of the first suggestion, not its text', async function () {
-                const suggestion = 'const token = "lsfix-suggestion-secret"'
+            async function generateAndReadLog(response: object) {
                 ;(service as any).client = {
-                    send: sandbox.stub().resolves({
-                        completions: [{ content: suggestion, references: [] }],
-                        $metadata: { requestId: 'test-request-id' },
-                    }),
+                    send: sandbox.stub().resolves({ ...response, $metadata: { requestId: 'test-request-id' } }),
                 }
-
                 const result = await service.generateSuggestions({
                     fileContext: {
                         filename: 'test.js',
@@ -418,14 +413,45 @@ describe('CodeWhispererService', function () {
                     },
                     maxResults: 1,
                 })
-
-                assert.strictEqual(result.suggestions[0].content, suggestion)
                 const logged = mockLogging.info
                     .getCalls()
                     .map((call: sinon.SinonSpyCall) => String(call.args[0]))
                     .join('\n')
+                return { result, logged }
+            }
+
+            it('logs the length of the first suggestion, not its text', async function () {
+                const suggestion = 'const token = "lsfix-suggestion-secret"'
+                const { result, logged } = await generateAndReadLog({
+                    completions: [{ content: suggestion, references: [] }],
+                })
+
+                assert.strictEqual(result.suggestions[0].content, suggestion)
                 assert.ok(logged.includes(`"firstSuggestionLength": ${suggestion.length} characters`), logged)
                 assert.ok(!logged.includes('lsfix-suggestion-secret'), logged)
+            })
+
+            it('logs the length of the first edit suggestion, not its text', async function () {
+                const suggestion = 'const token = "lsfix-edit-secret"'
+                const { result, logged } = await generateAndReadLog({
+                    predictions: [{ edit: { content: suggestion, references: [] } }],
+                })
+
+                assert.strictEqual(result.suggestions[0].content, suggestion)
+                assert.ok(logged.includes(`"firstSuggestionLength": ${suggestion.length} characters`), logged)
+                assert.ok(!logged.includes('lsfix-edit-secret'), logged)
+            })
+
+            it('logs that there is no suggestion when the response has none', async function () {
+                const { logged } = await generateAndReadLog({ completions: [] })
+
+                assert.ok(logged.includes('"firstSuggestionLength": No suggestion'), logged)
+            })
+
+            it('logs a length of 0 for a first suggestion without content', async function () {
+                const { logged } = await generateAndReadLog({ completions: [{ references: [] }] })
+
+                assert.ok(logged.includes('"firstSuggestionLength": 0 characters'), logged)
             })
         })
     })
