@@ -2276,7 +2276,7 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
         } catch {}
 
         const logged = infoSpy.getCalls().map(c => String(c.args[0]))
-        expect(logged).to.include('MCP: Executing command: npx (3 arguments) (env: API_TOKEN)')
+        expect(logged).to.include('MCP: Executing command: npx --api-key (2 values hidden) (env: API_TOKEN)')
         expect(logged.join('\n')).to.not.include('arg-value-123')
         expect(logged.join('\n')).to.not.include('env-value-456')
     })
