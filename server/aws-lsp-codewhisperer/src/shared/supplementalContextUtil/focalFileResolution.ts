@@ -406,7 +406,8 @@ export class FocalFileResolver {
         const exts = config.extensions
 
         try {
-            const crawler = new fdir()
+            // Skip links: one could point outside the project, or at a FIFO or device that blocks the read
+            const crawler = new fdir({ excludeSymlinks: true })
                 .withFullPaths()
                 .exclude((dirName: string, dirPath: string) => {
                     const relativePath = path.relative(projectRoot, dirPath)
