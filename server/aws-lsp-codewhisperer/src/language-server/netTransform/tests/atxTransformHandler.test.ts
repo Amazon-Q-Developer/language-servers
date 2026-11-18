@@ -1254,6 +1254,20 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(downloadStub.callCount).to.equal(4)
         })
 
+        // The step ID names the folder its checkpoint is extracted to (LS103)
+        it('skips a completed step whose ID is not a folder name', async () => {
+            const plan = itGenPlan()
+            plan.Root.Children[0].Children.push({ StepId: '..', Status: 'SUCCEEDED', Children: [] })
+            const listed = listedArtifacts()
+            listed.artifacts.push({ artifactId: 'a-bad', planStepId: '..' })
+            sendStub.resolves(listed)
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, plan)
+
+            expect(downloadStub.getCalls().map(c => c.args[2])).to.not.include('..')
+            expect(appliedOrder()).to.deep.equal(['proj-a', 'round-1', 'round-2'])
+        })
+
         // Beam-to-IDE: the parent web job's plan. A pre-beam transform step, then the beamed repo's card with its
         // unit tests, and Local Verification with LBV (and an error-fix round), an ITGen code fix and adding the tests.
         const beamPlan = () => ({
@@ -1843,6 +1857,69 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.filesRemoved).to.equal(0)
             expect(result.filesUpdated).to.equal(0)
             expect(result.filesMoved).to.equal(0)
+        })
+
+        // LS40: an entry must not reach a file outside the solution folder
+        it('skips added, updated, removed and moved entries outside the solution folder', async () => {
+            const outside = path.join(tmpRoot, 'outside')
+            fs.mkdirSync(outside)
+            fs.writeFileSync(path.join(outside, 'victim.cs'), '// outside')
+            fs.writeFileSync(path.join(outside, 'moved.cs'), '// outside')
+            fs.mkdirSync(path.join(checkpointFolder, 'after', 'src'), { recursive: true })
+            fs.writeFileSync(path.join(checkpointFolder, 'after', 'src', 'Inside.cs'), '// inside')
+            fs.writeFileSync(path.join(tmpRoot, 'escape.cs'), '// staged outside after/')
+            writeMetadata({
+                filesAdded: ['../outside/added.cs', 'src/../../outside/added2.cs', '../escape.cs', 'src/Inside.cs'],
+                filesUpdated: ['../outside/victim.cs', path.join(outside, 'victim.cs')],
+                filesRemoved: ['../outside/victim.cs'],
+                movedFilesMap: [{ before: '../outside/moved.cs', after: 'stolen.cs' }],
+            })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.addedFiles).to.deep.equal(['src/Inside.cs'])
+            expect(fs.existsSync(path.join(solutionRoot, 'src', 'Inside.cs'))).to.be.true
+            expect(fs.readdirSync(outside).sort()).to.deep.equal(['moved.cs', 'victim.cs'])
+            expect(fs.readFileSync(path.join(outside, 'victim.cs'), 'utf-8')).to.equal('// outside')
+            expect(fs.existsSync(path.join(solutionRoot, 'stolen.cs'))).to.be.false
+            expect(fs.existsSync(path.join(tmpRoot, 'added.cs'))).to.be.false
+            expect((logging.error as sinon.SinonStub).args.flat().join('\n')).to.include(
+                'Skipped added file outside the solution folder: ../outside/added.cs'
+            )
+        })
+
+        it('skips entries in the job data folder', async () => {
+            const jobFile = path.join(workspaceFolderName, 'job-1', 'checkpoints', 'source-files.json')
+            fs.mkdirSync(path.join(solutionRoot, path.dirname(jobFile)), { recursive: true })
+            fs.writeFileSync(path.join(solutionRoot, jobFile), '{"sourceFiles":[]}')
+            fs.mkdirSync(path.join(checkpointFolder, 'after', path.dirname(jobFile)), { recursive: true })
+            fs.writeFileSync(path.join(checkpointFolder, 'after', jobFile), 'replaced')
+            writeMetadata({ filesUpdated: [jobFile], filesRemoved: [jobFile.toUpperCase()] })
+
+            const result = await (handler as any).applyChanges(checkpointFolder, solutionRoot)
+
+            expect(result.success).to.be.true
+            expect(result.filesUpdated).to.equal(0)
+            expect(result.filesRemoved).to.equal(0)
+            expect(fs.readFileSync(path.join(solutionRoot, jobFile), 'utf-8')).to.equal('{"sourceFiles":[]}')
+        })
+
+        it('skips a diff artifact whose step ID is not a folder name, before downloading it', async () => {
+            const downloadUrl = sinon.stub(handler as any, 'createArtifactDownloadUrl').resolves(undefined)
+
+            for (const stepId of ['..', '.', '', 'a/../b', 'a\\b']) {
+                const result = await (handler as any).downloadDiffArtifact(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    solutionRoot,
+                    stepId
+                )
+                expect(result, stepId).to.equal('')
+            }
+
+            sinon.assert.notCalled(downloadUrl)
         })
 
         it('should skip removal when target file does not exist', async () => {
