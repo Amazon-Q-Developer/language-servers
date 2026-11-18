@@ -55,3 +55,24 @@ export function shellCommandBlock(command: string): string {
 export function codeBlockLines(text: string): string {
     return text.replace(/^( {0,3})(?=```)/gm, (_match, indent: string) => indent + ' '.repeat(4 - indent.length))
 }
+
+/** Most characters of an MCP tool name that a tool card shows. A longer name is cut short with an ellipsis. */
+export const MAX_SHOWN_TOOL_NAME_LENGTH = 128
+
+/**
+ * Markdown that shows an MCP tool name as plain text on one line. Whitespace and control characters become
+ * single spaces, invisible formatting characters are removed, a name longer than MAX_SHOWN_TOOL_NAME_LENGTH
+ * characters ends with an ellipsis, and markdown punctuation is escaped.
+ */
+export function toolNameText(name: string | undefined): string {
+    const line = String(name)
+        .replace(/\p{Cf}/gu, '')
+        .replace(/[\s\p{Cc}]+/gu, ' ')
+        .trim()
+    const characters = Array.from(line)
+    const shown =
+        characters.length > MAX_SHOWN_TOOL_NAME_LENGTH
+            ? characters.slice(0, MAX_SHOWN_TOOL_NAME_LENGTH - 1).join('') + '…'
+            : line
+    return shown.replace(/[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/g, '\\$&')
+}
