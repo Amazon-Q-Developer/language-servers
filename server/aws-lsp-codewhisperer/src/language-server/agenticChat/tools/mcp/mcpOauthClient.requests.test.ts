@@ -110,9 +110,14 @@ for (const implementation of ['native', 'fallback'] as const) {
             await Promise.all([close(endpoint), close(destination)])
         })
 
-        function exchange(grant: 'refresh' | 'authorization_code', authMethod: string, url = endpointUrl) {
+        function exchange(
+            grant: 'refresh' | 'authorization_code',
+            authMethod: string,
+            url = endpointUrl,
+            authorizationEndpoint = 'https://auth.example.com/authorize'
+        ) {
             const meta = {
-                authorization_endpoint: 'https://auth.example.com/authorize',
+                authorization_endpoint: authorizationEndpoint,
                 token_endpoint: url,
             }
             const reg = {
@@ -141,7 +146,17 @@ for (const implementation of ['native', 'fallback'] as const) {
             })
             const token = await exchange('authorization_code', 'none')
             assert.equal(token.access_token, 'test-access-token')
+            assert.equal(requests[0].body.get('code'), 'test-code')
             sinon.assert.calledOnce(showDocument)
+        })
+
+        it('opens a loopback HTTP authorization endpoint in the external browser', async () => {
+            const token = await exchange('authorization_code', 'none', endpointUrl, 'http://127.0.0.1:9/authorize')
+            assert.equal(token.access_token, 'test-access-token')
+            sinon.assert.calledOnce(showDocument)
+            const opened = new URL(showDocument.firstCall.args[0].uri)
+            assert.equal(opened.origin + opened.pathname, 'http://127.0.0.1:9/authorize')
+            assert.equal(showDocument.firstCall.args[0].external, true)
         })
 
         for (const grant of ['refresh', 'authorization_code'] as const) {

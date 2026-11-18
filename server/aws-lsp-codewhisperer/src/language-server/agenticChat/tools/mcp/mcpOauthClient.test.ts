@@ -163,6 +163,7 @@ describe('OAuthClient helpers', () => {
             'http://auth.example.com/authorize',
             'ftp://auth.example.com/authorize',
             'vscode://extension/other',
+            'command:workbench.action.terminal.new',
             'not a url',
         ]) {
             it(`rejects ${endpoint}`, () => {
@@ -225,6 +226,8 @@ describe('OAuthClient.pkceGrant() authorization endpoint', () => {
         'data:text/plain,authorize',
         'http://insecure.example.com/authorize',
         'vscode://extension/other',
+        'command:workbench.action.terminal.new',
+        'not a url',
     ]) {
         it(`refuses to open ${authorization_endpoint} and never calls showDocument`, async () => {
             const meta = { authorization_endpoint, token_endpoint: 'https://auth.example.com/token' }
@@ -472,7 +475,7 @@ describe('OAuthClient.discoverAS()', () => {
                     headers: {
                         get: (h: string) =>
                             h.toLowerCase() === 'www-authenticate'
-                                ? 'Bearer resource_metadata="http://169.254.169.254/meta"'
+                                ? 'Bearer resource_metadata="http://meta.example.com/meta"'
                                 : '',
                     },
                 }
@@ -482,12 +485,12 @@ describe('OAuthClient.discoverAS()', () => {
 
         const result = await (OAuthClient as any).discoverAS(new URL('https://mcp.example.com/mcp'))
 
-        // The insecure resource_metadata link is rejected; discovery falls through to synthesized endpoints,
-        // and the internal address is never fetched.
+        // The http resource_metadata link is rejected (the host is public, so only the https rule refuses it);
+        // discovery falls through to synthesized endpoints, and the link is never fetched.
         expect(result.authorization_endpoint).to.equal('https://mcp.example.com/mcp/authorize')
         const fetchedMeta = fetchStub
             .getCalls()
-            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('169.254.169.254'))
+            .some((c: sinon.SinonSpyCall) => String(c.args[0]).includes('meta.example.com'))
         expect(fetchedMeta).to.be.false
     })
 })
@@ -1377,8 +1380,14 @@ describe('OAuthClient getValidAccessToken()', () => {
             sinon.stub(OAuthClient as any, 'pkceGrant').rejects(new Error('authorization_timed_out'))
             const write = sinon.stub(OAuthClient as any, 'write').resolves()
 
-            await signIn().catch(() => undefined)
+            let error: Error | undefined
+            try {
+                await signIn()
+            } catch (e: any) {
+                error = e
+            }
 
+            expect(error?.message).to.include('authorization_timed_out')
             sinon.assert.notCalled(rm)
             expect(registrationsWritten(write)).to.deep.equal([])
             expect(tokensWritten(write)).to.deep.equal([])
