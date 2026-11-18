@@ -17,13 +17,14 @@ describe('ArtifactManager', () => {
 
     let artifactManager: ArtifactManager
     let processDirectory: sinon.SinonStub
+    let processFilesByLanguage: sinon.SinonStub
 
     beforeEach(() => {
         // Two workspace folders
         artifactManager = new ArtifactManager({} as Workspace, logging, [proj, projOther])
         // The directory processing reads the disk, so these tests check only the workspace folder that it gets
         processDirectory = sinon.stub(artifactManager, 'processDirectory').resolves(new Map())
-        sinon.stub(artifactManager as any, 'processFilesByLanguage').resolves([])
+        processFilesByLanguage = sinon.stub(artifactManager as any, 'processFilesByLanguage').resolves([])
     })
 
     afterEach(() => {
@@ -35,6 +36,14 @@ describe('ArtifactManager', () => {
             await artifactManager.addNewDirectories([URI.file('/work/proj-other/src')], projOther)
 
             sinon.assert.calledOnceWithExactly(processDirectory, projOther, '/work/proj-other/src', 'src')
+            // The files of the directory are zipped as part of the same folder, under the same relative path
+            sinon.assert.calledOnceWithExactly(
+                processFilesByLanguage,
+                projOther,
+                sinon.match.object,
+                sinon.match.map,
+                'src'
+            )
         })
 
         it('processes a new directory with a workspace folder whose URI has an uppercase drive letter', async () => {
@@ -43,6 +52,13 @@ describe('ArtifactManager', () => {
             await artifactManager.addNewDirectories([URI.parse('file:///C:/work/proj/lib')], driveFolder)
 
             sinon.assert.calledOnceWithExactly(processDirectory, driveFolder, '/C:/work/proj/lib', 'lib')
+            sinon.assert.calledOnceWithExactly(
+                processFilesByLanguage,
+                driveFolder,
+                sinon.match.object,
+                sinon.match.map,
+                'lib'
+            )
         })
     })
 
@@ -58,6 +74,13 @@ describe('ArtifactManager', () => {
             )
 
             sinon.assert.calledOnceWithExactly(processDirectory, projOther, '/work/proj-other/src', 'src')
+            sinon.assert.calledOnceWithExactly(
+                processFilesByLanguage,
+                projOther,
+                sinon.match.object,
+                sinon.match.map,
+                'src'
+            )
         })
     })
 })
