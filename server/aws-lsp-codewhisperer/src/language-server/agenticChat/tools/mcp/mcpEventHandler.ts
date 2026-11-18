@@ -20,6 +20,7 @@ import {
     normalizePathFromUri,
     getWorkspaceMcpConfigPaths,
     getGlobalMcpConfigPath,
+    describeMcpFormValuesForLog,
 } from './mcpUtils'
 import {
     McpPermissionType,
@@ -384,7 +385,12 @@ export class McpEventHandler {
      */
 
     async onMcpServerClick(params: McpServerClickParams) {
-        this.#features.logging.log(`onMcpServerClick event with params: ${JSON.stringify(params)}`)
+        this.#features.logging.log(
+            `onMcpServerClick event with params: ${JSON.stringify({
+                ...params,
+                optionsValues: params.optionsValues && describeMcpFormValuesForLog(params.optionsValues),
+            })}`
+        )
 
         // Use a map of handlers for different action types
         const handlers: Record<string, () => Promise<any>> = {

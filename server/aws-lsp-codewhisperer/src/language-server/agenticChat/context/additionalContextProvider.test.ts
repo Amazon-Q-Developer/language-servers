@@ -167,6 +167,36 @@ describe('AdditionalContextProvider', () => {
             assert.strictEqual(result[0].pinned, true)
         })
 
+        it('gives the workspace rules as the items to keep with the pinned context', async () => {
+            const mockWorkspaceFolder = {
+                uri: URI.file('/workspace').toString(),
+                name: 'test',
+            }
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns(['/workspace'])
+            const rule = {
+                workspaceFolder: '/workspace',
+                type: 'file',
+                relativePath: path.join('.amazonq', 'rules', 'rule1.md'),
+                id: path.join('/workspace', '.amazonq', 'rules', 'rule1.md'),
+            } as ContextCommandItem
+            sinon.stub(provider, 'collectWorkspaceRules').resolves([rule])
+            ;(chatHistoryDb.getPinnedContext as sinon.SinonStub).returns([
+                { id: 'pinned-file', command: 'Pinned File', label: 'file', route: ['/workspace', 'src/pinned.ts'] },
+            ])
+            getContextCommandPromptStub.resolves([])
+
+            await provider.getAdditionalContext({ workspaceFolder: mockWorkspaceFolder }, 'tab1')
+
+            // The pinned file is not among the items to keep, so the index ignore patterns apply to it
+            const [pinnedItems, keptItems] = getContextCommandPromptStub.secondCall.args
+            assert.deepStrictEqual(
+                pinnedItems.map((item: ContextCommandItem) => item.id),
+                [rule.id, 'pinned-file']
+            )
+            assert.deepStrictEqual(keptItems, [rule])
+            assert.strictEqual(getContextCommandPromptStub.firstCall.args.length, 1)
+        })
+
         it('should handle explicit context (@-mentions) correctly', async () => {
             const mockWorkspaceFolder = {
                 uri: URI.file('/workspace').toString(),
