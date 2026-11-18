@@ -10,6 +10,7 @@ import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { URI } from 'vscode-uri'
 import { InitializeParams } from '@aws/language-server-runtimes/protocol'
 import * as childProcess from '@aws/lsp-core/out/util/processUtils'
+import { withCheckedFileOperations } from './checkedFileFixtures.test'
 
 describe('GrepSearch Tool', () => {
     let features: TestFeatures
@@ -451,5 +452,30 @@ describe('GrepSearch requiresAcceptance (expanded boundary + approvals)', () => 
         await makeGrep(ws).requiresAcceptance({ query: 'x', path: ws })
         await makeGrep(ws).requiresAcceptance({ query: 'x', path: outside })
         sinon.assert.notCalled(rgStub)
+    })
+
+    it('requires acceptance for a search file in the workspace that shares its data with another name on disk', async function () {
+        fs.writeFileSync(path.join(outside, 'other.txt'), 'synthetic fixture only')
+        fs.writeFileSync(path.join(ws, 'notes.txt'), 'synthetic fixture only')
+        try {
+            fs.linkSync(path.join(outside, 'other.txt'), path.join(ws, 'alias.txt'))
+        } catch {
+            return this.skip()
+        }
+        const grep = new GrepSearch({
+            logging: noopLogging,
+            workspace: {
+                getAllWorkspaceFolders: () => [{ uri: URI.file(ws).toString(), name: 'ws' }],
+                fs: withCheckedFileOperations({} as Features['workspace']['fs']),
+            },
+            lsp: {},
+        } as any)
+
+        const linked = await grep.requiresAcceptance({ query: 'x', path: path.join(ws, 'alias.txt') })
+        const ordinary = await grep.requiresAcceptance({ query: 'x', path: path.join(ws, 'notes.txt') })
+
+        assert.equal(linked.requiresAcceptance, true)
+        assert.equal(linked.acceptanceReason, 'multiplyLinkedFile')
+        assert.equal(ordinary.requiresAcceptance, false)
     })
 })
