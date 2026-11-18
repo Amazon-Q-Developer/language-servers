@@ -174,6 +174,38 @@ describe('McpMynahUi', () => {
             }
         })
 
+        it('shows servers waiting for trust with a warning icon and a details action', () => {
+            mcpMynahUi.listMcpServers({
+                list: [
+                    {
+                        groupName: 'Waiting for trust',
+                        children: [
+                            {
+                                title: 'Held server',
+                                description: 'Waiting for workspace trust. Trust this project in your IDE to start it.',
+                                children: [
+                                    {
+                                        groupName: 'serverInformation',
+                                        children: [{ title: 'status', description: 'DISABLED' }],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            } as ListMcpServersResult)
+
+            const detailedList = (mynahUi.openDetailedList as sinon.SinonStub).firstCall.args[0].detailedList
+            const row = detailedList.list[0].children[0]
+            assert.strictEqual(detailedList.list[0].groupName, 'Waiting for trust')
+            assert.strictEqual(row.iconForegroundStatus, 'warning')
+            assert.deepStrictEqual(
+                row.actions.map((action: ChatItemButton) => action.id),
+                ['open-mcp-server']
+            )
+            sinon.assert.calledWith(toMynahIconStub, 'block')
+        })
+
         it('should handle disabled servers correctly', () => {
             // Create mock params with a disabled server
             const params: ListMcpServersResult = {

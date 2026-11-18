@@ -24,6 +24,9 @@ import {
     GREP_SEARCH,
     FILE_SEARCH,
     EXECUTE_BASH,
+    CODE_REVIEW,
+    DISPLAY_FINDINGS,
+    SEMANTIC_SEARCH,
     BUTTON_RUN_SHELL_COMMAND,
     BUTTON_REJECT_SHELL_COMMAND,
     BUTTON_REJECT_MCP_TOOL,
@@ -36,6 +39,7 @@ import {
     SUFFIX_PERMISSION,
     SUFFIX_UNDOALL,
     SUFFIX_EXPLANATION,
+    getReservedBuiltInToolNames,
 } from './constants/toolConstants'
 import { SendMessageCommandInput, ChatCommandInput, ChatCommandOutput } from '../../shared/streamingClientService'
 import {
@@ -54,6 +58,7 @@ import {
     ActiveEditorChangedParams,
     PinnedContextParams,
     ChatUpdateParams,
+    MessageActionItem,
     MessageType,
     ExecuteCommandParams,
     FollowUpClickParams,
@@ -146,7 +151,13 @@ import {
 } from './agenticChatEventParser'
 import { ChatSessionService } from '../chat/chatSessionService'
 import { AgenticChatResultStream, progressPrefix, ResultStreamWriter } from './agenticChatResultStream'
-import { toolResultMessage } from './textFormatting'
+import {
+    codeBlockLines,
+    codeFence,
+    shellCommandBlock,
+    shellCommandBlockStart,
+    toolResultMessage,
+} from './textFormatting'
 import {
     AdditionalContentEntryAddition,
     AgenticChatTriggerContext,
@@ -166,14 +177,20 @@ import { CheckedTarget, logFileAccess, readCheckedFile, updateCheckedFile } from
 import { FsRead, FsReadParams } from './tools/fsRead'
 import { ListDirectory, ListDirectoryParams } from './tools/listDirectory'
 import { FsWrite, FsWriteParams } from './tools/fsWrite'
-import { ExecuteBash, ExecuteBashParams } from './tools/executeBash'
+import { ExecuteBash, ExecuteBashOutput, ExecuteBashParams } from './tools/executeBash'
 import {
     CommandValidation,
     ExplanatoryParams,
     InvokeOutput,
+    canonicalizeWorkspaceFolders,
     discardResolvedTargets,
     withResolvedTargets,
     getFileUpdate,
+    hasAdditionalHardLinks,
+    isPathApproved,
+    isSamePath,
+    isRegularFile,
+    requiresPathAcceptance,
     resolveCanonicalPath,
     resolveSymlinkAwarePath,
     ToolApprovalException,
@@ -277,6 +294,26 @@ type ChatHandlers = Omit<
     | 'onSubscriptionUpgrade'
 >
 
+// `\\host\share`, `//host/x`, `\\?\` and `\\.\` paths reach a remote host or a device, not a local file.
+function isNetworkOrDevicePath(filePath: string | undefined): boolean {
+    return !!filePath && filePath.replace(/\\/g, '/').startsWith('//')
+}
+
+// The most characters of a path to show in a prompt
+const maxPromptPathLength = 300
+
+/**
+ * A path as shown in a prompt. The path can come from model output, so it is shown on one line, and a
+ * path longer than the limit keeps only its start and end.
+ */
+function pathForPrompt(filePath: string): string {
+    const singleLine = filePath.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ')
+    const half = maxPromptPathLength / 2
+    return singleLine.length > maxPromptPathLength
+        ? `${singleLine.slice(0, half)}...${singleLine.slice(-half)}`
+        : singleLine
+}
+
 export class AgenticChatController implements ChatHandlers {
     #features: Features
     #chatSessionManagementService: ChatSessionManagementService
@@ -291,6 +328,8 @@ export class AgenticChatController implements ChatHandlers {
     #contextCommandsProvider: ContextCommandsProvider
     #memoryBankController: MemoryBankController
     #stoppedToolUses = new Set<string>()
+    // Shell command cards whose output stream has written the fence that closes the command's code block
+    #closedShellCommandBlocks = new Set<string>()
     #userWrittenCodeTracker: UserWrittenCodeTracker | undefined
     #toolUseStartTimes: Record<string, number> = {}
     #toolUseLatencies: Array<{ toolName: string; toolUseId: string; latency: number }> = []
@@ -323,12 +362,13 @@ export class AgenticChatController implements ChatHandlers {
      * @param toolUse The tool use object
      * @returns The message ID to use
      */
-    #getMessageIdForToolUse(toolType: string | undefined, toolUse: ToolUse): string {
+    #getMessageIdForToolUse(toolUse: ToolUse): string {
         const toolUseId = toolUse.toolUseId!
+        // Keyed on the registered tool name only. The server-supplied name for
+        // an MCP tool must not steer a card to the built-in executeBash
+        // message id.
         // Return plain toolUseId for executeBash, add "_permission" suffix for all other tools
-        return toolUse.name === EXECUTE_BASH || toolType === EXECUTE_BASH
-            ? toolUseId
-            : `${toolUseId}${SUFFIX_PERMISSION}`
+        return toolUse.name === EXECUTE_BASH ? toolUseId : `${toolUseId}${SUFFIX_PERMISSION}`
     }
 
     /**
@@ -387,13 +427,24 @@ export class AgenticChatController implements ChatHandlers {
         // Inject McpManager.getResources as a callback to avoid importing McpManager directly
         // in AdditionalContextProvider, which would pull Node.js-only MCP SDK dependencies
         // (node:process, node:stream) into the webworker webpack bundle and break packaging.
-        this.#additionalContextProvider = new AdditionalContextProvider(features, this.#chatHistoryDb, () => {
-            try {
-                return McpManager.isInitialized() ? McpManager.instance.getResources() : []
-            } catch {
-                return []
+        this.#additionalContextProvider = new AdditionalContextProvider(
+            features,
+            this.#chatHistoryDb,
+            () => {
+                try {
+                    return McpManager.isInitialized() ? McpManager.instance.getResources() : []
+                } catch {
+                    return []
+                }
+            },
+            () => {
+                try {
+                    return McpManager.isInitialized() ? McpManager.instance.getResourceSources() : new Map()
+                } catch {
+                    return new Map()
+                }
             }
-        })
+        )
         this.#contextCommandsProvider = new ContextCommandsProvider(
             this.#features.logging,
             this.#features.chat,
@@ -962,10 +1013,12 @@ export class AgenticChatController implements ChatHandlers {
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 
-        // Memory Bank Creation Flow - Delegate to MemoryBankController
-        if (this.#memoryBankController.isMemoryBankCreationRequest(params.prompt.prompt)) {
+        // Memory Bank Creation Flow - Delegate to MemoryBankController.
+        // The flag belongs to this request and is passed down its agent loop, so a turn that is still
+        // running in the same tab never sees it.
+        let isMemoryBankGeneration = this.#memoryBankController.isMemoryBankCreationRequest(params.prompt.prompt)
+        if (isMemoryBankGeneration) {
             this.#features.logging.info(`Memory Bank creation request detected for tabId: ${params.tabId}`)
-            session.isMemoryBankGeneration = true
 
             // Store original prompt to prevent data loss on failure
             const originalPrompt = params.prompt.prompt
@@ -1048,7 +1101,7 @@ export class AgenticChatController implements ChatHandlers {
                 // Restore original prompt to ensure no data loss
                 params.prompt.prompt = originalPrompt
                 // Reset memory bank flag since preparation failed
-                session.isMemoryBankGeneration = false
+                isMemoryBankGeneration = false
             }
         }
 
@@ -1218,7 +1271,8 @@ export class AgenticChatController implements ChatHandlers {
                     session.conversationId,
                     token,
                     triggerContext.documentReference,
-                    additionalContext
+                    additionalContext,
+                    isMemoryBankGeneration
                 )
             }
 
@@ -1499,7 +1553,8 @@ export class AgenticChatController implements ChatHandlers {
         conversationIdentifier?: string,
         token?: CancellationToken,
         documentReference?: FileList,
-        additionalContext?: AdditionalContentEntryAddition[]
+        additionalContext?: AdditionalContentEntryAddition[],
+        isMemoryBankGeneration: boolean = false
     ): Promise<Result<AgenticChatResultWithMetadata, string>> {
         let currentRequestInput = { ...initialRequestInput }
         let finalResult: Result<AgenticChatResultWithMetadata, string> | null = null
@@ -1736,7 +1791,8 @@ export class AgenticChatController implements ChatHandlers {
                     session,
                     tabId,
                     token,
-                    additionalContext
+                    additionalContext,
+                    isMemoryBankGeneration
                 )
                 if (toolResults.some(toolResult => this.#shouldSendBackErrorContent(toolResult))) {
                     content = 'There was an error processing one or more tool uses. Try again, do not apologize.'
@@ -2052,7 +2108,43 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     /**
-     * Processes tool uses by running the tools and collecting results
+     * Approved paths for a memory bank generation request, which also include the memory
+     * bank files. The user asked for these files, so writing them does not ask again.
+     * A memory bank file that is a link, or is in a linked folder, or that has another name
+     * on disk, is left out so the usual checks still ask about it.
+     */
+    async #withMemoryBankFiles(approvedPaths: Map<string, Set<string>>): Promise<Map<string, Set<string>>> {
+        const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+        if (!workspaceFolders.length) {
+            return approvedPaths
+        }
+
+        const [canonicalWorkspaceFolder] = await canonicalizeWorkspaceFolders([workspaceFolders[0]])
+        const memoryBankFilePaths: string[] = []
+        for (const filePath of this.#memoryBankController.getMemoryBankFilePaths(workspaceFolders[0])) {
+            // A file that can't be resolved, such as a link to itself, is left out as well
+            const resolvedPath = await resolveSymlinkAwarePath(sanitize(filePath)).catch(() => undefined)
+            const expectedPath = path.join(canonicalWorkspaceFolder, path.relative(workspaceFolders[0], filePath))
+            if (
+                resolvedPath !== undefined &&
+                isSamePath(resolvedPath, expectedPath) &&
+                !(await hasAdditionalHardLinks(resolvedPath))
+            ) {
+                memoryBankFilePaths.push(resolvedPath)
+            }
+        }
+
+        const result = new Map(approvedPaths)
+        for (const toolName of [FS_WRITE, FS_REPLACE]) {
+            result.set(toolName, new Set([...(approvedPaths.get(toolName) ?? []), ...memoryBankFilePaths]))
+        }
+        return result
+    }
+
+    /**
+     * Processes tool uses by running the tools and collecting results.
+     * @param isMemoryBankGeneration True only when the request that runs these tool uses asked for a
+     * memory bank; it lets that request write the memory bank files.
      */
     async processToolUses(
         toolUses: Array<ToolUse & { stop: boolean }>,
@@ -2060,7 +2152,8 @@ export class AgenticChatController implements ChatHandlers {
         session: ChatSessionService,
         tabId: string,
         token?: CancellationToken,
-        additionalContext?: AdditionalContentEntryAddition[]
+        additionalContext?: AdditionalContentEntryAddition[],
+        isMemoryBankGeneration: boolean = false
     ): Promise<ToolResult[]> {
         const results: ToolResult[] = []
 
@@ -2072,6 +2165,8 @@ export class AgenticChatController implements ChatHandlers {
             // Retain acceptance-check targets for execution and approval caching.
             let checkedCanonicalPaths: string[] | undefined
             let checkedTargets: readonly CheckedTarget[] | undefined
+            // What an approval of an executeBash prompt allows for later commands
+            let approvalPaths: readonly string[] | undefined
             let executionInput: object | undefined
             if (!toolUse.name || !toolUse.toolUseId) continue
             session.toolUseLookup.set(toolUse.toolUseId, toolUse)
@@ -2128,7 +2223,7 @@ export class AgenticChatController implements ChatHandlers {
 
                         const { Tool } = toolMap[toolUse.name as keyof typeof toolMap]
                         const tool =
-                            toolUse.name === FS_READ && session.isMemoryBankGeneration
+                            toolUse.name === FS_READ && isMemoryBankGeneration
                                 ? new Tool(
                                       this.#features,
                                       FSREAD_MEMORY_BANK_MAX_PER_FILE,
@@ -2142,7 +2237,9 @@ export class AgenticChatController implements ChatHandlers {
                         // const builtInPermission = permission !== 'alwaysAllow'
 
                         // Get the approved paths from the session
-                        const approvedPaths = session.approvedPaths
+                        const approvedPaths = isMemoryBankGeneration
+                            ? await this.#withMemoryBankFiles(session.approvedPaths)
+                            : session.approvedPaths
 
                         // Pass the approved paths to the tool's requiresAcceptance method
                         const {
@@ -2153,7 +2250,13 @@ export class AgenticChatController implements ChatHandlers {
                             canonicalPaths,
                             checkedTargets: acceptedTargets,
                             validationError,
-                        } = await tool.requiresAcceptance(toolUse.input as any, approvedPaths)
+                            approvalPaths: pathsForApproval,
+                        } = await tool.requiresAcceptance(
+                            toolUse.input as any,
+                            approvedPaths,
+                            session.approvedLinkedFiles
+                        )
+                        approvalPaths = pathsForApproval
 
                         // Filesystem execution requires the canonical targets returned by acceptance.
                         const isFsTool = [FS_READ, FS_WRITE, FS_REPLACE, FILE_SEARCH, LIST_DIRECTORY].includes(
@@ -2196,7 +2299,8 @@ export class AgenticChatController implements ChatHandlers {
                                 commandCategory,
                                 undefined,
                                 undefined,
-                                acceptanceReason
+                                acceptanceReason,
+                                (toolUse.input as { path?: unknown } | undefined)?.path
                             )
                             cachedButtonBlockId = await chatResultStream.writeResultBlock(confirmationResult)
                             const isExecuteBash = toolUse.name === EXECUTE_BASH
@@ -2235,10 +2339,10 @@ export class AgenticChatController implements ChatHandlers {
 
                         break
                     }
-                    case CodeReview.toolName:
-                    case DisplayFindings.toolName:
+                    case CODE_REVIEW:
+                    case DISPLAY_FINDINGS:
                     // no need to write tool message for CodeReview or DisplayFindings
-                    case SemanticSearch.toolName:
+                    case SEMANTIC_SEARCH:
                         // For internal A/B we don't need tool message
                         break
                     // — DEFAULT ⇒ Only MCP tools, but can also handle generic tool execution messages
@@ -2352,33 +2456,6 @@ export class AgenticChatController implements ChatHandlers {
                     }
                 }
 
-                // Record the path only when the user was actually asked and
-                // allowed it. Recording every path a tool touches turns this map
-                // into "paths the tool has seen", which then short-circuits the
-                // acceptance check on later calls — so a path that was harmless
-                // on first use (an ordinary file inside the workspace) would
-                // skip the check after it becomes something the user should be
-                // asked about, such as a name that a hard link now shares with a
-                // file outside the workspace.
-                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
-                if (toolApprovalGranted && checkedCanonicalPaths) {
-                    for (const checkedPath of checkedCanonicalPaths) {
-                        session.addApprovedPath(checkedPath, toolUse.name)
-                    }
-                } else if (inputPath && toolApprovalGranted) {
-                    session.addApprovedPath(inputPath, toolUse.name)
-                    // The acceptance check compares the canonical path, so also
-                    // record that form; otherwise an approval never matches when
-                    // the input reaches the file through a symlinked ancestor
-                    // (a symlinked home directory, or macOS /tmp) and the user is
-                    // asked again on every call. Resolved the same way as
-                    // requiresPathAcceptance.
-                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
-                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
-                        session.addApprovedPath(canonicalInputPath, toolUse.name)
-                    }
-                }
-
                 const ws = this.#getWritableStream(chatResultStream, toolUse)
                 if (checkedTargets) {
                     if (token?.isCancellationRequested) {
@@ -2403,6 +2480,48 @@ export class AgenticChatController implements ChatHandlers {
                         toolName: toolUse.name,
                         canonicalPaths: checkedCanonicalPaths,
                     })
+                }
+
+                // Record the path only when the user was actually asked and
+                // allowed it, and the tool then succeeded. Recording every path
+                // a tool touches turns this map into "paths the tool has seen",
+                // which then short-circuits the acceptance check on later calls,
+                // so a path that was harmless on first use (an ordinary file
+                // inside the workspace) would skip the check after it becomes
+                // something the user should be asked about, such as a name that
+                // a hard link now shares with a file outside the workspace.
+                const inputPath = (toolUse.input as any)?.path || (toolUse.input as any)?.cwd
+                // A command that exits with an error returns a result rather than throwing
+                const exitStatus =
+                    toolUse.name === EXECUTE_BASH
+                        ? ((result as InvokeOutput | undefined)?.output?.content as ExecuteBashOutput | undefined)
+                              ?.exitStatus
+                        : undefined
+                const toolSucceeded = exitStatus === undefined || exitStatus === '0'
+                if (toolApprovalGranted && toolSucceeded && checkedTargets) {
+                    // With the target, a file with more than one hard link stays approved only as it was
+                    for (const target of checkedTargets) {
+                        session.addApprovedPath(target.path, toolUse.name, target)
+                    }
+                } else if (toolUse.name === EXECUTE_BASH) {
+                    // Only an out-of-workspace prompt allows the cwd for later commands
+                    if (toolApprovalGranted && toolSucceeded) {
+                        for (const approvalPath of approvalPaths ?? []) {
+                            session.addApprovedPath(approvalPath, toolUse.name)
+                        }
+                    }
+                } else if (inputPath && toolApprovalGranted && toolSucceeded) {
+                    session.addApprovedPath(inputPath, toolUse.name)
+                    // The acceptance check compares the canonical path, so also
+                    // record that form; otherwise an approval never matches when
+                    // the input reaches the file through a symlinked ancestor
+                    // (a symlinked home directory, or macOS /tmp) and the user is
+                    // asked again on every call. Resolved the same way as
+                    // requiresPathAcceptance.
+                    const canonicalInputPath = await resolveSymlinkAwarePath(sanitize(inputPath)).catch(() => undefined)
+                    if (canonicalInputPath && canonicalInputPath !== inputPath) {
+                        session.addApprovedPath(canonicalInputPath, toolUse.name)
+                    }
                 }
 
                 let toolResultContent: ToolResultContentBlock
@@ -2758,7 +2877,7 @@ export class AgenticChatController implements ChatHandlers {
                     const completedErrorResult = {
                         type: 'tool',
                         messageId: toolUse.toolUseId,
-                        body: `\`\`\`shell\n${command}\n\`\`\``,
+                        body: shellCommandBlock(command),
                         header: {
                             body: 'shell',
                             status: {
@@ -2769,9 +2888,25 @@ export class AgenticChatController implements ChatHandlers {
                             buttons: [],
                         },
                     } as ChatResult
+                    // Output the stream has not written yet is not shown, so it cannot land after the fence below
+                    this.#stoppedToolUses.add(toolUse.toolUseId)
 
-                    if (existingCard) {
-                        await chatResultStream.overwriteResultBlock(completedErrorResult, existingCard)
+                    if (existingCard !== undefined) {
+                        // Output written so far follows the card's first block, so open the code block
+                        // there and close it after the output
+                        await chatResultStream.overwriteResultBlock(
+                            { ...completedErrorResult, body: shellCommandBlockStart(command) },
+                            existingCard
+                        )
+                        if (!this.#closedShellCommandBlocks.has(toolUse.toolUseId)) {
+                            await chatResultStream.writeResultBlock({
+                                type: 'tool',
+                                messageId: toolUse.toolUseId,
+                                body: codeFence(command),
+                                header: completedErrorResult.header,
+                            })
+                            this.#closedShellCommandBlocks.add(toolUse.toolUseId)
+                        }
                     } else {
                         this.#features.chat.sendChatUpdate({
                             tabId,
@@ -2781,7 +2916,6 @@ export class AgenticChatController implements ChatHandlers {
                             },
                         })
                     }
-                    this.#stoppedToolUses.add(toolUse.toolUseId)
                 }
                 const errMsg = err instanceof Error ? err.message : 'unknown error'
                 this.#log(`Error running tool ${toolUse.name}:`, errMsg)
@@ -2998,7 +3132,8 @@ export class AgenticChatController implements ChatHandlers {
                 await chatResultStream.writeResultBlock({
                     type: 'tool',
                     messageId: toolMsgId,
-                    body: chunk,
+                    // The output is shown inside the code block that the card opened for the command
+                    body: chunk === undefined || chunk === null ? chunk : codeBlockLines(String(chunk)),
                     header: headerEmitted ? undefined : initialHeader,
                 })
 
@@ -3011,10 +3146,12 @@ export class AgenticChatController implements ChatHandlers {
                 await chatResultStream.writeResultBlock({
                     type: 'tool',
                     messageId: toolMsgId,
-                    body: '```',
+                    // Closes the code block that the card opened for the command
+                    body: codeFence((toolUse.input as unknown as ExecuteBashParams).command),
                     header: completedHeader,
                 })
 
+                this.#closedShellCommandBlocks.add(toolMsgId)
                 this.#stoppedToolUses.add(toolMsgId)
             },
         })
@@ -3033,14 +3170,21 @@ export class AgenticChatController implements ChatHandlers {
         originalToolName: string,
         toolType?: string
     ): ChatResult {
+        // Dispatch on the registered tool name. `originalToolName` and `toolType`
+        // carry the server-supplied name for MCP tools and are display-only, so
+        // they must not be able to select built-in rendering. The built-in path
+        // passes toolUse.name here, so built-in behavior is unchanged.
+        const dispatchName = toolUse.name
         const toolName = originalToolName ?? (toolType || toolUse.name)
 
         // Handle bash commands with special formatting
-        if (toolName === EXECUTE_BASH) {
+        if (dispatchName === EXECUTE_BASH) {
             return {
                 messageId: toolUse.toolUseId,
                 type: 'tool',
-                body: '```shell\n' + (toolUse.input as unknown as ExecuteBashParams).command,
+                body: isAccept
+                    ? shellCommandBlockStart((toolUse.input as unknown as ExecuteBashParams).command)
+                    : shellCommandBlock((toolUse.input as unknown as ExecuteBashParams).command),
                 header: {
                     body: 'shell',
                     ...(isAccept
@@ -3064,7 +3208,7 @@ export class AgenticChatController implements ChatHandlers {
         }
         let body: string | undefined
 
-        switch (toolName) {
+        switch (dispatchName) {
             case FS_REPLACE:
             case FS_WRITE:
             case FS_READ:
@@ -3101,7 +3245,7 @@ export class AgenticChatController implements ChatHandlers {
                         content: {
                             header: {
                                 icon: 'tools',
-                                body: `${originalToolName ?? (toolType || toolUse.name)}`,
+                                body: `${toolName}`,
                                 status: {
                                     status: isAccept ? 'success' : 'error',
                                     icon: isAccept ? 'ok' : 'cancel',
@@ -3124,7 +3268,7 @@ export class AgenticChatController implements ChatHandlers {
         }
 
         return {
-            messageId: this.#getMessageIdForToolUse(toolType, toolUse),
+            messageId: this.#getMessageIdForToolUse(toolUse),
             type: 'tool',
             body,
             header,
@@ -3143,7 +3287,7 @@ export class AgenticChatController implements ChatHandlers {
                     {
                         messageId,
                         type: 'tool',
-                        body: `\`\`\`shell\n${command}\n\`\`\``,
+                        body: shellCommandBlock(command),
                         header: {
                             body: 'shell',
                             status: {
@@ -3278,13 +3422,28 @@ export class AgenticChatController implements ChatHandlers {
         commandCategory?: CommandCategory,
         toolType?: string,
         builtInPermission?: boolean,
-        acceptanceReason?: CommandValidation['acceptanceReason']
+        acceptanceReason?: CommandValidation['acceptanceReason'],
+        requestedPath?: unknown
     ): ChatResult {
+        // The name used for dispatch and classification is the registered tool
+        // name, which is namespaced for MCP tools. `toolType` carries the
+        // server-supplied original name and is display-only, so it must not be
+        // able to select built-in rendering by matching a built-in name.
+        const dispatchName = toolUse.name
         const toolName = toolType || toolUse.name
-        // A multiply linked path is inside the workspace, so the filesystem
-        // prompts below describe the shared file rather than a location outside
-        // the workspace.
-        const isMultiplyLinkedFile = acceptanceReason === 'multiplyLinkedFile'
+        // A multiply linked path or a configuration file is inside the workspace,
+        // so the filesystem prompts below do not describe a location outside the
+        // workspace.
+        const isInWorkspacePath = acceptanceReason !== undefined
+        // A configuration file prompt also names the requested path when it reaches the file
+        // through a link, because the requested name may be what makes it configuration
+        const requestedPathNote = (shownPath: string) =>
+            acceptanceReason === 'configFile' &&
+            typeof requestedPath === 'string' &&
+            !isSamePath(path.resolve(sanitize(requestedPath)), shownPath)
+                ? // Without segments that `..` cancels, so it names only folders on the way to the file
+                  `\nRequested as \`${path.resolve(sanitize(requestedPath))}\``
+                : ''
         let buttons: Button[] = []
         let header: {
             body: string
@@ -3302,7 +3461,7 @@ export class AgenticChatController implements ChatHandlers {
         let body: string | undefined
 
         // Configure tool-specific UI elements
-        switch (toolName) {
+        switch (dispatchName) {
             case EXECUTE_BASH: {
                 const commandString = (toolUse.input as unknown as ExecuteBashParams).command
                 // get feature flag
@@ -3358,7 +3517,7 @@ export class AgenticChatController implements ChatHandlers {
                     body: 'shell',
                     buttons,
                 }
-                body = '```shell\n' + commandString
+                body = shellCommandBlockStart(commandString)
                 break
             }
 
@@ -3374,15 +3533,16 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    (builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
-                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``) +
+                    requestedPathNote(writeFilePath)
                 break
             }
 
@@ -3398,15 +3558,16 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'warning',
                     iconForegroundStatus: 'warning',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow file modification'
                             : '#### Allow file modification outside of your workspace',
                     buttons,
                 }
                 body =
-                    builtInPermission || isMultiplyLinkedFile
+                    (builtInPermission || isInWorkspacePath
                         ? `I need permission to modify files.\n\`${writeFilePath}\``
-                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``
+                        : `I need permission to modify files outside of your workspace.\n\`${writeFilePath}\``) +
+                    requestedPathNote(writeFilePath)
                 break
             }
 
@@ -3417,13 +3578,13 @@ export class AgenticChatController implements ChatHandlers {
                     icon: 'tools',
                     iconForegroundStatus: 'tools',
                     body:
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? '#### Allow read-only tools'
                             : '#### Allow read-only tools outside your workspace',
                     buttons,
                 }
 
-                if (toolName === FS_READ) {
+                if (dispatchName === FS_READ) {
                     const paths = (toolUse.input as unknown as FsReadParams).paths
 
                     // Validate paths using our synchronous utility
@@ -3433,7 +3594,7 @@ export class AgenticChatController implements ChatHandlers {
                     const formattedPaths: string[] = []
                     paths.forEach(element => formattedPaths.push(`\`${element}\``))
                     body =
-                        builtInPermission || isMultiplyLinkedFile
+                        builtInPermission || isInWorkspacePath
                             ? `I need permission to read files.\n${formattedPaths.join('\n')}`
                             : `I need permission to read files outside the workspace.\n${formattedPaths.join('\n')}`
                 } else {
@@ -3465,16 +3626,17 @@ export class AgenticChatController implements ChatHandlers {
         }
 
         // Determine if this is a built-in tool or MCP tool
-        const isStandardTool = toolName !== undefined && this.#features.agent.getBuiltInToolNames().includes(toolName)
+        const isStandardTool =
+            dispatchName !== undefined && this.#features.agent.getBuiltInToolNames().includes(dispatchName)
 
         if (isStandardTool) {
             return {
                 type: 'tool',
-                messageId: this.#getMessageIdForToolUse(toolType, toolUse),
+                messageId: this.#getMessageIdForToolUse(toolUse),
                 header,
                 // The warning explains why acceptance is needed, so show it above
                 // the body rather than using it only as a spacing flag.
-                body: warning ? (toolName === EXECUTE_BASH ? '' : warning + '\n\n') + body : body,
+                body: warning ? (dispatchName === EXECUTE_BASH ? '' : warning + '\n\n') + body : body,
             }
         } else {
             return {
@@ -3864,9 +4026,6 @@ export class AgenticChatController implements ChatHandlers {
             },
         })
 
-        // Reset memory bank flag after completion
-        session.isMemoryBankGeneration = false
-
         return chatResultStream.getResult()
     }
 
@@ -3902,12 +4061,8 @@ export class AgenticChatController implements ChatHandlers {
             requestModelId
         )
 
-        // Reset memory bank flag on request error
         const sessionResult = this.#chatSessionManagementService.getSession(tabId)
         const modelId = requestModelId ?? (sessionResult.success ? sessionResult.data.modelId : undefined)
-        if (sessionResult.success) {
-            sessionResult.data.isMemoryBankGeneration = false
-        }
 
         if (isUsageLimitError(err)) {
             if (this.#paidTierMode !== 'paidtier') {
@@ -4224,16 +4379,136 @@ export class AgenticChatController implements ChatHandlers {
                     fileContent: toolUse.fileChange?.after,
                 })
             } else if (toolUse?.name === FS_READ) {
-                await this.#features.lsp.window.showDocument({ uri: URI.file(params.filePath).toString() })
+                await this.#openIfAllowed(params.filePath, FS_READ, session.data, true)
             } else {
-                const absolutePath = params.fullPath ?? (await this.#resolveAbsolutePath(params.filePath))
-                if (absolutePath) {
-                    await this.#features.lsp.window.showDocument({ uri: URI.file(absolutePath).toString() })
+                if (isNetworkOrDevicePath(params.fullPath ?? params.filePath)) {
+                    this.#features.logging.info(`Not opening network or device path from a chat file click`)
+                    return
                 }
+                const absolutePath = params.fullPath ?? (await this.#resolveAbsolutePath(params.filePath))
+                if (!absolutePath) {
+                    // The path comes from model output, so only a bounded file name is echoed back.
+                    const name = path.basename(params.filePath).slice(0, 100)
+                    await this.#features.lsp.window.showMessage({
+                        type: MessageType.Warning,
+                        message: `Could not find ${name} in your workspace.`,
+                    })
+                    return
+                }
+                // Only an fsRead card can retain an Open choice; answer links and other cards prompt on every
+                // out-of-workspace click, though an approval the tool already holds still applies.
+                await this.#openIfAllowed(absolutePath, toolUse?.name ?? FS_READ, session.data)
             }
         } catch (e: any) {
             this.#features.logging.error(`Error opening file: ${e.message}`)
         }
+    }
+
+    /**
+     * Open a file from a chat click only when the user could have read it through the tools: inside a workspace
+     * folder, or a path already approved for `toolName` in this session. Paths can come from model-generated
+     * answer links, tool results, and service findings, so an unchecked path plus one click would open any readable
+     * file and feed it to completion context.
+     *
+     * The user prompts directory is allowed as well: `#resolveAbsolutePath` deliberately resolves `.prompt.md`
+     * files there, and they are user-authored context files rather than arbitrary disk contents.
+     */
+    async #openIfAllowed(
+        filePath: string,
+        toolName: string,
+        session: ChatSessionService | undefined,
+        recordToolApproval = false
+    ): Promise<void> {
+        if (isNetworkOrDevicePath(filePath)) {
+            this.#features.logging.info(`Not opening network or device path from a chat file click`)
+            return
+        }
+        const canonicalPath = await resolveCanonicalPath(filePath)
+        // A link can resolve to a network or device path that the check on the clicked path did not see, so the
+        // resolved path is checked before anything else reads it. A workspace on a mapped network drive resolves
+        // to such a path as well, so a path inside the workspace or already approved for the tool is let through.
+        if (
+            isNetworkOrDevicePath(canonicalPath) &&
+            !workspaceUtils.isInWorkspace(
+                await canonicalizeWorkspaceFolders(workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)),
+                canonicalPath
+            ) &&
+            !isPathApproved(canonicalPath, toolName, session?.approvedPaths)
+        ) {
+            this.#features.logging.info(`Not opening network or device path from a chat file click`)
+            return
+        }
+        const promptsDirectory = await resolveCanonicalPath(getUserPromptsDirectory())
+        const isPromptFile =
+            canonicalPath.endsWith(promptFileExtension) &&
+            workspaceUtils.isParentFolder(promptsDirectory, canonicalPath)
+        if (!isPromptFile) {
+            const { requiresAcceptance, warning } = await requiresPathAcceptance(
+                canonicalPath,
+                toolName,
+                this.#features.workspace,
+                this.#features.logging,
+                session?.approvedPaths
+            )
+            if (requiresAcceptance) {
+                // Paths from model output open only after explicit confirmation. Opening a file the fsRead tool
+                // was asked to read may retain that choice for fsRead; any other click must not grant tool access.
+                const retainApproval = recordToolApproval && (await this.#isFsReadRequestedPath(canonicalPath, session))
+                const open: MessageActionItem = { title: 'Open' }
+                const cancel: MessageActionItem = { title: 'Cancel' }
+                const choice = await this.#features.lsp.window.showMessageRequest({
+                    type: MessageType.Warning,
+                    message:
+                        `${warning ?? 'This file is outside your workspace.'}\n\n` +
+                        `Open ${pathForPrompt(canonicalPath)} in the editor?` +
+                        (retainApproval
+                            ? ' Amazon Q will also be able to read this file for the rest of this chat.'
+                            : ''),
+                    actions: [open, cancel],
+                })
+                if (choice?.title !== open.title) {
+                    this.#features.logging.info(`User declined to open out-of-workspace file from a chat card`)
+                    return
+                }
+                if (retainApproval) {
+                    session?.addApprovedPath(canonicalPath, toolName)
+                }
+            }
+        }
+        await this.#features.lsp.window.showDocument({ uri: URI.file(canonicalPath).toString() })
+    }
+
+    /**
+     * Whether any fsRead tool use in this session asked for `canonicalPath`. The card's messageId and filePath come
+     * from the client, and consecutive fsRead calls share one card, so the path is checked against every fsRead input
+     * rather than trusting the clicked card.
+     */
+    async #isFsReadRequestedPath(canonicalPath: string, session: ChatSessionService | undefined): Promise<boolean> {
+        // An approved directory covers everything under it, so only a regular file can keep an Open choice.
+        if (!(await isRegularFile(canonicalPath))) {
+            return false
+        }
+        for (const toolUse of session?.toolUseLookup.values() ?? []) {
+            if (toolUse.name !== FS_READ) {
+                continue
+            }
+            const paths = (toolUse.input as unknown as FsReadParams | undefined)?.paths
+            for (const requested of Array.isArray(paths) ? paths : []) {
+                if (
+                    typeof requested !== 'string' ||
+                    !(path.isAbsolute(requested) || /^~(?:[\\/]|$)/.test(requested)) ||
+                    isNetworkOrDevicePath(requested)
+                ) {
+                    continue
+                }
+                // A path that can't be resolved, such as a link to itself, is not the clicked file
+                const requestedPath = await resolveCanonicalPath(requested).catch(() => undefined)
+                if (requestedPath !== undefined && isSamePath(requestedPath, canonicalPath)) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     async onFollowUpClicked(params: FollowUpClickParams) {
@@ -4500,7 +4775,7 @@ export class AgenticChatController implements ChatHandlers {
                         {
                             messageId: toolUseId,
                             type: 'tool',
-                            body: `\`\`\`shell\n${command}\n\`\`\``,
+                            body: shellCommandBlock(command),
                             header: {
                                 body: 'shell',
                                 status: { icon: 'block', text: 'Ignored' },
@@ -5124,13 +5399,20 @@ export class AgenticChatController implements ChatHandlers {
         // TODO: mcp tool spec name will be server___tool.
         // TODO: Will also need to handle rare edge cases of long server name + long tool name > 64 char
         const allNamespacedTools = new Set<string>()
+        const builtInToolNames = getReservedBuiltInToolNames(this.#features.agent.getBuiltInToolNames())
         let mcpToolSpecNames: Set<string>
         try {
             mcpToolSpecNames = new Set(
                 McpManager.instance
                     .getAllTools()
                     .map(tool =>
-                        createNamespacedToolName(tool.serverName, tool.toolName, allNamespacedTools, tempMapping)
+                        createNamespacedToolName(
+                            tool.serverName,
+                            tool.toolName,
+                            allNamespacedTools,
+                            tempMapping,
+                            builtInToolNames
+                        )
                     )
             )
         } catch (error) {

@@ -17,7 +17,7 @@ import { ChatMessage, ContextCommand, ListAvailableModelsResult } from '@aws/lan
 import { ChatHistory } from './features/history'
 import { pairProgrammingModeOn, pairProgrammingModeOff } from './texts/pairProgramming'
 import { deprecationCard } from './texts/deprecation'
-import { strictEqual } from 'assert'
+import { deepStrictEqual, strictEqual } from 'assert'
 
 describe('MynahUI', () => {
     let messager: Messager
@@ -807,6 +807,88 @@ describe('MynahUI', () => {
             } finally {
                 customMynahUi.destroy()
             }
+        })
+    })
+
+    describe('chat answer link clicks', () => {
+        const props = () => (mynahUi as any).props
+        const telemetryNamed = (name: string) =>
+            (outboundChatApi.telemetry as sinon.SinonStub).getCalls().filter(c => c.args[0].name === name)
+
+        it('sends a relative link as a file click without the answer messageId', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'src/foo.ts#L10', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: 'src/foo.ts',
+                fullPath: undefined,
+            })
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+        })
+
+        it('records link-click telemetry for a file link without sending it to the IDE link opener', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'src/foo.ts', undefined, 'event-1')
+            props().onInfoLinkClick('tab-1', '/home/x/a.ts', undefined, 'event-2')
+
+            deepStrictEqual(
+                telemetryNamed('linkClick').map(c => c.args[0]),
+                [{ tabId: 'tab-1', messageId: 'answer-1', link: 'src/foo.ts', eventId: 'event-1', name: 'linkClick' }]
+            )
+            deepStrictEqual(
+                telemetryNamed('infoLinkClick').map(c => c.args[0]),
+                [{ tabId: 'tab-1', link: '/home/x/a.ts', eventId: 'event-2', name: 'infoLinkClick' }]
+            )
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(notifySpy)
+        })
+
+        it('sends an absolute Windows answer link as a file click with fullPath', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'C:\\work\\src\\a.ts#L10', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: 'C:\\work\\src\\a.ts',
+                fullPath: 'C:\\work\\src\\a.ts',
+            })
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+        })
+
+        it('sends an https link as a link click', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com/doc', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.linkClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/doc',
+                eventId: 'event-1',
+            })
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+        })
+
+        it('opens nothing for a network path or a non-http scheme and tells the user', () => {
+            props().onLinkClick('tab-1', 'answer-1', '\\\\host\\share\\x', undefined, 'event-1')
+            props().onInfoLinkClick('tab-1', 'vscode://x', undefined, 'event-2')
+
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.calledTwice(notifySpy)
+            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
+            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
+            strictEqual(telemetryNamed('linkClick').length, 1)
+            strictEqual(telemetryNamed('infoLinkClick').length, 1)
+        })
+
+        it('sends an absolute info link path as a file click with fullPath', () => {
+            props().onInfoLinkClick('tab-1', '/home/x/a.ts', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: '/home/x/a.ts',
+                fullPath: '/home/x/a.ts',
+            })
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
         })
     })
 

@@ -325,6 +325,33 @@ describe('ATXTransformHandler - Chat APIs', () => {
         })
     })
 
+    describe('getJob', () => {
+        it('returns null and fills the error code and status when GetJob fails', async () => {
+            sendStub.rejects(
+                Object.assign(new Error('not authorized'), {
+                    name: 'AccessDeniedException',
+                    $metadata: { httpStatusCode: 403 },
+                })
+            )
+            const errorInfo: any = {}
+
+            const job = await handler.getJob('ws-123', 'job-456', false, errorInfo)
+
+            expect(job).to.be.null
+            expect(errorInfo).to.deep.equal({ errorCode: 'AccessDeniedException', statusCode: 403 })
+        })
+
+        it('leaves the error info empty when GetJob succeeds', async () => {
+            sendStub.resolves({ job: { jobId: 'job-456' } })
+            const errorInfo: any = {}
+
+            const job = await handler.getJob('ws-123', 'job-456', false, errorInfo)
+
+            expect(job).to.deep.equal({ jobId: 'job-456' })
+            expect(errorInfo).to.deep.equal({})
+        })
+    })
+
     describe('error handling', () => {
         it('should throw error when client not initialized', async () => {
             ;(handler as any).atxClient = null
@@ -498,6 +525,20 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         expect(result?.ErrorString).to.equal('JOB_NOT_FOUND')
         expect((logging.error as sinon.SinonStub).called).to.be.true
+    })
+
+    it('should return the GetJob error code and status with JOB_NOT_FOUND', async () => {
+        getJobStub.callsFake(async (_ws: string, _job: string, _objective: boolean, errorInfo: any) => {
+            errorInfo.errorCode = 'AccessDeniedException'
+            errorInfo.statusCode = 403
+            return null
+        })
+
+        const result: any = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.ErrorString).to.equal('JOB_NOT_FOUND')
+        expect(result?.ErrorCode).to.equal('AccessDeniedException')
+        expect(result?.StatusCode).to.equal(403)
     })
 
     it('should return COMPLETED with artifact path and plan', async () => {

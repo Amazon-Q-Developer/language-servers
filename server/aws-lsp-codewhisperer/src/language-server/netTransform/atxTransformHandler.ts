@@ -6,6 +6,9 @@ import * as path from 'path'
 import * as crypto from 'crypto'
 import { pipeline } from 'stream/promises'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
+import { SignatureV4 } from '@smithy/signature-v4'
+import { parseAtxTenantUrl } from '../../shared/atxTenantUrl'
+import { Sha256 } from '@aws-crypto/sha256-js'
 import AdmZip = require('adm-zip')
 import { ArtifactManager } from './artifactManager'
 import {
@@ -63,7 +66,10 @@ import {
     AtxDashboardRepo,
     AtxUploadCustomPlanRequest,
     AtxUploadCustomPlanResponse,
+    AtxValidateSessionResponse,
 } from './atxModels'
+import { classifyAtxSessionValidationError } from './atxSessionValidation'
+import { AtxErrorInfo, getAtxErrorInfo } from './atxErrorInfo'
 import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
 
@@ -255,6 +261,12 @@ export class ATXTransformHandler {
             const atxServiceManager = AtxTokenServiceManager.getInstance()
             const applicationUrl = atxServiceManager.getActiveApplicationUrl()
 
+            // IAM: the tenant URL comes from the client, so only a valid AWS Transform URL gives a region; no
+            // fallback to the default region.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                return parseAtxTenantUrl(applicationUrl)?.region
+            }
+
             if (applicationUrl) {
                 // Extract region from applicationURL: https://xxx.transform.REGION.on.aws
                 const urlMatch = applicationUrl.match(/\.transform(?:-gamma)?\.([^.]+)\.on\.aws/)
@@ -276,6 +288,20 @@ export class ATXTransformHandler {
     private async addAuthToCommand(command: any): Promise<void> {
         if (!this.serviceManager.isReady()) {
             throw new Error('Please select a valid Transform profile to continue')
+        }
+
+        const authType = this.serviceManager.getAuthType()
+
+        // IAM path: SigV4-sign the request. Additive branch; the bearer path below is unchanged.
+        if (authType === 'iam') {
+            await this.addSigV4AuthToCommand(command)
+            return
+        }
+
+        // No active auth (IAM credentials present but tenant URL not yet configured, or nothing
+        // signed in): fail before the request reaches the network.
+        if (authType !== 'bearer') {
+            throw new Error('AWS Transform is not signed in - no active authentication')
         }
 
         const bearerToken = await this.serviceManager.getBearerToken()
@@ -307,6 +333,72 @@ export class ATXTransformHandler {
             {
                 step: 'build',
                 name: 'addAtxAuthMiddleware',
+                priority: 'high',
+            }
+        )
+    }
+
+    /**
+     * SigV4-sign an ATX FES command using the active IAM credentials (service name `transform`).
+     * Region and the Origin header come from the tenant URL, which must be a valid AWS Transform URL
+     * (parseAtxTenantUrl); the request itself always goes to the region's FES endpoint.
+     */
+    private async addSigV4AuthToCommand(command: any): Promise<void> {
+        const iamCredentials = this.serviceManager.getIamCredentials()
+
+        // Never sign without a valid AWS Transform tenant URL: it gives the region and the Origin header.
+        const tenantUrl = parseAtxTenantUrl(await this.getActiveTransformProfileApplicationUrl())
+        if (!tenantUrl) {
+            throw new Error('ATX: No valid AWS Transform application URL for IAM (SigV4) auth')
+        }
+        const region = tenantUrl.region
+        const cleanOrigin = tenantUrl.origin
+
+        const signer = new SignatureV4({
+            service: 'transform',
+            region,
+            credentials: {
+                accessKeyId: iamCredentials.accessKeyId,
+                secretAccessKey: iamCredentials.secretAccessKey,
+                sessionToken: iamCredentials.sessionToken,
+            },
+            sha256: Sha256,
+        })
+
+        this.logging.log(`ATX: Using IAM (SigV4) auth for FES request (service=transform, region=${region})`)
+
+        command.middlewareStack?.add(
+            (next: any) => async (args: any) => {
+                if (!args.request.headers) {
+                    args.request.headers = {}
+                }
+
+                // Set headers case-insensitively (removing any existing case variant) BEFORE signing.
+                // The smithy client already sets a lowercase 'content-type'; a second differently-cased
+                // key would be signed but merged by the HTTP layer on send, invalidating the signature.
+                const setHeader = (name: string, value: string) => {
+                    for (const key of Object.keys(args.request.headers)) {
+                        if (key.toLowerCase() === name.toLowerCase()) {
+                            delete args.request.headers[key]
+                        }
+                    }
+                    args.request.headers[name] = value
+                }
+                setHeader('content-type', 'application/json; charset=UTF-8')
+                setHeader('content-encoding', 'amz-1.0')
+                if (cleanOrigin) {
+                    setHeader('origin', cleanOrigin)
+                }
+
+                // SignatureV4 adds Authorization, X-Amz-Date, and X-Amz-Security-Token (when a session
+                // token is present) over the canonical request.
+                args.request = await signer.sign(args.request)
+                return next(args)
+            },
+            {
+                // finalizeRequest so X-Amz-Target and the serialized body are present at signing time.
+                step: 'finalizeRequest',
+                name: 'addAtxSigV4Middleware',
                 priority: 'high',
             }
         )
@@ -363,14 +455,48 @@ export class ATXTransformHandler {
                 return false
             }
 
-            // Verify authentication details
-            await this.serviceManager.getBearerToken()
+            // Verify authentication details. Bearer validates the token; IAM validates the
+            // credentials in the iam slot. Both paths require the tenant (application) URL.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                this.serviceManager.getIamCredentials()
+            } else {
+                await this.serviceManager.getBearerToken()
+            }
             await this.getActiveTransformProfileApplicationUrl()
 
             return true
         } catch (error) {
             this.logging.error(`ATX: Session verification error: ${String(error)}`)
             return false
+        }
+    }
+
+    /**
+     * Confirms the active session works against FES with one read-only ListWorkspaces call (never the create path).
+     * Used by the client to validate IAM sign-in before reporting it connected. Failures are classified here, where
+     * the typed SDK error is available; only the reason, error name and HTTP status are returned and logged.
+     */
+    async validateSession(): Promise<AtxValidateSessionResponse> {
+        if (!(await this.verifySession())) {
+            this.logging.error('ATX: ValidateSession - session not ready (credentials or tenant URL missing)')
+            return { Valid: false, Reason: 'Other', ErrorCode: 'SessionNotReady' }
+        }
+
+        try {
+            const { ListWorkspacesCommand } = await import('@amazon/elastic-gumby-frontend-client')
+            const command = new ListWorkspacesCommand({ maxResults: 1 })
+            await this.addAuthToCommand(command)
+
+            await this.atxClient!.send(command)
+            this.logging.log('ATX: ValidateSession succeeded')
+            return { Valid: true }
+        } catch (error) {
+            const failure = classifyAtxSessionValidationError(error)
+            this.logging.error(
+                `ATX: ValidateSession failed - reason=${failure.Reason}, code=${failure.ErrorCode}, ` +
+                    `status=${failure.HttpStatus ?? 'none'}`
+            )
+            return { Valid: false, ...failure }
         }
     }
 
@@ -1422,7 +1548,15 @@ export class ATXTransformHandler {
         }
     }
 
-    async getJob(workspaceId: string, jobId: string, includeObjective: boolean = false): Promise<JobInfo | null> {
+    /**
+     * @param errorInfo When given, receives the error code and HTTP status if GetJob fails (the result is still null).
+     */
+    async getJob(
+        workspaceId: string,
+        jobId: string,
+        includeObjective: boolean = false,
+        errorInfo?: AtxErrorInfo
+    ): Promise<JobInfo | null> {
         try {
             this.logging.log(`ATX: Getting job: ${jobId} in workspace: ${workspaceId}`)
 
@@ -1444,6 +1578,9 @@ export class ATXTransformHandler {
             return response.job || null
         } catch (error) {
             this.logging.error(`ATX: GetJob error: ${String(error)}`)
+            if (errorInfo) {
+                Object.assign(errorInfo, getAtxErrorInfo(error))
+            }
             return null
         }
     }
@@ -1977,13 +2114,17 @@ export class ATXTransformHandler {
 
             // Check if we need to determine interactive mode from the job objective
             const needObjective = this.getCachedInteractiveMode(request.TransformationJobId) === null
-            const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective)
+            const getJobError: AtxErrorInfo = {}
+            const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective, getJobError)
 
             if (!job) {
                 this.logging.error(`ATX: Job not found: ${request.TransformationJobId}`)
+                // ErrorString stays JOB_NOT_FOUND for older IDEs; ErrorCode/StatusCode say why (e.g. AccessDenied).
                 return {
                     TransformationJob: null,
                     ErrorString: 'JOB_NOT_FOUND',
+                    ErrorCode: getJobError.errorCode,
+                    StatusCode: getJobError.statusCode,
                 } as unknown as AtxGetTransformInfoResponse
             }
 
