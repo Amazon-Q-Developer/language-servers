@@ -1,0 +1,1076 @@
+import { expect } from 'chai'
+import * as sinon from 'sinon'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import AdmZip = require('adm-zip')
+import { CategoryType, FileType } from '@amazon/elastic-gumby-frontend-client'
+import {
+    ATXTransformHandler,
+    ATX_HITL_TAG_INTEG_APP_LAUNCH,
+    ATX_HITL_TAG_INTEG_TEST_RUN,
+    isSafeRelativeProjectPath,
+    itGenProjectFolderName,
+} from '../atxTransformHandler'
+import { Utils, workspaceFolderName } from '../utils'
+import * as beamRepoFiles from '../beamRepoFiles'
+import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
+import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+
+const JOB_ID = 'job-itgen'
+const WS_ID = 'ws-itgen'
+
+const testRunRequest = (overrides: any = {}) => ({
+    schemaVersion: '1.0',
+    runId: 'r2',
+    side: 'original',
+    project: 'SampleWebApi',
+    artifactId: 'repo-artifact',
+    tests: { projectPath: 'GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj' },
+    limits: { projectTimeoutSeconds: 1800 },
+    ...overrides,
+})
+
+// What Utils.downloadAndExtractArchive leaves for a tests artifact: the test project, a root build file next
+// to it, and the downloaded ZIP.
+const fakeExtract = (saveToDir: string, exportName: string) => {
+    fs.mkdirSync(path.join(saveToDir, 'GeneratedApiTests.SampleWebApi'), { recursive: true })
+    fs.writeFileSync(
+        path.join(saveToDir, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj'),
+        '<Project/>'
+    )
+    fs.writeFileSync(path.join(saveToDir, 'Directory.Build.props'), '<Project/>')
+    fs.writeFileSync(path.join(saveToDir, exportName), 'zip')
+    return saveToDir
+}
+
+const testRunHitl = { taskId: 'task-run', tag: ATX_HITL_TAG_INTEG_TEST_RUN, planStepId: 'step-run' }
+const appLaunchHitl = { taskId: 'task-launch', tag: ATX_HITL_TAG_INTEG_APP_LAUNCH, planStepId: 'step-launch' }
+
+describe('ATXTransformHandler - ITGen test HITLs', () => {
+    let handler: ATXTransformHandler
+    let logging: Logging
+    let tmpRoot: string
+    let hitls: any[]
+    let jobStatus: string
+    let downloadJsonStub: sinon.SinonStub
+    let downloadUrlStub: sinon.SinonStub
+    let zipDownloadStub: sinon.SinonStub
+    let requestsByArtifact: Record<string, any>
+
+    const poll = () =>
+        handler.getTransformInfo({
+            TransformationJobId: JOB_ID,
+            WorkspaceId: WS_ID,
+            SolutionRootPath: tmpRoot,
+        } as any)
+
+    // ITGen runs only for a job whose objective has generate_integration_tests: true. The GetJob stub
+    // returns that objective; setItGen also updates the LS's per-job cache so a mid-test change is seen.
+    let itGenJob: boolean
+    const setItGen = (on: boolean) => {
+        itGenJob = on
+        ;(handler as any).itGenJobs.forget(JOB_ID)
+    }
+
+    beforeEach(() => {
+        itGenJob = true
+        tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-hitl-'))
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            logging,
+            {} as Runtime
+        )
+        sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
+        sinon.stub(handler as any, 'addAuthToCommand').resolves()
+        // Skip the interactive-mode lookups, which make their own ListHitlTasks calls.
+        ;(handler as any).interactiveModeByJob.set(JOB_ID, { mode: 'Interactive', source: 'test' })
+
+        hitls = []
+        jobStatus = 'EXECUTING'
+        // The real listHitls runs against this fake, so OpenHitls sees exactly what selection saw.
+        ;(handler as any).atxClient = {
+            send: sinon.stub().callsFake(async (command: any) => {
+                if (command.constructor.name === 'ListHitlTasksCommand') {
+                    return { hitlTasks: hitls }
+                }
+                throw new Error(`unexpected ${command.constructor.name}`)
+            }),
+        }
+        sinon.stub(handler, 'getJob').callsFake(
+            async () =>
+                ({
+                    statusDetails: { status: jobStatus },
+                    objective: JSON.stringify({ generate_integration_tests: itGenJob }),
+                }) as any
+        )
+        sinon.stub(handler, 'getTransformationPlan').resolves({ Root: { Children: [] } } as any)
+        sinon.stub(handler as any, 'listWorklogs').resolves(undefined)
+
+        requestsByArtifact = {
+            'art-run': testRunRequest(),
+            'art-launch': { schemaVersion: '1.0', side: 'transformed' },
+        }
+        downloadJsonStub = sinon
+            .stub(handler as any, 'downloadJsonArtifact')
+            .callsFake(async (...args: any[]) => requestsByArtifact[args[2]] ?? null)
+        // The tests artifact: the independent generated test project and a root build file next to it, plus
+        // the ZIP the real code leaves behind (contract decision 16: no application source).
+        downloadUrlStub = sinon
+            .stub(handler, 'createArtifactDownloadUrl')
+            .callsFake(async (...args: any[]) => ({ s3PresignedUrl: `url-${args[2]}`, requestHeaders: {} }))
+        zipDownloadStub = sinon
+            .stub(Utils, 'downloadAndExtractArchive')
+            .callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) =>
+                fakeExtract(saveToDir, exportName)
+            )
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(tmpRoot, { recursive: true, force: true })
+    })
+
+    describe('HITL selection order', () => {
+        it('picks integ-app-launch before integ-test-run', async () => {
+            hitls = [testRunHitl, appLaunchHitl]
+
+            const result = await poll()
+
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_APP_LAUNCH)
+            expect(result?.HitlTaskId).to.equal('task-launch')
+            expect(result?.StepInformation?.StepId).to.equal('step-launch')
+        })
+
+        it('keeps LBV and missing-packages ahead of the ITGen tags', async () => {
+            hitls = [testRunHitl, { taskId: 'task-lbv', tag: 'local-build-verification' }]
+            expect((await poll())?.HitlTag).to.equal('local-build-verification')
+
+            hitls = [testRunHitl, { taskId: 'task-pkg', tag: 'missing-packages' }]
+            expect((await poll())?.HitlTag).to.equal('missing-packages')
+        })
+
+        it('puts integ-test-run ahead of a post-LBV checkpoint only for a job with generate_integration_tests', async () => {
+            ;(handler as any).jobsPastLocalBuild.add(JOB_ID)
+            hitls = [{ taskId: 'task-cp', tag: `${JOB_ID}-checkpoint` }, testRunHitl]
+
+            expect((await poll())?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+
+            setItGen(false)
+            expect((await poll())?.HitlTag).to.equal(`${JOB_ID}-checkpoint`)
+        })
+
+        it('surfaces an ITGen HITL with its step on a PLANNING job, not as an unhandled tag', async () => {
+            jobStatus = 'PLANNING'
+            hitls = [testRunHitl]
+
+            const result = await poll()
+
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+            expect(result?.StepInformation?.StepId).to.equal('step-run')
+            expect((logging.warn as sinon.SinonStub).called).to.be.false
+        })
+
+        it('returns an ITGen HITL directly on an AWAITING_HUMAN_INPUT job, without a plan-ZIP download', async () => {
+            jobStatus = 'AWAITING_HUMAN_INPUT'
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const result = await poll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+            expect(result?.HitlTaskId).to.equal('task-run')
+            expect(result?.StepInformation?.StepId).to.equal('step-run')
+            // Only the tests artifact is extracted, never the request as a plan ZIP.
+            const zipNames = zipDownloadStub.getCalls().map(c => c.args[3])
+            expect(zipNames).to.not.include('transformation-plan-download.zip')
+        })
+    })
+
+    // A beamed repo: the job is the parent web job, whose objective never opts in; the repo's beam-map entry does.
+    // Sibling beamed repos in the same parent job have their own integ-* HITLs.
+    describe('beamed repo', () => {
+        const SCOPE = 'repo-a,repo-a-lv,step-launch,step-run'
+        const siblingLaunch = { taskId: 'task-sib', tag: ATX_HITL_TAG_INTEG_APP_LAUNCH, planStepId: 'repo-b-launch' }
+        let beamMapStub: sinon.SinonStub
+        let beamOptIn: boolean
+        // The beam-map read finishes only when a test releases it, like a real scan that takes a while.
+        let releaseBeamMap: () => void
+        let beamMapRead: Promise<void>
+
+        const manifestWritten = () => Promise.all([...(handler as any).beamManifestWrites.values()])
+        const beamPoll = (scope = SCOPE) =>
+            handler.getTransformInfo({
+                TransformationJobId: JOB_ID,
+                WorkspaceId: WS_ID,
+                SolutionRootPath: tmpRoot,
+                IsBeam: true,
+                beamScopeStepIds: scope,
+            } as any)
+
+        beforeEach(() => {
+            setItGen(false)
+            beamOptIn = true
+            beamMapRead = new Promise<void>(resolve => (releaseBeamMap = resolve))
+            // The gate's beam-map reader: true when a beam-map entry has generateIntegrationTests: true.
+            beamMapStub = sinon.stub(handler as any, 'readBeamOptIn').callsFake(async () => {
+                await beamMapRead
+                return beamOptIn
+            })
+        })
+
+        it("turns ITGen on from the repo's beam-map opt-in, without the objective, from the next poll", async () => {
+            hitls = [appLaunchHitl]
+
+            // The poll doesn't wait for the beam-map read.
+            const first = await beamPoll()
+            expect(first?.OpenHitls).to.be.undefined
+            releaseBeamMap()
+            await beamMapRead
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_APP_LAUNCH)
+            expect(result?.HitlTaskId).to.equal('task-launch')
+            expect(beamMapStub.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+            expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-launch'])
+        })
+
+        it("never surfaces or lists a sibling repo's integ-* HITL", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [siblingLaunch, testRunHitl]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTaskId).to.equal('task-run')
+            expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
+        })
+
+        for (const status of ['PLANNING', 'AWAITING_HUMAN_INPUT']) {
+            it(`never surfaces a sibling repo's integ-* HITL on a ${status} job`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch, testRunHitl]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.equal('task-run')
+                expect(result?.OpenHitls?.map(h => h.TaskId)).to.deep.equal(['task-run'])
+            })
+
+            it(`surfaces nothing on a ${status} job when only a sibling repo's integ-* HITL is open`, async () => {
+                ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+                jobStatus = status
+                hitls = [siblingLaunch]
+
+                const result = await beamPoll()
+
+                expect(result?.HitlTaskId).to.be.undefined
+                expect(result?.OpenHitls).to.deep.equal([])
+            })
+        }
+
+        it("surfaces nothing when only a sibling repo's integ-* HITL is open", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [siblingLaunch]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(result?.OpenHitls).to.deep.equal([])
+        })
+
+        it("doesn't count a sibling's integ-* HITL next to sibling LBVs as in scope", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            hitls = [
+                { taskId: 'task-sib-lbv', tag: 'local-build-verification', planStepId: 'repo-b-lbv' },
+                siblingLaunch,
+            ]
+
+            const result = await beamPoll()
+
+            expect(result?.HitlTaskId).to.be.undefined
+        })
+
+        it("keeps ITGen off when the beam-map doesn't opt in, and doesn't re-read it every poll", async () => {
+            beamOptIn = false
+            releaseBeamMap()
+            hitls = [appLaunchHitl]
+
+            const first = await beamPoll()
+            await beamMapRead
+            await beamPoll()
+
+            // OpenHitls is ITGen-only; with ITGen off the integ-* tag is just an unknown tag, as before.
+            expect(first?.OpenHitls).to.be.undefined
+            expect(beamMapStub.calledOnce).to.be.true
+        })
+
+        it('never delays a poll for a beam-map read that is still running', async () => {
+            hitls = [appLaunchHitl]
+
+            // beamMapRead is never released here: the poll must still come back.
+            const result = await beamPoll()
+
+            expect(result).to.not.be.null
+            expect(beamMapStub.calledOnce).to.be.true
+        })
+
+        it('surfaces no integ-* HITL while the gate is still unknown, e.g. right after an LS restart', async () => {
+            hitls = [appLaunchHitl]
+
+            // The beam-map read is still running (not released)
+            const result = await beamPoll()
+
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl-artifact-integ-app-launch'))).to
+                .be.false
+        })
+
+        it("writes the customer-changes manifest for a loaded beamed repo, and doesn't rewrite it", async () => {
+            fs.mkdirSync(path.join(tmpRoot, 'Web', 'bin'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'), 'bin')
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+
+            await beamPoll()
+            await manifestWritten()
+
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+            expect(manifest.sourceFiles).to.include(path.join(tmpRoot, 'Web', 'Program.cs'))
+            expect(manifest.sourceFiles).to.not.include(path.join(tmpRoot, 'Web', 'bin', 'Web.dll'))
+            expect(manifest.sourceFiles.some((f: string) => f.includes(workspaceFolderName))).to.be.false
+            expect(manifest.lastAppliedTimestamp).to.be.a('number')
+
+            fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, sourceFiles: ['kept'] }))
+            await beamPoll()
+            await manifestWritten()
+            expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles).to.deep.equal(['kept'])
+        })
+
+        it("sends a file the customer edited after Load with the transformed side's results", async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            const edited = path.join(tmpRoot, 'Web', 'appsettings.json')
+            fs.writeFileSync(edited, '{}')
+            await beamPoll()
+            await manifestWritten()
+            fs.writeFileSync(edited, '{ "edited": true }')
+            const later = new Date(Date.now() + 60_000)
+            fs.utimesSync(edited, later, later)
+            const uploadStub = sinon.stub(Utils, 'uploadArtifact').resolves(true)
+            sinon
+                .stub(handler, 'createArtifactUploadUrl')
+                .resolves({ uploadUrl: 'u', uploadId: 'up-1', requestHeaders: {} } as any)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true })
+            sinon.stub(handler, 'submitHitl').resolves({ status: 'SUBMITTED' } as any)
+            const zipPath = path.join(tmpRoot, 'launch.zip')
+            const zip = new AdmZip()
+            zip.addFile(
+                'launch-result.json',
+                Buffer.from(
+                    JSON.stringify({ schemaVersion: '1.1', side: 'transformed', status: 'APP_NOT_STARTED', attempt: 2 })
+                )
+            )
+            zip.writeZip(zipPath)
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', zipPath, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            const uploaded = new AdmZip(uploadStub.firstCall.args[1])
+            expect(
+                JSON.parse(uploaded.getEntry('workspace/metadata.json')!.getData().toString()).filesUpdated
+            ).to.deep.equal([path.join('Web', 'appsettings.json')])
+        })
+
+        // The downlink applies a beamed repo's post-beam steps whether or not it opts in to ITGen, so every loaded
+        // repo gets the baseline its user-edit protection needs. In a multi-repo beam the gate is job-wide.
+        it("writes the manifest for a beamed repo that doesn't opt in too", async () => {
+            beamOptIn = false
+            releaseBeamMap()
+            await beamPoll()
+            await beamMapRead
+            await manifestWritten()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.true
+        })
+
+        it('writes no manifest without the loaded repo (beam discovery has no scope)', async () => {
+            await beamPoll('')
+            await manifestWritten()
+
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')))
+                .to.be.false
+        })
+
+        // The walk runs in the background, but an apply in the same poll waits for it: otherwise a folder the apply
+        // adds (the generated unit-test project) can land after the walk passed it and before the manifest exists, and
+        // updateSourceFilesManifest, finding no manifest, never tracks it.
+        it('tracks the files an apply adds while the manifest is still being written', async () => {
+            fs.mkdirSync(path.join(tmpRoot, 'Web'), { recursive: true })
+            fs.writeFileSync(path.join(tmpRoot, 'Web', 'Program.cs'), 'class P {}')
+            let releaseWalk!: () => void
+            const walkHeld = new Promise<void>(resolve => (releaseWalk = resolve))
+            const list = beamRepoFiles.listBeamRepoFiles
+            sinon.stub(beamRepoFiles, 'listBeamRepoFiles').callsFake(async (...args) => {
+                const listed = await list(...args)
+                await walkHeld
+                return listed
+            })
+            const checkpoint = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'ut')
+            fs.mkdirSync(path.join(checkpoint, 'after', 'Web.Tests'), { recursive: true })
+            fs.writeFileSync(path.join(checkpoint, 'after', 'Web.Tests', 'T.cs'), 'class T {}')
+            fs.writeFileSync(
+                path.join(checkpoint, 'metadata.json'),
+                JSON.stringify({ filesAdded: [path.join('Web.Tests', 'T.cs')] })
+            )
+            await beamPoll()
+
+            const applying = (handler as any).applyChanges(checkpoint, tmpRoot, JOB_ID)
+            await new Promise(resolve => setTimeout(resolve, 50))
+            expect(fs.existsSync(path.join(tmpRoot, 'Web.Tests', 'T.cs')), 'the apply waits for the baseline').to.be
+                .false
+            releaseWalk()
+            const applied = await applying
+            ;(handler as any).updateSourceFilesManifest(tmpRoot, JOB_ID, applied.addedFiles)
+
+            const manifestPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints', 'source-files.json')
+            const sourceFiles: string[] = JSON.parse(fs.readFileSync(manifestPath, 'utf8')).sourceFiles
+            expect(sourceFiles.map(f => path.resolve(tmpRoot, f))).to.include.members([
+                path.join(tmpRoot, 'Web', 'Program.cs'),
+                path.join(tmpRoot, 'Web.Tests', 'T.cs'),
+            ])
+        })
+
+        it('never reads the beam-map for a job that is not beamed', async () => {
+            hitls = [appLaunchHitl]
+
+            await poll()
+
+            expect(beamMapStub.called).to.be.false
+        })
+    })
+
+    // For a job without generate_integration_tests an integ-* tag is just an unknown tag: every path must behave exactly as it
+    // did before ITGen, and nothing ITGen-specific (request.json, tests download) may happen.
+    describe('job without generate_integration_tests: existing behavior unchanged', () => {
+        beforeEach(() => {
+            setItGen(false)
+        })
+
+        const noItGenFiles = () => {
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl'))).to.be.false
+            expect(fs.existsSync(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen'))).to.be.false
+            expect(downloadJsonStub.called).to.be.false
+        }
+
+        it('EXECUTING: an integ-* HITL is surfaced by the generic first-in-list rule, without OpenHitls', async () => {
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const result = await poll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+            expect(result?.OpenHitls).to.be.undefined
+            expect(zipDownloadStub.called).to.be.false
+            noItGenFiles()
+        })
+
+        it('PLANNING: an integ-* HITL goes down the defensive unhandled-tag path, as before', async () => {
+            jobStatus = 'PLANNING'
+            hitls = [testRunHitl]
+
+            const result = await poll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+            expect(result?.StepInformation).to.be.undefined
+            expect((logging.warn as sinon.SinonStub).calledWithMatch(/unhandled HITL tag/)).to.be.true
+            noItGenFiles()
+        })
+
+        it('AWAITING_HUMAN_INPUT: an integ-* HITL still takes the old agent-artifact ZIP path', async () => {
+            jobStatus = 'AWAITING_HUMAN_INPUT'
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const result = await poll()
+
+            expect(result?.HitlTag).to.equal(ATX_HITL_TAG_INTEG_TEST_RUN)
+            expect(result?.OpenHitls).to.be.undefined
+            const zipNames = zipDownloadStub.getCalls().map(c => c.args[3])
+            expect(zipNames).to.include('transformation-plan-download.zip')
+            expect(zipNames).to.not.include('tests-artifact.zip')
+            noItGenFiles()
+        })
+    })
+
+    describe('OpenHitls', () => {
+        it('lists every open HITL, with the downloaded request for ITGen ones', async () => {
+            const expiry = new Date('2026-10-20T19:30:00Z')
+            hitls = [
+                { ...testRunHitl, agentArtifact: { artifactId: 'art-run' }, expiredAt: expiry },
+                { taskId: 'task-cp', tag: `${JOB_ID}-checkpoint` },
+            ]
+
+            const result = await poll()
+
+            const expectedPath = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'hitl', 'task-run', 'request.json')
+            const expectedTests = path.join(
+                tmpRoot,
+                workspaceFolderName,
+                JOB_ID,
+                'itgen',
+                'SampleWebApi',
+                'r2',
+                'tests'
+            )
+            expect(result?.OpenHitls).to.deep.equal([
+                {
+                    TaskId: 'task-run',
+                    Tag: ATX_HITL_TAG_INTEG_TEST_RUN,
+                    StepId: 'step-run',
+                    ExpiryTimestampUTC: '2026-10-20T19:30:00.000Z',
+                    RequestPath: expectedPath,
+                    TestsPath: expectedTests,
+                },
+                { TaskId: 'task-cp', Tag: `${JOB_ID}-checkpoint` },
+            ])
+            expect(JSON.parse(fs.readFileSync(expectedPath, 'utf-8'))).to.deep.equal(testRunRequest())
+            // The repo artifact named in the request, extracted with its ZIP removed.
+            expect(downloadUrlStub.firstCall.args[2]).to.equal('repo-artifact')
+            expect(
+                fs.existsSync(
+                    path.join(expectedTests, 'GeneratedApiTests.SampleWebApi', 'GeneratedApiTests.SampleWebApi.csproj')
+                )
+            ).to.be.true
+            expect(fs.existsSync(path.join(expectedTests, 'tests-artifact.zip'))).to.be.false
+            // The whole artifact is kept in its own layout, including files next to the test project.
+            expect(fs.readdirSync(expectedTests).sort()).to.deep.equal([
+                'Directory.Build.props',
+                'GeneratedApiTests.SampleWebApi',
+            ])
+            expect((logging.warn as sinon.SinonStub).called).to.be.false
+        })
+
+        it('warns when tests.projectPath is not in the artifact', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ tests: { projectPath: 'Other/Other.csproj' } })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.TestsPath).to.not.be.undefined
+            expect((logging.warn as sinon.SinonStub).calledWithMatch(/Other\/Other.csproj isn't in tests artifact/)).to
+                .be.true
+        })
+
+        it('refuses a tests.projectPath that is rooted or climbs out of the artifact', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ tests: { projectPath: '../outside/Evil.csproj' } })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.TestsPath).to.be.undefined
+            expect(open.RequestError).to.contain('Unsafe integ-test-run tests.projectPath')
+            expect(zipDownloadStub.called).to.be.false
+        })
+
+        it('removes the tests of earlier runs of the same project, and only those', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
+            const adminItgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi.Admin')
+            requestsByArtifact['art-run'] = testRunRequest({ runId: 'r1' })
+            requestsByArtifact['art-admin'] = testRunRequest({ runId: 'r5', project: 'SampleWebApi.Admin' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+            await poll()
+            hitls = [{ ...testRunHitl, taskId: 'task-admin', agentArtifact: { artifactId: 'art-admin' } }]
+            await poll()
+            // The IDE's result ZIP for r1 sits next to its tests.
+            fs.writeFileSync(path.join(itgen, 'r1', 'results.zip'), 'zip')
+
+            requestsByArtifact['art-run-2'] = testRunRequest({ runId: 'r2' })
+            hitls = [{ ...testRunHitl, taskId: 'task-run-2', agentArtifact: { artifactId: 'art-run-2' } }]
+            await poll()
+
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.false
+            expect(fs.existsSync(path.join(itgen, 'r1', 'results.zip'))).to.be.true
+            expect(fs.existsSync(path.join(adminItgen, 'r5', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
+        })
+
+        it('keeps the tests of two projects whose runs have the same id apart', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            requestsByArtifact['art-run'] = testRunRequest({ runId: 'r1' })
+            requestsByArtifact['art-admin'] = testRunRequest({ runId: 'r1', project: 'SampleWebApi.Admin' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+            const first = await poll()
+            hitls = [{ ...testRunHitl, taskId: 'task-admin', agentArtifact: { artifactId: 'art-admin' } }]
+            const second = await poll()
+
+            expect(first!.OpenHitls![0].TestsPath).to.equal(path.join(itgen, 'SampleWebApi', 'r1', 'tests'))
+            expect(second!.OpenHitls![0].TestsPath).to.equal(path.join(itgen, 'SampleWebApi.Admin', 'r1', 'tests'))
+            expect(fs.existsSync(path.join(itgen, 'SampleWebApi', 'r1', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'SampleWebApi.Admin', 'r1', 'tests'))).to.be.true
+        })
+
+        it('gives a project whose name is not a plain folder name a safe folder of its own', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            for (const [artifact, project] of [
+                ['art-space', 'Contoso Web'],
+                ['art-climb', '../SampleWebApi'],
+            ]) {
+                requestsByArtifact[artifact] = testRunRequest({ project })
+                hitls = [{ ...testRunHitl, taskId: `task-${artifact}`, agentArtifact: { artifactId: artifact } }]
+
+                const open = (await poll())!.OpenHitls![0]
+
+                expect(open.RequestError).to.be.undefined
+                const folder = path.relative(itgen, open.TestsPath!).split(path.sep)[0]
+                expect(folder).to.equal(itGenProjectFolderName(project))
+                expect(folder).to.match(/^[A-Za-z0-9][A-Za-z0-9._-]*-[0-9a-f]{8}$/)
+            }
+        })
+
+        it('treats an empty project as no project', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ project: '' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const open = (await poll())!.OpenHitls![0]
+
+            expect(open.TestsPath).to.equal(path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'r2', 'tests'))
+        })
+
+        it('keeps plain project names, and tells apart names that look alike once made safe', () => {
+            expect(itGenProjectFolderName('SampleWebApi.Admin')).to.equal('SampleWebApi.Admin')
+            expect(itGenProjectFolderName(undefined)).to.be.undefined
+            expect(itGenProjectFolderName('  ')).to.be.undefined
+            expect(itGenProjectFolderName('Contoso Web')).to.not.equal(itGenProjectFolderName('Contoso_Web '))
+            expect(itGenProjectFolderName('Shared.')).to.match(/^Shared-[0-9a-f]{8}$/)
+            expect(itGenProjectFolderName('CON')).to.match(/^CON-[0-9a-f]{8}$/)
+        })
+
+        it('downloads once when overlapping polls ask for the same task', async () => {
+            let release!: () => void
+            const gate = new Promise<void>(resolve => (release = resolve))
+            zipDownloadStub.callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
+                await gate
+                return fakeExtract(saveToDir, exportName)
+            })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const first = poll()
+            const second = poll()
+            await new Promise(resolve => setTimeout(resolve, 20))
+            release()
+            const [a, b] = await Promise.all([first, second])
+
+            expect(zipDownloadStub.callCount).to.equal(1)
+            expect(a!.OpenHitls![0].TestsPath).to.equal(b!.OpenHitls![0].TestsPath)
+        })
+
+        it('does not let a run that finishes late collect a newer run', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
+            let releaseR1!: () => void
+            const r1Gate = new Promise<void>(resolve => (releaseR1 = resolve))
+            zipDownloadStub.callsFake(async (_url: string, _headers: any, saveToDir: string, exportName: string) => {
+                if (saveToDir.includes(`${path.sep}r1${path.sep}`)) {
+                    await r1Gate
+                }
+                return fakeExtract(saveToDir, exportName)
+            })
+            const download = (taskId: string, runId: string) =>
+                (handler as any).downloadItGenTests(WS_ID, JOB_ID, tmpRoot, taskId, testRunRequest({ runId }))
+
+            const r1 = download('task-r1', 'r1')
+            await new Promise(resolve => setTimeout(resolve, 10))
+            await download('task-r2', 'r2')
+            releaseR1()
+            await r1
+
+            expect(fs.existsSync(path.join(itgen, 'r2', 'tests'))).to.be.true
+        })
+
+        it('never collects runs whose request has no side or project', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen')
+            const download = (taskId: string, runId: string, overrides: any) =>
+                (handler as any).downloadItGenTests(
+                    WS_ID,
+                    JOB_ID,
+                    tmpRoot,
+                    taskId,
+                    testRunRequest({ runId, ...overrides })
+                )
+
+            await download('task-r1', 'r1', { side: undefined, project: undefined })
+            await download('task-r2', 'r2', { side: undefined, project: undefined })
+
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.true
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests.project'))).to.be.false
+        })
+
+        it('backfills the project marker when it reuses tests downloaded before markers existed', async () => {
+            const itgen = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi')
+            // The layout before tests.project: tests/ and tests.task only.
+            fs.mkdirSync(path.join(itgen, 'r1', 'tests'), { recursive: true })
+            fs.writeFileSync(path.join(itgen, 'r1', 'tests.task'), 'task-r1')
+
+            await (handler as any).downloadItGenTests(
+                WS_ID,
+                JOB_ID,
+                tmpRoot,
+                'task-r1',
+                testRunRequest({ runId: 'r1' })
+            )
+            await (handler as any).downloadItGenTests(
+                WS_ID,
+                JOB_ID,
+                tmpRoot,
+                'task-r2',
+                testRunRequest({ runId: 'r2' })
+            )
+
+            expect(zipDownloadStub.callCount).to.equal(1)
+            expect(fs.readFileSync(path.join(itgen, 'r1', 'tests.project'), 'utf-8')).to.equal('original|SampleWebApi')
+            expect(fs.existsSync(path.join(itgen, 'r1', 'tests'))).to.be.false
+        })
+
+        it('downloads a task request and its tests once and reuses ListHitls (one call per poll)', async () => {
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            await poll()
+            await poll()
+
+            expect(downloadJsonStub.callCount).to.equal(1)
+            expect(zipDownloadStub.callCount).to.equal(1)
+            const send = (handler as any).atxClient.send as sinon.SinonStub
+            expect(send.callCount).to.equal(2)
+        })
+
+        it('downloads the tests again for a new test-run task, since the artifact is rewritten under the same id', async () => {
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+            await poll()
+
+            // The agent fixed the tests and opened a new run with a new task (same artifact id).
+            requestsByArtifact['art-run-2'] = testRunRequest({ runId: 'r3' })
+            hitls = [{ ...testRunHitl, taskId: 'task-run-2', agentArtifact: { artifactId: 'art-run-2' } }]
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(zipDownloadStub.callCount).to.equal(2)
+            expect(downloadUrlStub.secondCall.args[2]).to.equal('repo-artifact')
+            expect(open.TestsPath).to.equal(
+                path.join(tmpRoot, workspaceFolderName, JOB_ID, 'itgen', 'SampleWebApi', 'r3', 'tests')
+            )
+        })
+
+        it('does not download tests for an app launch', async () => {
+            hitls = [{ ...appLaunchHitl, agentArtifact: { artifactId: 'art-launch' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.RequestPath).to.not.be.undefined
+            expect(open.TestsPath).to.be.undefined
+            expect(zipDownloadStub.called).to.be.false
+        })
+
+        it('refuses a runId or task id that could leave the job folder', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ runId: '..\\..\\evil' })
+            hitls = [
+                { ...testRunHitl, agentArtifact: { artifactId: 'art-run' } },
+                { ...appLaunchHitl, taskId: '../task', agentArtifact: { artifactId: 'art-launch' } },
+            ]
+
+            const [run, launch] = (await poll())!.OpenHitls!
+
+            expect(run.TestsPath).to.be.undefined
+            expect(run.RequestError).to.contain('Unsafe integ-test-run runId')
+            expect(launch.RequestPath).to.be.undefined
+            expect(launch.RequestError).to.contain('Unsafe task id')
+            expect(zipDownloadStub.called).to.be.false
+        })
+
+        it('reports a tests artifact that cannot be downloaded', async () => {
+            downloadUrlStub.resolves(null)
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.RequestPath).to.not.be.undefined
+            expect(open.TestsPath).to.be.undefined
+            expect(open.RequestError).to.contain('Could not download the tests artifact repo-artifact')
+        })
+
+        it('rejects a request whose schemaVersion major is not 1', async () => {
+            requestsByArtifact['art-run'] = testRunRequest({ schemaVersion: '2.0' })
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.RequestPath).to.be.undefined
+            expect(open.RequestError).to.contain('schemaVersion: 2.0')
+        })
+
+        it('reports an ITGen HITL without an agent artifact', async () => {
+            hitls = [appLaunchHitl]
+
+            const [open] = (await poll())!.OpenHitls!
+
+            expect(open.RequestPath).to.be.undefined
+            expect(open.RequestError).to.contain('no agent artifact')
+        })
+
+        it('is absent for a job without generate_integration_tests', async () => {
+            setItGen(false)
+            hitls = [{ ...testRunHitl, agentArtifact: { artifactId: 'art-run' } }]
+
+            const result = await poll()
+
+            expect(result?.OpenHitls).to.be.undefined
+            expect(downloadJsonStub.called).to.be.false
+        })
+
+        it('is absent for terminal job statuses, which do not list HITLs', async () => {
+            jobStatus = 'STOPPED'
+            hitls = [testRunHitl]
+
+            expect((await poll())?.OpenHitls).to.be.undefined
+        })
+    })
+
+    describe('completeHitlWithTestResults', () => {
+        let uploadUrlStub: sinon.SinonStub
+        let uploadStub: sinon.SinonStub
+        let submitStub: sinon.SinonStub
+
+        const writeZip = (rel: string, entries: Record<string, string>) => {
+            const zip = new AdmZip()
+            for (const [name, content] of Object.entries(entries)) {
+                zip.addFile(name, Buffer.from(content))
+            }
+            const full = path.join(tmpRoot, rel)
+            fs.mkdirSync(path.dirname(full), { recursive: true })
+            zip.writeZip(full)
+            return full
+        }
+        const summary = (schemaVersion = '1.0') => JSON.stringify({ schemaVersion, runId: 'r2', status: 'COMPLETED' })
+
+        beforeEach(() => {
+            uploadUrlStub = sinon
+                .stub(handler, 'createArtifactUploadUrl')
+                .resolves({ uploadUrl: 'u', uploadId: 'upload-1', requestHeaders: {} } as any)
+            uploadStub = sinon.stub(Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true })
+            submitStub = sinon.stub(handler, 'submitHitl').resolves({ status: 'SUBMITTED' } as any)
+        })
+
+        it('uploads the ZIP as HITL_FROM_USER and submits the task by ID', async () => {
+            const rel = path.join(workspaceFolderName, JOB_ID, 'itgen', 'r2', 'results.zip')
+            const full = writeZip(rel, { 'summary.json': summary(), 'trx/SampleWebApi/r2.trx': '<TestRun/>' })
+
+            // Relative to SolutionRootPath, as in the contract example.
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', rel, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            expect(uploadUrlStub.firstCall.args).to.deep.equal([
+                WS_ID,
+                JOB_ID,
+                full,
+                CategoryType.HITL_FROM_USER,
+                FileType.ZIP,
+            ])
+            expect(uploadStub.firstCall.args[1]).to.equal(full)
+            expect(submitStub.firstCall.args).to.deep.equal([WS_ID, JOB_ID, 'task-run', 'upload-1'])
+        })
+
+        it("accepts a beamed repo's results right after an LS restart, from its beam-map opt-in", async () => {
+            setItGen(false)
+            const readBeamOptIn = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
+            const full = writeZip('results.zip', { 'summary.json': summary() })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            expect(readBeamOptIn.calledOnceWith(WS_ID, JOB_ID)).to.be.true
+        })
+
+        it('refuses for a job without generate_integration_tests', async () => {
+            setItGen(false)
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
+            const full = writeZip('results.zip', { 'summary.json': summary() })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.contain('requires a job with generate_integration_tests')
+            expect(uploadUrlStub.called).to.be.false
+        })
+
+        it('refuses a missing ZIP', async () => {
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', 'nope.zip', tmpRoot)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.contain('Result ZIP not found')
+        })
+
+        describe('customer changes (workspace/) on the transformed side', () => {
+            // The updateWorkspace manifest: tracked files, and the job start as the baseline.
+            const seedManifest = (files: Record<string, string>, jobStartMsAgo = 60_000) => {
+                const checkpoints = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
+                fs.mkdirSync(checkpoints, { recursive: true })
+                const absolute = Object.keys(files).map(rel => path.join(tmpRoot, rel))
+                for (const [rel, content] of Object.entries(files)) {
+                    fs.mkdirSync(path.dirname(path.join(tmpRoot, rel)), { recursive: true })
+                    fs.writeFileSync(path.join(tmpRoot, rel), content)
+                }
+                fs.writeFileSync(
+                    path.join(checkpoints, 'source-files.json'),
+                    JSON.stringify({
+                        createdAt: new Date(Date.now() - jobStartMsAgo).toISOString(),
+                        sourceFiles: absolute,
+                    })
+                )
+            }
+            const uploaded = () => new AdmZip(uploadStub.firstCall.args[1])
+            const launchResult = (side: string) =>
+                JSON.stringify({ schemaVersion: '1.1', side, status: 'APP_NOT_STARTED', attempt: 2 })
+
+            it('adds the files the customer changed since job start, in the updateWorkspace format', async () => {
+                seedManifest({ 'Web/appsettings.json': '{ "fixed": true }' })
+                const full = writeZip('launch.zip', {
+                    'launch-result.json': launchResult('transformed'),
+                    'app-startup.log': 'boom',
+                })
+
+                const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(result).to.deep.equal({ Success: true })
+                expect(uploadStub.firstCall.args[1]).to.equal(full.replace(/\.zip$/, '.with-workspace.zip'))
+                const zip = uploaded()
+                expect(JSON.parse(zip.getEntry('workspace/metadata.json')!.getData().toString())).to.deep.equal({
+                    filesUpdated: [path.join('Web', 'appsettings.json')],
+                })
+                expect(zip.getEntry('workspace/Web/appsettings.json')!.getData().toString()).to.equal(
+                    '{ "fixed": true }'
+                )
+                // The IDE's own entries are kept, and its ZIP isn't modified.
+                expect(zip.getEntry('app-startup.log')).to.not.be.null
+                expect(new AdmZip(full).getEntry('workspace/metadata.json')).to.be.null
+            })
+
+            it('adds them to transformed-side test-run results too', async () => {
+                seedManifest({ 'Web/Controllers/BookController.cs': '// customer edit between runs' })
+                const summaryJson = JSON.stringify({ schemaVersion: '1.1', side: 'transformed', status: 'COMPLETED' })
+                const full = writeZip('results.zip', { 'summary.json': summaryJson })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+                expect(uploaded().getEntry('workspace/Web/Controllers/BookController.cs')).to.not.be.null
+            })
+
+            it('sends an empty filesUpdated when nothing changed', async () => {
+                const full = writeZip('launch.zip', { 'launch-result.json': launchResult('transformed') })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                const metadata = uploaded().getEntry('workspace/metadata.json')!.getData().toString()
+                expect(JSON.parse(metadata)).to.deep.equal({ filesUpdated: [] })
+            })
+
+            it('sends nothing back on the original side', async () => {
+                seedManifest({ 'Web/appsettings.json': '{}' })
+                const full = writeZip('launch.zip', { 'launch-result.json': launchResult('original') })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(uploadStub.firstCall.args[1]).to.equal(full)
+                expect(uploaded().getEntry('workspace/metadata.json')).to.be.null
+            })
+
+            it('keeps a workspace/ the IDE already added', async () => {
+                seedManifest({ 'Web/appsettings.json': '{}' })
+                const full = writeZip('launch.zip', {
+                    'launch-result.json': launchResult('transformed'),
+                    'workspace/metadata.json': JSON.stringify({ filesUpdated: [] }),
+                })
+
+                await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+                expect(uploadStub.firstCall.args[1]).to.equal(full)
+            })
+        })
+
+        it('accepts an app-launch result ZIP (launch-result.json + startup log)', async () => {
+            const launchResult = JSON.stringify({ schemaVersion: '1.0', status: 'APP_NOT_STARTED', attempt: 1 })
+            const full = writeZip('launch.zip', { 'launch-result.json': launchResult, 'app-startup.log': 'boom' })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: true })
+            expect(submitStub.firstCall.args[2]).to.equal('task-launch')
+        })
+
+        it('refuses a launch-result.json with an unsupported schemaVersion', async () => {
+            const full = writeZip('launch.zip', { 'launch-result.json': JSON.stringify({ schemaVersion: '2.1' }) })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-launch', full, tmpRoot)
+
+            expect(result.Error).to.equal('Unsupported launch-result.json schemaVersion: 2.1')
+            expect(uploadUrlStub.called).to.be.false
+        })
+
+        it('refuses a ZIP with neither result file, before uploading', async () => {
+            const full = writeZip('results.zip', { 'trx/SampleWebApi/r2.trx': '<TestRun/>' })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result.Error).to.contain('neither summary.json nor launch-result.json')
+            expect(uploadUrlStub.called).to.be.false
+        })
+
+        it('refuses a summary.json with an unsupported schemaVersion', async () => {
+            const full = writeZip('results.zip', { 'summary.json': summary('2.0') })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result.Error).to.contain('schemaVersion: 2.0')
+            expect(uploadUrlStub.called).to.be.false
+        })
+
+        it('reports a failed submit', async () => {
+            submitStub.resolves(null)
+            const full = writeZip('results.zip', { 'summary.json': summary() })
+
+            const result = await handler.completeHitlWithTestResults(WS_ID, JOB_ID, 'task-run', full, tmpRoot)
+
+            expect(result).to.deep.equal({ Success: false, Error: 'Failed to submit HITL task' })
+        })
+    })
+
+    describe('isSafeRelativeProjectPath', () => {
+        it('accepts relative paths inside the artifact', () => {
+            for (const good of [
+                'GeneratedApiTests.SampleWebApi/GeneratedApiTests.SampleWebApi.csproj',
+                'tests\\Api\\Api.csproj',
+                './Api/Api.csproj',
+                'Api.csproj',
+            ]) {
+                expect(isSafeRelativeProjectPath(good), good).to.be.true
+            }
+        })
+
+        it('refuses missing, rooted and climbing paths', () => {
+            for (const bad of [
+                undefined,
+                '',
+                '   ',
+                '/abs/Api.csproj',
+                'C:\\x\\Api.csproj',
+                'a/../../Api.csproj',
+                42,
+            ]) {
+                expect(isSafeRelativeProjectPath(bad), String(bad)).to.be.false
+            }
+        })
+    })
+})
