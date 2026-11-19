@@ -1,5 +1,11 @@
-import { sanitize } from '@aws/lsp-core/out/util/path'
-import { CommandValidation, InvokeOutput, requiresPathAcceptance, validatePath } from './toolShared'
+import { CheckedTarget, readCheckedFile } from './checkedFileIo'
+import {
+    ApprovedLinkedFiles,
+    CommandValidation,
+    InvokeOutput,
+    requiresPathAcceptance,
+    validatePath,
+} from './toolShared'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { FSREAD_MAX_PER_FILE, FSREAD_MAX_TOTAL } from '../constants/constants'
 
@@ -34,41 +40,77 @@ export class FsRead {
         this.maxTotal = maxTotal ?? FsRead.maxResponseSizeTotal
     }
 
-    public async validate(params: FsReadParams): Promise<void> {
-        for (const path of params.paths) {
-            await validatePath(path, this.workspace.fs.exists)
+    /**
+     * `targetPaths` are the canonical paths the approval check evaluated for
+     * `params.paths`, in the same order; `params.paths` are never resolved here.
+     */
+    public async validate(params: FsReadParams, targets: readonly CheckedTarget[]): Promise<void> {
+        for (const [index, target] of targets.entries()) {
+            if (target.state === 'unverified') await validatePath(target.path, this.workspace.fs.exists)
+            if (target.state === 'missing') throw new Error(`File "${params.paths[index]}" does not exist.`)
         }
     }
 
     public async requiresAcceptance(
         params: FsReadParams,
-        approvedPaths?: Map<string, Set<string>>
+        approvedPaths?: Map<string, Set<string>>,
+        approvedLinkedFiles?: ApprovedLinkedFiles
     ): Promise<CommandValidation> {
-        // Check acceptance for all paths in the array
+        // Check every path and collect each canonical result, so the caller
+        // receives one resolved target per requested path even when the first
+        // path already requires approval.
+        const checkedTargets: CheckedTarget[] = []
+        const required: CommandValidation[] = []
         for (const path of params.paths) {
-            const validation = await requiresPathAcceptance(path, 'fsRead', this.workspace, this.logging, approvedPaths)
-            if (validation.requiresAcceptance) {
-                return validation
+            const validation = await requiresPathAcceptance(
+                path,
+                'fsRead',
+                this.workspace,
+                this.logging,
+                approvedPaths,
+                { flagMultiplyLinkedFiles: 'read', approvedLinkedFiles }
+            )
+            const target = validation.checkedTargets?.[0]
+            if (!target) {
+                return {
+                    requiresAcceptance: true,
+                    warning: validation.warning,
+                    validationError: validation.validationError,
+                }
+            }
+            checkedTargets.push(target)
+            if (validation.requiresAcceptance) required.push(validation)
+        }
+        // One prompt covers every path, so it shows each distinct warning. The shared-file
+        // wording applies only when that is why every path needs approval.
+        const warnings = [...new Set(required.map(validation => validation.warning).filter(Boolean))]
+        const acceptanceReason =
+            required.length > 0 && required.every(validation => validation.acceptanceReason === 'multiplyLinkedFile')
+                ? required[0].acceptanceReason
+                : undefined
+        return {
+            requiresAcceptance: required.length > 0,
+            ...(warnings.length > 0 ? { warning: warnings.join('\n\n') } : {}),
+            ...(acceptanceReason ? { acceptanceReason } : {}),
+            canonicalPaths: checkedTargets.map(target => target.path),
+            checkedTargets: Object.freeze(checkedTargets),
+        }
+    }
+
+    /** Uses the checked targets without resolving the original aliases again. */
+    public async invoke(params: FsReadParams, targets: readonly CheckedTarget[]): Promise<InvokeOutput> {
+        const fileResult: FileReadResult[] = []
+        for (const [i, path] of params.paths.entries()) {
+            try {
+                const content = await readCheckedFile(this.workspace, targets[i], this.logging)
+                this.logging.info(`Read file: ${targets[i].path}, size: ${content.length}`)
+                fileResult.push({ path, content, truncated: false })
+            } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error)
+                throw new Error(`Could not read "${path}": ${detail}`, { cause: error })
             }
         }
-        return { requiresAcceptance: false }
-    }
-
-    public async invoke(params: FsReadParams): Promise<InvokeOutput> {
-        const fileResult: FileReadResult[] = []
-        for (const path of params.paths) {
-            const sanitizedPath = sanitize(path)
-            const content = await this.readFile(sanitizedPath)
-            this.logging.info(`Read file: ${sanitizedPath}, size: ${content.length}`)
-            fileResult.push({ path, content, truncated: false })
-        }
-
         return this.createOutput(fileResult)
-    }
-
-    private async readFile(filePath: string): Promise<string> {
-        this.logging.info(`Reading file: ${filePath}`)
-        return await this.workspace.fs.readFile(filePath)
     }
 
     private createOutput(fileResult: FileReadResult[]): InvokeOutput {

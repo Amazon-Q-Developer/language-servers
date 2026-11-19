@@ -24,10 +24,22 @@ import {
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     isEmptyEnv,
+    describeStdioLaunchForLog,
+    describeArgsForLog,
+    describeUrlForLog,
+    describeMcpFormValuesForLog,
     sanitizeName,
     convertPersonaToAgent,
     migrateToAgentConfig,
+    restoreServerScopedPermissions,
+    getAgentConfigPathForMcpConfig,
+    isPermissionForServer,
+    DEFAULT_TOOL_EXEC_TIMEOUT_MS,
+    MAX_TOOL_EXEC_TIMEOUT_MS,
+    isUsableToolExecTimeout,
+    resolveMcpRequestTimeoutMs,
 } from './mcpUtils'
+import { getReservedBuiltInToolNames, STATIC_BUILT_IN_TOOL_NAMES } from '../../constants/toolConstants'
 import type { MCPServerConfig } from './mcpTypes'
 import { McpPermissionType } from './mcpTypes'
 import { pathToFileURL } from 'url'
@@ -265,6 +277,94 @@ describe('loadAgentConfig', () => {
         expect(serverConfig?.command).to.equal('test-command')
         expect(serverConfig?.args).to.deep.equal(['arg1', 'arg2'])
         expect(serverConfig?.env).to.deep.equal({ TEST_ENV: 'value' })
+    })
+
+    it('ignores absolute resources from a workspace agent config', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        const config = (resources: string[]) =>
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources })
+        fs.mkdirSync(path.dirname(globalPath), { recursive: true })
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(globalPath, config(['file:///global/rules.md']))
+        fs.writeFileSync(
+            workspacePath,
+            config(['file://docs/rules.md', 'file:///other/rules.md', 'file://C:/other/rules.md'])
+        )
+        const warn = sinon.spy(logger, 'warn')
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath, globalPath], null, false)
+
+        expect(result.agentConfig.resources).to.have.members(['file://docs/rules.md', 'file:///global/rules.md'])
+        for (const resource of ['file:///other/rules.md', 'file://C:/other/rules.md']) {
+            expect(warn.calledWithMatch(sinon.match(resource)), resource).to.be.true
+        }
+    })
+
+    it('logs a dropped resource as a single quoted line', async () => {
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        const forged = 'file:///other/rules.md\n[Error] forged line'
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(
+            workspacePath,
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources: [forged] })
+        )
+        const warn = sinon.spy(logger, 'warn')
+
+        await loadAgentConfig(workspace, logger, [workspacePath], null, false)
+
+        const lines = warn.args.map(args => String(args[0]))
+        expect(
+            lines.some(line => line.includes(JSON.stringify(forged))),
+            'the dropped resource is logged, quoted'
+        ).to.be.true
+        expect(
+            lines.some(line => line.split('\n').length > 1),
+            'a newline in the resource does not forge a second log line'
+        ).to.be.false
+    })
+
+    it('keeps other workspace resource entries and skips duplicates and non-strings', async () => {
+        const workspacePath = path.join(tmpDir, 'workspace', '.amazonq', 'agents', 'default.json')
+        fs.mkdirSync(path.dirname(workspacePath), { recursive: true })
+        fs.writeFileSync(
+            workspacePath,
+            JSON.stringify({
+                name: 'test-agent',
+                mcpServers: {},
+                tools: [],
+                allowedTools: [],
+                resources: ['docs/notes.md', 'file://docs/rules.md', 'file://docs/rules.md', 42, null],
+            })
+        )
+
+        const result = await loadAgentConfig(workspace, logger, [workspacePath], null, false)
+
+        expect(result.agentConfig.resources).to.deep.equal(['docs/notes.md', 'file://docs/rules.md'])
+    })
+
+    it('records the agent configs that list each resource', async () => {
+        const globalPath = getGlobalAgentConfigPath(tmpDir)
+        const firstPath = path.join(tmpDir, 'first', '.amazonq', 'agents', 'default.json')
+        const secondPath = path.join(tmpDir, 'second', '.amazonq', 'agents', 'default.json')
+        const config = (resources: string[]) =>
+            JSON.stringify({ name: 'test-agent', mcpServers: {}, tools: [], allowedTools: [], resources })
+        for (const [configPath, resources] of [
+            [globalPath, ['file://AmazonQ.md', 'file:///global/rules.md']],
+            [firstPath, ['file://docs/rules.md', 'file://AmazonQ.md', 'file:///other/rules.md']],
+            [secondPath, ['file://docs/rules.md']],
+        ] as const) {
+            fs.mkdirSync(path.dirname(configPath), { recursive: true })
+            fs.writeFileSync(configPath, config([...resources]))
+        }
+
+        const result = await loadAgentConfig(workspace, logger, [firstPath, secondPath, globalPath], null, false)
+
+        expect(Object.fromEntries(result.resourceSources ?? [])).to.deep.equal({
+            'file://docs/rules.md': { global: false, configPaths: [firstPath, secondPath] },
+            'file://AmazonQ.md': { global: true, configPaths: [firstPath] },
+            'file:///global/rules.md': { global: true, configPaths: [] },
+        })
     })
 })
 
@@ -513,7 +613,7 @@ describe('createNamespacedToolName', () => {
 
     it('adds server prefix when tool name conflicts', () => {
         tools.add('create_issue') // Pre-existing tool
-        const result = createNamespacedToolName('github', 'create_issue', tools, toolNameMapping)
+        const result = createNamespacedToolName('github', 'create_issue', tools, toolNameMapping, new Set())
         expect(result).to.equal('github___create_issue')
         expect(tools.has('github___create_issue')).to.be.true
         expect(toolNameMapping.get('github___create_issue')).to.deep.equal({
@@ -525,7 +625,7 @@ describe('createNamespacedToolName', () => {
     it('truncates server name when combined length exceeds limit', () => {
         tools.add('create_issue') // Force the function to use server prefix
         const longServer = 'very_long_server_name_that_definitely_exceeds_maximum_length_when_combined'
-        const result = createNamespacedToolName(longServer, 'create_issue', tools, toolNameMapping)
+        const result = createNamespacedToolName(longServer, 'create_issue', tools, toolNameMapping, new Set())
         expect(result.length).to.be.lessThanOrEqual(MAX_TOOL_NAME_LENGTH)
         expect(result.endsWith('___create_issue')).to.be.true
         expect(toolNameMapping.get(result)).to.deep.equal({
@@ -536,7 +636,7 @@ describe('createNamespacedToolName', () => {
 
     it('uses numeric suffix when tool name is too long', () => {
         const longTool = 'extremely_long_tool_name_that_definitely_exceeds_the_maximum_allowed_length_for_names'
-        const result = createNamespacedToolName('server', longTool, tools, toolNameMapping)
+        const result = createNamespacedToolName('server', longTool, tools, toolNameMapping, new Set())
         // Skip length check and use string comparison with the actual implementation behavior
         expect(toolNameMapping.get(result)).to.deep.equal({
             serverName: 'server',
@@ -546,13 +646,112 @@ describe('createNamespacedToolName', () => {
 
     it('truncates tool name and adds suffix when it exceeds MAX_TOOL_NAME_LENGTH', () => {
         const longTool = 'Smartanalyzerthatreadssummariescreatesmappingrulesandupdatespayloads'
-        const result = createNamespacedToolName('ConnectiveRx', longTool, tools, toolNameMapping)
+        const result = createNamespacedToolName('ConnectiveRx', longTool, tools, toolNameMapping, new Set())
         expect(result.length).to.equal(MAX_TOOL_NAME_LENGTH)
         expect(tools.has(result)).to.be.true
         expect(toolNameMapping.get(result)).to.deep.equal({
             serverName: 'ConnectiveRx',
             toolName: longTool,
         })
+    })
+
+    it('namespaces an MCP tool that collides with a reserved built-in name', () => {
+        const reserved = new Set(['fsRead', 'fsWrite', 'executeBash'])
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(result).to.equal('evil___fsRead')
+        expect(tools.has('fsRead')).to.be.false
+        expect(toolNameMapping.has('fsRead')).to.be.false
+        expect(toolNameMapping.get('evil___fsRead')).to.deep.equal({
+            serverName: 'evil',
+            toolName: 'fsRead',
+        })
+    })
+
+    it('does not reuse a stale mapping that points at a reserved built-in name', () => {
+        const reserved = new Set(['fsRead'])
+        toolNameMapping.set('fsRead', { serverName: 'evil', toolName: 'fsRead' })
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(result).to.equal('evil___fsRead')
+        expect(toolNameMapping.has('fsRead')).to.be.false
+    })
+
+    it('still prefers the bare tool name when it is not reserved', () => {
+        const reserved = new Set(['fsRead'])
+        const result = createNamespacedToolName('github', 'create_issue', tools, toolNameMapping, reserved)
+        expect(result).to.equal('create_issue')
+    })
+
+    it('refuses every statically dispatched built-in name even when it is not registered', () => {
+        const reserved = getReservedBuiltInToolNames([])
+
+        for (const builtIn of STATIC_BUILT_IN_TOOL_NAMES) {
+            const result = createNamespacedToolName('evil', builtIn, tools, toolNameMapping, reserved)
+            expect(result, `${builtIn} must not be claimed`).to.equal(`evil___${builtIn}`)
+            expect(tools.has(builtIn), `${builtIn} must stay unclaimed`).to.be.false
+        }
+    })
+
+    it('also reserves dynamically registered built-in names', () => {
+        const reserved = getReservedBuiltInToolNames(['lspGetDocuments'])
+        const result = createNamespacedToolName('evil', 'lspGetDocuments', tools, toolNameMapping, reserved)
+
+        expect(result).to.equal('evil___lspGetDocuments')
+        expect(tools.has('lspGetDocuments')).to.be.false
+    })
+
+    it('gives two servers advertising the same built-in name distinct namespaced names', () => {
+        const reserved = new Set(['fsRead'])
+        const first = createNamespacedToolName('alpha', 'fsRead', tools, toolNameMapping, reserved)
+        const second = createNamespacedToolName('beta', 'fsRead', tools, toolNameMapping, reserved)
+        expect(first).to.equal('alpha___fsRead')
+        expect(second).to.equal('beta___fsRead')
+        expect(tools.has('fsRead')).to.be.false
+    })
+
+    it('reuses the namespaced name when the same server tool is seen again', () => {
+        const reserved = new Set(['fsRead'])
+        const first = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        const second = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(second).to.equal(first)
+        expect(toolNameMapping.size).to.equal(1)
+    })
+
+    it('keeps a truncated namespaced name out of the reserved set', () => {
+        const longServer = 'very_long_server_name_that_definitely_exceeds_the_maximum_allowed_length'
+        const reserved = new Set(['fsRead'])
+        const result = createNamespacedToolName(longServer, 'fsRead', tools, toolNameMapping, reserved)
+        expect(result.length).to.be.lessThanOrEqual(MAX_TOOL_NAME_LENGTH)
+        expect(result.endsWith('___fsRead')).to.be.true
+        expect(reserved.has(result)).to.be.false
+    })
+
+    it('does not fall back onto a reserved name via the numeric suffix path', () => {
+        // Force the namespaced form to be unavailable so the suffix path runs.
+        tools.add('evil___fsRead')
+        const reserved = new Set(['fsRead', 'fsRead1'])
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, reserved)
+        expect(reserved.has(result)).to.be.false
+        expect(result).to.not.equal('fsRead')
+        expect(result).to.not.equal('fsRead1')
+    })
+
+    it('refuses a name that only becomes a built-in name after sanitization', () => {
+        const reserved = new Set(['fsRead'])
+
+        // sanitizeName strips disallowed characters, so these all collapse to
+        // 'fsRead' and must not be allowed to claim it.
+        for (const advertised of ['fs Read', 'fs/Read', 'fsRead!', 'fs.Read']) {
+            const localTools = new Set<string>()
+            const localMapping = new Map<string, { serverName: string; toolName: string }>()
+            const result = createNamespacedToolName('evil', advertised, localTools, localMapping, reserved)
+            expect(result, `${advertised} must not claim fsRead`).to.equal('evil___fsRead')
+            expect(localTools.has('fsRead'), `${advertised} must leave fsRead unclaimed`).to.be.false
+        }
+    })
+
+    it('supports an explicit empty reserved-name set', () => {
+        const result = createNamespacedToolName('evil', 'fsRead', tools, toolNameMapping, new Set())
+        expect(result).to.equal('fsRead')
     })
 })
 
@@ -645,6 +844,100 @@ describe('getGlobalMcpConfigPath', () => {
         const homePath = path.resolve('home_dir')
         const expected = path.join(homePath, '.aws', 'amazonq', 'mcp.json')
         expect(getGlobalMcpConfigPath(homePath)).to.equal(expected)
+    })
+})
+
+describe('describeArgsForLog', () => {
+    it('keeps flag names and counts every other argument', () => {
+        expect(
+            describeArgsForLog(['-y', '@docs/server', '--api-key', 'arg-value-123', '--token=arg-value-456'])
+        ).to.equal('-y --api-key --token (2 values hidden)')
+    })
+
+    it('hides short flags with attached values and a lone dash', () => {
+        expect(describeArgsForLog(['-pvalue', '-', '--', '-v'])).to.equal('-- -v (2 values hidden)')
+    })
+
+    it('hides a flag typed together with its value in one argument', () => {
+        expect(describeArgsForLog(['--api-key arg-value-123', '--token:arg-value-456', '--key=a b'])).to.equal(
+            '--key (2 values hidden)'
+        )
+    })
+
+    it('skips empty arguments', () => {
+        expect(describeArgsForLog(['', '-y', ''])).to.equal('-y')
+    })
+
+    it('returns an empty string for no arguments', () => {
+        expect(describeArgsForLog([])).to.equal('')
+        expect(describeArgsForLog(undefined)).to.equal('')
+    })
+})
+
+describe('describeStdioLaunchForLog', () => {
+    it('includes the command, the flag names and the env names, not their values', () => {
+        const text = describeStdioLaunchForLog('npx', ['-y', 'server', '--api-key', 'arg-value-123'], {
+            API_TOKEN: 'env-value-456',
+        })
+        expect(text).to.equal('npx -y --api-key (2 values hidden) (env: API_TOKEN)')
+    })
+
+    it('omits empty parts', () => {
+        expect(describeStdioLaunchForLog('node', ['server.js'], {})).to.equal('node (1 value hidden)')
+        expect(describeStdioLaunchForLog('node', undefined, {})).to.equal('node')
+    })
+})
+
+describe('describeMcpFormValuesForLog', () => {
+    it('does not change the values it is given', () => {
+        const values: any = { name: 's', env_variables: [{ env_var_name: 'A', env_var_value: 'v' }] }
+        describeMcpFormValuesForLog(values)
+        expect(values.env_variables[0].env_var_value).to.equal('v')
+    })
+
+    it('hides list fields that are not lists and values of unknown fields', () => {
+        expect(
+            describeMcpFormValuesForLog({
+                env_variables: 'A=v',
+                headers: 'Authorization: v',
+                args: '--api-key v',
+                url: 42,
+                extra: 'v',
+                nested: { token: 'v' },
+            } as any)
+        ).to.deep.equal({
+            env_variables: '(hidden)',
+            headers: '(hidden)',
+            args: '(hidden)',
+            url: '(invalid URL)',
+            extra: '(hidden)',
+            nested: '(hidden)',
+        })
+    })
+
+    it('keeps tool permission choices', () => {
+        expect(describeMcpFormValuesForLog({ search: 'alwaysAllow', fetch: 'deny', read: 'ask' })).to.deep.equal({
+            search: 'alwaysAllow',
+            fetch: 'deny',
+            read: 'ask',
+        })
+    })
+
+    it('returns an empty object for missing values', () => {
+        expect(describeMcpFormValuesForLog(undefined)).to.deep.equal({})
+    })
+})
+
+describe('describeUrlForLog', () => {
+    it('keeps only the origin', () => {
+        expect(describeUrlForLog('https://user:pass@mcp.example.com:8443/key-123/sse?token=abc#frag')).to.equal(
+            'https://mcp.example.com:8443'
+        )
+    })
+
+    it('does not echo a value that is not a valid URL', () => {
+        expect(describeUrlForLog('not a url with-a-token')).to.equal('(invalid URL)')
+        expect(describeUrlForLog(undefined)).to.equal('(invalid URL)')
     })
 })
 
@@ -1150,5 +1443,502 @@ describe('saveServerSpecificAgentConfig', () => {
         )
 
         expect(fs.existsSync(configPath)).to.be.true
+    })
+})
+
+describe('loadAgentConfig server-scoped permission restore', () => {
+    let tmpDir: string
+    let workspace: any
+    let logger: any
+
+    const writeJson = async (p: string, value: unknown) => {
+        await workspace.fs.mkdir(path.dirname(p), { recursive: true })
+        await workspace.fs.writeFile(p, JSON.stringify(value))
+    }
+
+    beforeEach(() => {
+        sinon.restore()
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentPermRestoreTest-'))
+        workspace = {
+            fs: {
+                exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
+                mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
+                getUserHomeDir: () => tmpDir,
+            },
+            getAllWorkspaceFolders: () => [],
+        }
+        logger = { warn: () => {}, info: () => {}, error: () => {}, debug: () => {} }
+    })
+
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('restores "Always Allow" for a server declared in a legacy mcp.json', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { jira: { command: 'jira-mcp', args: [] } },
+        })
+        // This is the shape saveServerSpecificAgentConfig writes for a legacy server: the
+        // permissions are persisted, but the server definition deliberately is not.
+        await writeJson(agentPath, {
+            name: 'test-agent',
+            mcpServers: {},
+            tools: ['@jira'],
+            allowedTools: ['@jira/jira_get_issue'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.servers.has('jira')).to.be.true
+        expect(result.agentConfig.tools).to.include('@jira')
+        expect(result.agentConfig.allowedTools).to.include('@jira/jira_get_issue')
+    })
+
+    it('does not apply global entries to a workspace server that replaces a global one', async () => {
+        const wsRoot = path.join(tmpDir, 'ws')
+        const wsAgentPath = path.join(wsRoot, '.amazonq', 'agents', 'default.json')
+        const globalAgentPath = getGlobalAgentConfigPath(tmpDir)
+
+        await writeJson(wsAgentPath, {
+            mcpServers: { dup: { command: 'dup-mcp', args: [] } },
+            tools: ['@dup'],
+            allowedTools: [],
+        })
+        // Global declares the same server; the workspace definition wins, so the global file's
+        // permissions belong to a different server definition and must not carry over.
+        await writeJson(globalAgentPath, {
+            mcpServers: { dup: { command: 'dup-mcp', args: [] } },
+            tools: ['@dup'],
+            allowedTools: ['@dup', '@dup/some_tool'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+        expect(result.servers.get('dup')?.__configPath__).to.equal(wsAgentPath)
+        expect(result.agentConfig.tools).to.deep.equal(['@dup'])
+        expect(result.agentConfig.allowedTools).to.be.empty
+    })
+
+    it('does not restore permissions for a server that no longer loads', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['@removed'],
+            allowedTools: ['@removed/tool'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.servers.size).to.equal(0)
+        expect(result.agentConfig.tools).to.not.include('@removed')
+        expect(result.agentConfig.allowedTools).to.not.include('@removed/tool')
+    })
+
+    it('keeps non server-scoped permissions untouched', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['fsRead', 'executeBash'],
+            allowedTools: ['fsRead'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.agentConfig.tools).to.deep.equal(['fsRead', 'executeBash'])
+        expect(result.agentConfig.allowedTools).to.deep.equal(['fsRead'])
+    })
+
+    it('does not leak permissions between servers with a shared name prefix', async () => {
+        const agentPath = getGlobalAgentConfigPath(tmpDir)
+        await writeJson(getGlobalMcpConfigPath(tmpDir), {
+            mcpServers: { jira: { command: 'jira-mcp', args: [] } },
+        })
+        await writeJson(agentPath, {
+            mcpServers: {},
+            tools: ['@jira'],
+            allowedTools: ['@jira/jira_get_issue', '@jira2/other_tool', '@jirax'],
+        })
+
+        const result = await loadAgentConfig(workspace, logger, [agentPath], null, false)
+
+        expect(result.agentConfig.allowedTools).to.include('@jira/jira_get_issue')
+        expect(result.agentConfig.allowedTools).to.not.include('@jira2/other_tool')
+        expect(result.agentConfig.allowedTools).to.not.include('@jirax')
+    })
+
+    describe('permissions listed in a workspace agent config', () => {
+        let wsRoot: string
+        let wsAgentPath: string
+        let globalAgentPath: string
+
+        beforeEach(async () => {
+            wsRoot = path.join(tmpDir, 'ws')
+            wsAgentPath = path.join(wsRoot, '.amazonq', 'agents', 'default.json')
+            globalAgentPath = getGlobalAgentConfigPath(tmpDir)
+            workspace.getAllWorkspaceFolders = () => [{ uri: pathToFileURL(wsRoot).href, name: 'ws' }]
+            await writeJson(globalAgentPath, { name: 'q_ide_default', mcpServers: {}, tools: [], allowedTools: [] })
+        })
+
+        it('are not applied to a server declared in the global agent config', async () => {
+            await writeJson(globalAgentPath, {
+                name: 'q_ide_default',
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: [],
+            })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: ['@srv/extra'], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(globalAgentPath)
+            expect(result.agentConfig.tools).to.deep.equal(['@srv'])
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are not applied to a server declared in the global mcp.json', async () => {
+            await writeJson(getGlobalMcpConfigPath(tmpDir), { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: [], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.has('srv')).to.be.true
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are not applied when the global mcp.json replaces a server the workspace declared', async () => {
+            const globalMcpPath = getGlobalMcpConfigPath(tmpDir)
+            await writeJson(globalMcpPath, { mcpServers: { srv: { command: 'srv-mcp', args: [] } } })
+            await writeJson(wsAgentPath, {
+                mcpServers: { srv: { command: 'other-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: ['@srv/tool'],
+            })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(globalMcpPath)
+            expect(result.agentConfig.allowedTools).to.not.include('@srv/tool')
+        })
+
+        it('are not applied to a server declared in another workspace folder', async () => {
+            const otherRoot = path.join(tmpDir, 'other')
+            const otherAgentPath = path.join(otherRoot, '.amazonq', 'agents', 'default.json')
+            await writeJson(otherAgentPath, { mcpServers: { srv: { command: 'srv-mcp', args: [] } }, tools: ['@srv'] })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: [], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(
+                workspace,
+                logger,
+                [wsAgentPath, otherAgentPath, globalAgentPath],
+                null,
+                false
+            )
+
+            expect(result.servers.get('srv')?.__configPath__).to.equal(otherAgentPath)
+            expect(result.agentConfig.allowedTools).to.be.empty
+        })
+
+        it('are applied to a server declared in the same file', async () => {
+            await writeJson(wsAgentPath, {
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+                tools: ['@srv'],
+                allowedTools: ['@srv/tool'],
+            })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.agentConfig.tools).to.include('@srv')
+            expect(result.agentConfig.allowedTools).to.include('@srv/tool')
+        })
+
+        it('are applied to a server declared in the mcp.json of the same folder', async () => {
+            await writeJson(path.join(wsRoot, '.amazonq', 'mcp.json'), {
+                mcpServers: { srv: { command: 'srv-mcp', args: [] } },
+            })
+            await writeJson(wsAgentPath, { mcpServers: {}, tools: ['@srv'], allowedTools: ['@srv/tool'] })
+
+            const result = await loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
+
+            expect(result.servers.has('srv')).to.be.true
+            expect(result.agentConfig.allowedTools).to.include('@srv/tool')
+        })
+    })
+})
+
+describe('restoreServerScopedPermissions()', () => {
+    const home = path.join(os.tmpdir(), 'home')
+    const globalAgentPath = getGlobalAgentConfigPath(home)
+    const wsAgentPath = path.join(os.tmpdir(), 'ws', '.amazonq', 'agents', 'default.json')
+
+    const baseAgentConfig = () =>
+        ({
+            name: 'a',
+            description: 'd',
+            mcpServers: {},
+            tools: [] as string[],
+            allowedTools: [] as string[],
+            toolsSettings: {},
+            resources: [],
+        }) as any
+
+    const fromFile = (file: string, ...entries: string[]) =>
+        new Map(entries.map(entry => [entry, new Set([file])] as [string, Set<string>]))
+
+    const serversAt = (configPath: string, ...names: string[]) =>
+        new Map(names.map(name => [name, { command: 'x', __configPath__: configPath } as MCPServerConfig]))
+
+    it('restores only entries belonging to a loaded server', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(globalAgentPath, 'srv'),
+            fromFile(globalAgentPath, '@srv', '@srv/tool', '@gone'),
+            fromFile(globalAgentPath, '@srv/tool', '@gone/tool')
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@srv', '@srv/tool'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('matches on the original (unsanitized) server name', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['my_server', 'my-server']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(globalAgentPath, 'my_server'),
+            fromFile(globalAgentPath, '@my-server'),
+            fromFile(globalAgentPath, '@my-server/tool')
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@my-server'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@my-server/tool'])
+    })
+
+    it('does not duplicate entries already applied', () => {
+        const agentConfig = baseAgentConfig()
+        agentConfig.tools.push('@srv')
+        agentConfig.allowedTools.push('@srv/tool')
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(globalAgentPath, 'srv'),
+            fromFile(globalAgentPath, '@srv'),
+            fromFile(globalAgentPath, '@srv/tool')
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@srv'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('is a no-op when no servers loaded', () => {
+        const agentConfig = baseAgentConfig()
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            new Map(),
+            new Map(),
+            fromFile(globalAgentPath, '@srv'),
+            fromFile(globalAgentPath, '@srv/tool')
+        )
+
+        expect(agentConfig.tools).to.be.empty
+        expect(agentConfig.allowedTools).to.be.empty
+    })
+
+    it('applies entries from a workspace file only to servers whose permissions live in that file', () => {
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([
+            ['global_srv', 'global_srv'],
+            ['ws_srv', 'ws_srv'],
+        ])
+        const servers = new Map([...serversAt(globalAgentPath, 'global_srv'), ...serversAt(wsAgentPath, 'ws_srv')])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            servers,
+            fromFile(wsAgentPath, '@global_srv', '@ws_srv'),
+            fromFile(wsAgentPath, '@global_srv/tool', '@ws_srv/tool')
+        )
+
+        expect(agentConfig.tools).to.deep.equal(['@ws_srv'])
+        expect(agentConfig.allowedTools).to.deep.equal(['@ws_srv/tool'])
+    })
+
+    it('maps a legacy mcp.json server to the agents/default.json next to it', () => {
+        const agentConfig = baseAgentConfig()
+        const wsMcpPath = path.join(path.dirname(path.dirname(wsAgentPath)), 'mcp.json')
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt(wsMcpPath, 'srv'),
+            new Map(),
+            fromFile(wsAgentPath, '@srv/tool')
+        )
+
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+
+    it('matches config paths that differ only in drive-letter case on Windows', function () {
+        if (process.platform !== 'win32') {
+            this.skip()
+        }
+        const agentConfig = baseAgentConfig()
+        const mapping = new Map([['srv', 'srv']])
+
+        restoreServerScopedPermissions(
+            agentConfig,
+            mapping,
+            serversAt('d:\\ws\\.amazonq\\mcp.json', 'srv'),
+            new Map(),
+            fromFile('D:\\ws\\.amazonq\\agents\\default.json', '@srv/tool')
+        )
+
+        expect(agentConfig.allowedTools).to.deep.equal(['@srv/tool'])
+    })
+})
+
+describe('restoreServerScopedPermissions() file ownership', () => {
+    const home = path.join(os.tmpdir(), 'home')
+    const files = {
+        globalAgent: getGlobalAgentConfigPath(home),
+        globalMcp: getGlobalMcpConfigPath(home),
+        wsAgent: path.join(os.tmpdir(), 'ws', '.amazonq', 'agents', 'default.json'),
+        wsMcp: path.join(os.tmpdir(), 'ws', '.amazonq', 'mcp.json'),
+        otherWsAgent: path.join(os.tmpdir(), 'other', '.amazonq', 'agents', 'default.json'),
+        otherWsMcp: path.join(os.tmpdir(), 'other', '.amazonq', 'mcp.json'),
+    }
+    // Where McpManager saves the permissions of a server declared in each file.
+    const savedTo: Record<keyof typeof files, keyof typeof files> = {
+        globalAgent: 'globalAgent',
+        globalMcp: 'globalAgent',
+        wsAgent: 'wsAgent',
+        wsMcp: 'wsAgent',
+        otherWsAgent: 'otherWsAgent',
+        otherWsMcp: 'otherWsAgent',
+    }
+    const agentFiles = ['globalAgent', 'wsAgent', 'otherWsAgent'] as const
+
+    for (const declaredIn of Object.keys(files) as (keyof typeof files)[]) {
+        for (const listedIn of agentFiles) {
+            const expected = savedTo[declaredIn] === listedIn
+            it(`server in ${declaredIn}, entries in ${listedIn}: ${expected ? 'applied' : 'dropped'}`, () => {
+                const agentConfig = {
+                    name: 'a',
+                    description: 'd',
+                    mcpServers: {},
+                    tools: [] as string[],
+                    allowedTools: [] as string[],
+                } as any
+                const servers = new Map([
+                    ['srv', { command: 'x', __configPath__: files[declaredIn] } as MCPServerConfig],
+                ])
+                const from = new Map([
+                    ['@srv', new Set([files[listedIn]])],
+                    ['@srv/tool', new Set([files[listedIn]])],
+                ])
+
+                restoreServerScopedPermissions(agentConfig, new Map([['srv', 'srv']]), servers, from, from)
+
+                expect(agentConfig.tools).to.deep.equal(expected ? ['@srv', '@srv/tool'] : [])
+                expect(agentConfig.allowedTools).to.deep.equal(expected ? ['@srv', '@srv/tool'] : [])
+            })
+        }
+    }
+
+    it('McpManager saves legacy server permissions to the file this check reads them from', () => {
+        for (const declaredIn of Object.keys(files) as (keyof typeof files)[]) {
+            expect(getAgentConfigPathForMcpConfig(files[declaredIn])).to.equal(files[savedTo[declaredIn]])
+        }
+    })
+})
+
+describe('getAgentConfigPathForMcpConfig()', () => {
+    it('maps a legacy mcp.json to the agents/default.json in the same folder', () => {
+        const dir = path.join(os.tmpdir(), 'ws', '.amazonq')
+        expect(getAgentConfigPathForMcpConfig(path.join(dir, 'mcp.json'))).to.equal(
+            path.join(dir, 'agents', 'default.json')
+        )
+    })
+
+    it('only replaces the file name, not a folder with the same name', () => {
+        const p = path.join(os.tmpdir(), 'mcp.json', '.amazonq', 'mcp.json')
+        expect(getAgentConfigPathForMcpConfig(p)).to.equal(
+            path.join(os.tmpdir(), 'mcp.json', '.amazonq', 'agents', 'default.json')
+        )
+    })
+
+    it('returns other paths unchanged', () => {
+        const p = path.join(os.tmpdir(), 'ws', '.amazonq', 'agents', 'default.json')
+        expect(getAgentConfigPathForMcpConfig(p)).to.equal(p)
+    })
+})
+
+describe('isPermissionForServer()', () => {
+    it('matches the server prefix and its tools only', () => {
+        expect(isPermissionForServer('@jira', 'jira')).to.be.true
+        expect(isPermissionForServer('@jira/jira_get_issue', 'jira')).to.be.true
+        expect(isPermissionForServer('@jira2', 'jira')).to.be.false
+        expect(isPermissionForServer('@jira2/tool', 'jira')).to.be.false
+        expect(isPermissionForServer('@jirax', 'jira')).to.be.false
+        expect(isPermissionForServer('fsRead', 'jira')).to.be.false
+    })
+})
+
+describe('resolveMcpRequestTimeoutMs()', () => {
+    it('returns the configured timeout when it is usable', () => {
+        expect(resolveMcpRequestTimeoutMs(300_000)).to.equal(300_000)
+        expect(resolveMcpRequestTimeoutMs(1)).to.equal(1)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('treats 0 as "no timeout" by returning the maximum timer value', () => {
+        expect(resolveMcpRequestTimeoutMs(0)).to.equal(MAX_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('falls back to the default for undefined, negative, non-finite and over-large values', () => {
+        expect(resolveMcpRequestTimeoutMs(undefined)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(-1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.NaN)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.POSITIVE_INFINITY)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(Number.MAX_SAFE_INTEGER)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+        expect(resolveMcpRequestTimeoutMs(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.equal(DEFAULT_TOOL_EXEC_TIMEOUT_MS)
+    })
+
+    it('never returns a value setTimeout would clamp', () => {
+        for (const candidate of [undefined, 0, -1, Number.NaN, Number.MAX_SAFE_INTEGER, 300_000]) {
+            const resolved = resolveMcpRequestTimeoutMs(candidate)
+            expect(Number.isFinite(resolved)).to.be.true
+            expect(resolved).to.be.greaterThan(0)
+            expect(resolved).to.be.at.most(MAX_TOOL_EXEC_TIMEOUT_MS)
+        }
+    })
+})
+
+describe('isUsableToolExecTimeout()', () => {
+    it('accepts finite positive values within the timer range', () => {
+        expect(isUsableToolExecTimeout(1)).to.be.true
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS)).to.be.true
+    })
+
+    it('rejects undefined, zero, negative, non-finite and over-large values', () => {
+        expect(isUsableToolExecTimeout(undefined)).to.be.false
+        expect(isUsableToolExecTimeout(0)).to.be.false
+        expect(isUsableToolExecTimeout(-1)).to.be.false
+        expect(isUsableToolExecTimeout(Number.NaN)).to.be.false
+        expect(isUsableToolExecTimeout(Number.POSITIVE_INFINITY)).to.be.false
+        expect(isUsableToolExecTimeout(MAX_TOOL_EXEC_TIMEOUT_MS + 1)).to.be.false
     })
 })

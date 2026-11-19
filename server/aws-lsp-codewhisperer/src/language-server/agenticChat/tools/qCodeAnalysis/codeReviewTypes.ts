@@ -1,6 +1,16 @@
 export type FileArtifacts = Array<{ path: string }>
 export type FolderArtifacts = Array<{ path: string }>
 export type RuleArtifacts = Array<{ path: string }>
+
+/**
+ * An artifact whose path has passed the workspace-boundary validation.
+ * `path` is the path exactly as submitted by the caller and is kept so the
+ * caller's intended file name and extension filter are preserved. `canonicalPath`
+ * is the strict on-disk location (`fs.promises.realpath`) that is used for the
+ * actual content read and Git execution, so the check and the use derive the
+ * same location.
+ */
+export type ValidatedArtifact = { path: string; canonicalPath: string }
 export type ArtifactType = 'FILE' | 'FOLDER'
 export enum FailedMetricName {
     MissingFileOrFolder = 'missingFileOrFolder',
