@@ -7,7 +7,8 @@ import * as crypto from 'crypto'
 import got from 'got'
 import AdmZip = require('adm-zip')
 import sinon = require('sinon')
-import { Readable } from 'stream'
+import * as http from 'http'
+import { AddressInfo } from 'net'
 import { Logging } from '@aws/language-server-runtimes/server-interface'
 import { stubInterface } from 'ts-sinon'
 
@@ -119,32 +120,30 @@ describe('Utils', () => {
 
     describe('uploadArtifact', () => {
         it('should upload artifact successfully', async () => {
-            const putStub = sinon.stub(got, 'put').resolves({ statusCode: 200 })
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            const putStub = sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 200 })
 
             const result = await Utils.uploadArtifact('http://test-url', testFile, {
                 'Content-Type': 'application/zip',
             })
 
             expect(result).to.be.true
-            expect(putStub.calledOnce).to.be.true
-            expect(createReadStreamStub.calledOnce).to.be.true
+            expect(putStub.calledOnceWith('http://test-url', testFile, { 'Content-Type': 'application/zip' })).to.be
+                .true
         })
 
         it('should handle array headers', async () => {
-            const putStub = sinon.stub(got, 'put').resolves({ statusCode: 200 })
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            const putStub = sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 200 })
 
             const result = await Utils.uploadArtifact('http://test-url', testFile, {
                 'Content-Type': ['application/zip'],
             })
 
             expect(result).to.be.true
+            expect(putStub.firstCall.args[2]).to.deep.equal({ 'Content-Type': 'application/zip' })
         })
 
         it('should return false on non-200 status', async () => {
-            const putStub = sinon.stub(got, 'put').resolves({ statusCode: 400 })
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 400 })
 
             const result = await Utils.uploadArtifact('http://test-url', testFile)
 
@@ -152,8 +151,7 @@ describe('Utils', () => {
         })
 
         it('should return false on error', async () => {
-            const putStub = sinon.stub(got, 'put').rejects(new Error('Network error'))
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            sinon.stub(Utils, 'putFileFromWorker').rejects(new Error('Network error'))
 
             const result = await Utils.uploadArtifact('http://test-url', testFile)
 
@@ -161,8 +159,7 @@ describe('Utils', () => {
         })
 
         it('should upload without headers', async () => {
-            const putStub = sinon.stub(got, 'put').resolves({ statusCode: 200 })
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 200 })
 
             const result = await Utils.uploadArtifact('http://test-url', testFile)
 
@@ -170,23 +167,91 @@ describe('Utils', () => {
         })
 
         it('should log file size when logger provided', async () => {
-            const putStub = sinon.stub(got, 'put').resolves({ statusCode: 200 })
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 200 })
 
             const result = await Utils.uploadArtifact('http://test-url', testFile, {}, mockLogger)
 
             expect(result).to.be.true
-            expect(mockLogger.info.calledOnce).to.be.true
+            expect(mockLogger.info.calledWith(`Artifact upload size: ${'test content'.length} bytes`)).to.be.true
         })
 
         it('should log error when upload fails', async () => {
-            const putStub = sinon.stub(got, 'put').rejects(new Error('Network error'))
-            const createReadStreamStub = sinon.stub(fs, 'createReadStream').returns(new Readable() as fs.ReadStream)
+            sinon.stub(Utils, 'putFileFromWorker').rejects(new Error('Network error'))
 
             const result = await Utils.uploadArtifact('http://test-url', testFile, {}, mockLogger)
 
             expect(result).to.be.false
             expect(mockLogger.error.calledOnce).to.be.true
+        })
+
+        it('should log the status code on non-200 status', async () => {
+            sinon.stub(Utils, 'putFileFromWorker').resolves({ statusCode: 400 })
+
+            const result = await Utils.uploadArtifact('http://test-url', testFile, {}, mockLogger)
+
+            expect(result).to.be.false
+            expect(mockLogger.error.firstCall.args[0]).to.include('Response code 400')
+        })
+    })
+
+    describe('putFileFromWorker', () => {
+        let server: http.Server
+        let url: string
+        let received: { method?: string; headers?: http.IncomingHttpHeaders; body?: string }
+        let respondWith: { status: number; body: string }
+
+        beforeEach(async () => {
+            received = {}
+            respondWith = { status: 200, body: '' }
+            server = http.createServer((req, res) => {
+                let body = ''
+                req.on('data', chunk => (body += chunk))
+                req.on('end', () => {
+                    received = { method: req.method, headers: req.headers, body }
+                    res.writeHead(respondWith.status)
+                    res.end(respondWith.body)
+                })
+            })
+            await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+            url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/upload`
+        })
+
+        afterEach(async () => {
+            await new Promise(resolve => server.close(resolve))
+        })
+
+        it('should PUT the file contents with headers and Content-Length', async () => {
+            const result = await Utils.putFileFromWorker(url, testFile, { 'Content-Type': 'application/zip' })
+
+            expect(result.statusCode).to.equal(200)
+            expect(received.method).to.equal('PUT')
+            expect(received.body).to.equal('test content')
+            expect(received.headers?.['content-type']).to.equal('application/zip')
+            expect(received.headers?.['content-length']).to.equal(String('test content'.length))
+        })
+
+        it('should return the status code of a failed upload', async () => {
+            respondWith = { status: 400, body: '<Error><Code>RequestTimeout</Code></Error>' }
+
+            const result = await Utils.putFileFromWorker(url, testFile, {})
+
+            expect(result.statusCode).to.equal(400)
+        })
+
+        it('should reject when the connection fails', async () => {
+            // Nothing listens on the original port any more; a fresh server keeps afterEach's close() valid.
+            const deadUrl = url
+            await new Promise(resolve => server.close(resolve))
+            server = http.createServer()
+            await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+
+            let error: unknown
+            try {
+                await Utils.putFileFromWorker(deadUrl, testFile, {})
+            } catch (e) {
+                error = e
+            }
+            expect(error).to.be.instanceOf(Error)
         })
     })
 

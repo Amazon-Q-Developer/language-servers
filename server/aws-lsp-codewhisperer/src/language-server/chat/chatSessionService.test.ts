@@ -343,6 +343,26 @@ describe('Chat Session Service', () => {
             assert.strictEqual(toolPaths.size, 1)
             assert.ok(toolPaths.has(unixPath))
         })
+
+        it('keeps the file as approved when it has more than one hard link', () => {
+            const linked = {
+                path: '/test/path/linked.js',
+                state: 'existing',
+                dev: '1',
+                ino: '2',
+                linkCount: '2',
+            } as const
+
+            chatSessionService.addApprovedPath(linked.path, 'fsRead', linked)
+            chatSessionService.addApprovedPath('/test/path/single.js', 'fsRead', { ...linked, linkCount: '1' })
+            chatSessionService.addApprovedPath('/test/path/unverified.js', 'fsRead', {
+                path: '/test/path/unverified.js',
+                state: 'unverified',
+            })
+
+            assert.deepStrictEqual([...chatSessionService.approvedLinkedFiles], [['fsRead', [linked]]])
+            assert.strictEqual(chatSessionService.approvedPaths.get('fsRead')!.size, 3)
+        })
     })
 
     describe('setModel encapsulation', () => {

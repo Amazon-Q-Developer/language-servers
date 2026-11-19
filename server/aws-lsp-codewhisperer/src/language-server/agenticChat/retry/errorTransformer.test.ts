@@ -31,6 +31,7 @@ describe('QErrorTransformer', () => {
 
             expect(result).to.be.instanceOf(AgenticChatError)
             expect(result.message).to.include('Request failed after 3 attempts')
+            expect(result.message).to.include('reached your Amazon Q usage limit')
             expect((result as AgenticChatError).code).to.equal('AmazonQUsageLimitError')
         })
 
@@ -45,7 +46,34 @@ describe('QErrorTransformer', () => {
             const result = transformer.transformFinalError(error)
 
             expect(result).to.be.instanceOf(AgenticChatError)
+            expect(result.message).to.include('reached your monthly Amazon Q request limit')
             expect((result as AgenticChatError).code).to.equal('AmazonQUsageLimitError')
+        })
+
+        it('should not make a usage limit indistinguishable from generic retry exhaustion', () => {
+            // A quota condition and a transport failure previously produced the identical
+            // 'Request failed after 3 attempts' string, which is what clients that surface
+            // ResponseError.message (rather than its structured data) show the user.
+            const usageLimit = new Error('Usage limit exceeded')
+            ;(usageLimit as any).code = 'AmazonQUsageLimitError'
+            const generic = new Error('socket hang up')
+
+            const usageLimitResult = transformer.transformFinalError(usageLimit)
+            const genericResult = transformer.transformFinalError(generic)
+
+            expect(usageLimitResult.message).to.not.equal(genericResult.message)
+        })
+
+        it('should keep the throttling message distinct from the usage limit message', () => {
+            const throttling = new Error('Throttling')
+            ;(throttling as any).code = 'ThrottlingException'
+            ;(throttling as any).statusCode = 429
+
+            const result = transformer.transformFinalError(throttling)
+
+            expect((result as AgenticChatError).code).to.equal('RequestThrottled')
+            expect(result.message).to.include('high traffic')
+            expect(result.message).to.not.include('usage limit')
         })
 
         it('should transform abort errors', () => {

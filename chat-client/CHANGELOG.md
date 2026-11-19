@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.1.59](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.58...chat-client/v0.1.59) (2026-11-12)
+
+
+### Bug Fixes
+
+* address security issues ([#3041](https://github.com/Amazon-Q-Developer/language-servers/issues/3041)) ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+* **amazonq:** stricter checks for chat file links and configuration files ([65217af](https://github.com/Amazon-Q-Developer/language-servers/commit/65217af1055e8f7364abbc143584165d33647af1))
+
+## [0.1.58](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.57...chat-client/v0.1.58) (2026-10-08)
+
+
+### Bug Fixes
+
+* **amazonq:** distinguish consent-denied MCP servers ([d51b874](https://github.com/Amazon-Q-Developer/language-servers/commit/d51b87433c4452240fe92647cd996cd4e3da4dfe))
+
+## [0.1.57](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.56...chat-client/v0.1.57) (2026-09-30)
+
+
+### Features
+
+* **chat-client:** add IDE deprecation notice ([#2877](https://github.com/Amazon-Q-Developer/language-servers/issues/2877)) ([73dd8c6](https://github.com/Amazon-Q-Developer/language-servers/commit/73dd8c66a3a11a28d8e011ef52bae2fb2d809d5b))
+
 ## [0.1.56](https://github.com/Amazon-Q-Developer/language-servers/compare/chat-client/v0.1.55...chat-client/v0.1.56) (2026-08-18)
 
 

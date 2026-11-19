@@ -1,10 +1,14 @@
-import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+﻿import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
 import * as fs from 'fs'
 import * as archiver from 'archiver'
 import got from 'got'
 import * as path from 'path'
 import * as crypto from 'crypto'
+import { pipeline } from 'stream/promises'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
+import { SignatureV4 } from '@smithy/signature-v4'
+import { parseAtxTenantUrl } from '../../shared/atxTenantUrl'
+import { Sha256 } from '@aws-crypto/sha256-js'
 import AdmZip = require('adm-zip')
 import { ArtifactManager } from './artifactManager'
 import {
@@ -62,11 +66,89 @@ import {
     AtxDashboardRepo,
     AtxUploadCustomPlanRequest,
     AtxUploadCustomPlanResponse,
+    AtxOpenHitl,
+    isSupportedAtxTestRunSchemaVersion,
+    AtxDownloadOriginalCodeResponse,
+    AtxValidateSessionResponse,
 } from './atxModels'
+import { classifyAtxSessionValidationError } from './atxSessionValidation'
+import { AtxErrorInfo, getAtxErrorInfo } from './atxErrorInfo'
 import { v4 as uuidv4 } from 'uuid'
 import { request } from 'http'
 
 import { Utils, workspaceFolderName } from './utils'
+import { beamApplyStepIds, isLocalBuildVerificationStep, listBeamRepoFiles } from './beamRepoFiles'
+import { BrowserInfo } from './models'
+import { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, ItGenJobGate } from './itgenJobGate'
+
+// ATX job objective keys for the integration-test option in the IDE start dialog (contract v0 §1).
+// generate_integration_tests is the only ITGen key: the Transform agent reads it to plan the app launches and
+// test runs. The browser is only sent with it. It also gates the LS's ITGen code: ITGen HITLs, OpenHitls,
+// test-result submits, diffs at any depth and the original-code download run only for jobs whose objective has
+// generate_integration_tests: true (ItGenJobGate); every other job behaves exactly as before ITGen.
+export { ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY, objectiveHasIntegrationTests } from './itgenJobGate'
+export const ATX_OBJECTIVE_BROWSER_KEY = 'browser'
+
+// ITGen HITL tags (contract v0 §3). The IDE answers both; one task per launch attempt / test run.
+export const ATX_HITL_TAG_INTEG_APP_LAUNCH = 'integ-app-launch'
+export const ATX_HITL_TAG_INTEG_TEST_RUN = 'integ-test-run'
+
+export function isItGenHitlTag(tag: unknown): boolean {
+    return tag === ATX_HITL_TAG_INTEG_APP_LAUNCH || tag === ATX_HITL_TAG_INTEG_TEST_RUN
+}
+
+// Agent-supplied ids (task id, runId) become folder names; refuse anything that could leave the folder.
+function isSafePathSegment(value: unknown): value is string {
+    return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..')
+}
+
+/**
+ * ITGen: the folder under itgen/ for a test-run request's project, or undefined for no project (absent or empty).
+ * Project names come from the customer's .csproj file names, so they can hold spaces, parentheses or other
+ * characters: a name that isn't a plain folder name is made one, with a hash of the name so two names that look
+ * alike after that still get their own folders.
+ */
+export function itGenProjectFolderName(project: unknown): string | undefined {
+    if (typeof project !== 'string' || project.trim() === '') {
+        return undefined
+    }
+    // Windows can't have a folder named after a device (CON, NUL, COM1...), nor one ending in a dot or a space
+    const windowsDevice = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i
+    if (isSafePathSegment(project) && !/[. ]$/.test(project) && !windowsDevice.test(project)) {
+        return project
+    }
+    const readable =
+        project
+            .replace(/[^A-Za-z0-9._-]/g, '_')
+            .replace(/\.{2,}/g, '_')
+            .replace(/^[^A-Za-z0-9]+/, '')
+            .replace(/[.]+$/, '')
+            .slice(0, 40) || 'project'
+    const hash = crypto.createHash('sha256').update(project).digest('hex').slice(0, 8)
+    return `${readable}-${hash}`
+}
+
+// IDE-supplied folders we extract into: absolute, with no '..' segment (a folder like 'Foo..Bar' is fine).
+function isSafeAbsolutePath(value: unknown): value is string {
+    return typeof value === 'string' && path.isAbsolute(value) && !value.split(/[\\/]/).includes('..')
+}
+
+/**
+ * ITGen: true when a test-run request's tests.projectPath is a relative path that stays inside the
+ * tests artifact (not missing, not rooted, no '..').
+ */
+export function isSafeRelativeProjectPath(projectPath: unknown): projectPath is string {
+    if (typeof projectPath !== 'string' || projectPath.trim() === '') {
+        return false
+    }
+    const segments = projectPath.split(/[\\/]+/).filter(s => s !== '' && s !== '.')
+    return (
+        !path.isAbsolute(projectPath) &&
+        !/^[A-Za-z]:/.test(projectPath) &&
+        segments.length > 0 &&
+        !segments.includes('..')
+    )
+}
 
 /**
  * Context object for tracking diff apply failures within a single getTransformInfo call.
@@ -75,6 +157,22 @@ interface DiffApplyContext {
     failed: boolean
     failedStepIds: string[]
 }
+
+// ITGen original code: artifactWorkspace/before holds one copy per solution. Its marker records the job
+// and the original-code artifact it came from; a copy is reused only when both match.
+const ORIGINAL_CODE_FOLDER = 'before'
+const ORIGINAL_CODE_JOB_MARKER = '.atx-itgen-job'
+// The marker the VS coordinator checks before it starts the original app: the plain job id (OriginalCodeBackup).
+const ORIGINAL_CODE_IDE_JOB_MARKER = '.atx-job-id'
+
+interface OriginalCodeMarker {
+    jobId: string
+    codeArtifactId: string
+}
+// MSBuild walks up from a project until it finds these; an empty stub stops the walk.
+const ORIGINAL_CODE_WALK_UP_FILES = ['Directory.Build.props', 'Directory.Build.targets', 'Directory.Packages.props']
+const ORIGINAL_CODE_STUB =
+    "<Project>\r\n  <!-- Created by AWS Transform so this copy doesn't import the files above it. -->\r\n</Project>\r\n"
 
 /**
  * Beam to IDE wire/shape types. These pin the shapes flowing through beam discovery so the
@@ -97,6 +195,12 @@ interface BeamMapRepo {
     tfm?: string
     target_framework?: string
     scenario?: string
+    // ITGen: the repo's ORIGINAL (pre-transformation) source zip, saved by the web job before
+    // transforming. The IDE builds and starts it to record the test baseline.
+    originalArtifactId?: string
+    // ITGen: true when this beamed repo runs Local Verification. The parent web job's objective never has
+    // generate_integration_tests, so this is the only signal for a beamed repo.
+    generateIntegrationTests?: boolean
 }
 
 /** The beamed-repo record returned to the IDE (PascalCase, as the C# client consumes it). */
@@ -106,6 +210,10 @@ interface BeamedRepoInfo {
     BeamStepId: string
     BeamTargetFramework: string
     BeamScenario: string
+    // '' when the web job didn't save an original (tests not requested, or flag off).
+    OriginalArtifactId: string
+    // false when the beam-map entry doesn't opt in, or the repo came from the beam-status fallback.
+    GenerateIntegrationTests: boolean
     IsLbvOpen: boolean
     // Beamed but LBV HITL not created yet (no beamed node / no LBV child / no plan). IDE shows Load
     // only when IsLbvOpen && !IsLbvPending, so a repo can't be Loaded before its HITL exists.
@@ -115,6 +223,135 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// The most jobs whose undownloadable beam-map candidates are remembered, to warn once per job.
+const BEAM_MAP_UNREADABLE_WARNED_MAX = 200
+
+// How long to stop starting optional beam-map scans after FES throttles us. Deliberately longer than
+// the 30s dashboard/info-bar poll interval: a cooldown shorter than the poll would merely delay calls
+// within one sweep instead of dropping whole sweeps, which is the only thing that reduces our rate.
+const BEAM_THROTTLE_COOLDOWN_MS = 90000
+// The most artifacts whose last CreateArtifactDownloadUrl failure reason is remembered (read by the
+// beam/original-code downloads to tell the IDE WHY; other callers never read it, so bound it).
+const DOWNLOAD_URL_ERROR_REASONS_MAX = 200
+// downloadArtifactToPath: how many times one artifact is downloaded before the failure is returned.
+// Each attempt asks for a new signed URL, so a URL that expired during a slow attempt is not reused.
+const ARTIFACT_DOWNLOAD_MAX_ATTEMPTS = 3
+// downloadArtifactToPath does not retry these: the disk or the save folder is the problem, not the link.
+const ARTIFACT_DOWNLOAD_LOCAL_ERROR_CODES = ['ENOSPC', 'EACCES', 'EPERM', 'EROFS', 'ENOENT', 'ENOTDIR', 'EISDIR']
+// downloadArtifactToPath starts no attempt once this much time has passed since the call began: the IDE
+// waits for the call inside its poll loop. An attempt on a link that went silent ends 60 seconds after
+// its last byte (the socket limit), so a first attempt that stalls early still gets its retry, and two
+// stalled attempts end past the budget, so no third is started. A running attempt is never cut.
+const ARTIFACT_DOWNLOAD_BUDGET_MS = 90000
+// downloadArtifactToPath removes the temp files of earlier downloads from the save folder once they are
+// this old. A younger one may belong to a download that is running now.
+const ARTIFACT_DOWNLOAD_STALE_TEMP_MS = 60 * 60 * 1000
+// downloadBeamArtifact's ErrorCode for a destination it refuses (retrying the same path can't help).
+export const BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION = 'InvalidDestination'
+
+/**
+ * How CreateArtifactDownloadUrl should react to a failed call:
+ * - 'throttle': FES pushed back — retry with backoff and record the cooldown.
+ * - 'transient': 5xx / network / "unknown error" (seen alongside a concurrent ListMessages
+ *   "unknown error" from the same IDE) — retry with the same bounded backoff.
+ * - 'permanent': not found / access denied / validation / other 4xx, or anything unrecognised —
+ *   retrying will not help, so fail now. Exception: an access denied (or 403) that gives no real
+ *   reason (empty or "UnknownError") is 'throttle' — seen to clear minutes later for the same artifact,
+ *   and a call storm has provoked access denied, so it also starts the scan cooldown.
+ */
+const KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS = [
+    'ResourceNotFoundException',
+    'AccessDeniedException',
+    'ValidationException',
+]
+
+/**
+ * True when classifyDownloadUrlError only called `error` permanent because it didn't recognise it (the
+ * fail-safe default), not because it is a known permanent error or a 4xx.
+ */
+export function isUnrecognizedDownloadUrlError(error: unknown): boolean {
+    const e = error as any
+    const status: number | undefined = e?.$metadata?.httpStatusCode
+    // A plain Error without service metadata is ours (e.g. "ATX client not initialized"), not a service error type.
+    const isServiceError = (!!e?.name && e.name !== 'Error') || e?.$metadata !== undefined
+    return (
+        isServiceError &&
+        classifyDownloadUrlError(error) === 'permanent' &&
+        !KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS.includes(e?.name ?? '') &&
+        !(typeof status === 'number' && status >= 400 && status < 500)
+    )
+}
+
+export function classifyDownloadUrlError(error: unknown): 'throttle' | 'transient' | 'permanent' {
+    const e = error as any
+    const name: string = e?.name ?? ''
+    const code: string = e?.code ?? ''
+    const status: number | undefined = e?.$metadata?.httpStatusCode
+    const msg = String(error)
+    if (
+        name === 'ThrottlingException' ||
+        name === 'TooManyRequestsException' ||
+        status === 429 ||
+        /throttl|too many requests|rate exceeded/i.test(msg)
+    ) {
+        return 'throttle'
+    }
+    // Any 5xx is transient whatever its name.
+    if (name === 'AccessDeniedException' || status === 403) {
+        const reason = String(e?.message ?? '').trim()
+        if (reason === '' || /unknown\s?error/i.test(reason)) {
+            return 'throttle'
+        }
+    }
+    if (typeof status === 'number' && status >= 500) {
+        return 'transient'
+    }
+    if (KNOWN_PERMANENT_DOWNLOAD_URL_ERRORS.includes(name)) {
+        return 'permanent'
+    }
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+        return 'permanent'
+    }
+    if (
+        ['InternalServerException', 'ServiceUnavailableException', 'TimeoutError', 'NetworkingError'].includes(name) ||
+        ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN'].includes(code) ||
+        /ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|unknown error/i.test(msg)
+    ) {
+        return 'transient'
+    }
+    return 'permanent'
+}
+
+// A short, URL-free description of a failed call for an IDE-facing message: "<ErrorName>: <message>".
+function describeDownloadUrlError(error: unknown): string {
+    const e = error as any
+    const name: string = e?.name || 'Error'
+    const message = String(e?.message ?? error ?? '')
+        .replace(/https?:\/\/\S+/gi, '<url>')
+        .replace(/\s+/g, ' ')
+        .trim()
+    const short = message.length > 160 ? `${message.slice(0, 157)}...` : message
+    return short ? `${name}: ${short}` : name
+}
+// Cap on the parsed-artifact cache. The two bounds above limit ONE scan; they cannot
+// limit the number of scans, so repeated discovery sweeps re-downloaded the same
+// artifacts indefinitely. The cache is what bounds the total.
+//
+// 4000 is derived from a measurement, not chosen: a 25-minute session on a 32-job
+// workspace touched 1043 DISTINCT artifacts while issuing ~30000 downloads (~29x
+// redundancy). An earlier value of 500 sat BELOW that working set, so the cache filled,
+// evicted, and refilled continuously — 36 evictions in 25 minutes — and the flood did
+// not move at all. The cap must exceed the working set or the cache is worse than
+// useless: it pays the bookkeeping and delivers no hits.
+const BEAM_JSON_ARTIFACT_CACHE_MAX = 4000
+
+// How long a PARSED artifact stays cached. Negatives ("not JSON") never expire — that is a property
+// of the bytes — but a positive can be rewritten under the same artifactId (web-orc re-writes the
+// beam-map), so pinning one for the session would hide a repo beamed later. 60s is far longer than
+// the ~13s sweep cadence, so it still collapses the repeated fetches this cache exists to stop,
+// while bounding staleness to one minute. It also bounds RETENTION: parsed values are arbitrary
+// size, so a TTL keeps customer artifact content from living in the LSP for the whole session.
+const BEAM_JSON_POSITIVE_TTL_MS = 60_000
 
 /**
  * ATX Transform Handler - Business logic for ATX FES Transform operations
@@ -128,9 +365,30 @@ export class ATXTransformHandler {
     private atxClient: ElasticGumbyFrontendClient | null = null
     private cachedHitl: string | null = null
     private cachedStepHitl: string | null = null
-    private cachedInteractiveMode: InteractiveMode | null = null
+    // Keyed by job id: the handler outlives any single job, and the carry-forward below writes the
+    // cached mode into the job's settings artifact, so an unscoped cache could write one job's mode
+    // into another's. `source` is for the carry-forward log only.
+    private interactiveModeByJob = new Map<string, { mode: InteractiveMode; source: string }>()
+    // ITGen: in-flight test downloads by job and task, and the newest run started per job, side and project.
+    private readonly itGenTestDownloads = new Map<string, Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>>>()
+    private readonly itGenLatestRunByProject = new Map<string, string>()
     private _applyingCheckpoints = false
     private _currentDiffContext: DiffApplyContext | null = null
+    // The last ListHitls result of the getTransformInfo call in progress (undefined = not listed
+    // yet), reused to build OpenHitls without a second ListHitls call. Same lifetime as
+    // _currentDiffContext.
+    private _currentPollHitls: any[] | undefined = undefined
+    // ITGen: whether each job's objective has generate_integration_tests: true (see ItGenJobGate).
+    private readonly itGenJobs = new ItGenJobGate(
+        (workspaceId, jobId) => this.getJob(workspaceId, jobId, true),
+        message => this.logging.log(message),
+        (workspaceId, jobId) => this.readBeamOptIn(workspaceId, jobId)
+    )
+    // Beam-to-IDE: customer-changes manifest writes in progress, by manifest path.
+    private readonly beamManifestWrites = new Map<string, Promise<void>>()
+    // Beam-map scan: per job, the undownloadable candidates last warned about, so a sweep that finds the same ones
+    // doesn't warn again.
+    private readonly beamMapUnreadableWarned = new Map<string, string>()
     // sendMessage chat-poll cadence. Defaults give a 15-minute ceiling
     // (180 attempts x 5s). Held as fields rather than inline literals so a test can
     // drive the no-response path to completion instantly (interval 0, few attempts)
@@ -141,6 +399,38 @@ export class ATXTransformHandler {
     // pre-job mode-selection -checkpoint (filter) from the post-build -checkpoint
     // (surface for auto-approve).
     private jobsPastLocalBuild: Set<string> = new Set()
+    // downloadOriginalCode calls queued per artifactWorkspace/before folder, so two calls for one solution
+    // never extract or swap at the same time.
+    private originalCodeQueue: Map<string, Promise<AtxDownloadOriginalCodeResponse>> = new Map()
+
+    // Beam: parsed small-JSON artifacts keyed by artifactId. A `null` value is a positive result
+    // meaning "these bytes are definitively not JSON" — the case that dominated the waste, and the
+    // only one cached indefinitely. Parsed values carry an expiry because the same id CAN be
+    // rewritten (see downloadJsonArtifact for why immutability is not assumed). Transient failures
+    // — no presigned URL — are never cached at all.
+    private readonly beamJsonArtifactCache = new Map<string, { value: any | null; expiresAt: number }>()
+    // Latch so the cap-reached notice is logged once per process, not once per eviction.
+    private beamJsonArtifactCacheEvicted = false
+
+    // Process-wide throttle cooldown. The per-call retry in createArtifactDownloadUrl is resilience
+    // for ONE call and does not reduce our rate — under sustained throttling it raises it, because a
+    // rejected call becomes up to four. Nothing currently tells the client to stop STARTING work.
+    // That is the gap behind an alarm that has fired five times in 2026 without resolution: each
+    // round produced a local "make this cheaper" fix while the client kept initiating at the same
+    // rate no matter how hard the service pushed back.
+    //
+    // So: any throttle sets a cooldown, and the optional beam-map scan — the only unbounded-ish
+    // fan-out we own — skips while it is in force. Deliberately longer than the 30s poll interval so
+    // it actually drops sweeps rather than merely delaying calls within one.
+    //
+    // Skipping is SAFE and not a feature regression: the beam-map is optional enrichment. When it is
+    // absent, discovery already derives beamed repos from beam-status artifacts (observed live:
+    // "no beam-map for job=… — derived 1 beamed repo(s) from beam-status artifacts"), and
+    // isRepoLbvOpen defaults to OPEN on a fetch failure so nothing is ever wrongly hidden. A
+    // throttled sweep therefore degrades to the path that already works, and the next uncooled sweep
+    // picks the beam-map up.
+    private beamThrottleCooldownUntilMs = 0
+    private beamThrottleCooldownLogged = false
 
     constructor(serviceManager: AtxTokenServiceManager, workspace: Workspace, logging: Logging, runtime: Runtime) {
         this.serviceManager = serviceManager
@@ -199,6 +489,12 @@ export class ATXTransformHandler {
             const atxServiceManager = AtxTokenServiceManager.getInstance()
             const applicationUrl = atxServiceManager.getActiveApplicationUrl()
 
+            // IAM: the tenant URL comes from the client, so only a valid AWS Transform URL gives a region; no
+            // fallback to the default region.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                return parseAtxTenantUrl(applicationUrl)?.region
+            }
+
             if (applicationUrl) {
                 // Extract region from applicationURL: https://xxx.transform.REGION.on.aws
                 const urlMatch = applicationUrl.match(/\.transform(?:-gamma)?\.([^.]+)\.on\.aws/)
@@ -220,6 +516,20 @@ export class ATXTransformHandler {
     private async addAuthToCommand(command: any): Promise<void> {
         if (!this.serviceManager.isReady()) {
             throw new Error('Please select a valid Transform profile to continue')
+        }
+
+        const authType = this.serviceManager.getAuthType()
+
+        // IAM path: SigV4-sign the request. Additive branch; the bearer path below is unchanged.
+        if (authType === 'iam') {
+            await this.addSigV4AuthToCommand(command)
+            return
+        }
+
+        // No active auth (IAM credentials present but tenant URL not yet configured, or nothing
+        // signed in): fail before the request reaches the network.
+        if (authType !== 'bearer') {
+            throw new Error('AWS Transform is not signed in - no active authentication')
         }
 
         const bearerToken = await this.serviceManager.getBearerToken()
@@ -251,6 +561,72 @@ export class ATXTransformHandler {
             {
                 step: 'build',
                 name: 'addAtxAuthMiddleware',
+                priority: 'high',
+            }
+        )
+    }
+
+    /**
+     * SigV4-sign an ATX FES command using the active IAM credentials (service name `transform`).
+     * Region and the Origin header come from the tenant URL, which must be a valid AWS Transform URL
+     * (parseAtxTenantUrl); the request itself always goes to the region's FES endpoint.
+     */
+    private async addSigV4AuthToCommand(command: any): Promise<void> {
+        const iamCredentials = this.serviceManager.getIamCredentials()
+
+        // Never sign without a valid AWS Transform tenant URL: it gives the region and the Origin header.
+        const tenantUrl = parseAtxTenantUrl(await this.getActiveTransformProfileApplicationUrl())
+        if (!tenantUrl) {
+            throw new Error('ATX: No valid AWS Transform application URL for IAM (SigV4) auth')
+        }
+        const region = tenantUrl.region
+        const cleanOrigin = tenantUrl.origin
+
+        const signer = new SignatureV4({
+            service: 'transform',
+            region,
+            credentials: {
+                accessKeyId: iamCredentials.accessKeyId,
+                secretAccessKey: iamCredentials.secretAccessKey,
+                sessionToken: iamCredentials.sessionToken,
+            },
+            sha256: Sha256,
+        })
+
+        this.logging.log(`ATX: Using IAM (SigV4) auth for FES request (service=transform, region=${region})`)
+
+        command.middlewareStack?.add(
+            (next: any) => async (args: any) => {
+                if (!args.request.headers) {
+                    args.request.headers = {}
+                }
+
+                // Set headers case-insensitively (removing any existing case variant) BEFORE signing.
+                // The smithy client already sets a lowercase 'content-type'; a second differently-cased
+                // key would be signed but merged by the HTTP layer on send, invalidating the signature.
+                const setHeader = (name: string, value: string) => {
+                    for (const key of Object.keys(args.request.headers)) {
+                        if (key.toLowerCase() === name.toLowerCase()) {
+                            delete args.request.headers[key]
+                        }
+                    }
+                    args.request.headers[name] = value
+                }
+                setHeader('content-type', 'application/json; charset=UTF-8')
+                setHeader('content-encoding', 'amz-1.0')
+                if (cleanOrigin) {
+                    setHeader('origin', cleanOrigin)
+                }
+
+                // SignatureV4 adds Authorization, X-Amz-Date, and X-Amz-Security-Token (when a session
+                // token is present) over the canonical request.
+                args.request = await signer.sign(args.request)
+                return next(args)
+            },
+            {
+                // finalizeRequest so X-Amz-Target and the serialized body are present at signing time.
+                step: 'finalizeRequest',
+                name: 'addAtxSigV4Middleware',
                 priority: 'high',
             }
         )
@@ -289,10 +665,11 @@ export class ATXTransformHandler {
     private clearJobCache(jobId?: string): void {
         this.cachedHitl = null
         this.cachedStepHitl = null
-        this.cachedInteractiveMode = null
         if (jobId) {
+            this.interactiveModeByJob.delete(jobId)
             this._worklogNextTokenByJob.delete(jobId)
             Utils.clearWorklogCacheForJob(jobId)
+            this.itGenJobs.forget(jobId)
         }
         this.logging.log('ATX: Cleared job cache')
     }
@@ -307,14 +684,48 @@ export class ATXTransformHandler {
                 return false
             }
 
-            // Verify authentication details
-            await this.serviceManager.getBearerToken()
+            // Verify authentication details. Bearer validates the token; IAM validates the
+            // credentials in the iam slot. Both paths require the tenant (application) URL.
+            if (this.serviceManager.getAuthType() === 'iam') {
+                this.serviceManager.getIamCredentials()
+            } else {
+                await this.serviceManager.getBearerToken()
+            }
             await this.getActiveTransformProfileApplicationUrl()
 
             return true
         } catch (error) {
             this.logging.error(`ATX: Session verification error: ${String(error)}`)
             return false
+        }
+    }
+
+    /**
+     * Confirms the active session works against FES with one read-only ListWorkspaces call (never the create path).
+     * Used by the client to validate IAM sign-in before reporting it connected. Failures are classified here, where
+     * the typed SDK error is available; only the reason, error name and HTTP status are returned and logged.
+     */
+    async validateSession(): Promise<AtxValidateSessionResponse> {
+        if (!(await this.verifySession())) {
+            this.logging.error('ATX: ValidateSession - session not ready (credentials or tenant URL missing)')
+            return { Valid: false, Reason: 'Other', ErrorCode: 'SessionNotReady' }
+        }
+
+        try {
+            const { ListWorkspacesCommand } = await import('@amazon/elastic-gumby-frontend-client')
+            const command = new ListWorkspacesCommand({ maxResults: 1 })
+            await this.addAuthToCommand(command)
+
+            await this.atxClient!.send(command)
+            this.logging.log('ATX: ValidateSession succeeded')
+            return { Valid: true }
+        } catch (error) {
+            const failure = classifyAtxSessionValidationError(error)
+            this.logging.error(
+                `ATX: ValidateSession failed - reason=${failure.Reason}, code=${failure.ErrorCode}, ` +
+                    `status=${failure.HttpStatus ?? 'none'}`
+            )
+            return { Valid: false, ...failure }
         }
     }
 
@@ -513,6 +924,8 @@ export class ATXTransformHandler {
         targetFramework?: string
         interactiveMode?: InteractiveMode
         generateUnitTests?: boolean
+        generateIntegrationTests?: boolean
+        browser?: BrowserInfo
     }): Promise<{ jobId: string; status: string } | null> {
         try {
             this.logging.log(`ATX: Starting CreateJob for workspace: ${request.workspaceId}`)
@@ -542,6 +955,25 @@ export class ATXTransformHandler {
                 objective.generate_unit_tests = request.generateUnitTests
             }
 
+            // The customer's integration-test choice, the only ITGen key. Same rule as unit tests: only a
+            // real boolean counts, and an explicit false is a decline.
+            if (typeof request.generateIntegrationTests === 'boolean') {
+                objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY] = request.generateIntegrationTests
+            }
+
+            // Browser used to run the generated tests against localhost. Only sent with integration tests;
+            // drop anything that isn't a well-formed object.
+            if (
+                request.generateIntegrationTests === true &&
+                request.browser &&
+                typeof request.browser.Type === 'string'
+            ) {
+                objective[ATX_OBJECTIVE_BROWSER_KEY] = {
+                    type: request.browser.Type,
+                    version: typeof request.browser.Version === 'string' ? request.browser.Version : null,
+                }
+            }
+
             const orchestratorAgent = getAtxOrchestratorAgent()
             if (process.env.ATX_ORCHESTRATOR_AGENT) {
                 this.logging.log(
@@ -566,6 +998,7 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: CreateJob RequestId: ${response.$metadata?.requestId}`)
 
             if (response.jobId && response.status) {
+                this.itGenJobs.rememberFlag(response.jobId, request.generateIntegrationTests === true)
                 return { jobId: response.jobId, status: response.status }
             }
 
@@ -584,6 +1017,54 @@ export class ATXTransformHandler {
      * by listing the parent job's artifacts and picking the beam-map JSON.
      */
     async listBeamedRepos(workspaceId: string, parentJobId: string, lightweight = false): Promise<BeamedRepoInfo[]> {
+        return (await this.discoverBeamedRepos(workspaceId, parentJobId, lightweight)).repos
+    }
+
+    /** ITGen: the gate's beam-map reader (ItGenJobGate.isBeamItGenJob, which says what each answer means). */
+    private async readBeamOptIn(workspaceId: string, jobId: string): Promise<boolean | 'unconfirmed' | undefined> {
+        const { repos, beamMapScanned, beamMapUnconfirmed, scanAborted, optInFound } = await this.discoverBeamedRepos(
+            workspaceId,
+            jobId,
+            false
+        )
+        // A beam-map read before the scan was cut short that opts a repo in decides: more candidates can't
+        // take the opt-in back. Remembered here, not left to discoverBeamedRepos' side effect.
+        if (optInFound) {
+            this.itGenJobs.rememberBeamOptIn(jobId)
+            return true
+        }
+        if (beamMapScanned) {
+            return repos.some(r => r.GenerateIntegrationTests)
+        }
+        // A scan that was cut short (timed out or throttled during the scan) counts as 'unconfirmed':
+        // it's retried with exponential back-off and eventually gives up after beamMaxReadsThatCannotTell
+        // attempts, rather than retrying flat every 60 s forever. For job 401bf8f4: 8 beam-status-*
+        // artifacts ahead of the pathless beam-map caused a 15 s timeout on every scan attempt because
+        // the old code didn't filter them. With the filter fix they are excluded, so this branch is now
+        // only hit when the beam-map is pathless but the download itself is slow or times out.
+        if (beamMapUnconfirmed || scanAborted) {
+            return 'unconfirmed'
+        }
+        return undefined
+    }
+
+    /**
+     * listBeamedRepos, plus whether the beam-map scan ran to the end, so a "no opt-in" answer can be told apart
+     * from "the beam-map wasn't read" (lightweight, throttle cooldown, scan budget used up, or an error), and
+     * whether it ended without a beam-map while a candidate went unread (beamMapUnconfirmed).
+     */
+    private async discoverBeamedRepos(
+        workspaceId: string,
+        parentJobId: string,
+        lightweight: boolean
+    ): Promise<{
+        repos: BeamedRepoInfo[]
+        beamMapScanned: boolean
+        beamMapUnconfirmed: boolean
+        scanAborted: boolean
+        /** A beam-map that was read opts at least one repo in (even if the scan was cut short afterwards). */
+        optInFound: boolean
+    }> {
         try {
             this.logging.log(`ATX: listBeamedRepos for parentJobId=${parentJobId} lightweight=${lightweight}`)
             if (!this.atxClient && !(await this.initializeAtxClient())) {
@@ -663,7 +1144,9 @@ export class ATXTransformHandler {
             // artifact that throws (or isn't JSON, e.g. an unrelated metadata.json / binary)
             // must NOT abort the scan, or we miss the real beam-map that comes later in the list
             // and wrongly fall back to zip-discovery (empty stepId). We scan ALL candidates and
-            // keep the LAST valid repos[] (beam-map is re-written on each beam; latest wins).
+            // merge every valid repos[]: the web writes a NEW beam-map on each beam batch (each
+            // merging the earlier ones), and ListArtifacts order isn't chronological, so the last
+            // one listed can be an older map. Per repo, the entry from the newest map wins.
             // Candidate beam-map artifacts = everything EXCEPT the transformed-source
             // bundles. The beam-map is itself stored as a ZIP by FES (downloadJsonArtifact
             // unzips + parses it), so we MUST NOT exclude by ".zip" extension — that would
@@ -673,26 +1156,62 @@ export class ATXTransformHandler {
             // source bundles, whose paths match "<repo>_<hash>/<repo>.zip" (ZIP_RE). Anything
             // else (including an unnamed/empty-path zip = the beam-map) is a candidate.
             let beamMapRepos: BeamMapRepo[] | null = null
+            const beamMaps: { repos: BeamMapRepo[]; createdAt: number }[] = []
             // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
             // beam-status + one plan fetch. stepId isn't resolved here; the IDE keeps the one from full
             // discovery / resolves it at Load.
+            // Sort candidates: pathless entries first (the beam-map has no path in ListArtifacts
+            // so it sorts to the front); skip beam-status-* JSON files (they never hold the
+            // beam-map and each one wastes scan budget). A multi-repo beam has N beam-status-*
+            // files plus one pathless beam-map; without this ordering the beam-map may fall
+            // outside the 15 s budget or be throttled before it is reached.
             const allCandidates = lightweight
                 ? []
-                : artifacts.filter(a => {
-                      const p = (a.fileMetadata?.path || '').toLowerCase()
-                      return !ZIP_RE.test(p) // keep non-transformed-bundle artifacts (incl. the beam-map zip)
-                  })
+                : artifacts
+                      .filter(a => {
+                          const p = (a.fileMetadata?.path || '').toLowerCase()
+                          return !ZIP_RE.test(p) && !/beam-status-/.test(p)
+                      })
+                      .sort((a, b) => {
+                          // Pathless = 0, has-path = 1. Beam-map is pathless; everything else
+                          // has a path. Within each group the order is arbitrary.
+                          const aPathless = a.fileMetadata?.path ? 1 : 0
+                          const bPathless = b.fileMetadata?.path ? 1 : 0
+                          return aPathless - bPathless
+                      })
             // Bound the scan: each candidate is a serial download+parse, so an artifact-heavy
             // job (logs, metadata) could otherwise stall the IDE's discovery UI. Cap the number
             // scanned and enforce an overall deadline; the beam-map is written early and is
             // small, so a bounded scan reliably finds it.
-            const candidates = allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
+            // Throttle cooldown: skip the optional scan rather than adding to the pressure. The
+            // existing per-call retry only rescues a single call; this is what stops us STARTING more
+            // work while the service is rejecting us.
+            //
+            // Empty the candidate list rather than returning early — an early return would abandon
+            // the whole of listBeamedRepos, including the beam-status discovery below, and the Beamed
+            // tab would go empty for the duration of the cooldown. Emptying skips only the optional
+            // enrichment and lets the path that actually finds beamed repos run untouched.
+            const beamThrottleCoolingDown = this.isBeamThrottleCooldownActive()
+            // A throttle during the scan moves this, and makes the scan unfinished (see scanFinished).
+            const throttleMarkBeforeScan = this.beamThrottleCooldownUntilMs
+            if (beamThrottleCoolingDown) {
+                this.logging.log(
+                    `[BEAM-PKG] beam-map scan: SKIPPED — throttle cooldown active for another ` +
+                        `${Math.max(0, this.beamThrottleCooldownUntilMs - Date.now())}ms. ` +
+                        `Beam-status discovery continues; the beam-map is optional enrichment.`
+                )
+            }
+            const candidates = beamThrottleCoolingDown ? [] : allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
             if (allCandidates.length > candidates.length) {
                 this.logging.log(
                     `[BEAM-PKG] beam-map scan: capping ${allCandidates.length} candidate(s) to ${candidates.length}`
                 )
             }
             const scanDeadline = Date.now() + BEAM_MAP_SCAN_BUDGET_MS
+            let scanCutShort = false
+            // Candidates that couldn't be downloaded (for example ResourceNotFound while the web side's
+            // copy to the user-facing bucket hasn't landed). Any of them could be the beam-map.
+            const unreadable: string[] = []
             this.logging.log(
                 `[BEAM-PKG] beam-map scan: ${candidates.length} candidate artifact(s) (excluded transformed-source bundles)`
             )
@@ -702,10 +1221,13 @@ export class ATXTransformHandler {
                     this.logging.log(
                         `[BEAM-PKG] beam-map scan: time budget (${BEAM_MAP_SCAN_BUDGET_MS}ms) exceeded — stopping scan`
                     )
+                    scanCutShort = true
                     break
                 }
                 try {
-                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId)
+                    const map = await this.downloadJsonArtifact(workspaceId, parentJobId, a.artifactId, () =>
+                        unreadable.push(a.artifactId)
+                    )
                     // Validate shape before trusting it: the beam-map is uploaded by the web
                     // orchestrator, so a malformed, unexpectedly-shaped, or attacker-influenced
                     // payload must NOT flow into normalizeBeamRepo (which drives which artifacts
@@ -723,9 +1245,13 @@ export class ATXTransformHandler {
                                 `[BEAM-PKG] beam-map validation: skipped ${rejected} malformed entr(y/ies) in artifact=${a.artifactId}`
                             )
                         }
-                        beamMapRepos = validRepos as BeamMapRepo[]
+                        beamMaps.push({
+                            repos: validRepos as BeamMapRepo[],
+                            // A Date from the SDK; also takes epoch ms or an ISO string. Missing or invalid: oldest.
+                            createdAt: new Date(a.artifactCreatedTimestamp ?? 0).getTime() || 0,
+                        })
                         this.logging.log(
-                            `[BEAM-PKG] beam-map found (${beamMapRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
+                            `[BEAM-PKG] beam-map found (${validRepos.length} valid repo(s)) artifact=${a.artifactId} — filtering discovery by beam-map membership`
                         )
                         // Do NOT break — keep scanning; a later artifact could be a newer beam-map.
                         // (Cost is bounded: only empty-path/non-zip artifacts, a handful per job.)
@@ -735,6 +1261,66 @@ export class ATXTransformHandler {
                     // download hiccup). Keep scanning the rest.
                     this.logging.log(`[BEAM-PKG] beam-map scan: skipped artifact ${a.artifactId}: ${String(e)}`)
                 }
+            }
+
+            if (beamMaps.length > 0) {
+                // Oldest first (stable, so maps without a timestamp keep list order), so a newer entry replaces it.
+                const byRepo = new Map<string, BeamMapRepo>()
+                for (const m of [...beamMaps].sort((x, y) => x.createdAt - y.createdAt)) {
+                    for (const r of m.repos) {
+                        byRepo.set(this.normalizeBeamRepo(r).RepositoryName.toLowerCase(), r)
+                    }
+                }
+                beamMapRepos = [...byRepo.values()]
+                if (beamMaps.length > 1) {
+                    this.logging.log(
+                        `[BEAM-PKG] beam-map: merged ${beamMaps.length} beam-maps into ${beamMapRepos.length} repo(s) for job=${parentJobId}`
+                    )
+                }
+            }
+
+            // A beam-map that was read and opts in decides. Otherwise a candidate that went unread (it
+            // couldn't be downloaded, or was past the candidate cap) can be a newer beam-map that opts in:
+            // the web publishes a beam-map where the IDE can download it only when a repo in it opts in,
+            // and the copy can land after the beam-map is listed. So the opt-in is unconfirmed: the gate
+            // retries later (and counts it) instead of caching "not opted in". A throttle during the scan
+            // makes it unfinished, like the throttle cooldown: retried, never counted.
+            const leftOut = beamThrottleCoolingDown ? 0 : allCandidates.length - candidates.length
+            const throttledDuringScan = this.beamThrottleCooldownUntilMs !== throttleMarkBeforeScan
+            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
+            const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
+            const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
+            // True when the scan ran but was cut short (time budget exhausted or a throttle arrived
+            // mid-scan). The gate treats this as 'unconfirmed': retried with exponential back-off,
+            // eventually gives up after beamMaxReadsThatCannotTell attempts, rather than retrying flat
+            // every 60 s forever. Both causes are included because a throttle mid-scan is just as
+            // incomplete as a budget timeout — the beam-map may not have been reached in either case.
+            const scanAborted = !lightweight && (scanCutShort || throttledDuringScan)
+            const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
+            if (unreadKey === undefined) {
+                // Only a finished scan with an answer ends the warning; a lightweight, throttled or
+                // cut-short sweep says nothing about the unread candidates.
+                if (scanFinished) {
+                    this.beamMapUnreadableWarned.delete(parentJobId)
+                }
+            } else if (this.beamMapUnreadableWarned.get(parentJobId) !== unreadKey) {
+                this.beamMapUnreadableWarned.delete(parentJobId)
+                this.beamMapUnreadableWarned.set(parentJobId, unreadKey)
+                while (this.beamMapUnreadableWarned.size > BEAM_MAP_UNREADABLE_WARNED_MAX) {
+                    this.beamMapUnreadableWarned.delete(this.beamMapUnreadableWarned.keys().next().value!)
+                }
+                const unread = [
+                    unreadable.length > 0
+                        ? `couldn't download ${unreadable.length} candidate artifact(s) (${unreadable.join(', ')})`
+                        : '',
+                    leftOut > 0
+                        ? `didn't read ${leftOut} candidate(s) past the ${BEAM_MAP_SCAN_MAX_CANDIDATES}-candidate cap`
+                        : '',
+                ].filter(Boolean)
+                this.logging.warn(
+                    `[BEAM-PKG] beam-map scan for job=${parentJobId} read no beam-map that opts in: ${unread.join(' and ')}; ` +
+                        `if one is the beam-map, its ITGen opt-in is unknown until a later scan reads it`
+                )
             }
 
             const beamed: BeamedRepoInfo[] = []
@@ -778,7 +1364,7 @@ export class ATXTransformHandler {
                             `[BEAM-PKG] beam-map repo '${nr.RepositoryName}': no transformed zip matched — falling back to beam-map artifactId ${nr.BeamArtifactId} (may not be downloadable)`
                         )
                     }
-                    const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, nr.RepositoryName) : true
+                    const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, nr.RepositoryName, parentJobId) : true
                     const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, nr.RepositoryName) : true
                     beamed.push({
                         RepositoryName: nr.RepositoryName,
@@ -786,11 +1372,13 @@ export class ATXTransformHandler {
                         BeamStepId: nr.BeamStepId || '',
                         BeamTargetFramework: nr.BeamTargetFramework || '',
                         BeamScenario: nr.BeamScenario || 'transformed',
+                        OriginalArtifactId: nr.OriginalArtifactId || '',
+                        GenerateIntegrationTests: nr.GenerateIntegrationTests,
                         IsLbvOpen: lbvOpen,
                         IsLbvPending: lbvPending,
                     })
                     this.logging.log(
-                        `[BEAM-PKG] beamed repo (from beam-map) | repo=${nr.RepositoryName} artifact=${artifactId} stepId=${nr.BeamStepId || '<empty>'} scenario=${nr.BeamScenario || 'transformed'} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                        `[BEAM-PKG] beamed repo (from beam-map) | job=${parentJobId} repo=${nr.RepositoryName} artifact=${artifactId} stepId=${nr.BeamStepId || '<empty>'} scenario=${nr.BeamScenario || 'transformed'} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
                     )
                 }
             } else {
@@ -834,7 +1422,7 @@ export class ATXTransformHandler {
                             )
                             continue
                         }
-                        const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, repoName) : true
+                        const lbvOpen = planRoot ? this.isRepoLbvOpen(planRoot, repoName, parentJobId) : true
                         const lbvPending = planRoot ? this.isRepoLbvHitlPending(planRoot, repoName) : true
                         beamed.push({
                             RepositoryName: repoName,
@@ -842,11 +1430,14 @@ export class ATXTransformHandler {
                             BeamStepId: '',
                             BeamTargetFramework: '',
                             BeamScenario: 'transformed',
+                            // Beam-status fallback has no beam-map entry, so no original id and no ITGen.
+                            OriginalArtifactId: '',
+                            GenerateIntegrationTests: false,
                             IsLbvOpen: lbvOpen,
                             IsLbvPending: lbvPending,
                         })
                         this.logging.log(
-                            `[BEAM-PKG] beamed repo (from beam-status) | repo=${repoName} artifact=${zip.artifactId} path=${zip.path} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
+                            `[BEAM-PKG] beamed repo (from beam-status) | job=${parentJobId} repo=${repoName} artifact=${zip.artifactId} path=${zip.path} lbvOpen=${lbvOpen} lbvPending=${lbvPending}`
                         )
                     }
                     this.logging.log(
@@ -861,11 +1452,44 @@ export class ATXTransformHandler {
                 }
             }
 
+            // ITGen: the parent job runs Local Verification for its beamed repos when any of them opts in.
+            if (beamed.some(r => r.GenerateIntegrationTests)) {
+                this.itGenJobs.rememberBeamOptIn(parentJobId)
+            }
             this.logging.log(`[BEAM-PKG] listBeamedRepos: ${beamed.length} beamed repo(s) for job=${parentJobId}`)
-            return beamed
+            // Single summary line per scan — the most useful line for diagnosing future failures.
+            const scanResultLabel = beamMapOptsIn
+                ? 'found-opted-in'
+                : beamMapUnconfirmed
+                  ? 'unconfirmed'
+                  : scanAborted
+                    ? scanCutShort
+                        ? 'timed-out'
+                        : 'throttled-during-scan'
+                    : scanFinished
+                      ? 'not-opted-in'
+                      : 'no-scan'
+            this.logging.log(
+                `[BEAM-PKG] scan-summary job=${parentJobId} result=${scanResultLabel} ` +
+                    `candidates=${candidates.length} unreadable=${unreadable.length} ` +
+                    `beamMapFound=${beamMaps.length > 0} repos=${beamed.length}`
+            )
+            return {
+                repos: beamed,
+                beamMapScanned: scanFinished && !beamMapUnconfirmed,
+                beamMapUnconfirmed,
+                scanAborted,
+                optInFound: beamMapOptsIn,
+            }
         } catch (error) {
             this.logging.error(`ATX: listBeamedRepos error: ${String(error)}`)
-            return []
+            return {
+                repos: [],
+                beamMapScanned: false,
+                beamMapUnconfirmed: false,
+                scanAborted: false,
+                optInFound: false,
+            }
         }
     }
 
@@ -905,6 +1529,29 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Beam-to-IDE, ITGen: drops the integ-* HITLs outside the loaded repo's subtree (a sibling beamed repo's) and
+     * the ones with no step id, which can't be shown to belong to it. While the job isn't known to be an ITGen job
+     * (e.g. right after an LS restart, before the background beam-map read finishes) it drops all of them, so none
+     * goes down the generic artifact path as an unknown tag. Unchanged when no scope is set (non-beam).
+     */
+    private withoutSiblingItGenHitls(hitls: any[], scopeStepIds: string[], jobId: string): any[] {
+        if (scopeStepIds.length === 0) {
+            return hitls
+        }
+        const itGen = this.itGenJobs.isKnownItGenJob(jobId)
+        return hitls.filter(
+            h => !isItGenHitlTag(h.tag) || (itGen && scopeStepIds.includes(String(this.getStepId(h) ?? '')))
+        )
+    }
+
+    private static parseScopeStepIds(beamScopeStepIds: string | undefined): string[] {
+        return (beamScopeStepIds || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+    }
+
+    /**
      * Normalize a beam-map repo item into the PascalCase shape the C# IDE consumes,
      * tolerant of key-name variants from the web writer (repoName/repo/name,
      * artifactId/beamArtifactId, stepId/planStepId, targetFramework/tfm).
@@ -917,6 +1564,8 @@ export class ATXTransformHandler {
             BeamStepId: this.getStepId(o) ?? '',
             BeamTargetFramework: o.targetFramework ?? o.tfm ?? o.target_framework ?? '',
             BeamScenario: o.scenario ?? 'transformed',
+            OriginalArtifactId: o.originalArtifactId ?? '',
+            GenerateIntegrationTests: o.generateIntegrationTests === true,
         }
     }
 
@@ -927,10 +1576,72 @@ export class ATXTransformHandler {
      * "Unexpected token 'P'"). So: fetch as a buffer, try JSON.parse first, and on
      * failure unzip (AdmZip) and parse the first JSON entry inside.
      */
-    private async downloadJsonArtifact(workspaceId: string, jobId: string, artifactId: string): Promise<any | null> {
+    /**
+     * Record that FES pushed back. Set on every throttle, retried or not — the signal is "we are
+     * being rejected", which is equally true on the first attempt and the last.
+     */
+    private noteBeamThrottled(): void {
+        this.beamThrottleCooldownUntilMs = Date.now() + BEAM_THROTTLE_COOLDOWN_MS
+        if (!this.beamThrottleCooldownLogged) {
+            this.beamThrottleCooldownLogged = true
+            this.logging.log(
+                `[BEAM-PKG] FES throttled us — pausing the optional beam-map scan for ` +
+                    `${BEAM_THROTTLE_COOLDOWN_MS}ms after each throttle. Logged once per process.`
+            )
+        }
+    }
+
+    private isBeamThrottleCooldownActive(): boolean {
+        return Date.now() < this.beamThrottleCooldownUntilMs
+    }
+
+    /**
+     * `onUnreadable` is called when the artifact couldn't be downloaded (no download URL, or the
+     * download failed), as opposed to read and found not to be JSON: both return null.
+     */
+    private async downloadJsonArtifact(
+        workspaceId: string,
+        jobId: string,
+        artifactId: string,
+        onUnreadable?: () => void
+    ): Promise<any | null> {
+        // Beam discovery re-scans the same candidate artifacts on every sweep, so without a cache
+        // the same artifact is downloaded and re-parsed on every pass (measured: ~2000 download-URL
+        // creations and 1230 repeated "not JSON" parses in 90s, which provoked AccessDenied on
+        // unrelated calls — chat included).
+        //
+        // Deliberately NOT relying on artifacts being immutable. An earlier version did, on the
+        // assumption that a re-upload mints a new artifactId — but this file's own comments record
+        // web-orc RE-WRITING the beam-map (see the beam-map notes above: "re-written on each beam;
+        // latest wins", and the BeamArtifactId "thrash" that forced the beam-status fallback). If a
+        // rewrite reuses the id, a permanent positive cache would pin the FIRST beam-map for the
+        // whole LSP session, so a repo beamed later never appears in the panel until restart, and a
+        // re-beam would leave chat routed at a dead stepId.
+        //
+        // So: NEGATIVES are cached permanently (an artifact that is not JSON does not become JSON,
+        // and negatives were 1230 of the 1980 wasted fetches — the bulk of the win), while POSITIVES
+        // get a short TTL. Positives are a handful per job, so re-fetching one every TTL is cheap,
+        // and it removes the dependency on platform semantics we have not verified.
+        const hit = this.beamJsonArtifactCache.get(artifactId)
+        if (hit && Date.now() < hit.expiresAt) {
+            // Re-insert to move this entry to the end: Map iterates in insertion order, so
+            // "oldest key first" is only a true LRU ordering if a hit refreshes position.
+            this.beamJsonArtifactCache.delete(artifactId)
+            this.beamJsonArtifactCache.set(artifactId, hit)
+            return hit.value
+        }
+        if (hit) {
+            // Expired positive — drop it so the fetch below refreshes it.
+            this.beamJsonArtifactCache.delete(artifactId)
+        }
         try {
             const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
-            if (!dl?.s3PresignedUrl) return null
+            // No presigned URL is a transient condition (throttle/authz), so it is NOT
+            // cached — the next sweep must be free to retry.
+            if (!dl?.s3PresignedUrl) {
+                onUnreadable?.()
+                return null
+            }
             const response = await got.get(dl.s3PresignedUrl, {
                 headers: dl.requestHeaders || {},
                 responseType: 'buffer',
@@ -940,7 +1651,9 @@ export class ATXTransformHandler {
 
             // Direct JSON first (artifact stored raw).
             try {
-                return JSON.parse(buf.toString('utf8'))
+                const parsed = JSON.parse(buf.toString('utf8'))
+                this.cacheJsonArtifact(artifactId, parsed)
+                return parsed
             } catch {
                 // Not raw JSON — likely a ZIP (PK magic). Unzip and parse the first
                 // JSON entry (the beam-map is a single JSON file inside).
@@ -953,18 +1666,65 @@ export class ATXTransformHandler {
                             this.logging.log(
                                 `[BEAM-PKG] downloadJsonArtifact: parsed ${artifactId} from zip entry ${entry.entryName}`
                             )
+                            this.cacheJsonArtifact(artifactId, parsed)
                             return parsed
                         } catch {
                             // not this entry — try the next
                         }
                     }
                 }
-                throw new Error('artifact is neither raw JSON nor a zip containing JSON')
+                // Definitively not JSON, and not a zip containing JSON. That is a
+                // PERMANENT property of these bytes, so remember it: this was the bulk
+                // of the waste (1230 repeats in 90s), and it now logs once per artifact
+                // instead of once per sweep.
+                this.logging.log(
+                    `ATX: downloadJsonArtifact: ${artifactId} is neither raw JSON nor a zip containing JSON — caching as not-JSON`
+                )
+                this.cacheJsonArtifact(artifactId, null)
+                return null
             }
         } catch (error) {
+            // TRANSIENT (download/network/throttle/AccessDenied, or a malformed zip that
+            // made AdmZip throw). Deliberately NOT cached — caching one of these would
+            // permanently mark a readable artifact as unreadable.
             this.logging.log(`ATX: downloadJsonArtifact parse/download failed for ${artifactId}: ${String(error)}`)
+            onUnreadable?.()
             return null
         }
+    }
+
+    /**
+     * Record a parsed artifact (or `null` for "definitively not JSON") against its
+     * immutable artifactId, evicting least-recently-used entries at the cap.
+     *
+     * Evicts ONE entry rather than clearing the map. The first version cleared wholesale,
+     * which turns an under-sized cap from a partial loss into a total one: at the cap it
+     * discards every entry including the ones about to be hit, so the hit rate collapses
+     * to zero and the cache does nothing. That is exactly what happened with a cap of 500
+     * against a 1043-artifact working set. Single-victim eviction degrades gradually
+     * instead, so a workspace larger than the cap still gets most of the benefit.
+     */
+    private cacheJsonArtifact(artifactId: string, value: any | null): void {
+        while (this.beamJsonArtifactCache.size >= BEAM_JSON_ARTIFACT_CACHE_MAX) {
+            const oldest = this.beamJsonArtifactCache.keys().next()
+            if (oldest.done) break
+            this.beamJsonArtifactCache.delete(oldest.value)
+            // Logged ONCE, not per eviction — the signal we want is "the working set
+            // exceeded the cap", which is what made the previous under-sized cap
+            // diagnosable. Per-eviction logging would itself become the flood.
+            if (!this.beamJsonArtifactCacheEvicted) {
+                this.beamJsonArtifactCacheEvicted = true
+                this.logging.log(
+                    `[BEAM-PKG] downloadJsonArtifact cache hit its ${BEAM_JSON_ARTIFACT_CACHE_MAX}-entry cap — ` +
+                        `evicting LRU. If this appears, the workspace's artifact working set exceeds the cap ` +
+                        `and the hit rate is degrading; consider raising it.`
+                )
+            }
+        }
+        // value === null means "definitively not JSON" — a permanent property of the bytes, so it
+        // never expires. A parsed positive may be rewritten under the same id, so it does.
+        const expiresAt = value === null ? Number.MAX_SAFE_INTEGER : Date.now() + BEAM_JSON_POSITIVE_TTL_MS
+        this.beamJsonArtifactCache.set(artifactId, { value, expiresAt })
     }
 
     /**
@@ -977,19 +1737,24 @@ export class ATXTransformHandler {
         parentJobId: string,
         beamArtifactId: string,
         destDir: string
-    ): Promise<{ Success: boolean; ExtractedPath?: string; Error?: string }> {
+    ): Promise<{ Success: boolean; ExtractedPath?: string; Error?: string; ErrorCode?: string }> {
         try {
             this.logging.log(`[BEAM-PKG] downloadBeamArtifact ${beamArtifactId} -> ${destDir}`)
             // destDir must be an absolute path (the IDE passes a resolved workspace path).
             // Reject relative/traversal input so extraction can't be aimed at an unexpected
             // location; the zip-slip guard in extractAllEntriesTo then confines each entry
             // within this dir.
-            if (!destDir || !path.isAbsolute(destDir) || destDir.includes('..')) {
-                return { Success: false, Error: 'Invalid destination directory for beam artifact' }
+            if (!isSafeAbsolutePath(destDir)) {
+                // ErrorCode lets the IDE tell this apart without matching the (English) message.
+                return {
+                    Success: false,
+                    Error: 'Invalid destination directory for beam artifact',
+                    ErrorCode: BEAM_DOWNLOAD_ERROR_INVALID_DESTINATION,
+                }
             }
             const dl = await this.createArtifactDownloadUrl(workspaceId, parentJobId, beamArtifactId)
             if (!dl?.s3PresignedUrl) {
-                return { Success: false, Error: 'No presigned URL for beam artifact' }
+                return { Success: false, Error: this.downloadUrlFailureMessage(beamArtifactId, 'beam artifact') }
             }
             // downloadAndExtractArchive both downloads AND unzips into destDir.
             const extractedPath = await Utils.downloadAndExtractArchive(
@@ -1004,6 +1769,188 @@ export class ATXTransformHandler {
         } catch (error) {
             this.logging.error(`[BEAM-PKG] downloadBeamArtifact error: ${String(error)}`)
             return { Success: false, Error: String(error) }
+        }
+    }
+
+    /**
+     * ITGen — download a beamed repo's ORIGINAL (pre-transformation) source by its artifact id and
+     * extract it into `<SolutionRootPath>/artifactWorkspace/before`, the same folder the IDE copies a
+     * local job's original to, so the original-side app launches and test runs find it in one place.
+     *
+     * One copy per solution. It's reused only when its marker names the same job AND the same
+     * original-code artifact (a web job has one original per repo, and an original can be re-saved);
+     * otherwise it's replaced. Calls for the same folder are queued, so they never extract or swap at
+     * the same time; a queued duplicate finds the finished copy and reuses it.
+     *
+     * Each call extracts into its own staging folder. The swap removes the old marker first, so a copy
+     * that is only partly replaced is never reused, then moves the old copy aside, renames the staging
+     * folder into place and deletes the old copy best-effort (a file the IDE still holds open only
+     * leaves a leftover that the next call cleans up).
+     */
+    async downloadOriginalCode(
+        workspaceId: string,
+        jobId: string,
+        codeArtifactId: string,
+        solutionRootPath: string
+    ): Promise<AtxDownloadOriginalCodeResponse> {
+        if (!isSafeAbsolutePath(solutionRootPath)) {
+            return { Success: false, Error: 'Invalid solution root path for original code' }
+        }
+        // jobId is written to the marker and used for the FES call: keep it a plain id.
+        if (!isSafePathSegment(jobId)) {
+            return { Success: false, Error: 'Invalid job id for original code' }
+        }
+        // Only beamed repos download their original, and for them `jobId` is the parent web job.
+        if (!(await this.itGenJobs.isBeamItGenJob(workspaceId, jobId))) {
+            return { Success: false, Error: 'downloadOriginalCode requires a job with generate_integration_tests' }
+        }
+        const originalDir = path.join(solutionRootPath, workspaceFolderName, ORIGINAL_CODE_FOLDER)
+        const key = path.resolve(originalDir).toLowerCase()
+        const previous: Promise<unknown> = this.originalCodeQueue.get(key) ?? Promise.resolve()
+        const run = previous
+            .catch(() => undefined)
+            .then(() => this.downloadOriginalCodeNow(workspaceId, jobId, codeArtifactId, originalDir))
+        this.originalCodeQueue.set(key, run)
+        try {
+            return await run
+        } finally {
+            if (this.originalCodeQueue.get(key) === run) {
+                this.originalCodeQueue.delete(key)
+            }
+        }
+    }
+
+    private async downloadOriginalCodeNow(
+        workspaceId: string,
+        jobId: string,
+        codeArtifactId: string,
+        originalDir: string
+    ): Promise<AtxDownloadOriginalCodeResponse> {
+        const marker = path.join(originalDir, ORIGINAL_CODE_JOB_MARKER)
+        const ideMarker = path.join(originalDir, ORIGINAL_CODE_IDE_JOB_MARKER)
+        let stagingDir: string | undefined
+        try {
+            // Before the reuse check, so leftovers from an earlier interrupted call go even when the copy is reused.
+            await this.removeOriginalCodeLeftovers(originalDir)
+            const current = await this.readOriginalCodeMarker(marker)
+            // A copy without the IDE's marker (written before it was added) is replaced: VS wouldn't start it.
+            if (
+                current?.jobId === jobId &&
+                current.codeArtifactId === codeArtifactId &&
+                (await this.readOriginalCodeIdeMarker(ideMarker)) === jobId
+            ) {
+                this.logging.log(`ATX: downloadOriginalCode: reusing ${codeArtifactId} at ${originalDir}`)
+                return { Success: true, OriginalPath: originalDir, AlreadyPresent: true }
+            }
+
+            this.logging.log(`ATX: downloadOriginalCode ${codeArtifactId} -> ${originalDir}`)
+            const dl = await this.createArtifactDownloadUrl(workspaceId, jobId, codeArtifactId)
+            if (!dl?.s3PresignedUrl) {
+                return {
+                    Success: false,
+                    Error: this.downloadUrlFailureMessage(codeArtifactId, 'original code artifact'),
+                }
+            }
+
+            stagingDir = `${originalDir}.partial-${uuidv4()}`
+            const archiveName = 'original-source.zip'
+            await Utils.downloadAndExtractArchive(
+                dl.s3PresignedUrl,
+                dl.requestHeaders,
+                stagingDir,
+                archiveName,
+                this.logging
+            )
+            // extractArchiveFromBuffer leaves the zip next to its contents; it isn't source.
+            fs.rmSync(path.join(stagingDir, archiveName), { force: true })
+            // The copy sits inside the transformed solution: without these at its root, MSBuild would
+            // walk up and import the transformed solution's files.
+            for (const name of ORIGINAL_CODE_WALK_UP_FILES) {
+                const file = path.join(stagingDir, name)
+                if (!fs.existsSync(file)) {
+                    fs.writeFileSync(file, ORIGINAL_CODE_STUB)
+                }
+            }
+            const newMarker: OriginalCodeMarker = { jobId, codeArtifactId }
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_JOB_MARKER), JSON.stringify(newMarker))
+            await fs.promises.writeFile(path.join(stagingDir, ORIGINAL_CODE_IDE_JOB_MARKER), jobId, 'utf8')
+
+            // Swap. The old markers go first: from here on the old copy is never reused or started.
+            fs.rmSync(marker, { force: true })
+            fs.rmSync(ideMarker, { force: true })
+            let aside: string | undefined
+            if (fs.existsSync(originalDir)) {
+                aside = `${originalDir}.old-${uuidv4()}`
+                await fs.promises.rename(originalDir, aside)
+            }
+            try {
+                await fs.promises.rename(stagingDir, originalDir)
+            } catch (error) {
+                if (aside) {
+                    try {
+                        await fs.promises.rename(aside, originalDir) // put the old copy back (without its marker)
+                    } catch {
+                        /* the next call cleans up */
+                    }
+                }
+                throw error
+            }
+            stagingDir = undefined
+            if (aside) {
+                try {
+                    await fs.promises.rm(aside, { recursive: true, force: true })
+                } catch (error) {
+                    this.logging.log(`ATX: downloadOriginalCode: couldn't remove ${aside} yet: ${String(error)}`)
+                }
+            }
+            this.logging.log(`ATX: downloadOriginalCode extracted -> ${originalDir}`)
+            return { Success: true, OriginalPath: originalDir, AlreadyPresent: false }
+        } catch (error) {
+            this.logging.error(`ATX: downloadOriginalCode error: ${String(error)}`)
+            return { Success: false, Error: String(error) }
+        } finally {
+            if (stagingDir) {
+                try {
+                    await fs.promises.rm(stagingDir, { recursive: true, force: true })
+                } catch {
+                    /* the next call cleans up */
+                }
+            }
+        }
+    }
+
+    /** The job id in the IDE's marker; null when it's missing or unreadable. */
+    private async readOriginalCodeIdeMarker(markerPath: string): Promise<string | null> {
+        try {
+            return (await fs.promises.readFile(markerPath, 'utf8')).trim()
+        } catch {
+            return null
+        }
+    }
+
+    /** Null for a missing, unreadable or older plain-text marker, so those copies are replaced. */
+    private async readOriginalCodeMarker(markerPath: string): Promise<OriginalCodeMarker | null> {
+        try {
+            const parsed = JSON.parse(await fs.promises.readFile(markerPath, 'utf8'))
+            return typeof parsed?.jobId === 'string' && typeof parsed?.codeArtifactId === 'string' ? parsed : null
+        } catch {
+            return null
+        }
+    }
+
+    /** Staging and moved-aside folders that an interrupted call left next to artifactWorkspace/before. */
+    private async removeOriginalCodeLeftovers(originalDir: string): Promise<void> {
+        const parent = path.dirname(originalDir)
+        if (!fs.existsSync(parent)) return
+        const base = path.basename(originalDir)
+        for (const name of fs.readdirSync(parent)) {
+            if (name.startsWith(`${base}.partial-`) || name.startsWith(`${base}.old-`)) {
+                try {
+                    await fs.promises.rm(path.join(parent, name), { recursive: true, force: true })
+                } catch {
+                    /* still locked; try again next time */
+                }
+            }
         }
     }
 
@@ -1162,9 +2109,6 @@ export class ATXTransformHandler {
         try {
             this.logging.log(`ATX: Starting transform workflow for workspace: ${request.workspaceId}`)
 
-            // Cache the interactive mode setting
-            this.cachedInteractiveMode = request.interactiveMode || 'Autonomous'
-
             // Step 1: Create transformation job
             const createJobResponse = await this.createJob({
                 workspaceId: request.workspaceId,
@@ -1172,11 +2116,17 @@ export class ATXTransformHandler {
                 targetFramework: (request.startTransformRequest as any).TargetFramework,
                 interactiveMode: request.interactiveMode,
                 generateUnitTests: (request.startTransformRequest as any).GenerateUnitTests,
+                generateIntegrationTests: (request.startTransformRequest as any).GenerateIntegrationTests,
+                browser: (request.startTransformRequest as any).Browser,
             })
 
             if (!createJobResponse?.jobId) {
                 throw new Error('Failed to create ATX transformation job')
             }
+
+            // Cache the interactive mode against the new job. Deferred until the job id exists,
+            // since the cache is per job.
+            this.setCachedInteractiveMode(createJobResponse.jobId, request.interactiveMode || 'Autonomous', 'job-start')
 
             // Step 2: Create ZIP file
             const zipFilePath = await this.createZip(request.startTransformRequest)
@@ -1231,7 +2181,7 @@ export class ATXTransformHandler {
             // Step 7: Write source files list to checkpoints folder for tracking (only in interactive mode)
             if (request.interactiveMode && request.interactiveMode !== 'Autonomous') {
                 const startTransformReq = request.startTransformRequest as any
-                this.writeSourceFilesManifest(
+                await this.writeSourceFilesManifest(
                     startTransformReq.SolutionRootPath,
                     createJobResponse.jobId,
                     startTransformReq
@@ -1251,7 +2201,24 @@ export class ATXTransformHandler {
         }
     }
 
-    async getJob(workspaceId: string, jobId: string, includeObjective: boolean = false): Promise<JobInfo | null> {
+    /**
+     * ITGen: whether the job's objective has generate_integration_tests: true. The LS runs its ITGen
+     * code (ITGen HITLs, OpenHitls, test-result submits, diffs at any depth, the original-code
+     * download) only for these jobs. A failed GetJob isn't cached, so the next call asks again.
+     */
+    async isItGenJob(workspaceId: string, jobId: string): Promise<boolean> {
+        return this.itGenJobs.isItGenJob(workspaceId, jobId)
+    }
+
+    /**
+     * @param errorInfo When given, receives the error code and HTTP status if GetJob fails (the result is still null).
+     */
+    async getJob(
+        workspaceId: string,
+        jobId: string,
+        includeObjective: boolean = false,
+        errorInfo?: AtxErrorInfo
+    ): Promise<JobInfo | null> {
         try {
             this.logging.log(`ATX: Getting job: ${jobId} in workspace: ${workspaceId}`)
 
@@ -1273,6 +2240,9 @@ export class ATXTransformHandler {
             return response.job || null
         } catch (error) {
             this.logging.error(`ATX: GetJob error: ${String(error)}`)
+            if (errorInfo) {
+                Object.assign(errorInfo, getAtxErrorInfo(error))
+            }
             return null
         }
     }
@@ -1282,18 +2252,76 @@ export class ATXTransformHandler {
     // misleading "No presigned URL") is VISIBLE in the log. Reset only on process restart.
     private _createDownloadUrlCallCount = 0
 
+    // Last CreateArtifactDownloadUrl failure reason per artifactId (absent = the service returned no
+    // URL, or the call succeeded). createArtifactDownloadUrl keeps returning null on failure so every
+    // existing caller is unchanged; the beam/original-code downloads read the reason from here so the
+    // IDE can show WHY instead of a fixed "No presigned URL".
+    // missingUrl: the last attempt returned no URL, after an earlier attempt failed with `reason`.
+    private readonly downloadUrlErrorReasons = new Map<string, { reason: string; missingUrl: boolean }>()
+    // Error names already warned about as unrecognised (once each per process).
+    private readonly warnedUnrecognizedDownloadUrlErrors = new Set<string>()
+    // Base of the retry backoff (250, 500, 1000ms, jittered). A field so tests can make it ~0.
+    private downloadUrlBackoffBaseMs = 250
+    // downloadArtifactToPath: wait before attempt 2 (1x) and attempt 3 (2x), and between tries of the
+    // rename that gives a finished download its real name. Fields so tests can make them 0.
+    private artifactDownloadRetryBaseMs = 1000
+    private artifactDownloadRenameRetryMs = 100
+
+    /** IDE-facing message for a null createArtifactDownloadUrl result. Never includes the URL. */
+    private downloadUrlFailureMessage(artifactId: string, what: string): string {
+        const entry = this.downloadUrlErrorReasons.get(artifactId)
+        this.downloadUrlErrorReasons.delete(artifactId)
+        if (!entry) {
+            return `The service returned no download URL for the ${what}`
+        }
+        return entry.missingUrl
+            ? `The service returned no download URL for the ${what} (after an earlier error: ${entry.reason})`
+            : `Could not get a download URL for the ${what} (${entry.reason})`
+    }
+
+    private setDownloadUrlErrorReason(artifactId: string, reason: string | undefined, missingUrl = false): void {
+        this.downloadUrlErrorReasons.delete(artifactId)
+        if (reason === undefined) {
+            return
+        }
+        if (this.downloadUrlErrorReasons.size >= DOWNLOAD_URL_ERROR_REASONS_MAX) {
+            // Oldest first (Map insertion order).
+            const oldest = this.downloadUrlErrorReasons.keys().next().value
+            if (oldest !== undefined) {
+                this.downloadUrlErrorReasons.delete(oldest)
+            }
+        }
+        this.downloadUrlErrorReasons.set(artifactId, { reason, missingUrl })
+    }
+
     async createArtifactDownloadUrl(
         workspaceId: string,
         jobId: string,
         artifactId: string
     ): Promise<{ s3PresignedUrl: string; requestHeaders?: any } | null> {
-        // Retry on throttling. The get-URL call is throttled by FES under load (a poll storm can
-        // exhaust the quota); a throttled call previously fell straight to null → "No presigned
-        // URL", failing a Load that would have succeeded on retry. Bounded exponential backoff
-        // makes Load resilient to transient throttling without masking a genuine absent-URL (that
-        // still returns null after retries).
+        // Retry on throttling AND on transient errors (5xx, network, "unknown error"). The get-URL
+        // call is throttled by FES under load (a poll storm can exhaust the quota), and a short
+        // service/auth hiccup fails it outright; either previously fell straight to null → "No
+        // presigned URL", failing a Load that would have succeeded on retry (observed: a Load failed
+        // 118ms after start, i.e. NOT a throttle, and the same Load succeeded minutes later).
+        // Bounded exponential backoff makes Load resilient without masking a genuine failure: not
+        // found / access denied / validation / other 4xx fail on the first attempt, and an absent
+        // URL is retried only once (eventual consistency) before returning null.
         const maxAttempts = 4
         let lastErr: any = null
+        let missingUrlRetried = false
+        this.setDownloadUrlErrorReason(artifactId, undefined)
+        const backoff = async (attempt: number, label: string) => {
+            // Exponential base (250, 500, 1000ms) with jitter: under concurrent throttling,
+            // unjittered lockstep retries amplify the thundering herd that caused the throttle.
+            // Randomize to spread the retries out.
+            const base = this.downloadUrlBackoffBaseMs * Math.pow(2, attempt - 1)
+            const backoffMs = Math.round(base * (0.5 + Math.random()))
+            this.logging.log(
+                `ATX: CreateArtifactDownloadUrl ${label} (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`
+            )
+            await new Promise(r => setTimeout(r, backoffMs))
+        }
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 this._createDownloadUrlCallCount++
@@ -1315,6 +2343,7 @@ export class ATXTransformHandler {
                 const result = (await this.atxClient!.send(command)) as any
                 if (result && result.s3PreSignedUrl) {
                     this.logging.log(`ATX: CreateArtifactDownloadUrl completed successfully`)
+                    this.setDownloadUrlErrorReason(artifactId, undefined)
 
                     const normalizedHeaders: Record<string, string> = {}
                     if (result.requestHeaders) {
@@ -1328,36 +2357,57 @@ export class ATXTransformHandler {
                         requestHeaders: normalizedHeaders,
                     }
                 } else {
-                    // Genuine absent URL (not an error) — retrying won't help; return null now.
+                    // A 200 without a URL is not an error; it may be eventual consistency, so give it
+                    // ONE more try, then return null (no reason recorded → "returned no download URL").
+                    if (!missingUrlRetried && attempt < maxAttempts) {
+                        missingUrlRetried = true
+                        await backoff(attempt, 'returned no s3PreSignedUrl, retryable=true')
+                        continue
+                    }
                     this.logging.error(
-                        `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}) — NOT a throttle; not retrying`
+                        `ATX: CreateArtifactDownloadUrl failed - missing s3PreSignedUrl (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — NOT a throttle; not retrying`
                     )
+                    // Keep the reason of an earlier failed attempt, if any: it's likely why there's no URL.
+                    const earlier = this.downloadUrlErrorReasons.get(artifactId)
+                    if (earlier) {
+                        this.setDownloadUrlErrorReason(artifactId, earlier.reason, true)
+                    }
                     return null
                 }
             } catch (error) {
                 lastErr = error
-                // Distinguish throttling from other errors so the log tells us WHY a Load failed
-                // (was misattributed to "No presigned URL"). Retry only throttling.
+                // Distinguish throttling / transient / permanent so the log tells us WHY a Load
+                // failed (was misattributed to "No presigned URL").
+                const kind = classifyDownloadUrlError(error)
+                const isThrottle = kind === 'throttle'
+                const retryable = kind !== 'permanent'
                 const name = (error as any)?.name ?? ''
                 const msg = String(error)
-                const isThrottle =
-                    name === 'ThrottlingException' ||
-                    name === 'TooManyRequestsException' ||
-                    /throttl|too many requests|rate exceeded/i.test(msg)
-                if (isThrottle && attempt < maxAttempts) {
-                    // Exponential base (250, 500, 1000ms) with jitter: under concurrent
-                    // throttling, unjittered lockstep retries amplify the thundering herd that
-                    // caused the throttle. Randomize to spread the retries out.
-                    const base = 250 * Math.pow(2, attempt - 1)
-                    const backoffMs = Math.round(base * (0.5 + Math.random()))
-                    this.logging.log(
-                        `ATX: CreateArtifactDownloadUrl THROTTLED (artifact=${artifactId}, attempt=${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`
+                if (isThrottle) {
+                    // Record it regardless of whether we retry: the signal is "the service is
+                    // pushing back", which is true on the last attempt as much as the first.
+                    this.noteBeamThrottled()
+                }
+                if (isUnrecognizedDownloadUrlError(error)) {
+                    // Permanent is the fail-safe default; say so once per name so a new error type is visible.
+                    const unknownName = name || 'Error'
+                    if (!this.warnedUnrecognizedDownloadUrlErrors.has(unknownName)) {
+                        this.warnedUnrecognizedDownloadUrlErrors.add(unknownName)
+                        this.logging.warn(
+                            `[BEAM-PKG] CreateArtifactDownloadUrl: unrecognized error name=${unknownName} status=${(error as any)?.$metadata?.httpStatusCode ?? 'none'} — treated as permanent`
+                        )
+                    }
+                }
+                this.setDownloadUrlErrorReason(artifactId, describeDownloadUrlError(error))
+                if (retryable && attempt < maxAttempts) {
+                    await backoff(
+                        attempt,
+                        isThrottle ? 'THROTTLED' : `transient error (name=${name || 'Error'}, retryable=true)`
                     )
-                    await new Promise(r => setTimeout(r, backoffMs))
                     continue
                 }
                 this.logging.error(
-                    `ATX: CreateArtifactDownloadUrl error (artifact=${artifactId}, throttle=${isThrottle}, attempt=${attempt}/${maxAttempts}): ${msg}`
+                    `ATX: CreateArtifactDownloadUrl error (artifact=${artifactId}, name=${name || 'Error'}, throttle=${isThrottle}, retryable=${retryable}, attempt=${attempt}/${maxAttempts}): ${msg}`
                 )
                 return null
             }
@@ -1390,7 +2440,11 @@ export class ATXTransformHandler {
             const result = await this.atxClient!.send(command)
 
             this.logging.log(`ATX: ListHitls completed - Found ${result.hitlTasks?.length || 0} tasks`)
-            return result.hitlTasks || []
+            const hitls = result.hitlTasks || []
+            if (this._currentDiffContext && this.itGenJobs.isKnownItGenJob(jobId)) {
+                this._currentPollHitls = hitls
+            }
+            return hitls
         } catch (error) {
             this.logging.error(`ATX: ListHitls error: ${String(error)}`)
             return null
@@ -1530,6 +2584,381 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * ITGen: completes an integ-test-run or integ-app-launch HITL with the IDE's result ZIP
+     * (contract v0 §5 / §6) — upload it as a HITL_FROM_USER ZIP, then submit the task by ID, like
+     * completeHitlWithBuildResults. The ZIP must hold a summary.json (test run) or a
+     * launch-result.json (app launch) with a supported schemaVersion; anything else is refused
+     * before upload so the agent never receives a result it can't read. On the transformed side the
+     * customer's changed files are added as workspace/ (addCustomerChangesToResultZip). No size
+     * limit here: the limit is an IDE constant (C13).
+     */
+    async completeHitlWithTestResults(
+        workspaceId: string,
+        jobId: string,
+        taskId: string,
+        resultZipPath: string,
+        solutionRootPath: string
+    ): Promise<{ Success: boolean; Error?: string }> {
+        try {
+            // Beam-aware: after an LS restart, a beamed repo's parent job is known to be an ITGen job only once its
+            // beam-map is read, which may not have happened yet.
+            if (!(await this.itGenJobs.isBeamItGenJob(workspaceId, jobId))) {
+                return {
+                    Success: false,
+                    Error: 'completeHitlWithTestResults requires a job with generate_integration_tests',
+                }
+            }
+            if (!taskId) {
+                return { Success: false, Error: 'TaskId is required' }
+            }
+
+            const zipPath = path.resolve(solutionRootPath || '', resultZipPath || '')
+            this.logging.log(`ATX: Completing HITL ${taskId} with test results ${zipPath}`)
+            if (!resultZipPath || !fs.existsSync(zipPath) || !fs.statSync(zipPath).isFile()) {
+                return { Success: false, Error: `Result ZIP not found: ${zipPath}` }
+            }
+
+            const resultFile = this.readTestResultZip(zipPath)
+            if ('error' in resultFile) {
+                return { Success: false, Error: resultFile.error }
+            }
+            // The customer can change code at any time on the transformed side; the original copy
+            // is never sent back to the agent.
+            const uploadPath =
+                resultFile.result?.side === 'transformed'
+                    ? this.addCustomerChangesToResultZip(zipPath, solutionRootPath, jobId)
+                    : zipPath
+
+            // HITL_FROM_USER for the same reason as completeHitlWithBuildResults: the submit
+            // fails with ResourceNotFoundException for any other category.
+            const uploadResponse = await this.createArtifactUploadUrl(
+                workspaceId,
+                jobId,
+                uploadPath,
+                CategoryType.HITL_FROM_USER,
+                FileType.ZIP
+            )
+            if (!uploadResponse?.uploadUrl) {
+                return { Success: false, Error: 'Failed to create artifact upload URL' }
+            }
+
+            const uploadSuccess = await Utils.uploadArtifact(
+                uploadResponse.uploadUrl,
+                uploadPath,
+                uploadResponse.requestHeaders,
+                this.logging
+            )
+            if (!uploadSuccess) {
+                return { Success: false, Error: 'Failed to upload test results' }
+            }
+
+            const completeResponse = await this.completeArtifactUpload(workspaceId, jobId, uploadResponse.uploadId)
+            if (!completeResponse?.success) {
+                return { Success: false, Error: 'Failed to complete artifact upload' }
+            }
+
+            // integ-test-run is a CRITICAL HITL like LBV, so the critical submit closes it directly.
+            const submitResult = await this.submitHitl(workspaceId, jobId, taskId, uploadResponse.uploadId)
+            if (!submitResult) {
+                return { Success: false, Error: 'Failed to submit HITL task' }
+            }
+
+            this.logging.log(`ATX: HITL ${taskId} completed with test results successfully`)
+            return { Success: true }
+        } catch (error) {
+            this.logging.error(`ATX: completeHitlWithTestResults error: ${String(error)}`)
+            return { Success: false, Error: String(error) }
+        }
+    }
+
+    /**
+     * Reads an ITGen result ZIP's result file (summary.json for a test run, else launch-result.json
+     * for an app launch), or says why the ZIP can't be submitted.
+     */
+    private readTestResultZip(zipPath: string): { result: any } | { error: string } {
+        let fileName: string
+        let result: any
+        try {
+            const zip = new AdmZip(zipPath)
+            const entry = zip.getEntry('summary.json') || zip.getEntry('launch-result.json')
+            if (!entry) {
+                return { error: 'Result ZIP has neither summary.json nor launch-result.json at its root' }
+            }
+            fileName = entry.entryName
+            result = JSON.parse(entry.getData().toString('utf-8'))
+        } catch (error) {
+            return { error: `Result ZIP is unreadable: ${String(error)}` }
+        }
+        if (!isSupportedAtxTestRunSchemaVersion(result?.schemaVersion)) {
+            return { error: `Unsupported ${fileName} schemaVersion: ${result?.schemaVersion}` }
+        }
+        return { result }
+    }
+
+    /**
+     * ITGen (contract v0 §6): adds the customer's changed files to a transformed-side result ZIP as
+     * workspace/metadata.json ({ filesUpdated }) plus workspace/<relative path>, with the same scan
+     * and metadata as updateWorkspace: every tracked file modified since job start. metadata.json is
+     * written even when nothing changed, so the agent can tell "no changes" from an old IDE. The
+     * IDE's ZIP is left as it is: the result goes to a copy next to it, whose path is returned. A
+     * ZIP that already has workspace/ is returned unchanged.
+     */
+    private addCustomerChangesToResultZip(zipPath: string, solutionRootPath: string, jobId: string): string {
+        const zip = new AdmZip(zipPath)
+        if (zip.getEntries().some(entry => entry.entryName.startsWith('workspace/'))) {
+            return zipPath
+        }
+
+        const filesUpdated: string[] = []
+        for (const filePath of this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId, true)) {
+            const relativePath = path.relative(solutionRootPath, filePath)
+            if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+                continue
+            }
+            try {
+                zip.addFile(`workspace/${relativePath.split(path.sep).join('/')}`, fs.readFileSync(filePath))
+                filesUpdated.push(relativePath)
+            } catch (error) {
+                this.logging.error(`ATX: could not add ${filePath} to the result ZIP: ${String(error)}`)
+            }
+        }
+        zip.addFile('workspace/metadata.json', Buffer.from(JSON.stringify({ filesUpdated }, null, 2)))
+
+        const uploadPath = zipPath.replace(/\.zip$/i, '') + '.with-workspace.zip'
+        zip.writeZip(uploadPath)
+        this.logging.log(`ATX: added ${filesUpdated.length} customer-changed file(s) to ${uploadPath}`)
+        return uploadPath
+    }
+
+    /**
+     * ITGen: the first open integ-app-launch, else integ-test-run HITL in the pool. Undefined when
+     * the job has no generate_integration_tests, so every selection site keeps today's order.
+     */
+    private findItGenHitl(pool: any[], jobId: string): any | undefined {
+        if (!this.itGenJobs.isKnownItGenJob(jobId)) {
+            return undefined
+        }
+        return (
+            pool.find(h => h.tag === ATX_HITL_TAG_INTEG_APP_LAUNCH) ||
+            pool.find(h => h.tag === ATX_HITL_TAG_INTEG_TEST_RUN)
+        )
+    }
+
+    /**
+     * ITGen: OpenHitls for the response (contract v0 §3), one per HITL listed this poll. For
+     * integ-* HITLs the agent's request is downloaded once per task to
+     * artifactWorkspace/<job>/hitl/<taskId>/request.json (a task's request never changes; each
+     * launch attempt or run is a new task) and its schemaVersion checked.
+     */
+    private async buildOpenHitls(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        hitls: any[]
+    ): Promise<AtxOpenHitl[]> {
+        const openHitls: AtxOpenHitl[] = []
+        for (const hitl of hitls) {
+            if (!hitl?.taskId) {
+                continue
+            }
+            const openHitl: AtxOpenHitl = { TaskId: hitl.taskId }
+            if (hitl.tag) {
+                openHitl.Tag = hitl.tag
+            }
+            const stepId = this.getStepId(hitl)
+            if (stepId) {
+                openHitl.StepId = stepId
+            }
+            if (hitl.expiredAt) {
+                openHitl.ExpiryTimestampUTC = new Date(hitl.expiredAt).toISOString()
+            }
+            if (isItGenHitlTag(hitl.tag)) {
+                Object.assign(openHitl, await this.downloadItGenHitlRequest(workspaceId, jobId, solutionRootPath, hitl))
+            }
+            openHitls.push(openHitl)
+        }
+        return openHitls
+    }
+
+    private async downloadItGenHitlRequest(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        hitl: any
+    ): Promise<Pick<AtxOpenHitl, 'RequestPath' | 'RequestError' | 'TestsPath'>> {
+        if (!isSafePathSegment(hitl.taskId)) {
+            return { RequestError: `Unsafe task id: ${hitl.taskId}` }
+        }
+        const requestPath = path.join(solutionRootPath, workspaceFolderName, jobId, 'hitl', hitl.taskId, 'request.json')
+        try {
+            let request: any
+            if (fs.existsSync(requestPath)) {
+                request = JSON.parse(fs.readFileSync(requestPath, 'utf-8'))
+            } else {
+                const artifactId = hitl.agentArtifact?.artifactId
+                if (!artifactId) {
+                    return { RequestError: `${hitl.tag} HITL has no agent artifact` }
+                }
+                request = await this.downloadJsonArtifact(workspaceId, jobId, artifactId)
+                if (!request) {
+                    return { RequestError: `Could not download the ${hitl.tag} request` }
+                }
+                await Utils.directoryExists(path.dirname(requestPath))
+                fs.writeFileSync(requestPath, JSON.stringify(request, null, 2))
+                this.logging.log(`ATX: ${hitl.tag} request for task ${hitl.taskId} saved to ${requestPath}`)
+            }
+            if (!isSupportedAtxTestRunSchemaVersion(request?.schemaVersion)) {
+                return { RequestError: `Unsupported ${hitl.tag} request schemaVersion: ${request?.schemaVersion}` }
+            }
+            if (hitl.tag !== ATX_HITL_TAG_INTEG_TEST_RUN) {
+                return { RequestPath: requestPath }
+            }
+            const tests = await this.downloadItGenTests(workspaceId, jobId, solutionRootPath, hitl.taskId, request)
+            return { RequestPath: requestPath, ...tests }
+        } catch (error) {
+            this.logging.error(`ATX: downloadItGenHitlRequest error for task ${hitl.taskId}: ${String(error)}`)
+            return { RequestError: String(error) }
+        }
+    }
+
+    /**
+     * ITGen: downloads the repo artifact holding the generated test projects (request.artifactId)
+     * into artifactWorkspace/<job>/itgen/<project>/<runId>/tests (itgen/<runId>/tests for a request
+     * without a project), for tests.projectPath to resolve against (contract v0 §4). The agent can use
+     * the same run ids for every project, so each project has its own folder. The agent rewrites that
+     * artifact under the same id on every test fix, so it's downloaded again for every test-run task
+     * and never reused by id; a marker file holding the task id keeps one task's later polls from
+     * downloading it again.
+     */
+    private downloadItGenTests(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        taskId: string,
+        request: any
+    ): Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>> {
+        // Overlapping polls for the same task share one download, so a late duplicate can't finish
+        // after a newer run and clean that run up.
+        const key = `${jobId}|${taskId}`
+        const inFlight = this.itGenTestDownloads.get(key)
+        if (inFlight) {
+            return inFlight
+        }
+        const download = this.downloadItGenTestsOnce(workspaceId, jobId, solutionRootPath, taskId, request).finally(
+            () => this.itGenTestDownloads.delete(key)
+        )
+        this.itGenTestDownloads.set(key, download)
+        return download
+    }
+
+    private async downloadItGenTestsOnce(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        taskId: string,
+        request: any
+    ): Promise<Pick<AtxOpenHitl, 'TestsPath' | 'RequestError'>> {
+        if (!request?.artifactId) {
+            return { RequestError: 'integ-test-run request has no artifactId' }
+        }
+        if (!isSafePathSegment(request.runId)) {
+            return { RequestError: `Unsafe integ-test-run runId: ${request.runId}` }
+        }
+        if (!isSafeRelativeProjectPath(request.tests?.projectPath)) {
+            return { RequestError: `Unsafe integ-test-run tests.projectPath: ${request.tests?.projectPath}` }
+        }
+        const itgenDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'itgen')
+        // The project's runs share a folder; another project's run with the same id has its own
+        const projectFolder = itGenProjectFolderName(request.project)
+        const runsDir = projectFolder ? path.join(itgenDir, projectFolder) : itgenDir
+        const runDir = path.join(runsDir, request.runId)
+        const testsPath = path.join(runDir, 'tests')
+        const markerPath = path.join(runDir, 'tests.task')
+        const projectMarkerPath = path.join(runDir, 'tests.project')
+        // Cleanup is keyed by side and project; without both, this run's tests are kept and never collected.
+        const projectKey =
+            typeof request.side === 'string' && request.side && typeof request.project === 'string' && request.project
+                ? `${request.side}|${request.project}`
+                : undefined
+        if (fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8') === taskId && fs.existsSync(testsPath)) {
+            if (projectKey && !fs.existsSync(projectMarkerPath)) {
+                fs.writeFileSync(projectMarkerPath, projectKey)
+            }
+            return { TestsPath: testsPath }
+        }
+
+        // The newest run started for this side and project; only that run may collect earlier ones.
+        const latestKey = `${jobId}|${projectKey}`
+        if (projectKey) {
+            this.itGenLatestRunByProject.set(latestKey, request.runId)
+        }
+        const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, request.artifactId)
+        if (!downloadInfo) {
+            return { RequestError: `Could not download the tests artifact ${request.artifactId}` }
+        }
+        // The artifact is unpacked whole, in its own layout: the generated test project plus any files
+        // next to it that its build reads (for example a root Directory.Build.props or nuget.config).
+        // Test projects are independent of the app's source (contract decision 16). Disk use is bounded by
+        // removing earlier runs' tests below.
+        fs.rmSync(testsPath, { recursive: true, force: true })
+        const zipName = 'tests-artifact.zip'
+        await Utils.downloadAndExtractArchive(
+            downloadInfo.s3PresignedUrl,
+            downloadInfo.requestHeaders,
+            testsPath,
+            zipName,
+            this.logging
+        )
+        fs.rmSync(path.join(testsPath, zipName), { force: true })
+        if (!fs.existsSync(path.join(testsPath, request.tests.projectPath))) {
+            this.logging.warn(
+                `ATX: ${request.tests.projectPath} isn't in tests artifact ${request.artifactId} (run ${request.runId})`
+            )
+        }
+        fs.writeFileSync(markerPath, taskId)
+        if (projectKey) {
+            fs.writeFileSync(projectMarkerPath, projectKey)
+            if (this.itGenLatestRunByProject.get(latestKey) === request.runId) {
+                this.removeOlderItGenTests(runsDir, request.runId, projectKey)
+            } else {
+                this.logging.log(
+                    `ATX: run ${request.runId} (${projectKey}) finished after a newer run started; not collecting earlier runs`
+                )
+            }
+        }
+        this.logging.log(`ATX: tests artifact ${request.artifactId} for run ${request.runId} extracted to ${testsPath}`)
+        return { TestsPath: testsPath }
+    }
+
+    /**
+     * ITGen: keeps only the latest run's tests per side and project, so a job holds at most one copy of
+     * the artifact per project instead of one per run. The agent opens a project's next run only after
+     * the IDE submitted the previous one, so an older run's tests are no longer needed. The run folder
+     * itself (with the IDE's result ZIP) stays. runsDir is the folder holding the project's runs.
+     */
+    private removeOlderItGenTests(runsDir: string, currentRunId: string, projectKey: string): void {
+        for (const entry of fs.readdirSync(runsDir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || entry.name === currentRunId) {
+                continue
+            }
+            const keyPath = path.join(runsDir, entry.name, 'tests.project')
+            const oldTests = path.join(runsDir, entry.name, 'tests')
+            try {
+                if (
+                    fs.existsSync(oldTests) &&
+                    fs.existsSync(keyPath) &&
+                    fs.readFileSync(keyPath, 'utf-8') === projectKey
+                ) {
+                    fs.rmSync(oldTests, { recursive: true, force: true })
+                    this.logging.log(`ATX: removed the tests of earlier run ${entry.name} (${projectKey})`)
+                }
+            } catch (error) {
+                this.logging.warn(`ATX: couldn't remove the tests of earlier run ${entry.name}: ${String(error)}`)
+            }
+        }
+    }
+
     async getHitl(workspaceId: string, jobId: string, taskId: string): Promise<any | null> {
         try {
             this.logging.log(`ATX: Getting Hitl task: ${taskId}`)
@@ -1585,11 +3014,18 @@ export class ATXTransformHandler {
         }
     }
 
+    /**
+     * The open HITL to surface, with its agent artifact downloaded. Null when there's none to surface: no HITL is
+     * open, or `beamScopeStepIds` is set and the only open HITLs are local-build-verification HITLs outside that
+     * scope (a sibling repo's, on a multi-repo beam job). Also null when the lookup fails; a caller that needs to
+     * tell that apart passes `lookup`, whose `failed` is set only when the job's HITLs couldn't be listed.
+     */
     async getHitlAgentArtifact(
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        beamScopeStepIds?: string
+        beamScopeStepIds?: string,
+        lookup: { failed: boolean } = { failed: false }
     ): Promise<{
         PlanPath?: string
         ReportPath?: string
@@ -1604,12 +3040,21 @@ export class ATXTransformHandler {
 
             if (!this.atxClient && !(await this.initializeAtxClient())) {
                 this.logging.error('ATX: Failed to initialize client for GetHitlAgentArtifact')
+                lookup.failed = true
                 return null
             }
 
-            const hitls = await this.listHitls(workspaceId, jobId)
+            const listedHitls = await this.listHitls(workspaceId, jobId)
 
-            if (!hitls || hitls.length === 0) {
+            if (!listedHitls) {
+                this.logging.log(`ATX: Could not list hitls`)
+                lookup.failed = true
+                return null
+            }
+            const scopeStepIds = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
+            const hitls = this.withoutSiblingItGenHitls(listedHitls, scopeStepIds, jobId)
+
+            if (hitls.length === 0) {
                 this.logging.log(`ATX: No hitls available`)
                 return null
             }
@@ -1624,10 +3069,6 @@ export class ATXTransformHandler {
             // picking the plain first (below) may return a SIBLING's, shadowing the loaded repo's
             // own HITL so it never builds unless loaded in list order. Tolerate any stepId field
             // spelling (stepId/planStepId/parentStepId), same as the forwarding path.
-            const scopeStepIds = (beamScopeStepIds || '')
-                .split(',')
-                .map(s => s.trim())
-                .filter(s => s.length > 0)
             const { scopedLbv, allOutOfScopeLbv } = this.selectScopedLbvHitl(hitls, scopeStepIds)
             if (scopeStepIds.length > 0) {
                 this.logging.log(
@@ -1636,7 +3077,8 @@ export class ATXTransformHandler {
                 // Scope is set and the pending HITL(s) are LBV, but NONE is in the loaded repo's
                 // subtree → they all belong to sibling repos. Return null so the IDE isn't handed a
                 // sibling's HITL it would only skip every poll. Non-LBV HITLs (e.g.
-                // missing-packages) still fall through below and are handled normally.
+                // missing-packages) still fall through below and are handled normally. The lookup
+                // answered, so `lookup.failed` stays unset (here and in the fallback below).
                 if (allOutOfScopeLbv) {
                     this.logging.log(
                         'ATX: getHitlAgentArtifact — all pending HITLs are sibling-repo LBV (none in loaded scope); returning none'
@@ -1658,6 +3100,7 @@ export class ATXTransformHandler {
                 scopedLbv ||
                 fallbackPool.find(h => h.tag === 'local-build-verification') ||
                 fallbackPool.find(h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl') ||
+                this.findItGenHitl(fallbackPool, jobId) ||
                 fallbackPool[0]
             if (!hitl) {
                 this.logging.log(
@@ -1686,6 +3129,18 @@ export class ATXTransformHandler {
                 )
                 return lbvStepId !== undefined
                     ? { HitlTag: hitlTag, TaskId: hitl.taskId, StepId: lbvStepId }
+                    : { HitlTag: hitlTag, TaskId: hitl.taskId }
+            }
+
+            // ITGen: the IDE answers these too. The agent artifact is request.json, not a plan ZIP;
+            // it's downloaded per task for OpenHitls (buildOpenHitls), not here.
+            if (this.itGenJobs.isKnownItGenJob(jobId) && isItGenHitlTag(hitlTag)) {
+                const itGenStepId = this.getStepId(hitl)
+                this.logging.log(
+                    `ATX: ${hitlTag} HITL — returning tag for IDE to handle | stepId=${itGenStepId ?? '<none>'}`
+                )
+                return itGenStepId !== undefined
+                    ? { HitlTag: hitlTag, TaskId: hitl.taskId, StepId: itGenStepId }
                     : { HitlTag: hitlTag, TaskId: hitl.taskId }
             }
 
@@ -1763,6 +3218,7 @@ export class ATXTransformHandler {
             if (hitl) {
                 return { HitlTag: hitl.tag || null, TaskId: hitl.taskId }
             }
+            lookup.failed = true
             return null
         }
     }
@@ -1774,20 +3230,52 @@ export class ATXTransformHandler {
         const diffContext: DiffApplyContext = { failed: false, failedStepIds: [] }
         this._currentDiffContext = diffContext
         try {
+            if (request.IsBeam === true) {
+                // ITGen for a beamed repo: the gate decides which HITLs this poll surfaces, and the beam path never
+                // reads the job's objective otherwise. A beam-map read it needs runs in the background, so it never
+                // delays a poll.
+                await this.itGenJobs.isBeamItGenJob(request.WorkspaceId, request.TransformationJobId, false)
+                // The customer-changes baseline, for every loaded beamed repo (the downlink applies post-beam steps
+                // to each of them, opted in or not). In the background: the walk can take a while on a large repo.
+                // Only an apply waits for it (applyChanges), so the files the apply adds are tracked.
+                if (ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds).length > 0) {
+                    void this.ensureBeamSourceFilesManifest(request.SolutionRootPath, request.TransformationJobId) // never rejects
+                }
+            }
             const result = await this._getTransformInfoInternal(request, diffContext)
             if (result && diffContext.failed) {
                 result.DiffApplyFailed = true
                 result.DiffApplyFailedStepIds = diffContext.failedStepIds
             }
-            // Surface the backend-resolved interactive mode (from job.objective) on every
-            // response so the IDE can restore it. Single injection point covers all internal
-            // return paths. cachedInteractiveMode is populated in _getTransformInfoInternal.
-            if (result && this.cachedInteractiveMode) {
-                result.InteractiveMode = this.cachedInteractiveMode
+            // Surface the resolved interactive mode on every response so the IDE can restore it.
+            // Single injection point covers all internal return paths; the cache is populated in
+            // _getTransformInfoInternal.
+            const resolvedMode = this.getCachedInteractiveMode(request.TransformationJobId)
+            if (result && resolvedMode) {
+                result.InteractiveMode = resolvedMode
+            }
+            // ITGen: every open HITL, from the ListHitls this poll already made (terminal job
+            // statuses don't list HITLs, so they get no OpenHitls).
+            if (
+                result &&
+                this.itGenJobs.isKnownItGenJob(request.TransformationJobId) &&
+                this._currentPollHitls !== undefined
+            ) {
+                result.OpenHitls = await this.buildOpenHitls(
+                    request.WorkspaceId,
+                    request.TransformationJobId,
+                    request.SolutionRootPath,
+                    this.withoutSiblingItGenHitls(
+                        this._currentPollHitls,
+                        ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds),
+                        request.TransformationJobId
+                    )
+                )
             }
             return result
         } finally {
             this._currentDiffContext = null
+            this._currentPollHitls = undefined
         }
     }
 
@@ -1798,35 +3286,62 @@ export class ATXTransformHandler {
         try {
             this.logging.log(`ATX: Getting transform info for job: ${request.TransformationJobId}`)
 
-            // Check if we need to determine interactive mode from the job objective
-            const needObjective = this.cachedInteractiveMode === null
-            const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective)
+            // Check if we need to determine interactive mode, or whether this is an ITGen job, from the
+            // job objective
+            const needObjective =
+                this.getCachedInteractiveMode(request.TransformationJobId) === null ||
+                !this.itGenJobs.isKnown(request.TransformationJobId)
+            const getJobError: AtxErrorInfo = {}
+            const job = await this.getJob(request.WorkspaceId, request.TransformationJobId, needObjective, getJobError)
 
             if (!job) {
                 this.logging.error(`ATX: Job not found: ${request.TransformationJobId}`)
+                // ErrorString stays JOB_NOT_FOUND for older IDEs; ErrorCode/StatusCode say why (e.g. AccessDenied).
                 return {
                     TransformationJob: null,
                     ErrorString: 'JOB_NOT_FOUND',
+                    ErrorCode: getJobError.errorCode,
+                    StatusCode: getJobError.statusCode,
                 } as unknown as AtxGetTransformInfoResponse
             }
 
+            if (needObjective && !this.itGenJobs.isKnown(request.TransformationJobId)) {
+                this.itGenJobs.rememberObjective(request.TransformationJobId, job.objective)
+            }
+
+            // A mid-job mode change is written to the checkpoint-settings artifact and never back
+            // into the objective, which is the job-creation payload and immutable. Reading the
+            // objective alone therefore restores the mode the job STARTED in and silently discards
+            // any later switch, so reopening the IDE reverted the mode. Prefer the
+            // artifact - it is the store every client writes, so it also reflects a switch made
+            // from the web UI or another IDE - and keep the objective as the fallback for a job
+            // whose mode was never changed and so has no artifact yet.
+            if (this.getCachedInteractiveMode(request.TransformationJobId) === null) {
+                const modeFromSettings = await this.readInteractiveModeFromCheckpointSettings(
+                    request.WorkspaceId,
+                    request.TransformationJobId
+                )
+                if (modeFromSettings) {
+                    this.setCachedInteractiveMode(request.TransformationJobId, modeFromSettings, 'settings-artifact')
+                    this.logging.log(
+                        `ATX: Determined interactive mode from checkpoint-settings artifact: ${modeFromSettings}`
+                    )
+                }
+            }
+
             // If interactive mode is not cached, try to get it from the job objective
-            if (this.cachedInteractiveMode === null && job.objective) {
+            if (this.getCachedInteractiveMode(request.TransformationJobId) === null && job.objective) {
                 try {
                     const objective = JSON.parse(job.objective)
                     // Map backend string format to InteractiveMode enum
                     // "interactive" -> Interactive, "auto" -> Autonomous
-                    if (objective.interactive_mode === 'interactive') {
-                        this.cachedInteractiveMode = 'Interactive'
-                    } else {
-                        this.cachedInteractiveMode = 'Autonomous'
-                    }
-                    this.logging.log(
-                        `ATX: Determined interactive mode from job objective: ${this.cachedInteractiveMode}`
-                    )
+                    const objectiveMode: InteractiveMode =
+                        objective.interactive_mode === 'interactive' ? 'Interactive' : 'Autonomous'
+                    this.setCachedInteractiveMode(request.TransformationJobId, objectiveMode, 'objective')
+                    this.logging.log(`ATX: Determined interactive mode from job objective: ${objectiveMode}`)
                 } catch (e) {
                     this.logging.log('ATX: Could not parse job objective for interactive mode')
-                    this.cachedInteractiveMode = 'Autonomous'
+                    this.setCachedInteractiveMode(request.TransformationJobId, 'Autonomous', 'objective-unparseable')
                 }
             }
 
@@ -1845,7 +3360,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 return {
@@ -1888,7 +3404,8 @@ export class ATXTransformHandler {
                     request.WorkspaceId,
                     request.TransformationJobId,
                     request.SolutionRootPath,
-                    request.IsBeam === true
+                    request.IsBeam === true,
+                    request.beamScopeStepIds
                 )
 
                 // If GetCheckpoints is requested, populate HasCheckpoint field on steps
@@ -1928,12 +3445,15 @@ export class ATXTransformHandler {
                     // list (which may be a sibling's on a multi-repo beam job → shadows the loaded
                     // repo). Same selection rule as getHitlAgentArtifact; applies to the EXECUTING
                     // path too since a beam job surfaces its LBV HITL here.
-                    const execScopeStepIds = (request.beamScopeStepIds || '')
-                        .split(',')
-                        .map(s => s.trim())
-                        .filter(s => s.length > 0)
-                    const { scopedLbv: scopedExecLbv, allOutOfScopeLbv: execAllOutOfScope } = this.selectScopedLbvHitl(
+                    const execScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                    // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
+                    const scopedBlockingHitls = this.withoutSiblingItGenHitls(
                         blockingHitls,
+                        execScopeStepIds,
+                        request.TransformationJobId
+                    )
+                    const { scopedLbv: scopedExecLbv, allOutOfScopeLbv: execAllOutOfScope } = this.selectScopedLbvHitl(
+                        scopedBlockingHitls,
                         execScopeStepIds
                     )
                     if (execScopeStepIds.length > 0) {
@@ -1965,14 +3485,15 @@ export class ATXTransformHandler {
                     // from the fallback pool in that case; only non-LBV blocking HITLs remain.
                     const execFallbackPool =
                         execScopeStepIds.length > 0 && !scopedExecLbv
-                            ? blockingHitls.filter(h => h.tag !== 'local-build-verification')
-                            : blockingHitls
+                            ? scopedBlockingHitls.filter(h => h.tag !== 'local-build-verification')
+                            : scopedBlockingHitls
                     const execHitl =
                         scopedExecLbv ||
                         execFallbackPool.find(h => h.tag === 'local-build-verification') ||
                         execFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
+                        this.findItGenHitl(execFallbackPool, request.TransformationJobId) ||
                         execFallbackPool.find(h => String(h.tag).endsWith('-checkpoint')) ||
                         execFallbackPool[0]
                     if (!execHitl) {
@@ -2032,7 +3553,8 @@ export class ATXTransformHandler {
                         request.WorkspaceId,
                         request.TransformationJobId,
                         request.SolutionRootPath,
-                        request.IsBeam === true
+                        request.IsBeam === true,
+                        request.beamScopeStepIds
                     )
                 } catch (e) {
                     // Plan not available yet
@@ -2043,18 +3565,21 @@ export class ATXTransformHandler {
                 // in-scope one (parity with AWAITING_HUMAN_INPUT). No-op when scope is empty, so non-beam is unchanged.
                 const hitls = await this.listHitls(request.WorkspaceId, request.TransformationJobId)
                 if (hitls && hitls.length > 0) {
-                    const planScopeStepIds = (request.beamScopeStepIds || '')
-                        .split(',')
-                        .map(s => s.trim())
-                        .filter(s => s.length > 0)
+                    const planScopeStepIds = ATXTransformHandler.parseScopeStepIds(request.beamScopeStepIds)
+                    // A sibling beamed repo's integ-* HITLs never count for the loaded repo.
+                    const scopedPlanHitls = this.withoutSiblingItGenHitls(
+                        hitls,
+                        planScopeStepIds,
+                        request.TransformationJobId
+                    )
                     const { scopedLbv: scopedPlanLbv, allOutOfScopeLbv: planAllOutOfScopeLbv } =
-                        this.selectScopedLbvHitl(hitls, planScopeStepIds)
+                        this.selectScopedLbvHitl(scopedPlanHitls, planScopeStepIds)
                     // Beam multi-repo parity with EXECUTING / getHitlAgentArtifact: if scope is set and every
-                    // pending HITL is a sibling repo's LBV (none in the loaded repo's subtree), do NOT surface a
-                    // sibling's LBV — return plan-only. Prevents handing the IDE another repo's build HITL.
-                    if (planScopeStepIds.length > 0 && planAllOutOfScopeLbv) {
+                    // pending HITL is a sibling repo's (none in the loaded repo's subtree), do NOT surface a
+                    // sibling's HITL — return plan-only. Prevents handing the IDE another repo's HITL.
+                    if (planScopeStepIds.length > 0 && (planAllOutOfScopeLbv || scopedPlanHitls.length === 0)) {
                         this.logging.log(
-                            'ATX: PLANNING job — all pending HITLs are sibling-repo LBV (none in loaded scope); not surfacing'
+                            'ATX: PLANNING job — all pending HITLs belong to sibling repos (LBV or integ-*, none in loaded scope); not surfacing'
                         )
                         return {
                             TransformationJob: {
@@ -2069,14 +3594,15 @@ export class ATXTransformHandler {
                     // pool so the plain find() below can't select a sibling's LBV (mixed pending-set case).
                     const planFallbackPool =
                         planScopeStepIds.length > 0 && !scopedPlanLbv
-                            ? hitls.filter(h => h.tag !== 'local-build-verification')
-                            : hitls
+                            ? scopedPlanHitls.filter(h => h.tag !== 'local-build-verification')
+                            : scopedPlanHitls
                     const hitl =
                         scopedPlanLbv ||
                         planFallbackPool.find(h => h.tag === 'local-build-verification') ||
                         planFallbackPool.find(
                             h => h.tag === 'missing-packages' || h.tag === 'handle_missing_packages_hitl'
                         ) ||
+                        this.findItGenHitl(planFallbackPool, request.TransformationJobId) ||
                         planFallbackPool[0]
                     this.logging.log(`ATX: Found HITL task - tag: ${hitl.tag}, hasArtifact: ${!!hitl.agentArtifact}`)
                     // For missing packages HITL, try to download artifact if available
@@ -2121,6 +3647,23 @@ export class ATXTransformHandler {
                             HitlTag: hitl.tag,
                             HitlTaskId: hitl.taskId,
                             StepInformation: planLbvStepId ? { StepId: planLbvStepId } : undefined,
+                            TransformationPlan: plan,
+                        } as AtxGetTransformInfoResponse
+                    }
+                    if (this.itGenJobs.isKnownItGenJob(request.TransformationJobId) && isItGenHitlTag(hitl.tag)) {
+                        const itGenStepId = this.getStepId(hitl)
+                        this.logging.log(
+                            `ATX: ${jobStatus} job has pending ${hitl.tag} HITL — taskId=${hitl.taskId} stepId=${itGenStepId ?? '<none>'}; surfacing AWAITING_HUMAN_INPUT to IDE`
+                        )
+                        return {
+                            TransformationJob: {
+                                WorkspaceId: request.WorkspaceId,
+                                JobId: request.TransformationJobId,
+                                Status: 'AWAITING_HUMAN_INPUT',
+                            } as AtxTransformationJob,
+                            HitlTag: hitl.tag,
+                            HitlTaskId: hitl.taskId,
+                            StepInformation: itGenStepId ? { StepId: itGenStepId } : undefined,
                             TransformationPlan: plan,
                         } as AtxGetTransformInfoResponse
                     }
@@ -2191,11 +3734,13 @@ export class ATXTransformHandler {
         // Check for local-build-verification HITL first — it can happen with or without a plan.
         // Beam-to-IDE: pass the loaded repo's scope so we surface THIS repo's LBV HITL, not
         // the first in the list (which may be a sibling's on a multi-repo beam job).
+        const hitlLookup = { failed: false }
         const hitlResponse = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.beamScopeStepIds
+            request.beamScopeStepIds,
+            hitlLookup
         )
         if (hitlResponse?.HitlTag === 'local-build-verification') {
             this.logging.log(
@@ -2205,7 +3750,8 @@ export class ATXTransformHandler {
                 request.WorkspaceId,
                 request.TransformationJobId,
                 request.SolutionRootPath,
-                request.IsBeam === true
+                request.IsBeam === true,
+                request.beamScopeStepIds
             )
             return {
                 TransformationJob: {
@@ -2223,17 +3769,73 @@ export class ATXTransformHandler {
             } as AtxGetTransformInfoResponse
         }
 
+        // ITGen app-launch / test-run HITLs: the IDE handles them, like LBV (the request is in OpenHitls).
+        if (this.itGenJobs.isKnownItGenJob(request.TransformationJobId) && isItGenHitlTag(hitlResponse?.HitlTag)) {
+            const plan = await this.getTransformationPlan(
+                request.WorkspaceId,
+                request.TransformationJobId,
+                request.SolutionRootPath,
+                request.IsBeam === true,
+                request.beamScopeStepIds
+            )
+            return {
+                TransformationJob: {
+                    WorkspaceId: request.WorkspaceId,
+                    JobId: request.TransformationJobId,
+                    Status: 'AWAITING_HUMAN_INPUT',
+                } as any,
+                TransformationPlan: plan,
+                HitlTag: hitlResponse!.HitlTag,
+                HitlTaskId: hitlResponse!.TaskId,
+                StepInformation: hitlResponse!.StepId ? { StepId: hitlResponse!.StepId } : undefined,
+            } as AtxGetTransformInfoResponse
+        }
+
         // Try to get the transformation plan first
         const plan = await this.getTransformationPlan(
             request.WorkspaceId,
             request.TransformationJobId,
             request.SolutionRootPath,
-            request.IsBeam === true
+            request.IsBeam === true,
+            request.beamScopeStepIds
         )
 
         const hasPlan = plan.Root.Children.length > 0 && plan.Root.Children[0].Children.length > 0
 
-        if (hasPlan) {
+        // missing-packages can be raised once a plan already exists. Only the planning
+        // path forwards HitlTag/MissingPackageJsonPath; handleExecutionPhaseHitl handles step-level
+        // ({stepId}-review) HITLs and would drop them, so the IDE never shows the package-upload
+        // dialog. Return it directly, mirroring the local-build-verification early-exit above.
+        if (hitlResponse?.HitlTag === 'missing-packages' || hitlResponse?.HitlTag === 'handle_missing_packages_hitl') {
+            this.logging.log(
+                `ATX: missing-packages HITL — returning directly to IDE (hasPlan=${hasPlan}, jsonPath=${hitlResponse.MissingPackageJsonPath ?? '<none>'})`
+            )
+            return {
+                TransformationJob: {
+                    WorkspaceId: request.WorkspaceId,
+                    JobId: request.TransformationJobId,
+                    Status: 'AWAITING_HUMAN_INPUT',
+                } as any,
+                TransformationPlan: plan,
+                HitlTag: hitlResponse.HitlTag,
+                HitlTaskId: hitlResponse.TaskId,
+                MissingPackageJsonPath: hitlResponse.MissingPackageJsonPath,
+            } as AtxGetTransformInfoResponse
+        }
+
+        // hasPlan guesses the phase from the plan's shape, and a first step with no sub-steps (e.g. "Assess
+        // Solution") looks like planning. Two signals mean the execution phase whatever the shape:
+        // - the open HITL is the step review ({stepId}-review) of a step in the plan;
+        // - ListHitls answered and there's no HITL to surface. Either none is open (the agent is waiting on a chat
+        //   answer, e.g. at the end of the job), or the request is beam-scoped and the only open HITLs are sibling
+        //   repos' local-build-verification HITLs, which getHitlAgentArtifact leaves out (the planning path would
+        //   look them up again without the scope and return a sibling's tag; the EXECUTING and PLANNING branches
+        //   return the plan alone for them too). Return the plan so the IDE keeps seeing step statuses (ITGen
+        //   stops its apps once Local Verification has finished). A failed lookup is neither case: it keeps the
+        //   shape-based choice, and the planning path looks the HITL up again.
+        const isStepReviewHitl = !!hitlResponse?.HitlTag && this.isStepReviewTag(plan.Root, hitlResponse.HitlTag)
+        const noHitlToSurface = !hitlResponse && !hitlLookup.failed && plan.Root.Children.length > 0
+        if (hasPlan || isStepReviewHitl || noHitlToSurface) {
             // Execution phase: Plan exists, HITL raised during transformation
             return await this.handleExecutionPhaseHitl(request, plan)
         } else {
@@ -2246,10 +3848,12 @@ export class ATXTransformHandler {
      * Handles HITL during planning phase - downloads plan.md and report.md for user review.
      */
     private async handlePlanningPhaseHitl(request: AtxGetTransformInfoRequest): Promise<AtxGetTransformInfoResponse> {
+        // Beam-to-IDE: the loaded repo's scope, as in handleAwaitingHumanInput, so a sibling repo's HITL isn't picked.
         const response = await this.getHitlAgentArtifact(
             request.WorkspaceId,
             request.TransformationJobId,
-            request.SolutionRootPath
+            request.SolutionRootPath,
+            request.beamScopeStepIds
         )
 
         this.logging.log(
@@ -2371,6 +3975,13 @@ export class ATXTransformHandler {
     }
 
     /**
+     * Whether the tag is the step-review tag ({stepId}-review, see findStepLevelHitl) of a step in the plan tree.
+     */
+    private isStepReviewTag(step: AtxPlanStep, tag: string): boolean {
+        return `${step.StepId}-review` === tag || step.Children.some(child => this.isStepReviewTag(child, tag))
+    }
+
+    /**
      * Beam to IDE: decide whether a beamed repo's Local Build Verification is
      * still OPEN (i.e. the repo is still waiting for the user to run LBV in the IDE), given the
      * parent job's plan tree. Used by listBeamedRepos so the IDE shows only repos still awaiting
@@ -2381,25 +3992,43 @@ export class ATXTransformHandler {
      * name, then inspect its LBV descendant: OPEN = the LBV node exists and is non-terminal
      * (PENDING_HUMAN_INPUT / IN_PROGRESS / NOT_STARTED); CLOSED = terminal (SUCCEEDED / COMPLETED /
      * FAILED / STOPPED). Returns TRUE (open) when we can't resolve it — no plan yet, node not
-     * found, or no LBV child — so a freshly transferred repo is never hidden before its LBV status
-     * is known (the IDE mirrors this default). The caller skips this call entirely when no plan is
-     * available.
+     * found, or no LBV child on a still-live repo node — so a freshly transferred repo is never
+     * hidden before its LBV status is known (the IDE mirrors this default). The one exception is a
+     * repo node that is itself terminal with no LBV child: that beam ended without ever opening
+     * LBV, so it is CLOSED rather than forever-pending. The caller skips this call entirely when no
+     * plan is available.
      */
-    private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string): boolean {
+    private isRepoLbvOpen(planRoot: AtxPlanStep, repoName: string, jobId: string): boolean {
         const repoNode = this.findBeamedRepoNode(planRoot, repoName)
         if (!repoNode) {
             // unknown → default open (don't hide a fresh transfer)
             this.logging.log(
-                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): no beamed repo node found in plan tree`
+                `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' → OPEN (default): no beamed repo node found in plan tree`
             )
             return true
         }
 
         const lbvNode = this.findLbvNode(repoNode)
         if (!lbvNode) {
+            // No LBV child. Two very different states look identical here: a fresh transfer whose
+            // sub-agent hasn't created the HITL YET, and a beam whose sub-agent never booted and was
+            // reaped by the web orchestrator's spawn-gap recovery (which stops the instance and marks
+            // this repo node terminal). Only the repo node's own status separates them — so read it
+            // before defaulting to open, or a reaped repo sits in the Transferred list forever with a
+            // disabled Load button and no explanation (its re-beam notice goes to the job owner, not
+            // to whoever is waiting in the IDE). Safe on re-beam: the orchestrator re-drives this
+            // node to IN_PROGRESS before reusing it, so a re-beamed repo reads live again.
+            if (this.isTerminalStepStatus(repoNode.Status)) {
+                this.logging.log(
+                    `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' node='${repoNode.StepName}' ` +
+                        `repoStatus=${repoNode.Status} → CLOSED: no Local Build Verification child and the repo node is ` +
+                        `terminal, so the beam ended without ever opening LBV (spawn-gap reap or cancel)`
+                )
+                return false
+            }
             // no LBV node yet → still pending
             this.logging.log(
-                `[BEAM-LBVOPEN] repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
+                `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' → OPEN (default): repo node '${repoNode.StepName}' has no Local Build Verification child yet`
             )
             return true
         }
@@ -2409,7 +4038,7 @@ export class ATXTransformHandler {
         // is how we PROVE the show-set actually flips: watch a repo go lbvStatus=IN_PROGRESS/
         // PENDING_HUMAN_INPUT (OPEN) → SUCCEEDED (CLOSED) after Load, and confirm it then drops off.
         this.logging.log(
-            `[BEAM-LBVOPEN] repo='${repoName}' node='${repoNode.StepName}' lbvNode='${lbvNode.StepName}' ` +
+            `[BEAM-LBVOPEN] job=${jobId} repo='${repoName}' node='${repoNode.StepName}' lbvNode='${lbvNode.StepName}' ` +
                 `lbvStatus=${lbvNode.Status} terminal=${terminal} → ${terminal ? 'CLOSED (will be hidden)' : 'OPEN (will show)'}`
         )
         return !terminal
@@ -2438,28 +4067,71 @@ export class ATXTransformHandler {
      * jobs that name the beam node just "<repo>") if no "(beamed)" node exists anywhere.
      */
     private findBeamedRepoNode(step: AtxPlanStep, repoName: string): AtxPlanStep | null {
-        const beamed = this.findNodeByName(step, `${repoName} (beamed)`.toLowerCase())
+        const beamed = this.pickLiveNode(this.findAllNodesByName(step, `${repoName} (beamed)`.toLowerCase()))
         if (beamed) return beamed
-        return this.findNodeByName(step, repoName.toLowerCase())
+        return this.pickLiveNode(this.findAllNodesByName(step, repoName.toLowerCase()))
     }
 
-    private findNodeByName(step: AtxPlanStep, lowerName: string): AtxPlanStep | null {
-        if ((step.StepName || '').toLowerCase() === lowerName) return step
-        for (const child of step.Children) {
-            const found = this.findNodeByName(child, lowerName)
-            if (found) return found
+    /**
+     * ALL name matches in DFS order, not just the first. Re-beam makes duplicates real: web-orc
+     * mints a fresh beam-batch parent per batch, so a repo beamed twice has TWO "<repo> (beamed)"
+     * nodes, and runtime RECREATES the LBV child rather than reviving the terminal one (only
+     * non-terminal children are reused). A first-match walk then resolves to the DEAD node, the
+     * repo reports lbvOpen=false, and a successful re-beam never reappears in the Beamed tab.
+     * A matched node's own subtree is not searched, matching the previous first-match semantics.
+     */
+    private findAllNodesByName(step: AtxPlanStep, lowerName: string): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if ((step.StepName || '').toLowerCase() === lowerName) {
+            found.push(step)
+            return found
         }
-        return null
+        for (const child of step.Children) {
+            found.push(...this.findAllNodesByName(child, lowerName))
+        }
+        return found
     }
 
-    /** Find the "Local Build Verification" node anywhere under the given node. */
+    /**
+     * Of several candidate nodes for one repo, pick the LIVE one: the first whose LBV child is
+     * still non-terminal. A candidate with no LBV child yet counts as live — it is pre-terminal,
+     * the same default isRepoLbvOpen applies elsewhere. When every candidate is terminal (all
+     * attempts finished) fall back to the LAST, which is the newest since children are appended.
+     * Non-terminal is the PRIMARY rule precisely so append-order is only ever a tiebreak.
+     */
+    private pickLiveNode(candidates: AtxPlanStep[]): AtxPlanStep | null {
+        if (candidates.length === 0) return null
+        if (candidates.length === 1) return candidates[0]
+        const live = candidates.find(c => {
+            const lbv = this.findLbvNode(c)
+            return lbv ? !this.isTerminalStepStatus(lbv.Status) : true
+        })
+        return live ?? candidates[candidates.length - 1]
+    }
+
+    /**
+     * Find the repo's LIVE "Local Build Verification" node. Prefers a non-terminal node over a
+     * terminal one for the same reason as pickLiveNode: after a re-beam the old STOPPED/FAILED
+     * child and the fresh one sit under the same parent, and a first-match walk picks the dead
+     * one. Falls back to the last (newest) when every attempt is terminal, which is what the
+     * terminal-drop in RebuildBeamedRepos wants to see.
+     */
     private findLbvNode(step: AtxPlanStep): AtxPlanStep | null {
-        if ((step.StepName || '').toLowerCase().includes('local build verification')) return step
-        for (const child of step.Children) {
-            const found = this.findLbvNode(child)
-            if (found) return found
+        const all = this.findAllLbvNodes(step)
+        if (all.length === 0) return null
+        return all.find(n => !this.isTerminalStepStatus(n.Status)) ?? all[all.length - 1]
+    }
+
+    private findAllLbvNodes(step: AtxPlanStep): AtxPlanStep[] {
+        const found: AtxPlanStep[] = []
+        if (isLocalBuildVerificationStep(step.StepName)) {
+            found.push(step)
+            return found
         }
-        return null
+        for (const child of step.Children) {
+            found.push(...this.findAllLbvNodes(child))
+        }
+        return found
     }
 
     /** Terminal step statuses (LBV done, one way or another). */
@@ -2710,11 +4382,19 @@ export class ATXTransformHandler {
         }
     }
 
+    /** True when *p* exists and is a directory; a missing or unreadable path is not one. */
+    private isDirectory(p: string): Promise<boolean> {
+        return fs.promises.stat(p).then(
+            s => s.isDirectory(),
+            () => false
+        )
+    }
+
     /**
      * Writes a manifest of source files to the checkpoints folder for tracking changes.
      * Creates source-files.json containing all source code file paths from the transformation request.
      */
-    private writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): void {
+    private async writeSourceFilesManifest(solutionRootPath: string, jobId: string, request: any): Promise<void> {
         try {
             const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
 
@@ -2755,17 +4435,27 @@ export class ATXTransformHandler {
                 }
             }
 
+            // A Web Site project's ProjectPath is its folder, not a file: listed here it would show
+            // up as a modified file and break the uplink zip. Only a ProjectPath can be a folder, so
+            // only those are checked, without blocking; getModifiedFilesSinceCheckpoint is the backstop.
+            const projectPaths: string[] = (request.ProjectMetadata ?? [])
+                .map((project: any) => project.ProjectPath)
+                .filter((p: unknown): p is string => typeof p === 'string' && p.length > 0)
+            const isFolder = await Promise.all(projectPaths.map(p => this.isDirectory(p)))
+            const folders = new Set(projectPaths.filter((_, i) => isFolder[i]))
+            const files = sourceFiles.filter(p => !folders.has(p))
+
             const manifest = {
                 jobId: jobId,
                 solutionRootPath: solutionRootPath,
                 createdAt: new Date().toISOString(),
-                sourceFiles: sourceFiles,
+                sourceFiles: files,
             }
 
             const manifestPath = path.join(checkpointsDir, 'source-files.json')
             fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
 
-            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${sourceFiles.length} files`)
+            this.logging.log(`ATX: Source files manifest written to ${manifestPath} with ${files.length} files`)
         } catch (error) {
             this.logging.error(`ATX: Failed to write source files manifest: ${String(error)}`)
         }
@@ -2886,7 +4576,9 @@ export class ATXTransformHandler {
                 try {
                     if (fs.existsSync(filePath)) {
                         const stats = fs.statSync(filePath)
-                        if (stats.mtimeMs > baseline) {
+                        // Only a file can be a modified file: a manifest can still list a folder
+                        // (written before folders were skipped, or added from a checkpoint).
+                        if (stats.isFile() && stats.mtimeMs > baseline) {
                             modifiedFiles.push(filePath)
                         }
                     }
@@ -3288,34 +4980,49 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        isBeam: boolean = false
+        isBeam: boolean = false,
+        beamScopeStepIds?: string
     ): Promise<AtxTransformationPlan> {
         try {
             const plan = await this.fetchPlanTree(workspaceId, jobId)
 
-            // Fetch worklogs in parallel (fire and forget, don't block plan return)
-            this.fetchWorklogs(workspaceId, jobId, solutionRootPath).catch(e => {
-                this.logging.log(`ATX: Could not get worklogs for workspace: ${workspaceId}, job: ${jobId}`)
-            })
+            // Fetch worklogs in parallel (fire and forget, don't block plan return). Not without a solution root
+            // (beam discovery): they'd be written relative to the LS's working directory.
+            if (solutionRootPath) {
+                this.fetchWorklogs(workspaceId, jobId, solutionRootPath).catch(e => {
+                    this.logging.log(`ATX: Could not get worklogs for workspace: ${workspaceId}, job: ${jobId}`)
+                })
+            }
 
             // Download completed step artifacts if not already present.
             //
-            // Beam-to-IDE (transformed): SKIP this pass. The beamed source is already
-            // the transformed output, so the prior transform job's completed-step
-            // checkpoint diffs are (a) already baked in and (b) not present in the beam
-            // bundle. Attempting to apply them logs "Checkpoint folder not available for
-            // step" and sets DiffApplyFailed on every poll, stalling the LBV loop. New
-            // LBV-round diffs are surfaced via the separate diff-artifact path, which is
-            // not gated here.
+            // Beam-to-IDE (transformed): the beamed source is already the transformed output, so the
+            // steps before the beam are baked in and not in the beam bundle; applying them logs
+            // "Checkpoint folder not available for step" and stalls the LBV loop. Only steps under the
+            // loaded repo's card (beamScopeStepIds) are applied: the card is created at beam time, so
+            // they all came after it (unit tests, ITGen code fixes, adding the tests). The card's own
+            // step and LBV steps are left out (beamApplyStepIds). Without a scope (not resolved yet,
+            // or beam discovery) nothing is applied.
+            let beamScope: Set<string> | undefined
             if (isBeam) {
-                this.logging.log(
-                    `ATX: [BEAM] skipping completed-step artifact apply for beamed job ${jobId} — source is already transformed`
-                )
-                this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
-                return plan
+                const scope = ATXTransformHandler.parseScopeStepIds(beamScopeStepIds)
+                if (scope.length === 0 || !solutionRootPath) {
+                    this.logging.log(
+                        `ATX: [BEAM] no loaded-repo scope for beamed job ${jobId} — not applying completed-step artifacts`
+                    )
+                    this.logging.log(`ATX: Successfully built plan tree with ${plan.Root.Children.length} root steps`)
+                    return plan
+                }
+                beamScope = beamApplyStepIds(plan.Root, new Set(scope))
             }
 
-            const anyFailed = await this.downloadCompletedStepArtifacts(workspaceId, jobId, solutionRootPath, plan)
+            const anyFailed = await this.downloadCompletedStepArtifacts(
+                workspaceId,
+                jobId,
+                solutionRootPath,
+                plan,
+                beamScope
+            )
             if (anyFailed && this._currentDiffContext) {
                 this._currentDiffContext.failed = true
             }
@@ -3336,7 +5043,8 @@ export class ATXTransformHandler {
         workspaceId: string,
         jobId: string,
         solutionRootPath: string,
-        plan: AtxTransformationPlan
+        plan: AtxTransformationPlan,
+        beamScope?: Set<string>
     ): Promise<boolean> {
         let anyFailed = false
         // Prevent concurrent execution
@@ -3347,10 +5055,25 @@ export class ATXTransformHandler {
         this._applyingCheckpoints = true
 
         try {
-            const completedSteps = this.findCompletedSteps(plan.Root)
+            let completedSteps: (AtxPlanStep & { score?: number })[]
+            if (beamScope) {
+                // A beamed repo's steps are nested under its card; only the ones in scope, in application order.
+                completedSteps = await this.findCompletedStepsAnyDepth(
+                    workspaceId,
+                    jobId,
+                    solutionRootPath,
+                    plan.Root,
+                    step => beamScope.has(step.StepId)
+                )
+            } else if (await this.isItGenJob(workspaceId, jobId)) {
+                // Already in application order (tree post-order).
+                completedSteps = await this.findCompletedStepsAnyDepth(workspaceId, jobId, solutionRootPath, plan.Root)
+            } else {
+                completedSteps = this.findCompletedSteps(plan.Root)
 
-            // Sort by score to ensure correct application order
-            completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+                // Sort by score to ensure correct application order
+                completedSteps.sort((a, b) => (a.score || 0) - (b.score || 0))
+            }
 
             this.logging.log(`ATX: Found ${completedSteps.length} completed steps to check for artifacts`)
 
@@ -3394,9 +5117,10 @@ export class ATXTransformHandler {
                             // path at the downloadDiffArtifact call site already does). Without
                             // it, ``lastAppliedTimestamp`` stays absent here, so the user-edit
                             // protection in applyChanges sees an empty modified-set and is a
-                            // no-op on the exact interactive path DealerFx lost edits on. The
-                            // per-step re-stamp can't shrink later steps' protection because
-                            // the byte-equal short-circuit ignores the agent's own re-writes.
+                            // no-op on the exact interactive path where a customer reported
+                            // losing edits. The per-step re-stamp can't shrink later steps'
+                            // protection because the byte-equal short-circuit ignores the
+                            // agent's own re-writes.
                             this.saveLastAppliedTimestamp(solutionRootPath, jobId, step.StepId)
                         } else {
                             this.logging.error(`ATX: Failed to apply changes for step ${step.StepId}: ${result.error}`)
@@ -3505,6 +5229,180 @@ export class ATXTransformHandler {
         }
 
         return completedSteps
+    }
+
+    /**
+     * ITGen variant of findCompletedSteps: the not-yet-applied SUCCEEDED steps at ANY depth that
+     * have a diff to apply, i.e. a checkpoint folder on disk or a step-tagged CUSTOMER_OUTPUT
+     * artifact. With integration tests on, the agent nests LBV under local-verification, so the
+     * LBV error-fix rounds move to depth 3 and the nested LBV step itself (depth 2) has no diff.
+     * Keying on the artifact rather than the depth applies the rounds, and skips the LBV step
+     * instead of reporting it as a failed apply on every poll. A step whose artifact isn't
+     * listed yet is left out and picked up on a later poll.
+     *
+     * Returned in tree post-order (score-sorted siblings, children before their parent): a
+     * parent finishes after its children, and checkpoints overwrite whole files, so a parent's
+     * diff must land last.
+     */
+    private async findCompletedStepsAnyDepth(
+        workspaceId: string,
+        jobId: string,
+        solutionRootPath: string,
+        root: AtxPlanStep,
+        include: (step: AtxPlanStep) => boolean = () => true
+    ): Promise<AtxPlanStep[]> {
+        const applied = new Set(this.loadAppliedCheckpoints(solutionRootPath, jobId))
+        const pending = this.findSucceededStepsPostOrder(root).filter(
+            step => include(step) && !applied.has(step.StepId)
+        )
+        const checkpointsDir = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints')
+        const isDownloaded = (step: AtxPlanStep) => fs.existsSync(path.join(checkpointsDir, step.StepId))
+
+        // Only list artifacts when some pending step still needs a download.
+        if (pending.every(isDownloaded)) {
+            return pending
+        }
+
+        const stepIdsWithArtifact = await this.listStepIdsWithCustomerOutput(workspaceId, jobId)
+        if (!stepIdsWithArtifact) {
+            // Listing failed: apply what is already on disk and retry the rest on the next poll.
+            return pending.filter(isDownloaded)
+        }
+        return pending.filter(step => isDownloaded(step) || stepIdsWithArtifact.has(step.StepId))
+    }
+
+    /**
+     * ITGen for a beamed repo: the customer-changes manifest that addCustomerChangesToResultZip and the user-edit
+     * protection in applyChanges read. startTransform writes it for a standalone job; a beamed repo never runs
+     * startTransform, so it's written on the first beamed poll, once the solution is open and its root is known.
+     * It lists the files under the root, without build output and the IDE's own folders, and its baseline is now:
+     * edits after Load count as the customer's. Overlapping polls share one write; it never throws.
+     */
+    private ensureBeamSourceFilesManifest(solutionRootPath: string, jobId: string): Promise<void> {
+        if (!solutionRootPath || !isSafeAbsolutePath(solutionRootPath)) {
+            return Promise.resolve()
+        }
+        const manifestPath = path.join(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+        const key = ATXTransformHandler.beamManifestKey(solutionRootPath, jobId)
+        const running = this.beamManifestWrites.get(key)
+        if (running) {
+            return running
+        }
+        const write = this.writeBeamSourceFilesManifest(solutionRootPath, jobId, manifestPath).finally(() =>
+            this.beamManifestWrites.delete(key)
+        )
+        this.beamManifestWrites.set(key, write)
+        return write
+    }
+
+    private static beamManifestKey(solutionRootPath: string, jobId: string): string {
+        return path
+            .resolve(solutionRootPath, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+            .toLowerCase()
+    }
+
+    private async writeBeamSourceFilesManifest(
+        solutionRootPath: string,
+        jobId: string,
+        manifestPath: string
+    ): Promise<void> {
+        const checkpointsDir = path.dirname(manifestPath)
+        try {
+            await fs.promises.access(manifestPath)
+            return
+        } catch {
+            // not written yet
+        }
+        try {
+            const {
+                files: sourceFiles,
+                truncated,
+                unreadableFolders,
+            } = await listBeamRepoFiles(solutionRootPath, workspaceFolderName)
+            if (truncated) {
+                this.logging.warn(
+                    `ATX: [BEAM] source files manifest stopped at ${sourceFiles.length} files; later files aren't tracked`
+                )
+            }
+            if (unreadableFolders.length > 0) {
+                this.logging.debug(
+                    `ATX: [BEAM] source files manifest left out unreadable folders: ${unreadableFolders.join(', ')}`
+                )
+            }
+            const now = Date.now()
+            const manifest = {
+                jobId: jobId,
+                solutionRootPath: solutionRootPath,
+                createdAt: new Date(now).toISOString(),
+                lastAppliedTimestamp: now,
+                sourceFiles: sourceFiles,
+            }
+            await fs.promises.mkdir(checkpointsDir, { recursive: true })
+            await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+            this.logging.log(
+                `ATX: [BEAM] source files manifest written to ${manifestPath} with ${sourceFiles.length} files`
+            )
+        } catch (error) {
+            this.logging.error(`ATX: [BEAM] could not write the source files manifest: ${String(error)}`)
+        }
+    }
+
+    /**
+     * All SUCCEEDED steps below the root, children before their parent. Siblings are already
+     * sorted by score (buildTreeFromFlatList).
+     */
+    private findSucceededStepsPostOrder(step: AtxPlanStep, depth: number = 0): AtxPlanStep[] {
+        const steps: AtxPlanStep[] = []
+        for (const child of step.Children) {
+            steps.push(...this.findSucceededStepsPostOrder(child, depth + 1))
+        }
+        if (depth > 0 && step.Status === 'SUCCEEDED') {
+            steps.push(step)
+        }
+        return steps
+    }
+
+    /**
+     * The plan step IDs that have at least one CUSTOMER_OUTPUT artifact for this job, from one
+     * paginated job-wide ListArtifacts. Job-level deliverables carry no planStepId and are
+     * ignored. Returns null on error.
+     */
+    private async listStepIdsWithCustomerOutput(workspaceId: string, jobId: string): Promise<Set<string> | null> {
+        try {
+            if (!this.atxClient && !(await this.initializeAtxClient())) {
+                this.logging.error('ATX: Failed to initialize client for listStepIdsWithCustomerOutput')
+                return null
+            }
+
+            const stepIds = new Set<string>()
+            let nextToken: string | undefined
+            do {
+                const command = new ListArtifactsCommand({
+                    workspaceId: workspaceId,
+                    jobFilter: {
+                        jobId: jobId,
+                        categoryType: 'CUSTOMER_OUTPUT',
+                    },
+                    ...(nextToken && { nextToken }),
+                })
+
+                await this.addAuthToCommand(command)
+                const result = await this.atxClient!.send(command)
+
+                for (const artifact of result?.artifacts || []) {
+                    if (artifact.planStepId) {
+                        stepIds.add(artifact.planStepId)
+                    }
+                }
+                nextToken = result?.nextToken
+            } while (nextToken)
+
+            this.logging.log(`ATX: ${stepIds.size} plan step(s) have CUSTOMER_OUTPUT artifacts for job: ${jobId}`)
+            return stepIds
+        } catch (error) {
+            this.logging.error(`ATX: listStepIdsWithCustomerOutput error: ${String(error)}`)
+            return null
+        }
     }
 
     /**
@@ -3870,6 +5768,79 @@ export class ATXTransformHandler {
         return { hasMore: this._worklogNextTokenByJob.has(jobId) }
     }
 
+    /** Mode cached for this job, or null when none has been resolved yet. */
+    private getCachedInteractiveMode(jobId: string): InteractiveMode | null {
+        return this.interactiveModeByJob.get(jobId)?.mode ?? null
+    }
+
+    /** Where this job's cached mode came from, for diagnostics. Empty when nothing is cached. */
+    private getCachedInteractiveModeSource(jobId: string): string {
+        return this.interactiveModeByJob.get(jobId)?.source ?? ''
+    }
+
+    private setCachedInteractiveMode(jobId: string, mode: InteractiveMode, source: string): void {
+        this.interactiveModeByJob.set(jobId, { mode, source })
+    }
+
+    /**
+     * Reads the effective interactive mode from the checkpoint-settings HITL artifact, which is the
+     * only store a mid-job mode change is written to. Every client that changes the mode uploads
+     * that artifact, so it reflects a switch made from this IDE, another IDE, or the web UI -
+     * unlike objective.interactive_mode, which is fixed when the job is created. Returns null when
+     * no artifact exists yet (the mode was never changed) or it carries no recognisable mode,
+     * leaving the caller to fall back to the objective.
+     */
+    private async readInteractiveModeFromCheckpointSettings(
+        workspaceId: string,
+        jobId: string
+    ): Promise<InteractiveMode | null> {
+        try {
+            const hitlTask = await this.findCheckpointSettingsHitl(workspaceId, jobId)
+            const artifactId = hitlTask?.humanArtifact?.artifactId
+            if (!artifactId) {
+                this.logging.log('ATX: no checkpoint-settings artifact available to read interactive mode from')
+                return null
+            }
+
+            const settings = await this.downloadJsonArtifact(workspaceId, jobId, artifactId)
+            const mode = settings?.interactive_mode
+            if (mode === 'interactive') {
+                return 'Interactive'
+            }
+            if (mode === 'auto') {
+                return 'Autonomous'
+            }
+
+            this.logging.log(
+                `ATX: checkpoint-settings artifact ${artifactId} carries no usable interactive_mode (got ${String(mode)})`
+            )
+            return null
+        } catch (e) {
+            this.logging.log(`ATX: could not read interactive mode from checkpoint-settings: ${String(e)}`)
+            return null
+        }
+    }
+
+    /**
+     * Reads interactive_mode back out of the last checkpoint-settings.json we wrote, so a
+     * checkpoints-only sync can preserve it instead of dropping it. Returns null when the file is
+     * absent, unreadable, or holds a value the agent would not recognise - in which case the caller
+     * writes no mode and the agent falls back to its default.
+     */
+    private readPersistedInteractiveMode(jsonFilePath: string): string | null {
+        try {
+            if (!fs.existsSync(jsonFilePath)) {
+                return null
+            }
+            const previous = JSON.parse(fs.readFileSync(jsonFilePath, 'utf8'))
+            const mode = previous?.interactive_mode
+            return mode === 'interactive' || mode === 'auto' ? mode : null
+        } catch (e) {
+            this.logging.log(`ATX: could not read previous checkpoint-settings for interactive_mode: ${String(e)}`)
+            return null
+        }
+    }
+
     /**
      * Set checkpoints for interactive mode transformation.
      * Lists HITLs with "checkpoint-settings" tag, uploads checkpoints as JSON artifact,
@@ -3904,6 +5875,8 @@ export class ATXTransformHandler {
                 fs.mkdirSync(artifactDir, { recursive: true })
             }
 
+            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
+
             // Build JSON content with optional interactiveMode
             const jsonContent: Record<string, any> = { ...checkpoints }
             if (interactiveMode) {
@@ -3911,10 +5884,41 @@ export class ATXTransformHandler {
                 let mappedMode = 'auto'
                 if (interactiveMode === 'Interactive') mappedMode = 'interactive'
                 jsonContent.interactive_mode = mappedMode
+                // Keep this job's cache in step with the mode just asserted. It is what
+                // getTransformInfo reports back to the IDE on every poll, and it is the
+                // carry-forward source below, so leaving it on the job-start value after a switch
+                // makes both of those stale.
+                this.setCachedInteractiveMode(jobId, interactiveMode, 'user-switch')
                 this.logging.log(`ATX: setCheckpoints interactive_mode=${mappedMode}`)
+            } else {
+                // This artifact is full state and the agent reads a missing interactive_mode as "use
+                // the default", not "leave it alone", so a checkpoints-only sync has to carry the
+                // current mode forward or it silently reverts the user's choice.
+                // Known limitation: the cache is resolved once per job, so a switch made elsewhere
+                // after that read is overwritten by the next sync.
+                const cachedMode = this.getCachedInteractiveMode(jobId)
+                let carriedMode: string | null
+                let carriedFrom = this.getCachedInteractiveModeSource(jobId)
+                if (cachedMode === 'Interactive') {
+                    carriedMode = 'interactive'
+                } else if (cachedMode === 'Autonomous') {
+                    carriedMode = 'auto'
+                } else {
+                    carriedMode = this.readPersistedInteractiveMode(jsonFilePath)
+                    carriedFrom = 'local-settings-file'
+                }
+                if (carriedMode) {
+                    this.logging.log(
+                        `ATX: setCheckpoints carrying forward interactive_mode=${carriedMode} (from ${carriedFrom})`
+                    )
+                    jsonContent.interactive_mode = carriedMode
+                } else {
+                    this.logging.log(
+                        'ATX: setCheckpoints has no interactive_mode to carry forward - agent will apply its default'
+                    )
+                }
             }
 
-            const jsonFilePath = path.join(artifactDir, 'checkpoint-settings.json')
             this.logging.log(`ATX: Writing checkpoint-settings.json to ${jsonFilePath}`)
             fs.writeFileSync(jsonFilePath, JSON.stringify(jsonContent, null, 2))
 
@@ -4247,6 +6251,11 @@ export class ATXTransformHandler {
         conflictedFiles?: string[]
     }> {
         try {
+            // Beam to IDE: a beamed repo's customer-changes baseline is written before its first apply, so the files
+            // the apply adds are tracked (updateSourceFilesManifest needs the manifest).
+            if (jobId) {
+                await this.beamManifestWrites.get(ATXTransformHandler.beamManifestKey(solutionRootPath, jobId))
+            }
             this.logging.log(`ATX: Starting applyChanges from ${checkpointFolderPath} to ${solutionRootPath}`)
 
             // Read metadata.json from checkpoint folder
@@ -4271,13 +6280,14 @@ export class ATXTransformHandler {
 
             // Files the customer edited locally since the last checkpoint apply. Applying
             // the transform's version on top of these silently destroys the customer's
-            // work (DealerFx P452432920 — edits to an already-transformed project clobbered
-            // by a later sync). Compute the protected set ONCE up front (a per-step stamp
-            // would shrink it for later steps in this run) and resolve to absolute paths so
-            // it can be membership-tested against each resolved destination. ``getModified…``
-            // returns absolute paths; an absent watermark (no prior apply) yields [], i.e.
-            // first-apply is unprotected by necessity — no ``before/`` baseline ships, so a
-            // 3-way merge is infeasible and the first write onto a virgin tree cannot conflict.
+            // work (a customer-reported edit clobber: edits to an already-transformed
+            // project were overwritten by a later sync). Compute the protected set ONCE up
+            // front (a per-step stamp would shrink it for later steps in this run) and
+            // resolve to absolute paths so it can be membership-tested against each resolved
+            // destination. ``getModified…`` returns absolute paths; an absent watermark (no
+            // prior apply) yields [], i.e. first-apply is unprotected by necessity — no
+            // ``before/`` baseline ships, so a 3-way merge is infeasible and the first write
+            // onto a virgin tree cannot conflict.
             const userModifiedFiles = new Set(
                 (jobId ? this.getModifiedFilesSinceCheckpoint(solutionRootPath, jobId) : []).map(p => path.resolve(p))
             )
@@ -4352,8 +6362,9 @@ export class ATXTransformHandler {
                     const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
                     const destPath = path.join(solutionRootPath, relativePath)
 
-                    // The DealerFx clobber: if the customer edited this already-applied file
-                    // since the last sync, preserve their version instead of overwriting it.
+                    // The customer-reported edit clobber: if the customer edited this
+                    // already-applied file since the last sync, preserve their version instead
+                    // of overwriting it.
                     if (
                         this.shouldPreserveUserFile(
                             destPath,
@@ -4576,8 +6587,23 @@ export class ATXTransformHandler {
             const sendResult = (await this.atxClient!.send(command)) as any
             const sentMessageId = sendResult?.message?.messageId
 
+            // Join key for correlating a beamed turn across all three packages on one timeline.
+            // The two backends key on different fields — runtime on message_id_sent, web-orc on
+            // msg_len (its send response carries no createdAt) — so emit both names here rather
+            // than forcing either side to translate. beamStep identifies which repo's lane.
+            this.logging.log(
+                `[BEAM-CHAT] sent | message_id_sent=${sentMessageId ?? '<none>'} msg_len=${messageText.length} ` +
+                    `beamStep=${request.beamStepId || '<none>'} job=${request.jobId ?? '<none>'} ` +
+                    `skipPolling=${!!request.skipPolling}`
+            )
+
             if (!sentMessageId || request.skipPolling) {
-                return { success: true, data: sendResult }
+                // Must match the shape the polling path returns below. The client reads the sent id
+                // from data.sentMessage.messageId and adds it to its seen-set so its own poll does
+                // not re-render the message the user just sent. Returning the raw sendResult nests
+                // that id under `message` instead of `sentMessage`, leaving it unreadable — so every
+                // message sent on this path rendered twice: once locally, once again from the poll.
+                return { success: true, data: { sentMessage: sendResult?.message, response: null } }
             }
 
             // Poll for response until the configured attempt ceiling (default 180 x 5s
@@ -4737,27 +6763,174 @@ export class ATXTransformHandler {
         savePath: string,
         artifactName?: string
     ): Promise<{ Success: boolean; FilePath?: string; Error?: string }> {
-        try {
-            const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
-            if (!downloadInfo) {
-                return { Success: false, Error: 'Failed to get download URL' }
+        const deadline = Date.now() + ARTIFACT_DOWNLOAD_BUDGET_MS
+        await this.removeStaleDownloadTempFiles(savePath)
+        let lastError = ''
+        for (let attempt = 1; attempt <= ARTIFACT_DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+            // Tracked outside the try so a mid-download failure can report how far it got
+            // (distinguishes a stalled connection from a never-started one).
+            let downloadedBytes = 0
+            // Each attempt writes to its own name beside the target. The file gets its real name only
+            // when it is whole, so a download that stops partway leaves no cut file for the IDE to
+            // open, a failed re-download does not destroy the copy already on disk, and two downloads
+            // of the same artifact do not truncate each other's file.
+            let tempPath: string | undefined
+            try {
+                // A new signed URL for every attempt: the one from a slow or stalled attempt may have expired.
+                const downloadInfo = await this.createArtifactDownloadUrl(workspaceId, jobId, artifactId)
+                if (!downloadInfo) {
+                    const msg = `Failed to get download URL for artifact=${artifactId} (job=${jobId})`
+                    this.logging.error(`ATX: downloadArtifactToPath ${msg}`)
+                    // On a later attempt, keep why the earlier one failed: it is the reason this URL was asked for.
+                    lastError = lastError ? `${msg}; last download error: ${lastError}` : msg
+                    break
+                }
+
+                await Utils.directoryExists(savePath)
+                const fileName = artifactName ? path.basename(artifactName) : 'artifact.zip'
+                const filePath = path.join(savePath, fileName)
+                tempPath = `${filePath}.${uuidv4().substring(0, 8)}.part`
+
+                // Stream the artifact straight to disk instead of buffering the entire file in memory.
+                // Large artifacts (e.g. Transformation_Report.html) previously failed here: the old
+                // `timeout: { request: 30000 }` caps the WHOLE request — including receiving the full
+                // body — so a large-but-healthy download would abort with a TimeoutError, which was
+                // then swallowed and surfaced to the user as a generic "could not download" error.
+                // `responseType: 'buffer'` also held the full file (plus a copy) in memory. Streaming
+                // with inactivity-based timeouts (time-to-headers + socket idle) removes the size
+                // ceiling while still failing fast on a genuinely stalled connection.
+                this.logging.log(
+                    `ATX: downloadArtifactToPath streaming artifact=${artifactId} to ${filePath} (attempt=${attempt}/${ARTIFACT_DOWNLOAD_MAX_ATTEMPTS})`
+                )
+                const downloadStream = got.stream(downloadInfo.s3PresignedUrl, {
+                    headers: downloadInfo.requestHeaders || {},
+                    timeout: { response: 30000, socket: 60000 },
+                })
+
+                // The size the server promised. Not used with a Content-Encoding other than identity
+                // (which means no encoding): Content-Length then counts the encoded bytes and got
+                // writes the decoded ones.
+                let expectedBytes: number | undefined
+                downloadStream.on('response', (response: any) => {
+                    const contentEncoding = response?.headers?.['content-encoding']
+                    const contentLength = Number(response?.headers?.['content-length'])
+                    if ((!contentEncoding || contentEncoding === 'identity') && Number.isInteger(contentLength)) {
+                        expectedBytes = contentLength
+                    }
+                })
+                downloadStream.on('downloadProgress', ({ transferred }) => {
+                    downloadedBytes = transferred
+                })
+
+                await pipeline(downloadStream, fs.createWriteStream(tempPath))
+
+                const writtenBytes = (await fs.promises.stat(tempPath)).size
+                if (expectedBytes !== undefined && writtenBytes !== expectedBytes) {
+                    throw new Error(`Incomplete download: wrote ${writtenBytes} of ${expectedBytes} bytes`)
+                }
+                await this.moveDownloadedArtifact(tempPath, filePath)
+
+                this.logging.log(`ATX: downloadArtifactToPath completed artifact=${artifactId}, bytes=${writtenBytes}`)
+                return { Success: true, FilePath: savePath }
+            } catch (error) {
+                if (tempPath) {
+                    // recursive: the fs.rm documentation says maxRetries and retryDelay are ignored without it.
+                    await fs.promises
+                        .rm(tempPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 })
+                        .catch(() => {})
+                }
+                // Log every failure with enough context to diagnose without a repro: the got error
+                // `code` (ETIMEDOUT/ECONNRESET/...), the timeout phase for a TimeoutError, the HTTP
+                // status for an HTTPError, bytes received before the failure, and the full stack.
+                const err = error as any
+                const diagnostics: string[] = []
+                if (err?.code) diagnostics.push(`code=${err.code}`)
+                if (err?.event) diagnostics.push(`timeoutPhase=${err.event}`)
+                if (err?.response?.statusCode) diagnostics.push(`httpStatus=${err.response.statusCode}`)
+                const suffix = diagnostics.length ? ` [${diagnostics.join(', ')}]` : ''
+                this.logging.error(
+                    `ATX: downloadArtifactToPath failed artifact=${artifactId} (job=${jobId}, attempt=${attempt}/${ARTIFACT_DOWNLOAD_MAX_ATTEMPTS}) after ${downloadedBytes} bytes: ${String(err?.stack ?? error)}${suffix}`
+                )
+                lastError = `${String(err?.message ?? error)}${suffix}`
+                if (
+                    attempt >= ARTIFACT_DOWNLOAD_MAX_ATTEMPTS ||
+                    ARTIFACT_DOWNLOAD_LOCAL_ERROR_CODES.includes(err?.code)
+                ) {
+                    break
+                }
+                // No attempt starts after the time budget of the call is spent, also when the wait ran long.
+                const retryDelayMs = this.artifactDownloadRetryBaseMs * attempt
+                let budgetSpent = Date.now() + retryDelayMs >= deadline
+                if (!budgetSpent) {
+                    await Utils.sleep(retryDelayMs)
+                    budgetSpent = Date.now() >= deadline
+                }
+                if (budgetSpent) {
+                    this.logging.log(
+                        `ATX: downloadArtifactToPath starts no attempt ${attempt + 1} for artifact=${artifactId}: the ${ARTIFACT_DOWNLOAD_BUDGET_MS}ms budget of the call is spent`
+                    )
+                    break
+                }
             }
-
-            const response = await got.get(downloadInfo.s3PresignedUrl, {
-                headers: downloadInfo.requestHeaders || {},
-                responseType: 'buffer',
-                timeout: { request: 30000 },
-            })
-
-            await Utils.directoryExists(savePath)
-            const fileName = artifactName ? path.basename(artifactName) : 'artifact.zip'
-            const filePath = path.join(savePath, fileName)
-            fs.writeFileSync(filePath, Buffer.from(response.body))
-
-            return { Success: true, FilePath: savePath }
-        } catch (error) {
-            return { Success: false, Error: String(error) }
         }
+        return { Success: false, Error: lastError }
+    }
+
+    /**
+     * Removes the temp files that earlier calls of downloadArtifactToPath left in the save folder. A
+     * process that goes away mid-download leaves its temp file, and every attempt has its own name, so
+     * they would add up. Only names of the form "<name>.<8 hex>.part" are removed, and only when the
+     * file was last written over an hour ago. Nothing here fails the download.
+     */
+    private async removeStaleDownloadTempFiles(savePath: string): Promise<void> {
+        const names = await fs.promises.readdir(savePath).catch(() => [] as string[])
+        const cutoff = Date.now() - ARTIFACT_DOWNLOAD_STALE_TEMP_MS
+        for (const name of names) {
+            if (!/\.[0-9a-f]{8}\.part$/.test(name)) {
+                continue
+            }
+            const stalePath = path.join(savePath, name)
+            try {
+                const stats = await fs.promises.lstat(stalePath)
+                if (stats.isFile() && stats.mtimeMs < cutoff) {
+                    await fs.promises.unlink(stalePath)
+                    this.logging.log(`ATX: downloadArtifactToPath removed old temp file ${stalePath}`)
+                }
+            } catch {
+                // Held open or already gone. The next download tries again.
+            }
+        }
+    }
+
+    /**
+     * Gives a finished download its real name. rename replaces an older copy in one step. Windows
+     * refuses the rename while another program holds the older copy open, so after a few tries the
+     * finished file is copied over it instead, which is what the direct write did before. The copy
+     * writes into the older copy's file, so that copy cannot be kept when the copy goes wrong: a
+     * short result is an error here, and the caller downloads again.
+     */
+    private async moveDownloadedArtifact(tempPath: string, filePath: string): Promise<void> {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await fs.promises.rename(tempPath, filePath)
+                return
+            } catch (error) {
+                const code = (error as any)?.code
+                if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') {
+                    throw error
+                }
+                await Utils.sleep(this.artifactDownloadRenameRetryMs * attempt)
+            }
+        }
+        await fs.promises.copyFile(tempPath, filePath)
+        const tempBytes = (await fs.promises.stat(tempPath)).size
+        const copiedBytes = (await fs.promises.stat(filePath)).size
+        if (copiedBytes !== tempBytes) {
+            throw new Error(`Incomplete copy: ${filePath} has ${copiedBytes} of ${tempBytes} bytes and is cut`)
+        }
+        // The artifact is in place, so a temp file that cannot be removed now (a scanner holds it) is
+        // not a failed download. removeStaleDownloadTempFiles removes it on a later call.
+        await fs.promises.rm(tempPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100 }).catch(() => {})
     }
 
     /**
