@@ -8,6 +8,7 @@ import {
 import { AtxTokenServiceManager } from '../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { ATXTransformHandler } from './atxTransformHandler'
 import { AtxTransformHandlerLegacy } from './atxTransformHandlerLegacy'
+import { getAtxErrorInfo } from './atxErrorInfo'
 import {
     AtxListOrCreateWorkspaceRequest,
     AtxListJobsRequest,
@@ -21,10 +22,12 @@ import {
     AtxListArtifactsRequest,
     AtxDownloadArtifactRequest,
     AtxCompleteLocalBuildHitlRequest,
+    AtxCompleteHitlWithTestResultsRequest,
     AtxGetJobDashboardRequest,
     AtxGetJobReportRequest,
     AtxUploadCustomPlanRequest,
     AtxLoadOlderWorklogsRequest,
+    AtxDownloadOriginalCodeRequest,
 } from './atxModels'
 
 // ATX FES Commands - Consolidated APIs
@@ -43,10 +46,19 @@ const AtxBatchGetMessagesCommand = 'aws/atxTransform/batchGetMessages'
 const AtxListArtifactsCommand = 'aws/atxTransform/listArtifacts'
 const AtxDownloadArtifactCommand = 'aws/atxTransform/downloadArtifact'
 const AtxCompleteLocalBuildHitlCommand = 'aws/atxTransform/completeLocalBuildHitl'
+// ITGen; the handler refuses it unless the job has generate_integration_tests
+const AtxCompleteHitlWithTestResultsCommand = 'aws/atxTransform/completeHitlWithTestResults'
 const AtxGetJobDashboardCommand = 'aws/atxTransform/getJobDashboard'
 const AtxGetJobReportCommand = 'aws/atxTransform/getJobReport'
 const AtxUploadCustomPlanCommand = 'aws/atxTransform/uploadCustomPlan'
 const AtxLoadOlderWorklogsCommand = 'aws/atxTransform/loadOlderWorklogs'
+// Beam to IDE
+const AtxListBeamedReposCommand = 'aws/atxTransform/listBeamedRepos'
+const AtxDownloadBeamArtifactCommand = 'aws/atxTransform/downloadBeamArtifact'
+// ITGen; the handler refuses it unless the job has generate_integration_tests
+const AtxDownloadOriginalCodeCommand = 'aws/atxTransform/downloadOriginalCode'
+// Read-only session check used to validate IAM sign-in
+export const AtxValidateSessionCommand = 'aws/atxTransform/validateSession'
 
 export const AtxNetTransformServerToken =
     (): Server =>
@@ -62,6 +74,9 @@ export const AtxNetTransformServerToken =
                         const request = params as AtxListOrCreateWorkspaceRequest
                         const result = await atxTransformHandler.listOrCreateWorkspace(request)
                         return result
+                    }
+                    case AtxValidateSessionCommand: {
+                        return await atxTransformHandler.validateSession()
                     }
                     case AtxListJobsCommand: {
                         const { WorkspaceId } = params as AtxListJobsRequest
@@ -170,12 +185,13 @@ export const AtxNetTransformServerToken =
                         return await atxTransformHandler.uploadPackages(request)
                     }
                     case AtxSendMessageCommand: {
-                        const { workspaceId, jobId, text, skipPolling } = params as any
+                        const { workspaceId, jobId, text, skipPolling, beamStepId } = params as any
                         return await atxTransformHandler.sendMessage({
                             workspaceId,
                             jobId,
                             text,
                             skipPolling,
+                            beamStepId,
                         })
                     }
                     case AtxListMessagesCommand: {
@@ -233,6 +249,22 @@ export const AtxNetTransformServerToken =
                             SolutionRootPath
                         )
                     }
+                    case AtxCompleteHitlWithTestResultsCommand: {
+                        const { WorkspaceId, TransformationJobId, TaskId, ResultZipPath, SolutionRootPath } =
+                            params as AtxCompleteHitlWithTestResultsRequest
+
+                        logging.log(
+                            `ATX: completeHitlWithTestResults received — jobId=${TransformationJobId} taskId=${TaskId} zip=${ResultZipPath}`
+                        )
+
+                        return await atxTransformHandler.completeHitlWithTestResults(
+                            WorkspaceId,
+                            TransformationJobId,
+                            TaskId,
+                            ResultZipPath,
+                            SolutionRootPath
+                        )
+                    }
                     case AtxGetJobDashboardCommand: {
                         const { WorkspaceId, JobId } = params as AtxGetJobDashboardRequest
 
@@ -269,13 +301,66 @@ export const AtxNetTransformServerToken =
                             request.nextToken
                         )
                     }
+                    // ---- Beam to IDE ----
+                    case AtxListBeamedReposCommand: {
+                        // PascalCase params/return to match the C# ExecuteCommandParams convention.
+                        // Lightweight (optional): the poll-tick refresh sets it to skip the beam-map
+                        // download scan (throttle-safe).
+                        const { WorkspaceId, ParentJobId, Lightweight } = params as any
+                        if (!WorkspaceId || !ParentJobId) {
+                            throw new Error('WorkspaceId and ParentJobId are required for listBeamedRepos')
+                        }
+                        const repos = await atxTransformHandler.listBeamedRepos(
+                            WorkspaceId,
+                            ParentJobId,
+                            Lightweight === true
+                        )
+                        return { Repos: repos }
+                    }
+                    case AtxDownloadBeamArtifactCommand: {
+                        // PascalCase params to match the C# ExecuteCommandParams serialization
+                        // convention used by every other C#-backed ATX command (e.g. downloadArtifact).
+                        const { WorkspaceId, ParentJobId, BeamArtifactId, DestDir } = params as any
+                        if (!WorkspaceId || !ParentJobId || !BeamArtifactId || !DestDir) {
+                            throw new Error(
+                                'WorkspaceId, ParentJobId, BeamArtifactId and DestDir are required for downloadBeamArtifact'
+                            )
+                        }
+                        return await atxTransformHandler.downloadBeamArtifact(
+                            WorkspaceId,
+                            ParentJobId,
+                            BeamArtifactId,
+                            DestDir
+                        )
+                    }
+                    case AtxDownloadOriginalCodeCommand: {
+                        const request = params as AtxDownloadOriginalCodeRequest
+                        if (
+                            !request.WorkspaceId ||
+                            !request.TransformationJobId ||
+                            !request.CodeArtifactId ||
+                            !request.SolutionRootPath
+                        ) {
+                            throw new Error(
+                                'WorkspaceId, TransformationJobId, CodeArtifactId and SolutionRootPath are required for downloadOriginalCode'
+                            )
+                        }
+                        return await atxTransformHandler.downloadOriginalCode(
+                            request.WorkspaceId,
+                            request.TransformationJobId,
+                            request.CodeArtifactId,
+                            request.SolutionRootPath
+                        )
+                    }
                     default: {
                         throw new Error(`Unknown ATX FES command: ${params.command}`)
                     }
                 }
             } catch (e: any) {
                 logging.error(`ATXTransformServer: Error executing command: ${String(e)}`)
-                return { error: true, message: e.message }
+                // errorCode and statusCode let the IDE act on the failure (e.g. stop polling on AccessDenied)
+                // without reading the message.
+                return { error: true, message: e.message, ...getAtxErrorInfo(e) }
             }
         }
 
@@ -307,10 +392,15 @@ export const AtxNetTransformServerToken =
                             AtxListArtifactsCommand,
                             AtxDownloadArtifactCommand,
                             AtxCompleteLocalBuildHitlCommand,
+                            AtxCompleteHitlWithTestResultsCommand,
                             AtxGetJobDashboardCommand,
                             AtxGetJobReportCommand,
                             AtxUploadCustomPlanCommand,
                             AtxLoadOlderWorklogsCommand,
+                            AtxListBeamedReposCommand,
+                            AtxDownloadBeamArtifactCommand,
+                            AtxDownloadOriginalCodeCommand,
+                            AtxValidateSessionCommand,
                         ],
                     },
                 },
