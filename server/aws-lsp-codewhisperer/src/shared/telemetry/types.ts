@@ -253,6 +253,13 @@ export type AgencticLoop_InvokeLLMEvent = {
     enabled?: boolean
     languageServerVersion?: string
     latency?: string
+    /**
+     * Classifies *why* a call failed, for failures that are handled inside the agent loop and are
+     * therefore not user-visible. Used by downstream metrics to exclude transient, self-recovering
+     * iterations from per-call success rates. Absent when `result` is 'Succeeded', and absent for
+     * failures that have no specific classification.
+     */
+    reason?: string
 }
 
 export type ToolUseSuggestedEvent = {

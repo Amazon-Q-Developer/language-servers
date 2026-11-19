@@ -16,7 +16,8 @@ import { ChatClientAdapter } from '../contracts/chatClientAdapter'
 import { ChatMessage, ContextCommand, ListAvailableModelsResult } from '@aws/language-server-runtimes-types'
 import { ChatHistory } from './features/history'
 import { pairProgrammingModeOn, pairProgrammingModeOff } from './texts/pairProgramming'
-import { strictEqual } from 'assert'
+import { deprecationCard } from './texts/deprecation'
+import { deepStrictEqual, strictEqual } from 'assert'
 
 describe('MynahUI', () => {
     let messager: Messager
@@ -91,7 +92,7 @@ describe('MynahUI', () => {
         createTabStub.returns({})
         getChatItemsStub = sinon.stub(tabFactory, 'getChatItems')
         getChatItemsStub.returns([])
-        const mynahUiResult = createMynahUi(messager, tabFactory, true, true, undefined, undefined, true)
+        const mynahUiResult = createMynahUi(messager, tabFactory, true, false, undefined, undefined, true)
         mynahUi = mynahUiResult[0]
         inboundChatApi = mynahUiResult[1]
         getSelectedTabIdStub = sinon.stub(mynahUi, 'getSelectedTabId')
@@ -104,11 +105,8 @@ describe('MynahUI', () => {
     })
 
     afterEach(() => {
+        mynahUi.destroy()
         sinon.restore()
-
-        Object.keys(mynahUi.getAllTabs()).forEach(tabId => {
-            mynahUi.removeTab(tabId, (mynahUi as any).lastEventId)
-        })
     })
 
     describe('handleChatPrompt', () => {
@@ -163,14 +161,18 @@ describe('MynahUI', () => {
     })
 
     describe('openTab', () => {
-        it('should create a new tab with welcome messages if tabId not passed and previous messages not passed', () => {
+        it('should show the deprecation card while initializing the first tab', () => {
+            sinon.assert.calledWith(getChatItemsStub, true, true)
+        })
+
+        it('should show the deprecation card in each new tab until it is acknowledged', () => {
             createTabStub.resetHistory()
             getChatItemsStub.resetHistory()
 
             inboundChatApi.openTab(requestId, {})
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
-            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, undefined)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
         })
@@ -204,6 +206,31 @@ describe('MynahUI', () => {
             sinon.assert.calledOnceWithExactly(getChatItemsStub, false, false, mockMessages)
             sinon.assert.notCalled(selectTabSpy)
             sinon.assert.calledOnce(onOpenTabSpy)
+        })
+
+        it('should show the deprecation card in a new tab after a restored chat is opened', () => {
+            const mockMessages: ChatMessage[] = [
+                {
+                    messageId: 'restored-message',
+                    body: 'Restored response',
+                    type: ChatItemType.ANSWER,
+                },
+            ]
+
+            createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
+
+            inboundChatApi.openTab(requestId, {
+                newTabOptions: {
+                    data: {
+                        messages: mockMessages,
+                    },
+                },
+            })
+            inboundChatApi.openTab(requestId, {})
+
+            sinon.assert.calledWithExactly(getChatItemsStub.firstCall, false, false, mockMessages)
+            sinon.assert.calledWithExactly(getChatItemsStub.secondCall, true, true, undefined)
         })
 
         it('should call onOpenTab if a new tab if tabId not passed and tab not created', () => {
@@ -251,6 +278,7 @@ describe('MynahUI', () => {
             this.timeout(10000) // Increase timeout to 10 seconds
             // clear create tab stub since set up process calls it twice
             createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
             // Stub setTimeout to execute immediately
             const setTimeoutStub = sinon.stub(global, 'setTimeout').callsFake((fn: Function) => {
                 fn()
@@ -265,6 +293,7 @@ describe('MynahUI', () => {
             inboundChatApi.sendGenericCommand({ genericCommand, selection, tabId, triggerType })
 
             sinon.assert.calledOnceWithExactly(createTabStub, false)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, true, [])
             // updateStore is called four times for a brand new tab:
             //   1. onTabAdd seeds the tab (chatItems + welcome tabHeaderDetails)
             //   2. handleChatPrompt clears the welcome splash before the first prompt
@@ -766,14 +795,152 @@ describe('MynahUI', () => {
                 stringOverrides
             )
 
-            // Access the config texts from the instance
-            const configTexts = (customMynahUi as any).props.config.texts
+            try {
+                // Access the config texts from the instance
+                const configTexts = (customMynahUi as any).props.config.texts
 
-            // Verify that string overrides were applied and defaults are preserved
-            strictEqual(configTexts.spinnerText, 'Custom loading message...')
-            strictEqual(configTexts.stopGenerating, 'Custom stop text')
-            strictEqual(configTexts.showMore, 'Custom show more text')
-            strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+                // Verify that string overrides were applied and defaults are preserved
+                strictEqual(configTexts.spinnerText, 'Custom loading message...')
+                strictEqual(configTexts.stopGenerating, 'Custom stop text')
+                strictEqual(configTexts.showMore, 'Custom show more text')
+                strictEqual(configTexts.clickFileToViewDiff, uiComponentsTexts.clickFileToViewDiff)
+            } finally {
+                customMynahUi.destroy()
+            }
+        })
+    })
+
+    describe('chat answer link clicks', () => {
+        const props = () => (mynahUi as any).props
+        const telemetryNamed = (name: string) =>
+            (outboundChatApi.telemetry as sinon.SinonStub).getCalls().filter(c => c.args[0].name === name)
+
+        it('sends a relative link as a file click without the answer messageId', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'src/foo.ts#L10', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: 'src/foo.ts',
+                fullPath: undefined,
+            })
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+        })
+
+        it('records link-click telemetry for a file link without sending it to the IDE link opener', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'src/foo.ts', undefined, 'event-1')
+            props().onInfoLinkClick('tab-1', '/home/x/a.ts', undefined, 'event-2')
+
+            deepStrictEqual(
+                telemetryNamed('linkClick').map(c => c.args[0]),
+                [{ tabId: 'tab-1', messageId: 'answer-1', link: 'src/foo.ts', eventId: 'event-1', name: 'linkClick' }]
+            )
+            deepStrictEqual(
+                telemetryNamed('infoLinkClick').map(c => c.args[0]),
+                [{ tabId: 'tab-1', link: '/home/x/a.ts', eventId: 'event-2', name: 'infoLinkClick' }]
+            )
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(notifySpy)
+        })
+
+        it('sends an absolute Windows answer link as a file click with fullPath', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'C:\\work\\src\\a.ts#L10', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: 'C:\\work\\src\\a.ts',
+                fullPath: 'C:\\work\\src\\a.ts',
+            })
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+        })
+
+        it('sends an https link as a link click', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com/doc', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.linkClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/doc',
+                eventId: 'event-1',
+            })
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+        })
+
+        it('opens nothing for a network path or a non-http scheme and tells the user', () => {
+            props().onLinkClick('tab-1', 'answer-1', '\\\\host\\share\\x', undefined, 'event-1')
+            props().onInfoLinkClick('tab-1', 'vscode://x', undefined, 'event-2')
+
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.calledTwice(notifySpy)
+            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
+            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
+            strictEqual(telemetryNamed('linkClick').length, 1)
+            strictEqual(telemetryNamed('infoLinkClick').length, 1)
+        })
+
+        it('sends an absolute info link path as a file click with fullPath', () => {
+            props().onInfoLinkClick('tab-1', '/home/x/a.ts', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.fileClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                filePath: '/home/x/a.ts',
+                fullPath: '/home/x/a.ts',
+            })
+            sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+        })
+    })
+
+    describe('onMessageDismiss', () => {
+        it('acknowledges the deprecation card and removes it from every open and future new chat', () => {
+            const updateTabDefaultsSpy = sinon.spy(mynahUi, 'updateTabDefaults')
+            const retainedItem = {
+                messageId: 'retained-message',
+                type: ChatItemType.ANSWER,
+                body: 'Keep me',
+            }
+            getAllTabsStub.returns({
+                'tab-1': {
+                    store: {
+                        chatItems: [deprecationCard, retainedItem],
+                    },
+                },
+                'tab-2': {
+                    store: {
+                        chatItems: [deprecationCard],
+                    },
+                },
+                'tab-3': {
+                    store: {
+                        chatItems: [retainedItem],
+                    },
+                },
+            })
+            updateStoreSpy.resetHistory()
+            ;(mynahUi as any).props.onMessageDismiss('tab-1', deprecationCard.messageId)
+
+            sinon.assert.calledWithExactly(
+                outboundChatApi.chatPromptOptionAcknowledged as sinon.SinonStub,
+                deprecationCard.messageId
+            )
+            sinon.assert.calledWithExactly(updateStoreSpy, 'tab-1', { chatItems: [retainedItem] })
+            sinon.assert.calledWithExactly(updateStoreSpy, 'tab-2', { chatItems: [] })
+            sinon.assert.neverCalledWith(updateStoreSpy, 'tab-3', sinon.match.any)
+            sinon.assert.calledWithExactly(getChatItemsStub, true, false)
+            sinon.assert.calledWithExactly(updateTabDefaultsSpy, {
+                store: {
+                    chatItems: [],
+                },
+            })
+
+            createTabStub.resetHistory()
+            getChatItemsStub.resetHistory()
+
+            inboundChatApi.openTab(requestId, {})
+
+            sinon.assert.calledOnceWithExactly(createTabStub, false)
+            sinon.assert.calledOnceWithExactly(getChatItemsStub, true, false, undefined)
         })
     })
 })
@@ -815,6 +982,11 @@ describe('withAdapter', () => {
             true
         )
         mynahUi = mynahUiResult[0]
+    })
+
+    afterEach(() => {
+        mynahUi.destroy()
+        sinon.restore()
     })
 
     it('should instantiate and inject mynahUIRef to Adapter', () => {

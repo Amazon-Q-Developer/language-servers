@@ -1,12 +1,51 @@
-import { expect } from 'chai'
+﻿import { expect } from 'chai'
 import * as sinon from 'sinon'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { ATXTransformHandler } from '../atxTransformHandler'
+import { Readable } from 'stream'
+import got from 'got'
+import {
+    ATXTransformHandler,
+    ATX_OBJECTIVE_BROWSER_KEY,
+    ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY,
+    classifyDownloadUrlError,
+    isUnrecognizedDownloadUrlError,
+    objectiveHasIntegrationTests,
+} from '../atxTransformHandler'
 import { workspaceFolderName } from '../utils'
 import { AtxTokenServiceManager } from '../../../shared/amazonQServiceManager/AtxTokenServiceManager'
 import { Logging, Runtime, Workspace } from '@aws/language-server-runtimes/server-interface'
+
+// The interactive-mode cache is keyed by job id, so tests reach it through these rather than a
+// single field. Job scoping is what stops one job's mode being written into another's artifact.
+function cachedMode(handler: any, jobId: string): string | undefined {
+    return handler.interactiveModeByJob.get(jobId)?.mode
+}
+
+function setCachedMode(handler: any, jobId: string, mode: string, source = 'test'): void {
+    handler.interactiveModeByJob.set(jobId, { mode, source })
+}
+
+// Stands in for got.stream in the downloadArtifactToPath tests: emits got's 'response' event when
+// headers are given, then the chunks, then ends, or stops with failWith as a dropped connection does.
+function fakeDownload(chunks: Buffer[], headers?: Record<string, string>, failWith?: Error): Readable {
+    const stream = new Readable({ read() {} })
+    setImmediate(() => {
+        if (headers) {
+            stream.emit('response', { headers })
+        }
+        for (const chunk of chunks) {
+            stream.push(chunk)
+        }
+        if (failWith) {
+            stream.destroy(failWith)
+        } else {
+            stream.push(null)
+        }
+    })
+    return stream
+}
 
 describe('ATXTransformHandler - Chat APIs', () => {
     let handler: ATXTransformHandler
@@ -38,6 +77,100 @@ describe('ATXTransformHandler - Chat APIs', () => {
         sinon.restore()
     })
 
+    // The beam artifact cache had no tests at all, and the LRU-victim case below is exactly the bug
+    // the cap-correction commit fixed — nothing guarded the regression.
+    describe('downloadJsonArtifact cache', () => {
+        let urlStub: sinon.SinonStub
+
+        beforeEach(() => {
+            urlStub = sinon.stub(handler as any, 'createArtifactDownloadUrl')
+        })
+
+        it('caches a NEGATIVE (not JSON) so the artifact is never re-fetched', async () => {
+            // Negatives were 1230 of the 1980 wasted fetches — the bulk of the win — and "these
+            // bytes are not JSON" is a permanent property, so it must not expire.
+            ;(handler as any).beamJsonArtifactCache.set('a1', {
+                value: null,
+                expiresAt: Number.MAX_SAFE_INTEGER,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a1')
+
+            expect(result).to.equal(null)
+            expect(urlStub.called).to.be.false
+        })
+
+        it('says when an artifact could not be downloaded, and not when it was read and is not JSON', async () => {
+            const onUnreadable = sinon.spy()
+            urlStub.resolves(null)
+
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'gone', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce).to.be.true
+
+            onUnreadable.resetHistory()
+            urlStub.rejects(new Error('AccessDenied'))
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'failed', onUnreadable)).to.equal(null)
+            expect(onUnreadable.calledOnce, 'a download that fails').to.be.true
+
+            onUnreadable.resetHistory()
+            ;(handler as any).beamJsonArtifactCache.set('not-json', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            expect(await (handler as any).downloadJsonArtifact('ws', 'job', 'not-json', onUnreadable)).to.equal(null)
+            expect(onUnreadable.called).to.be.false
+        })
+
+        it('serves a fresh POSITIVE from cache without re-fetching', async () => {
+            ;(handler as any).beamJsonArtifactCache.set('a2', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() + 60_000,
+            })
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a2')
+
+            expect(result).to.deep.equal({ repos: ['alice'] })
+            expect(urlStub.called).to.be.false
+        })
+
+        it('RE-FETCHES an expired positive — a rewritten beam-map must not be pinned', async () => {
+            // Why positives carry a TTL: web-orc re-writes the beam-map, and if a rewrite reuses the
+            // artifactId a permanent cache would hide every repo beamed after the first one until
+            // the LSP restarted.
+            ;(handler as any).beamJsonArtifactCache.set('a3', {
+                value: { repos: ['alice'] },
+                expiresAt: Date.now() - 1,
+            })
+            urlStub.resolves(null) // no presigned URL — proves only that the fetch was ATTEMPTED
+
+            const result = await (handler as any).downloadJsonArtifact('ws', 'job', 'a3')
+
+            expect(urlStub.calledOnce).to.be.true
+            expect(result).to.equal(null)
+        })
+
+        it('does NOT cache a missing presigned URL — that is transient', async () => {
+            urlStub.resolves(null)
+
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'a4')
+
+            expect(urlStub.calledTwice).to.be.true
+            expect((handler as any).beamJsonArtifactCache.has('a4')).to.be.false
+        })
+
+        it('evicts the least-recently-USED entry, not the oldest inserted', async () => {
+            // Guards the cap-correction commit: a hit must refresh recency. Without the
+            // delete+re-insert on read, Map insertion order makes this evict 'first' — the entry
+            // just used — which is how an under-sized cap collapsed the hit rate to zero.
+            const cache = (handler as any).beamJsonArtifactCache
+            cache.set('first', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+            cache.set('second', { value: null, expiresAt: Number.MAX_SAFE_INTEGER })
+
+            // Touch 'first' so it becomes most-recently-used.
+            await (handler as any).downloadJsonArtifact('ws', 'job', 'first')
+
+            expect(Array.from(cache.keys())).to.deep.equal(['second', 'first'])
+        })
+    })
+
     describe('sendMessage', () => {
         it('should send message and return response without polling', async () => {
             const mockResponse = {
@@ -51,7 +184,17 @@ describe('ATXTransformHandler - Chat APIs', () => {
                 skipPolling: true,
             })
 
-            expect(result).to.deep.equal({ success: true, data: mockResponse })
+            // skipPolling must return the SAME shape as the polling path, not the raw send result.
+            // The IDE reads data.sentMessage.messageId to seed its seen-set so the 3s chat poll does
+            // not render the server's copy as a second bubble; returning `mockResponse` verbatim
+            // left that unreadable and every beamed message appeared twice.
+            expect(result).to.deep.equal({
+                success: true,
+                data: { sentMessage: mockResponse.message, response: null },
+            })
+            // Assert the consumed path explicitly — deep.equal above would still pass if the field
+            // were renamed on both sides, but the IDE reads exactly this.
+            expect(result.data.sentMessage.messageId).to.equal('msg-123')
             expect(sendStub.calledOnce).to.be.true
         })
 
@@ -224,6 +367,33 @@ describe('ATXTransformHandler - Chat APIs', () => {
             const callArgs = sendStub.firstCall.args[0]
             expect(callArgs.input.workspaceId).to.equal('ws-123')
             expect(callArgs.input.messageIds).to.have.lengthOf(3)
+        })
+    })
+
+    describe('getJob', () => {
+        it('returns null and fills the error code and status when GetJob fails', async () => {
+            sendStub.rejects(
+                Object.assign(new Error('not authorized'), {
+                    name: 'AccessDeniedException',
+                    $metadata: { httpStatusCode: 403 },
+                })
+            )
+            const errorInfo: any = {}
+
+            const job = await handler.getJob('ws-123', 'job-456', false, errorInfo)
+
+            expect(job).to.be.null
+            expect(errorInfo).to.deep.equal({ errorCode: 'AccessDeniedException', statusCode: 403 })
+        })
+
+        it('leaves the error info empty when GetJob succeeds', async () => {
+            sendStub.resolves({ job: { jobId: 'job-456' } })
+            const errorInfo: any = {}
+
+            const job = await handler.getJob('ws-123', 'job-456', false, errorInfo)
+
+            expect(job).to.deep.equal({ jobId: 'job-456' })
+            expect(errorInfo).to.deep.equal({})
         })
     })
 
@@ -402,6 +572,20 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect((logging.error as sinon.SinonStub).called).to.be.true
     })
 
+    it('should return the GetJob error code and status with JOB_NOT_FOUND', async () => {
+        getJobStub.callsFake(async (_ws: string, _job: string, _objective: boolean, errorInfo: any) => {
+            errorInfo.errorCode = 'AccessDeniedException'
+            errorInfo.statusCode = 403
+            return null
+        })
+
+        const result: any = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.ErrorString).to.equal('JOB_NOT_FOUND')
+        expect(result?.ErrorCode).to.equal('AccessDeniedException')
+        expect(result?.StatusCode).to.equal(403)
+    })
+
     it('should return COMPLETED with artifact path and plan', async () => {
         getJobStub.resolves({ statusDetails: { status: 'COMPLETED' } })
         downloadFinalArtifactStub.resolves('C:/sln/artifact.zip')
@@ -473,6 +657,59 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTaskId).to.equal('task-lbv')
     })
 
+    it('forwards the missing-packages HITL to the IDE when a plan already exists', async () => {
+        // Regression: handleExecutionPhaseHitl (taken once a plan exists) only handles step-level
+        // HITLs and dropped HitlTag/MissingPackageJsonPath, so the IDE never showed the upload dialog.
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.HitlTaskId).to.equal('task-mp')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('forwards the handle_missing_packages_hitl tag when a plan already exists', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({
+            Root: { Children: [{ StepId: 's1', Children: [{ StepId: 's1a' }] }] },
+        })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'handle_missing_packages_hitl',
+            TaskId: 'task-mp2',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('handle_missing_packages_hitl')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
+    it('still forwards the missing-packages HITL when no plan exists yet', async () => {
+        getJobStub.resolves({ statusDetails: { status: 'AWAITING_HUMAN_INPUT' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        getHitlAgentArtifactStub.resolves({
+            HitlTag: 'missing-packages',
+            TaskId: 'task-mp3',
+            MissingPackageJsonPath: 'C:/sln/missing-packages.json',
+        })
+
+        const result = await handler.getTransformInfo(baseRequest)
+
+        expect(result?.HitlTag).to.equal('missing-packages')
+        expect(result?.MissingPackageJsonPath).to.equal('C:/sln/missing-packages.json')
+    })
+
     it('should default to PLANNING-like fallthrough for unknown statuses', async () => {
         getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
         getTransformationPlanStub.resolves({ Root: { Children: [] } })
@@ -495,6 +732,30 @@ describe('ATXTransformHandler - getTransformInfo', () => {
         expect(result?.HitlTag).to.equal('local-build-verification')
         expect(result?.HitlTaskId).to.equal('task-lbv')
         expect((handler as any).jobsPastLocalBuild.has('job-123')).to.be.true
+    })
+
+    it('should NOT surface a sibling repo LBV when status is PLANNING and all pending LBVs are out of the loaded scope', async () => {
+        // Beam multi-repo: the IDE loaded one repo (beamScopeStepIds = its subtree). Every pending
+        // HITL is a local-build-verification for a DIFFERENT (sibling) repo's plan step. Surfacing
+        // one would make the IDE build the loaded solution against a sibling's HITL → false-green.
+        // Mirrors the EXECUTING/getHitlAgentArtifact guard: return the plan-only view instead.
+        getJobStub.resolves({ statusDetails: { status: 'PLANNING' } })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([
+            { tag: 'local-build-verification', taskId: 'task-sib1', stepId: 'sibling-step-1' },
+            { tag: 'local-build-verification', taskId: 'task-sib2', stepId: 'sibling-step-2' },
+        ])
+
+        const result = await handler.getTransformInfo({
+            ...baseRequest,
+            beamScopeStepIds: 'loaded-step-a,loaded-step-b',
+        })
+
+        // Plan-only view: original job status preserved, no HITL surfaced to the IDE.
+        expect(result?.TransformationJob.Status).to.equal('PLANNING')
+        expect(result?.HitlTag).to.be.undefined
+        expect(result?.HitlTaskId).to.be.undefined
+        expect(result?.TransformationPlan).to.deep.equal({ Root: { Children: [] } })
     })
 
     it('should filter pre-job mode-selection -checkpoint HITL before LBV has run', async () => {
@@ -570,10 +831,10 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
     })
 
-    it('should default cachedInteractiveMode to Autonomous when objective is unparseable', async () => {
+    it('should default the cached mode to Autonomous when objective is unparseable', async () => {
         getJobStub.resolves({
             statusDetails: { status: 'EXECUTING' },
             objective: 'not-json',
@@ -583,7 +844,81 @@ describe('ATXTransformHandler - getTransformInfo', () => {
 
         await handler.getTransformInfo(baseRequest)
 
-        expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    // The objective is the job-creation payload and never changes, so restoring the mode from it
+    // discards any mid-job switch. The checkpoint-settings artifact is the store every client
+    // writes when the mode changes, so it wins.
+    it('should prefer the checkpoint-settings artifact over the job objective', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+    })
+
+    it('should fall back to the objective when no checkpoint-settings artifact exists', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should fall back to the objective when the artifact carries no usable mode', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        // A checkpoints-only write from before the carry-forward fix: checkpoints, no mode.
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ 'step-a': true })
+
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Interactive')
+    })
+
+    it('should read the artifact only once, not on every poll', async () => {
+        getJobStub.resolves({
+            statusDetails: { status: 'EXECUTING' },
+            objective: '{"interactive_mode":"interactive"}',
+        })
+        getTransformationPlanStub.resolves({ Root: { Children: [] } })
+        listHitlsStub.resolves([])
+        const findStub = sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({
+            taskId: 't1',
+            humanArtifact: { artifactId: 'artifact-1' },
+        })
+        sinon.stub(handler as any, 'downloadJsonArtifact').resolves({ interactive_mode: 'auto' })
+
+        await handler.getTransformInfo(baseRequest)
+        await handler.getTransformInfo(baseRequest)
+
+        expect(cachedMode(handler, 'job-123')).to.equal('Autonomous')
+        expect(findStub.callCount).to.equal(1)
     })
 
     it('should return null when getJob throws', async () => {
@@ -754,6 +1089,58 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
             expect(node.Status).to.equal('NOT_STARTED')
             expect(node.score).to.equal(0)
         })
+
+        it('mapApiStepToNode defaults IsStatusOnly to false (structural pass assigns it)', () => {
+            // The service sends no machine-readable step label, so the per-node mapper never
+            // sets IsStatusOnly; it is assigned during tree assembly based on parent identity.
+            const node = (handler as any).mapApiStepToNode({
+                stepId: 's1',
+                stepName: 'Merge Tests',
+                status: 'IN_PROGRESS',
+            })
+            expect(node.IsStatusOnly).to.equal(false)
+        })
+    })
+
+    describe('buildTreeFromFlatList - IsStatusOnly (unit-test-generation substeps)', () => {
+        // A realistic flat plan: a "Generate Unit Tests" parent with 4 substeps, plus a
+        // sibling "Transform Projects" parent with its own substep, all under root.
+        const flatPlan = () => [
+            { stepId: 'gut', parentStepId: 'root', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'plan', parentStepId: 'gut', stepName: 'Plan Unit Test Generation', status: 'NOT_STARTED' },
+            { stepId: 'gen', parentStepId: 'gut', stepName: 'Generate Unit Tests', status: 'NOT_STARTED' },
+            { stepId: 'merge', parentStepId: 'gut', stepName: 'Merge Tests', status: 'NOT_STARTED' },
+            { stepId: 'cov', parentStepId: 'gut', stepName: 'Get Coverage', status: 'NOT_STARTED' },
+            { stepId: 'tp', parentStepId: 'root', stepName: 'Transform Projects', status: 'NOT_STARTED' },
+            { stepId: 'build', parentStepId: 'tp', stepName: 'Solution Build', status: 'NOT_STARTED' },
+        ]
+
+        const findById = (nodes: any[], id: string): any => {
+            for (const n of nodes) {
+                if (n.StepId === id) return n
+                const hit = findById(n.Children || [], id)
+                if (hit) return hit
+            }
+            return null
+        }
+
+        it('marks direct substeps of "Generate Unit Tests" as IsStatusOnly=true', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            for (const id of ['plan', 'gen', 'merge', 'cov']) {
+                expect(findById(roots, id).IsStatusOnly, id).to.equal(true)
+            }
+        })
+
+        it('leaves the parent "Generate Unit Tests" step interactive (IsStatusOnly=false)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'gut').IsStatusOnly).to.equal(false)
+        })
+
+        it('does not mark transformation substeps (different parent)', () => {
+            const roots = (handler as any).buildTreeFromFlatList(flatPlan())
+            expect(findById(roots, 'tp').IsStatusOnly).to.equal(false)
+            expect(findById(roots, 'build').IsStatusOnly).to.equal(false)
+        })
     })
 
     describe('findCompletedSteps', () => {
@@ -795,6 +1182,319 @@ describe('ATXTransformHandler - getTransformationPlan & helpers', () => {
 
             const completed = (handler as any).findCompletedSteps(root)
             expect(completed).to.deep.equal([])
+        })
+    })
+
+    describe('downloadCompletedStepArtifacts - ITGen any-depth apply', () => {
+        const JOB_ID = 'job-itgen'
+        let tmpRoot: string
+        let checkpointsDir: string
+        let sendStub: sinon.SinonStub
+        let downloadStub: sinon.SinonStub
+        let applyStub: sinon.SinonStub
+
+        // ITGen plan shape: LBV nested under local-verification, so the error-fix rounds sit at
+        // depth 3 and the nested LBV step (depth 2) has no diff of its own.
+        const itGenPlan = () => ({
+            Root: {
+                StepId: 'root',
+                Status: 'IN_PROGRESS',
+                Children: [
+                    {
+                        StepId: 'tp',
+                        Status: 'SUCCEEDED',
+                        Children: [{ StepId: 'proj-a', Status: 'SUCCEEDED', Children: [] }],
+                    },
+                    {
+                        StepId: 'lv',
+                        Status: 'SUCCEEDED',
+                        Children: [
+                            {
+                                StepId: 'lbv',
+                                Status: 'SUCCEEDED',
+                                Children: [
+                                    { StepId: 'round-1', Status: 'SUCCEEDED', Children: [] },
+                                    { StepId: 'round-2', Status: 'SUCCEEDED', Children: [] },
+                                    { StepId: 'round-3', Status: 'IN_PROGRESS', Children: [] },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        })
+
+        // Artifacts tagged to proj-a and the two finished rounds, plus a job-level deliverable.
+        const listedArtifacts = () => ({
+            artifacts: [
+                { artifactId: 'a-proj', planStepId: 'proj-a' },
+                { artifactId: 'a-r1', planStepId: 'round-1' },
+                { artifactId: 'a-r2', planStepId: 'round-2' },
+                { artifactId: 'a-final' },
+            ],
+        })
+
+        const appliedOrder = () => applyStub.getCalls().map(c => path.basename(c.args[0]))
+
+        beforeEach(() => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, true)
+            tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-itgen-apply-'))
+            checkpointsDir = path.join(tmpRoot, workspaceFolderName, JOB_ID, 'checkpoints')
+            sendStub = (handler as any).atxClient.send
+            sinon.stub(handler as any, 'addAuthToCommand').resolves()
+            // Materialize the step's checkpoint folder, as a real download would.
+            downloadStub = sinon
+                .stub(handler as any, 'downloadCompletedStepArtifact')
+                .callsFake(async (...args: any[]) => {
+                    fs.mkdirSync(path.join(checkpointsDir, args[2]), { recursive: true })
+                })
+            applyStub = sinon.stub(handler as any, 'applyChanges').resolves({ success: true })
+            sinon.stub(handler as any, 'saveLastAppliedTimestamp')
+        })
+
+        afterEach(() => {
+            fs.rmSync(tmpRoot, { recursive: true, force: true })
+        })
+
+        it('applies SUCCEEDED steps with an artifact at any depth, children before parents', async () => {
+            // Give the nested LBV a diff too, to pin that a parent lands after its children.
+            const listed = listedArtifacts()
+            listed.artifacts.push({ artifactId: 'a-lbv', planStepId: 'lbv' })
+            sendStub.resolves(listed)
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(appliedOrder()).to.deep.equal(['proj-a', 'round-1', 'round-2', 'lbv'])
+            expect(downloadStub.callCount).to.equal(4)
+        })
+
+        // Beam-to-IDE: the parent web job's plan. A pre-beam transform step, then the beamed repo's card with its
+        // unit tests, and Local Verification with LBV (and an error-fix round), an ITGen code fix and adding the tests.
+        const beamPlan = () => ({
+            Root: {
+                StepId: 'root',
+                Status: 'IN_PROGRESS',
+                Children: [
+                    { StepId: 'pre', StepName: 'Transform App', Status: 'SUCCEEDED', Children: [] },
+                    {
+                        StepId: 'repo',
+                        StepName: 'App (beamed)',
+                        Status: 'IN_PROGRESS',
+                        Children: [
+                            { StepId: 'ut', StepName: 'Generate unit tests', Status: 'SUCCEEDED', Children: [] },
+                            {
+                                StepId: 'lv',
+                                StepName: 'Local Verification',
+                                Status: 'IN_PROGRESS',
+                                Children: [
+                                    {
+                                        StepId: 'lbv',
+                                        StepName: 'Local Build Verification',
+                                        Status: 'SUCCEEDED',
+                                        Children: [
+                                            {
+                                                StepId: 'round-1',
+                                                StepName: 'Round 1',
+                                                Status: 'SUCCEEDED',
+                                                Children: [],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        StepId: 'fix-1',
+                                        StepName: 'Fixing code · iteration 1',
+                                        Status: 'SUCCEEDED',
+                                        Children: [],
+                                    },
+                                    {
+                                        StepId: 'add',
+                                        StepName: 'Adding tests to your solution',
+                                        Status: 'SUCCEEDED',
+                                        Children: [],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        })
+        const beamArtifacts = () => ({
+            artifacts: ['pre', 'ut', 'round-1', 'fix-1', 'add', 'lbv'].map(id => ({
+                artifactId: `a-${id}`,
+                planStepId: id,
+            })),
+        })
+        const BEAM_SCOPE = 'repo,ut,lv,lbv,round-1,fix-1,add'
+
+        describe('beamed job (getTransformationPlan with IsBeam)', () => {
+            beforeEach(() => {
+                sinon.stub(handler as any, 'fetchWorklogs').resolves()
+                sendStub.resolves(beamArtifacts())
+            })
+
+            it("applies the loaded repo's post-beam step diffs: unit tests, code fixes, adding the tests", async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(appliedOrder()).to.deep.equal(['ut', 'fix-1', 'add'])
+            })
+
+            it('never applies pre-beam steps or LBV steps and their rounds (those come through the step HITL)', async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(appliedOrder().filter(id => ['pre', 'lbv', 'round-1'].includes(id))).to.be.empty
+                expect(
+                    downloadStub
+                        .getCalls()
+                        .map(c => c.args[2])
+                        .filter(id => ['pre', 'lbv', 'round-1'].includes(id))
+                ).to.be.empty
+            })
+
+            it("marks only a failed step's apply as failed; the others still land and the plan comes back", async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+                applyStub.callsFake(async (checkpoint: string) =>
+                    path.basename(checkpoint) === 'fix-1' ? { success: false, error: 'conflict' } : { success: true }
+                )
+                ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+                const plan = await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, BEAM_SCOPE)
+
+                expect(plan.Root.Children).to.have.length(2)
+                expect(appliedOrder()).to.deep.equal(['ut', 'fix-1', 'add'])
+                expect((handler as any)._currentDiffContext).to.deep.equal({ failed: true, failedStepIds: ['fix-1'] })
+                ;(handler as any)._currentDiffContext = null
+            })
+
+            for (const scope of ['', undefined]) {
+                it(`applies nothing without the loaded repo's scope (${JSON.stringify(scope)})`, async () => {
+                    sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                    await handler.getTransformationPlan('ws-1', JOB_ID, tmpRoot, true, scope)
+
+                    expect(applyStub.called).to.be.false
+                    expect(downloadStub.called).to.be.false
+                })
+            }
+
+            it('applies nothing and fetches no worklogs without a solution root (beam discovery)', async () => {
+                sinon.stub(handler as any, 'fetchPlanTree').resolves(beamPlan())
+
+                await handler.getTransformationPlan('ws-1', JOB_ID, '', true, BEAM_SCOPE)
+
+                expect(applyStub.called).to.be.false
+                expect((handler as any).fetchWorklogs.called).to.be.false
+            })
+        })
+
+        it('skips SUCCEEDED steps with no artifact instead of reporting a failed apply', async () => {
+            sendStub.resolves(listedArtifacts())
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            // tp / lv / lbv have no diff: never downloaded, never flagged.
+            const downloaded = downloadStub.getCalls().map(c => c.args[2])
+            expect(downloaded).to.not.include.members(['tp', 'lv', 'lbv'])
+            expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal([])
+        })
+
+        it('pages through ListArtifacts', async () => {
+            sendStub
+                .onFirstCall()
+                .resolves({ artifacts: [{ artifactId: 'a-r1', planStepId: 'round-1' }], nextToken: 't' })
+            sendStub.onSecondCall().resolves({ artifacts: [{ artifactId: 'a-r2', planStepId: 'round-2' }] })
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            expect(sendStub.callCount).to.equal(2)
+            expect(sendStub.secondCall.args[0].input.nextToken).to.equal('t')
+            expect(appliedOrder()).to.deep.equal(['round-1', 'round-2'])
+        })
+
+        it('does not list artifacts once every SUCCEEDED step is applied', async () => {
+            fs.mkdirSync(checkpointsDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(checkpointsDir, 'checkpoints-applied.json'),
+                JSON.stringify({ appliedSteps: ['tp', 'proj-a', 'lv', 'lbv', 'round-1', 'round-2'] })
+            )
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(sendStub.called).to.be.false
+            expect(applyStub.called).to.be.false
+        })
+
+        it('applies already-downloaded checkpoints without listing', async () => {
+            fs.mkdirSync(checkpointsDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(checkpointsDir, 'checkpoints-applied.json'),
+                JSON.stringify({ appliedSteps: ['tp', 'proj-a', 'lv', 'lbv', 'round-1'] })
+            )
+            fs.mkdirSync(path.join(checkpointsDir, 'round-2'))
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            expect(sendStub.called).to.be.false
+            expect(appliedOrder()).to.deep.equal(['round-2'])
+        })
+
+        it('retries on the next poll when ListArtifacts fails, without reporting a failure', async () => {
+            sendStub.rejects(new Error('throttled'))
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.false
+            expect(downloadStub.called).to.be.false
+            expect(applyStub.called).to.be.false
+        })
+
+        it('reports a failure when a step with an artifact cannot be downloaded', async () => {
+            sendStub.resolves({ artifacts: [{ artifactId: 'a-r1', planStepId: 'round-1' }] })
+            downloadStub.callsFake(async () => {})
+            ;(handler as any)._currentDiffContext = { failed: false, failedStepIds: [] }
+
+            const anyFailed = await (handler as any).downloadCompletedStepArtifacts(
+                'ws-1',
+                JOB_ID,
+                tmpRoot,
+                itGenPlan()
+            )
+
+            expect(anyFailed).to.be.true
+            expect((handler as any)._currentDiffContext.failedStepIds).to.deep.equal(['round-1'])
+        })
+
+        it('keeps the depth-2-only behavior for a job without generate_integration_tests', async () => {
+            ;(handler as any).itGenJobs.rememberFlag(JOB_ID, false)
+            sendStub.resolves(listedArtifacts())
+
+            await (handler as any).downloadCompletedStepArtifacts('ws-1', JOB_ID, tmpRoot, itGenPlan())
+
+            // Depth 2 only: proj-a and the nested lbv (attempted even without an artifact).
+            expect(downloadStub.getCalls().map(c => c.args[2])).to.deep.equal(['proj-a', 'lbv'])
+            expect(sendStub.called).to.be.false
         })
     })
 
@@ -1183,9 +1883,9 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
             expect(result.error).to.be.a('string')
         })
 
-        // --- DealerFx P452432920: preserve customer edits instead of clobbering them ---
+        // --- A customer-reported edit clobber: preserve customer edits instead of overwriting them ---
 
-        const JOB_ID = 'job-dealerfx'
+        const JOB_ID = 'job-edit-clobber'
 
         // Seed the source-files manifest so getModifiedFilesSinceCheckpoint can flag the
         // listed dest paths as customer-edited since the last apply.
@@ -1408,7 +2108,7 @@ describe('ATXTransformHandler - updateWorkspace & applyChanges', () => {
 
         it('downloadCompletedStepArtifacts applies a step and stamps the apply watermark (interactive path)', async () => {
             // The interactive download path must also stamp lastAppliedTimestamp after a
-            // successful apply (the DealerFx co-fix — the diff-artifact path already did).
+            // successful apply (part of the edit-clobber fix — the diff-artifact path already did).
             // Drive it end-to-end: stub the per-step download to materialize a checkpoint,
             // let the real applyChanges run, and assert the step is marked applied AND the
             // watermark advances. (Kept in this block, which the coverage suite reliably
@@ -1787,6 +2487,130 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             expect(written.interactive_mode).to.equal('auto')
         })
 
+        // The settings artifact is full state and the agent reads a missing interactive_mode as
+        // "use the default" (interactive), not "leave it alone". A checkpoints-only sync therefore
+        // must not drop a mode the user already chose.
+        const stubUploadChain = () => {
+            sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
+            sinon.stub(handler, 'createArtifactUploadUrl').resolves({
+                uploadUrl: 'u',
+                uploadId: 'upload-1',
+                requestHeaders: {},
+            } as any)
+            const utilsModule = require('../utils')
+            sinon.stub(utilsModule.Utils, 'uploadArtifact').resolves(true)
+            sinon.stub(handler, 'completeArtifactUpload').resolves({ success: true } as any)
+            sinon.stub(handler, 'updateHitl').resolves({ ok: true })
+        }
+
+        const settingsPathFor = (jobId: string) =>
+            path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'checkpoint-settings.json')
+
+        it('should carry forward a previously written interactive_mode when none is supplied', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true }, 'Autonomous')
+            // A periodic checkpoints-only sync: no mode to assert.
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': false })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written['step-a']).to.equal(false)
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        it('should let an explicit mode override the carried-forward one', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Interactive')
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written.interactive_mode).to.equal('interactive')
+        })
+
+        it('should prefer the mode in effect over a stale local file', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            // A switch made from this machine earlier; the mode has since changed elsewhere.
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'interactive' }))
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written.interactive_mode).to.equal('auto')
+        })
+
+        // The handler outlives any single job, so an unscoped cache would let one job's mode be
+        // written into another job's settings artifact - which the agent treats as authoritative.
+        it("should not carry one job's mode into another job's artifact", async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Autonomous')
+
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-2'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it("should keep each job's asserted mode separate", async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+            await handler.setCheckpoints('ws-1', 'job-2', tmpRoot, {}, 'Interactive')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-2')).to.equal('Interactive')
+        })
+
+        it('should update the cached mode when a switch is asserted', async () => {
+            stubUploadChain()
+            setCachedMode(handler, 'job-1', 'Interactive')
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {}, 'Autonomous')
+
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
+        })
+
+        it('should omit interactive_mode when there is nothing to carry forward', async () => {
+            stubUploadChain()
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            const written = JSON.parse(fs.readFileSync(settingsPathFor('job-1'), 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should ignore an unrecognised persisted interactive_mode rather than echo it', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, JSON.stringify({ interactive_mode: 'bogus' }))
+
+            await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, {})
+
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written).to.not.have.property('interactive_mode')
+        })
+
+        it('should not fail the sync when the persisted settings file is corrupt', async () => {
+            stubUploadChain()
+
+            const settingsPath = settingsPathFor('job-1')
+            fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+            fs.writeFileSync(settingsPath, '{ not json')
+
+            const result = await handler.setCheckpoints('ws-1', 'job-1', tmpRoot, { 'step-a': true })
+
+            expect(result.Success).to.be.true
+            const written = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+            expect(written['step-a']).to.equal(true)
+        })
+
         it('should return error when uploadArtifact fails', async () => {
             sinon.stub(handler as any, 'findCheckpointSettingsHitl').resolves({ taskId: 't1' })
             sinon.stub(handler, 'createArtifactUploadUrl').resolves({
@@ -1837,6 +2661,49 @@ describe('ATXTransformHandler - setCheckpoints, getHitlAgentArtifact, getJobDash
             const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot)
 
             expect(result).to.be.null
+        })
+
+        it('should report a failed lookup when listHitls fails', async () => {
+            sinon.stub(handler, 'listHitls').resolves(null)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should report a failed lookup when the client cannot initialize', async () => {
+            ;(handler as any).atxClient = undefined
+            ;((handler as any).initializeAtxClient as sinon.SinonStub).resolves(false)
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.true
+        })
+
+        it('should not report a failed lookup when no HITL is open', async () => {
+            sinon.stub(handler, 'listHitls').resolves([])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, undefined, lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
+        })
+
+        it("should return null without reporting a failed lookup when beam scope leaves out a sibling repo's LBV HITL", async () => {
+            sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const lookup = { failed: false }
+
+            const result = await handler.getHitlAgentArtifact('ws-1', 'job-1', tmpRoot, 'loaded-repo', lookup)
+
+            expect(result).to.be.null
+            expect(lookup.failed).to.be.false
         })
 
         it('should return tag and taskId early for local-build-verification HITL (no download)', async () => {
@@ -2003,6 +2870,245 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
             const objective = JSON.parse(command.input.objective)
             expect(objective.interactive_mode).to.equal('auto')
         })
+
+        it('should include generate_unit_tests:true in objective when opted in', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: true })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(true)
+        })
+
+        it('should include generate_unit_tests:false in objective on explicit decline', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: false })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective.generate_unit_tests).to.equal(false)
+        })
+
+        it('should omit generate_unit_tests from objective when no choice is sent', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            await handler.createJob({ workspaceId: 'ws-1' })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
+
+        it('should omit generate_unit_tests when the value is not a real boolean', async () => {
+            sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+            // A mistyped/non-boolean value must read as "no choice sent", not a decision.
+            await handler.createJob({ workspaceId: 'ws-1', generateUnitTests: 'true' as any })
+
+            const command = sendStub.firstCall.args[0]
+            const objective = JSON.parse(command.input.objective)
+            expect(objective).to.not.have.property('generate_unit_tests')
+        })
+
+        describe('integration tests', () => {
+            it('should include generate_integration_tests:true in objective when opted in', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
+            })
+
+            it('should include generate_integration_tests:false in objective on explicit decline', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: false })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(false)
+            })
+
+            it('should omit generate_integration_tests and browser from objective when no choice is sent', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1' })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should omit generate_integration_tests when the value is not a real boolean', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: 'true' as any })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY)
+            })
+
+            it('should never write generate_ui_tests or generate_api_tests', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                // generate_integration_tests is the only ITGen key; anything else a client sends is dropped.
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    generateUiTests: true,
+                    generateApiTests: true,
+                } as any)
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property('generate_ui_tests')
+                expect(objective).to.not.have.property('generate_api_tests')
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(true)
+            })
+
+            it('should use the contract key name for integration tests', () => {
+                expect(ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY).to.equal('generate_integration_tests')
+            })
+
+            it('should include browser type and version in objective', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Type: 'edge', Version: '130.0.2849.68' },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'edge', version: '130.0.2849.68' })
+            })
+
+            it('should send a null browser version when no browser was found', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Type: 'none', Version: null },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective[ATX_OBJECTIVE_BROWSER_KEY]).to.deep.equal({ type: 'none', version: null })
+            })
+
+            it('should omit browser when it is malformed', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: true,
+                    browser: { Version: '1.0' } as any,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should omit browser without integration tests', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateIntegrationTests: false,
+                    browser: { Type: 'msedge', Version: '130.0.2849.68' },
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective).to.not.have.property(ATX_OBJECTIVE_BROWSER_KEY)
+            })
+
+            it('should keep generate_unit_tests independent of integration tests', async () => {
+                sendStub.resolves({ jobId: 'j', status: 'CREATED' })
+
+                await handler.createJob({
+                    workspaceId: 'ws-1',
+                    generateUnitTests: true,
+                    generateIntegrationTests: false,
+                })
+
+                const command = sendStub.firstCall.args[0]
+                const objective = JSON.parse(command.input.objective)
+                expect(objective.generate_unit_tests).to.equal(true)
+                expect(objective[ATX_OBJECTIVE_GENERATE_INTEGRATION_TESTS_KEY]).to.equal(false)
+            })
+
+            it('should remember the job as an ITGen job without asking GetJob', async () => {
+                sendStub.resolves({ jobId: 'job-it', status: 'CREATED' })
+                await handler.createJob({ workspaceId: 'ws-1', generateIntegrationTests: true })
+                sendStub.resetHistory()
+
+                expect(await handler.isItGenJob('ws-1', 'job-it')).to.be.true
+                expect(sendStub.called).to.be.false
+            })
+
+            it('should remember a job created without integration tests as not ITGen', async () => {
+                sendStub.resolves({ jobId: 'job-plain', status: 'CREATED' })
+                await handler.createJob({ workspaceId: 'ws-1' })
+                sendStub.resetHistory()
+
+                expect(await handler.isItGenJob('ws-1', 'job-plain')).to.be.false
+                expect(sendStub.called).to.be.false
+            })
+        })
+    })
+
+    describe('isItGenJob', () => {
+        it('reads the objective from GetJob once and caches it', async () => {
+            sendStub.resolves({ job: { objective: JSON.stringify({ generate_integration_tests: true }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-old')).to.be.true
+            expect(await handler.isItGenJob('ws-1', 'job-old')).to.be.true
+
+            expect(sendStub.callCount).to.equal(1)
+            expect(sendStub.firstCall.args[0].input.includeObjective).to.be.true
+        })
+
+        it('treats a job whose objective has no generate_integration_tests as not ITGen', async () => {
+            sendStub.resolves({ job: { objective: JSON.stringify({ target_framework: 'net10.0' }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-plain')).to.be.false
+        })
+
+        it('asks again on the next call when GetJob fails', async () => {
+            sendStub.onFirstCall().rejects(new Error('throttled'))
+            sendStub
+                .onSecondCall()
+                .resolves({ job: { objective: JSON.stringify({ generate_integration_tests: true }) } })
+
+            expect(await handler.isItGenJob('ws-1', 'job-x')).to.be.false
+            expect(await handler.isItGenJob('ws-1', 'job-x')).to.be.true
+            expect(sendStub.callCount).to.equal(2)
+        })
+    })
+
+    describe('objectiveHasIntegrationTests', () => {
+        it('is true only for a real true', () => {
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: true }))).to.be.true
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: false }))).to.be.false
+            expect(objectiveHasIntegrationTests(JSON.stringify({ generate_integration_tests: 'true' }))).to.be.false
+            expect(objectiveHasIntegrationTests(JSON.stringify({}))).to.be.false
+        })
+
+        it('is false for a missing or unparseable objective', () => {
+            expect(objectiveHasIntegrationTests(undefined)).to.be.false
+            expect(objectiveHasIntegrationTests('')).to.be.false
+            expect(objectiveHasIntegrationTests('{not json')).to.be.false
+        })
     })
 
     describe('createArtifactUploadUrl', () => {
@@ -2105,6 +3211,44 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
     })
 
     describe('startTransform', () => {
+        it('should forward GenerateIntegrationTests and Browser from the start request to createJob', async () => {
+            const createJobStub = sinon.stub(handler, 'createJob').resolves(null)
+
+            await handler.startTransform({
+                workspaceId: 'ws-1',
+                startTransformRequest: {
+                    TargetFramework: 'net8.0',
+                    GenerateIntegrationTests: true,
+                    Browser: { Type: 'chrome', Version: '131.0.6778.86' },
+                },
+            })
+
+            const args = createJobStub.firstCall.args[0]
+            expect(args.generateIntegrationTests).to.equal(true)
+            expect(args.browser).to.deep.equal({ Type: 'chrome', Version: '131.0.6778.86' })
+        })
+
+        it('should not forward GenerateUITests or GenerateApiTests from the start request', async () => {
+            const createJobStub = sinon.stub(handler, 'createJob').resolves(null)
+
+            await handler.startTransform({
+                workspaceId: 'ws-1',
+                startTransformRequest: {
+                    TargetFramework: 'net8.0',
+                    GenerateUnitTests: true,
+                    GenerateUITests: false,
+                    GenerateApiTests: true,
+                    GenerateIntegrationTests: true,
+                },
+            })
+
+            const args = createJobStub.firstCall.args[0]
+            expect(args.generateUnitTests).to.equal(true)
+            expect(args).to.not.have.property('generateUiTests')
+            expect(args).to.not.have.property('generateApiTests')
+            expect(args.generateIntegrationTests).to.equal(true)
+        })
+
         it('should return null when createJob returns null', async () => {
             sinon.stub(handler, 'createJob').resolves(null)
 
@@ -2244,7 +3388,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Interactive')
+            expect(cachedMode(handler, 'job-1')).to.equal('Interactive')
         })
 
         it('should default cached interactive mode to Autonomous when not specified', async () => {
@@ -2265,7 +3409,7 @@ describe('ATXTransformHandler - lifecycle (startTransform & helpers)', () => {
                 startTransformRequest: {},
             })
 
-            expect((handler as any).cachedInteractiveMode).to.equal('Autonomous')
+            expect(cachedMode(handler, 'job-1')).to.equal('Autonomous')
         })
     })
 })
@@ -2284,7 +3428,7 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
         serviceManager.getActiveApplicationUrl = sinon.stub().returns('https://app.example.com')
         serviceManager.getBearerToken = sinon.stub().resolves('token')
         workspace = {} as Workspace
-        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
         runtime = {} as Runtime
 
         handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
@@ -2532,6 +3676,186 @@ describe('ATXTransformHandler - workspace, job, artifact, HITL helpers', () => {
             const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
 
             expect(result).to.be.null
+        })
+
+        describe('retries', () => {
+            const svcError = (name: string, status?: number, message = `${name} happened`) =>
+                Object.assign(new Error(message), {
+                    name,
+                    ...(status !== undefined ? { $metadata: { httpStatusCode: status } } : {}),
+                })
+
+            beforeEach(() => {
+                // Keep the jittered backoff from sleeping for real.
+                ;(handler as any).downloadUrlBackoffBaseMs = 0
+            })
+
+            it('retries a non-throttle 500 and returns the URL from the next attempt', async () => {
+                sendStub.onFirstCall().rejects(svcError('InternalServerException', 500))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('does not retry ResourceNotFoundException', async () => {
+                sendStub.rejects(svcError('ResourceNotFoundException', 404))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+            })
+
+            for (const name of ['AccessDeniedException', 'ValidationException']) {
+                it(`does not retry ${name}`, async () => {
+                    sendStub.rejects(svcError(name, 400))
+
+                    expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                    expect(sendStub.callCount).to.equal(1)
+                })
+            }
+
+            it('retries an AccessDeniedException that gives no reason (UnknownError) as throttling', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('AccessDeniedException', 403, 'UnknownError'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('does not retry an AccessDeniedException with a real reason', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.rejects(
+                    svcError('AccessDeniedException', 403, 'User is not authorized to perform this action')
+                )
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(1)
+                expect(note.called).to.be.false
+            })
+
+            it('gives up after 4 attempts on a repeated network error', async () => {
+                sendStub.rejects(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+
+            it('retries a generic "unknown error"', async () => {
+                sendStub.onFirstCall().rejects(new Error('unknown error'))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                expect((await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1'))?.s3PresignedUrl).to.equal(
+                    'https://s3/dl'
+                )
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('retries a response without a URL exactly once', async () => {
+                sendStub.resolves({})
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(2)
+            })
+
+            it('still retries throttling and records the cooldown', async () => {
+                const note = sinon.spy(handler as any, 'noteBeamThrottled')
+                sendStub.onFirstCall().rejects(svcError('ThrottlingException', 400))
+                sendStub.onSecondCall().resolves({ s3PreSignedUrl: 'https://s3/dl' })
+
+                const result = await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+                expect(result?.s3PresignedUrl).to.equal('https://s3/dl')
+                expect(sendStub.callCount).to.equal(2)
+                expect(note.calledOnce).to.be.true
+            })
+
+            it('gives up after 4 attempts on repeated throttling', async () => {
+                sendStub.rejects(svcError('ThrottlingException', 400))
+
+                expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+                expect(sendStub.callCount).to.equal(4)
+            })
+        })
+    })
+
+    describe('classifyDownloadUrlError', () => {
+        it('treats any 5xx as transient whatever its name', () => {
+            const err = Object.assign(new Error('x'), {
+                name: 'ValidationException',
+                $metadata: { httpStatusCode: 502 },
+            })
+            expect(classifyDownloadUrlError(err)).to.equal('transient')
+        })
+
+        it('warns once per unrecognized error name and does not retry it', async () => {
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+            sendStub.rejects(Object.assign(new Error('new'), { name: 'BrandNewException' }))
+
+            expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')).to.be.null
+            expect(await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-2')).to.be.null
+
+            expect(sendStub.callCount).to.equal(2)
+            const unrecognized = warn
+                .getCalls()
+                .filter(c => /unrecognized error name=BrandNewException status=none/.test(String(c.args[0])))
+            expect(unrecognized).to.have.lengthOf(1)
+        })
+
+        it('isUnrecognizedDownloadUrlError: only service errors that fell through to the default', () => {
+            const err = (props: any, message = 'x') => Object.assign(new Error(message), props)
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'BrandNewException' }))).to.be.true
+            expect(isUnrecognizedDownloadUrlError(err({ $metadata: {} }))).to.be.true
+            expect(isUnrecognizedDownloadUrlError(err({}, 'ATX client not initialized'))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'X', $metadata: { httpStatusCode: 404 } }))).to.be.false
+            expect(isUnrecognizedDownloadUrlError(err({ name: 'X', $metadata: { httpStatusCode: 503 } }))).to.be.false
+        })
+
+        it('does not warn about known permanent errors', async () => {
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+            sendStub.rejects(Object.assign(new Error('gone'), { name: 'ResourceNotFoundException' }))
+
+            await handler.createArtifactDownloadUrl('ws-1', 'job-1', 'art-1')
+
+            expect(warn.getCalls().some(c => /unrecognized error/.test(String(c.args[0])))).to.be.false
+        })
+
+        it('classifies throttle, transient and permanent errors', () => {
+            const err = (props: any, message = 'x') => Object.assign(new Error(message), props)
+            expect(classifyDownloadUrlError(err({ name: 'ThrottlingException' }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 429 } }))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 503 } }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ServiceUnavailableException' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'TimeoutError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'NetworkingError' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ code: 'ETIMEDOUT' }))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'getaddrinfo EAI_AGAIN host'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({}, 'unknown error'))).to.equal('transient')
+            expect(classifyDownloadUrlError(err({ name: 'ResourceNotFoundException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'ValidationException' }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }))).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'UnknownError'))).to.equal(
+                'throttle'
+            )
+            expect(classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, ''))).to.equal('throttle')
+            expect(classifyDownloadUrlError(err({ $metadata: { httpStatusCode: 403 } }, 'unknownerror'))).to.equal(
+                'throttle'
+            )
+            expect(
+                classifyDownloadUrlError(err({ name: 'AccessDeniedException' }, 'User is not authorized to do this'))
+            ).to.equal('permanent')
+            expect(classifyDownloadUrlError(err({}, 'boom'))).to.equal('permanent')
         })
     })
 
@@ -3103,7 +4427,549 @@ describe('ATXTransformHandler - upload flows, polling, and small wrappers', () =
             const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', 'C:/save')
 
             expect(result.Success).to.be.false
-            expect(result.Error).to.equal('Failed to get download URL')
+            expect(result.Error).to.contain('Failed to get download URL')
+        })
+
+        it('should stream a large artifact to disk without buffering the whole file', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                // Simulate a large payload delivered as a stream (the fix path). The old
+                // implementation buffered this in memory under a 30s whole-request timeout.
+                const payload = Buffer.alloc(5 * 1024 * 1024, 'a')
+                sinon.stub(got, 'stream').returns(Readable.from([payload]) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                const written = fs.readFileSync(path.join(saveDir, 'Transformation_Report.html'))
+                expect(written.length).to.equal(payload.length)
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['Transformation_Report.html'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('should return Success=false with the error when the stream fails mid-download', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+
+                sinon
+                    .stub(got, 'stream')
+                    .callsFake((() => fakeDownload([], undefined, new Error('socket hang up'))) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // A download that stops partway used to leave the bytes it had under the artifact's real
+        // name, and the IDE opened that file: a report cut in the middle of its script is a blank page.
+        it('leaves no cut file and keeps the older copy when every attempt stops partway', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                const target = path.join(saveDir, 'transformation_report.html')
+                fs.writeFileSync(target, 'older whole copy')
+                const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const reset = Object.assign(new Error('The server aborted pending request'), { code: 'ECONNRESET' })
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() => fakeDownload([Buffer.alloc(1113423, 'a')], undefined, reset)) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'transformation_report.html'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('The server aborted pending request')
+                expect(result.Error).to.contain('code=ECONNRESET')
+                expect(urlStub.callCount).to.equal(3)
+                expect(streamStub.callCount).to.equal(3)
+                expect(fs.readFileSync(target, 'utf8')).to.equal('older whole copy')
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['transformation_report.html'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('downloads again with a new signed URL after an attempt stops partway', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+                urlStub
+                    .onCall(0)
+                    .resolves({ s3PresignedUrl: 'https://s3.example.com/first', requestHeaders: {} } as any)
+                urlStub
+                    .onCall(1)
+                    .resolves({ s3PresignedUrl: 'https://s3.example.com/second', requestHeaders: {} } as any)
+                const payload = Buffer.alloc(300000, 'b')
+                const streamStub = sinon.stub(got, 'stream')
+                streamStub
+                    .onCall(0)
+                    .callsFake((() =>
+                        fakeDownload([payload.subarray(0, 1000)], undefined, new Error('socket hang up'))) as any)
+                streamStub
+                    .onCall(1)
+                    .callsFake((() => fakeDownload([payload], { 'content-length': String(payload.length) })) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'NextSteps.md')
+
+                expect(result.Success).to.be.true
+                expect(streamStub.firstCall.args[0]).to.equal('https://s3.example.com/first')
+                expect(streamStub.secondCall.args[0]).to.equal('https://s3.example.com/second')
+                expect(fs.readFileSync(path.join(saveDir, 'NextSteps.md')).equals(payload)).to.be.true
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['NextSteps.md'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('rejects a body that ends without error but is shorter than Content-Length', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1113423, 'a')], { 'content-length': '4386914' })) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'transformation_report.html'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('Incomplete download: wrote 1113423 of 4386914 bytes')
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('does not compare sizes when the response has a Content-Encoding', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const payload = Buffer.alloc(5000, 'c')
+                sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([payload], { 'content-length': '120', 'content-encoding': 'gzip' })) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'plan.md')
+
+                expect(result.Success).to.be.true
+                expect(fs.readFileSync(path.join(saveDir, 'plan.md')).equals(payload)).to.be.true
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('copies the finished file over an older copy that cannot be replaced by rename', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRenameRetryMs = 0
+                const target = path.join(saveDir, 'Modernization_Plan.md')
+                fs.writeFileSync(target, 'older whole copy')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/plan',
+                    requestHeaders: {},
+                } as any)
+                const payload = Buffer.from('newer whole copy')
+                sinon.stub(got, 'stream').callsFake((() => fakeDownload([payload])) as any)
+                const renameStub = sinon
+                    .stub(fs.promises, 'rename')
+                    .rejects(Object.assign(new Error('operation not permitted'), { code: 'EPERM' }))
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Modernization_Plan.md'
+                )
+
+                expect(result.Success).to.be.true
+                expect(renameStub.callCount).to.equal(3)
+                expect(fs.readFileSync(target, 'utf8')).to.equal('newer whole copy')
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['Modernization_Plan.md'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The whole artifact is in place once the copy returns, so a temp file that cannot be removed
+        // (antivirus or the indexer holds it) is not a failed download.
+        it('reports success when the temp file cannot be removed after the copy', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                ;(handler as any).artifactDownloadRenameRetryMs = 0
+                const target = path.join(saveDir, 'Modernization_Plan.md')
+                fs.writeFileSync(target, 'older whole copy')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/plan',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() => fakeDownload([Buffer.from('newer whole copy')])) as any)
+                sinon
+                    .stub(fs.promises, 'rename')
+                    .rejects(Object.assign(new Error('operation not permitted'), { code: 'EPERM' }))
+                sinon
+                    .stub(fs.promises, 'rm')
+                    .rejects(Object.assign(new Error('resource busy or locked'), { code: 'EBUSY' }))
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Modernization_Plan.md'
+                )
+
+                expect(result.Success).to.be.true
+                expect(streamStub.callCount).to.equal(1)
+                expect(fs.readFileSync(target, 'utf8')).to.equal('newer whole copy')
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The copy writes into the older copy's file, so a copy that comes out short is a cut file
+        // under the real name. It has to be an error, and the download has to run again.
+        it('fails the attempt when the copy over the older copy comes out short', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                ;(handler as any).artifactDownloadRenameRetryMs = 0
+                const target = path.join(saveDir, 'Modernization_Plan.md')
+                fs.writeFileSync(target, 'older whole copy')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/plan',
+                    requestHeaders: {},
+                } as any)
+                const payload = Buffer.from('newer whole copy')
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => fakeDownload([payload])) as any)
+                sinon
+                    .stub(fs.promises, 'rename')
+                    .rejects(Object.assign(new Error('operation not permitted'), { code: 'EPERM' }))
+                const copyStub = sinon.stub(fs.promises, 'copyFile').callsFake((async (_from: string, to: string) => {
+                    fs.writeFileSync(to, payload.subarray(0, 5))
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Modernization_Plan.md'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('5 of 16 bytes')
+                expect((logging.error as sinon.SinonStub).calledWithMatch('5 of 16 bytes')).to.be.true
+                expect(streamStub.callCount).to.equal(3)
+                expect(copyStub.callCount).to.equal(3)
+                expect(fs.readdirSync(saveDir)).to.deep.equal(['Modernization_Plan.md'])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The fs.rm documentation says maxRetries and retryDelay are ignored unless recursive is set.
+        it('removes the temp file of a failed attempt with the options fs.rm documents for retries', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+                const rmSpy = sinon.spy(fs.promises, 'rm')
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(rmSpy.callCount).to.equal(3)
+                for (const call of rmSpy.getCalls()) {
+                    expect(call.args[0]).to.match(/artifact\.zip\.[0-9a-f]{8}\.part$/)
+                    expect(call.args[1]).to.deep.equal({
+                        force: true,
+                        recursive: true,
+                        maxRetries: 3,
+                        retryDelay: 100,
+                    })
+                }
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // The IDE waits for this call inside its poll loop, so the attempts share one time budget. An
+        // attempt on a link that went silent ends at the 60 second socket limit: the first one still
+        // gets its retry, and the second one ends past the budget.
+        it('starts no third attempt when two stalled attempts have used the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => {
+                    now += 61000
+                    const stalled = new Error("Timeout awaiting 'socket' for 60000ms")
+                    return fakeDownload(
+                        [Buffer.alloc(1000, 'a')],
+                        undefined,
+                        Object.assign(stalled, { code: 'ETIMEDOUT', event: 'socket' })
+                    )
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('timeoutPhase=socket')
+                expect(streamStub.callCount).to.equal(2)
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('starts no second attempt when the first one alone used the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon.stub(got, 'stream').callsFake((() => {
+                    now += 10 * 60 * 1000
+                    return fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))
+                }) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+                expect(streamStub.callCount).to.equal(1)
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('starts no further attempt when the wait before it runs past the time budget', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                let now = Date.now()
+                sinon.stub(Date, 'now').callsFake(() => now)
+                const utilsModule = require('../utils')
+                sinon.stub(utilsModule.Utils, 'sleep').callsFake(async () => {
+                    now += 10 * 60 * 1000
+                })
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('socket hang up')
+                expect(streamStub.callCount).to.equal(1)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // identity means no encoding, so Content-Length is still the number of bytes on disk.
+        it('compares sizes when the Content-Encoding is identity', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() =>
+                    fakeDownload([Buffer.alloc(1113423, 'a')], {
+                        'content-length': '4386914',
+                        'content-encoding': 'identity',
+                    })) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'transformation_report.html'
+                )
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.contain('Incomplete download: wrote 1113423 of 4386914 bytes')
+                expect(fs.readdirSync(saveDir)).to.deep.equal([])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('keeps the download error when a later attempt gets no download URL', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                ;(handler as any).artifactDownloadRetryBaseMs = 0
+                const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+                urlStub
+                    .onCall(0)
+                    .resolves({ s3PresignedUrl: 'https://s3.example.com/first', requestHeaders: {} } as any)
+                urlStub.onCall(1).resolves(null)
+                const streamStub = sinon
+                    .stub(got, 'stream')
+                    .callsFake((() =>
+                        fakeDownload([Buffer.alloc(1000, 'a')], undefined, new Error('socket hang up'))) as any)
+
+                const result = await handler.downloadArtifactToPath('ws-1', 'job-1', 'art-1', saveDir, 'artifact.zip')
+
+                expect(result.Success).to.be.false
+                expect(result.Error).to.equal(
+                    'Failed to get download URL for artifact=art-1 (job=job-1); last download error: socket hang up'
+                )
+                expect(urlStub.callCount).to.equal(2)
+                expect(streamStub.callCount).to.equal(1)
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        // A process that goes away mid-download leaves its temp file, and every attempt has its own
+        // name, so they add up. A young one is kept: another download may be writing it.
+        it('removes its own temp files that are over an hour old before it downloads, and nothing else', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+                for (const name of [
+                    'Transformation_Report.html.0a1b2c3d.part',
+                    'artifact.zip.89abcdef.part',
+                    'notes.part',
+                    'Modernization_Plan.md',
+                ]) {
+                    fs.writeFileSync(path.join(saveDir, name), 'left by an earlier run')
+                    fs.utimesSync(path.join(saveDir, name), twoHoursAgo, twoHoursAgo)
+                }
+                fs.writeFileSync(path.join(saveDir, 'Transformation_Report.html.11223344.part'), 'being written')
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() => fakeDownload([Buffer.from('whole report')])) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                expect(fs.readdirSync(saveDir).sort()).to.deep.equal([
+                    'Modernization_Plan.md',
+                    'Transformation_Report.html',
+                    'Transformation_Report.html.11223344.part',
+                    'notes.part',
+                ])
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
+        })
+
+        it('downloads when an old temp file cannot be removed', async () => {
+            const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-dl-'))
+            try {
+                const stale = path.join(saveDir, 'Transformation_Report.html.0a1b2c3d.part')
+                const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+                fs.writeFileSync(stale, 'left by an earlier run')
+                fs.utimesSync(stale, twoHoursAgo, twoHoursAgo)
+                const unlinkStub = sinon
+                    .stub(fs.promises, 'unlink')
+                    .rejects(Object.assign(new Error('resource busy or locked'), { code: 'EBUSY' }))
+                sinon.stub(handler, 'createArtifactDownloadUrl').resolves({
+                    s3PresignedUrl: 'https://s3.example.com/report',
+                    requestHeaders: {},
+                } as any)
+                sinon.stub(got, 'stream').callsFake((() => fakeDownload([Buffer.from('whole report')])) as any)
+
+                const result = await handler.downloadArtifactToPath(
+                    'ws-1',
+                    'job-1',
+                    'art-1',
+                    saveDir,
+                    'Transformation_Report.html'
+                )
+
+                expect(result.Success).to.be.true
+                expect(unlinkStub.calledOnceWith(stale)).to.be.true
+                expect(fs.readFileSync(path.join(saveDir, 'Transformation_Report.html'), 'utf8')).to.equal(
+                    'whole report'
+                )
+            } finally {
+                fs.rmSync(saveDir, { recursive: true, force: true })
+            }
         })
     })
 
@@ -3261,6 +5127,190 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
 
             expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
             expect(result?.StepInformation).to.be.undefined
+        })
+
+        // A plan whose first top-level step has no sub-steps, while later steps do.
+        const planWithLeafFirstStep = () =>
+            ({
+                Root: {
+                    StepId: 'root',
+                    Children: [
+                        { StepId: 'assess', Status: 'SUCCEEDED', Children: [] },
+                        {
+                            StepId: 'transform',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'transform-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                        {
+                            StepId: 'verify',
+                            Status: 'SUCCEEDED',
+                            Children: [{ StepId: 'verify-1', Status: 'SUCCEEDED', Children: [] }],
+                        },
+                    ],
+                },
+            }) as any
+
+        it('should return the plan when no HITL is open and only a later step has sub-steps', async () => {
+            // The agent is waiting on a chat answer (e.g. at the end of the job), not on a HITL. The
+            // first step having no sub-steps must not send this down the planning path, which
+            // returns no plan, so the IDE would stop seeing step statuses.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+        })
+
+        it('should keep the planning path for a tagged planning HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                PlanPath: '/p',
+                ReportPath: '/r',
+                HitlTag: 'plan-review',
+                TaskId: 'task-1',
+            } as any)
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.PlanPath).to.equal('/p')
+            expect(result?.ReportPath).to.equal('/r')
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it('should keep the planning path when no HITL is open and the plan is empty', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves(null)
+            sinon.stub(handler, 'getTransformationPlan').resolves({
+                Root: { StepId: 'root', Children: [] },
+            } as any)
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
+            expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should take the execution path for a step review HITL when the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'getHitlAgentArtifact').resolves({
+                HitlTag: 'transform-1-review',
+                TaskId: 'step-task',
+            } as any)
+            const plan = planWithLeafFirstStep()
+            plan.Root.Children[1].Status = 'IN_PROGRESS'
+            plan.Root.Children[1].Children[0].Status = 'PENDING_HUMAN_INPUT'
+            plan.Root.Children[2].Status = 'NOT_STARTED'
+            plan.Root.Children[2].Children[0].Status = 'NOT_STARTED'
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const findStepHitlStub = sinon.stub(handler as any, 'findStepLevelHitl').resolves({
+                taskId: 'step-task',
+                agentArtifact: { artifactId: 'art-1' },
+            })
+            sinon
+                .stub(handler as any, 'downloadAndParseStepHitlArtifact')
+                .resolves({ StepId: 'transform-1', DiffArtifactPath: '/d' })
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(findStepHitlStub.calledOnceWith('ws-1', 'job-1', 'transform-1')).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.StepInformation?.StepId).to.equal('transform-1')
+        })
+
+        it('should return the plan when ListHitls finds no HITL open and the first step has no sub-steps', async () => {
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            sinon.stub(handler, 'listHitls').resolves([])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+        })
+
+        it('should keep the planning path when ListHitls fails and the first step has no sub-steps', async () => {
+            // A failed ListHitls isn't "no HITL open": during plan review the planning path looks the HITL up
+            // again, so a transient failure still returns the plan review's tag and task in the same poll.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon.stub(handler, 'listHitls')
+            listHitlsStub.onFirstCall().resolves(null)
+            listHitlsStub.onSecondCall().resolves([{ tag: 'plan-review', taskId: 'task-1' }])
+            sinon.stub(handler, 'getTransformationPlan').resolves(planWithLeafFirstStep())
+            const executionSpy = sinon.spy(handler as any, 'handleExecutionPhaseHitl')
+
+            const result = await handler.getTransformInfo(baseRequest as any)
+
+            expect(executionSpy.called).to.be.false
+            expect(listHitlsStub.calledTwice).to.be.true
+            expect(result?.HitlTag).to.equal('plan-review')
+            expect(result?.HitlTaskId).to.equal('task-1')
+            expect(result?.TransformationPlan).to.be.undefined
+        })
+
+        it("should return the plan, not a sibling repo's LBV HITL, on a beam-scoped request when the first step has no sub-steps", async () => {
+            // Multi-repo beam job: the only open HITL is a sibling repo's local-build-verification. The beam-scoped
+            // lookup leaves it out and answers with no HITL (not a failed lookup), so this takes the execution path
+            // and returns the plan alone. The planning path would list the HITLs again without the scope and
+            // return the sibling's tag, with neither its step id nor the plan.
+            sinon.stub(handler, 'getJob').resolves({
+                statusDetails: { status: 'AWAITING_HUMAN_INPUT' },
+            } as any)
+            const listHitlsStub = sinon
+                .stub(handler, 'listHitls')
+                .resolves([{ tag: 'local-build-verification', taskId: 'task-sibling', stepId: 'sibling-lbv' }])
+            const plan = planWithLeafFirstStep()
+            sinon.stub(handler, 'getTransformationPlan').resolves(plan)
+            const planningSpy = sinon.spy(handler as any, 'handlePlanningPhaseHitl')
+
+            const result = await handler.getTransformInfo({
+                ...baseRequest,
+                beamScopeStepIds: 'transform,transform-1',
+            } as any)
+
+            expect(planningSpy.called).to.be.false
+            expect(listHitlsStub.calledOnce).to.be.true
+            expect(result?.TransformationJob.Status).to.equal('AWAITING_HUMAN_INPUT')
+            expect(result?.TransformationPlan).to.deep.equal(plan)
+            expect(result?.HitlTag).to.be.undefined
+            expect(result?.HitlTaskId).to.be.undefined
+            expect(result?.StepInformation).to.be.undefined
+            expect(result?.PlanPath).to.be.undefined
         })
     })
 
@@ -3459,8 +5509,8 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
     })
 
     describe('writeSourceFilesManifest & updateSourceFilesManifest', () => {
-        it('should write source-files.json with project paths', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should write source-files.json with project paths', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [
                     {
                         SourceCodeFilePaths: ['C:/sln/A.cs', 'C:/sln/B.cs'],
@@ -3483,8 +5533,8 @@ describe('ATXTransformHandler - HITL state branches and fs helpers', () => {
             ])
         })
 
-        it('should append new files to existing manifest', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should append new files to existing manifest', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [{ SourceCodeFilePaths: ['C:/sln/A.cs'] }],
             })
             ;(handler as any).updateSourceFilesManifest(tmpRoot, 'job-1', ['NewFile.cs'])
@@ -3864,12 +5914,12 @@ describe('ATXTransformHandler - final coverage push', () => {
         it('should null-out all cached HITL state', () => {
             ;(handler as any).cachedHitl = 'h'
             ;(handler as any).cachedStepHitl = 's'
-            ;(handler as any).cachedInteractiveMode = 'Interactive'
-            ;(handler as any).clearJobCache()
+            setCachedMode(handler, 'job-1', 'Interactive')
+            ;(handler as any).clearJobCache('job-1')
 
             expect((handler as any).cachedHitl).to.be.null
             expect((handler as any).cachedStepHitl).to.be.null
-            expect((handler as any).cachedInteractiveMode).to.be.null
+            expect(cachedMode(handler, 'job-1')).to.be.undefined
         })
     })
 
@@ -3982,8 +6032,8 @@ describe('ATXTransformHandler - final coverage push', () => {
     })
 
     describe('writeSourceFilesManifest edge cases', () => {
-        it('should produce empty sourceFiles when request has no metadata', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {})
+        it('should produce empty sourceFiles when request has no metadata', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {})
 
             const filePath = path.join(tmpRoot, workspaceFolderName, 'job-1', 'checkpoints', 'source-files.json')
             expect(fs.existsSync(filePath)).to.be.true
@@ -3991,8 +6041,8 @@ describe('ATXTransformHandler - final coverage push', () => {
             expect(data.sourceFiles).to.deep.equal([])
         })
 
-        it('should skip falsy file paths in SourceCodeFilePaths', () => {
-            ;(handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+        it('should skip falsy file paths in SourceCodeFilePaths', async () => {
+            await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
                 ProjectMetadata: [{ SourceCodeFilePaths: ['', null, 'C:/real.cs'] }],
             })
 
@@ -4122,5 +6172,1103 @@ describe('ATXTransformHandler - final coverage push', () => {
 
             expect(result).to.be.null
         })
+    })
+})
+
+describe('ATXTransformHandler - Beam to IDE', () => {
+    let handler: ATXTransformHandler
+    let serviceManager: AtxTokenServiceManager
+    let workspace: Workspace
+    let logging: Logging
+    let runtime: Runtime
+    let sendStub: sinon.SinonStub
+
+    beforeEach(() => {
+        serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        workspace = {} as Workspace
+        logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub(), warn: sinon.stub() } as any
+        runtime = {} as Runtime
+        handler = new ATXTransformHandler(serviceManager, workspace, logging, runtime)
+        sinon.stub(handler as any, 'initializeAtxClient').resolves(true)
+        sinon.stub(handler as any, 'addAuthToCommand').resolves()
+        sendStub = sinon.stub()
+        ;(handler as any).atxClient = { send: sendStub }
+        // No plan by default → IsLbvOpen defaults true; individual tests can restub.
+        sinon.stub(handler as any, 'getTransformationPlan').resolves(null)
+    })
+
+    afterEach(() => {
+        sinon.restore()
+    })
+
+    // --- getStepId: the centralized field-coalescing helper (contract-tolerant) ---
+    describe('getStepId', () => {
+        it('coalesces stepId / planStepId / parentStepId in priority order', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g({ stepId: 'a', planStepId: 'b', parentStepId: 'c' })).to.equal('a')
+            expect(g({ planStepId: 'b', parentStepId: 'c' })).to.equal('b')
+            expect(g({ parentStepId: 'c' })).to.equal('c')
+        })
+
+        it('returns undefined for null / non-object / no matching field', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            expect(g(null)).to.be.undefined
+            expect(g(undefined)).to.be.undefined
+            expect(g('str')).to.be.undefined
+            expect(g({ other: 'x' })).to.be.undefined
+        })
+
+        it('skips an empty-string stepId and falls through to planStepId / parentStepId (|| not ??)', () => {
+            const g = (o: any) => (handler as any).getStepId(o)
+            // Empty stepId must NOT short-circuit coalescing (the ??→|| hardening) — an empty
+            // string is falsy under ||, so the non-empty planStepId is returned.
+            expect(g({ stepId: '', planStepId: 'step-1' })).to.equal('step-1')
+            // Empty stepId + empty planStepId → fall all the way through to parentStepId.
+            expect(g({ stepId: '', planStepId: '', parentStepId: 'parent-1' })).to.equal('parent-1')
+        })
+    })
+
+    // --- normalizeBeamRepo: tolerant wire-shape mapping ---
+    describe('normalizeBeamRepo', () => {
+        it('maps varied key spellings to the PascalCase IDE shape', () => {
+            const nr = (handler as any).normalizeBeamRepo({
+                repositoryName: 'alice',
+                beamArtifactId: 'art-9',
+                planStepId: 'step-1',
+                tfm: 'net8.0',
+                scenario: 'transformed',
+            })
+            expect(nr.RepositoryName).to.equal('alice')
+            expect(nr.BeamArtifactId).to.equal('art-9')
+            expect(nr.BeamStepId).to.equal('step-1')
+            expect(nr.BeamTargetFramework).to.equal('net8.0')
+            expect(nr.BeamScenario).to.equal('transformed')
+        })
+
+        it('defaults empty fields and scenario=transformed on a bare object', () => {
+            const nr = (handler as any).normalizeBeamRepo({})
+            expect(nr.RepositoryName).to.equal('')
+            expect(nr.BeamScenario).to.equal('transformed')
+            expect(nr.OriginalArtifactId).to.equal('')
+        })
+
+        it('maps originalArtifactId to OriginalArtifactId', () => {
+            const nr = (handler as any).normalizeBeamRepo({ repoName: 'alice', originalArtifactId: 'orig-1' })
+            expect(nr.OriginalArtifactId).to.equal('orig-1')
+        })
+
+        it('maps generateIntegrationTests only as a real true', () => {
+            const flag = (value: unknown) =>
+                (handler as any).normalizeBeamRepo({ repoName: 'alice', generateIntegrationTests: value })
+                    .GenerateIntegrationTests
+            expect(flag(true)).to.equal(true)
+            for (const value of [false, 'true', 1, undefined, null]) {
+                expect(flag(value)).to.equal(false)
+            }
+        })
+    })
+
+    // --- listBeamedRepos: the core discovery function (empty / beam-map / beam-status / regex) ---
+    describe('listBeamedRepos', () => {
+        const zipArtifacts = (repo: string, hash = 'abc123') => [
+            { artifactId: `zip-${repo}`, fileMetadata: { path: `${repo}_${hash}/${repo}.zip` } },
+        ]
+
+        it('returns [] when the job has no artifacts (never beamed)', async () => {
+            sendStub.resolves({ artifacts: [] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+        })
+
+        it('returns [] when only transformed zips exist but no beam-map / beam-status', async () => {
+            sendStub.resolves({ artifacts: zipArtifacts('alice') })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // A transform-only job must NOT over-list its transformed zips as "beamed".
+            expect(result).to.deep.equal([])
+        })
+
+        it('filters discovery to beam-map membership when a beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice', stepId: 's1', scenario: 'transformed' }] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+            // No original saved for this repo → empty, never undefined (the C# side binds it).
+            expect(result[0].OriginalArtifactId).to.equal('')
+        })
+
+        // The web writes a new beam-map on each beam batch, and ListArtifacts order isn't chronological.
+        it('uses every beam-map, the newest entry per repo winning, whatever order they are listed in', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'map-new', fileMetadata: { path: '' }, artifactCreatedTimestamp: new Date(2_000) },
+                    { artifactId: 'not-a-map', fileMetadata: { path: '' } },
+                    {
+                        artifactId: 'map-old',
+                        fileMetadata: { path: '' },
+                        artifactCreatedTimestamp: new Date(1_000).toISOString(),
+                    },
+                ],
+            })
+            const maps: Record<string, any> = {
+                'map-old': { repos: [{ repoName: 'alice', stepId: 's1' }] },
+                'map-new': {
+                    repos: [
+                        {
+                            repoName: 'Alice',
+                            stepId: 's1',
+                            generateIntegrationTests: true,
+                            originalArtifactId: 'orig-a',
+                        },
+                        { repoName: 'bob', stepId: 's2' },
+                    ],
+                },
+                'not-a-map': { repos: 'malformed' },
+            }
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) => maps[id]) as any)
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['Alice', 'bob'])
+            const alice = result.find((r: any) => r.RepositoryName === 'Alice')!
+            expect(alice.GenerateIntegrationTests).to.equal(true)
+            expect(alice.OriginalArtifactId).to.equal('orig-a')
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
+        it('carries the original-source artifact id from the beam-map entry (ITGen row 22/15)', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [{ repoName: 'alice', stepId: 's1', originalArtifactId: 'orig-alice' }],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result[0].OriginalArtifactId).to.equal('orig-alice')
+            // The transformed source stays the beam artifact; the original never replaces it.
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('turns ITGen on for the parent job when a beamed repo opts in, and only then', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [
+                    {
+                        repoName: 'alice',
+                        stepId: 's1',
+                        originalArtifactId: 'orig-alice',
+                        generateIntegrationTests: true,
+                    },
+                    { repoName: 'bob', stepId: 's2' },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result.map((r: any) => [r.RepositoryName, r.GenerateIntegrationTests])).to.deep.equal([
+                ['alice', true],
+                ['bob', false],
+            ])
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+
+            mapStub.resolves({ repos: [{ repoName: 'alice', stepId: 's1' }] })
+            await handler.listBeamedRepos('ws-1', 'job-2')
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-2')).to.be.false
+        })
+
+        it("tells the gate whether a beam-map opts in, and that it can't tell when the scan was skipped", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            })
+            const readBeamOptIn = (jobId: string) => (handler as any).readBeamOptIn('ws-1', jobId)
+
+            expect(await readBeamOptIn('job-1')).to.equal(true)
+
+            mapStub.resolves({ repos: [{ repoName: 'alice', stepId: 's1' }] })
+            expect(await readBeamOptIn('job-2')).to.equal(false)
+
+            // Throttle cooldown: the beam-map scan is skipped, so "no opt-in" can't be told apart from "not read".
+            ;(handler as any).beamThrottleCooldownUntilMs = Date.now() + 60_000
+            expect(await readBeamOptIn('job-3')).to.equal(undefined)
+        })
+
+        // A beam-map that's listed but can't be downloaded yet (ResourceNotFound until the web side's copy to the
+        // user-facing bucket lands) must not turn ITGen off for the session: the gate retries a "can't tell".
+        it("can't tell whether a job opts in while a candidate can't be downloaded and no beam-map was read", async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                _id: string,
+                onUnreadable?: () => void
+            ) => {
+                onUnreadable?.()
+                return null
+            }) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(
+                warn.calledWithMatch(
+                    /read no beam-map that opts in: couldn't download 1 candidate artifact\(s\) \(beammap-1\)/
+                )
+            ).to.be.true
+
+            // The next sweep that finds the same unreadable candidate doesn't warn again, even with a lightweight
+            // sweep (a dashboard refresh) in between.
+            await handler.listBeamedRepos('ws-1', 'job-1', true)
+            await (handler as any).readBeamOptIn('ws-1', 'job-1')
+            expect(warn.callCount).to.equal(1)
+
+            // Once it downloads, the opt-in is read.
+            mapStub.callsFake(async () => ({
+                repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+            }))
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+        })
+
+        it("can't confirm the opt-in when the beam-map is past the candidate cap", async () => {
+            const others = Array.from({ length: 25 }, (_, i) => ({ artifactId: `cp-${i}`, fileMetadata: { path: '' } }))
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...others,
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .callsFake((async (_ws: string, _job: string, id: string) =>
+                    id === 'beammap-1'
+                        ? { repos: [{ repoName: 'alice', generateIntegrationTests: true }] }
+                        : null) as any)
+            const warn = (handler as any).logging.warn as sinon.SinonStub
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            expect(warn.calledWithMatch(/didn't read 1 candidate\(s\) past the 25-candidate cap/)).to.be.true
+        })
+
+        // The web publishes a beam-map only when a repo in it opts in, and the copy can land after it's listed: an unread
+        // candidate can be a newer beam-map that opts in.
+        for (const optIn of [false, true]) {
+            it(`with a beam-map read ${optIn ? 'that opts in, decides' : "that doesn't opt in, can't confirm"} while another candidate can't be downloaded`, async () => {
+                sendStub.resolves({
+                    artifacts: [
+                        ...zipArtifacts('alice'),
+                        { artifactId: 'newer-1', fileMetadata: { path: '' } },
+                        { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                    ],
+                })
+                sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                    _ws: string,
+                    _job: string,
+                    id: string,
+                    onUnreadable?: () => void
+                ) => {
+                    if (id === 'newer-1') {
+                        onUnreadable?.()
+                        return null
+                    }
+                    return { repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: optIn }] }
+                }) as any)
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(optIn ? true : 'unconfirmed')
+            })
+        }
+
+        // A throttle that starts during the scan also makes the scan incomplete — the beam-map may not
+        // have been reached — so it counts as 'unconfirmed' just like a budget timeout.
+        it('counts a scan throttled part-way as unconfirmed so the gate retries with back-off', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                _id: string,
+                onUnreadable?: () => void
+            ) => {
+                ;(handler as any).noteBeamThrottled()
+                onUnreadable?.()
+                return null
+            }) as any)
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+        })
+
+        it('says opted in when a beam-map read before the scan was cut short opts in', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                    { artifactId: 'other-1', fileMetadata: { path: '' } },
+                ],
+            })
+            sinon.stub(handler as any, 'downloadJsonArtifact').callsFake((async (
+                _ws: string,
+                _job: string,
+                id: string,
+                onUnreadable?: () => void
+            ) => {
+                if (id === 'beammap-1') {
+                    return { repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }] }
+                }
+                ;(handler as any).noteBeamThrottled() // the scan is cut short after the beam-map was read
+                onUnreadable?.()
+                return null
+            }) as any)
+            // (Before: 'unconfirmed', because the throttle made the scan count as aborted.)
+            const remember = sinon.spy((handler as any).itGenJobs, 'rememberBeamOptIn')
+
+            expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+            expect(remember.calledWith('job-1')).to.be.true
+        })
+
+        it('leaves ITGen off for a repo found only from its beam-status artifact', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'st-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            expect(result[0].GenerateIntegrationTests).to.equal(false)
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.false
+        })
+
+        // Core race: N beam-status-* files appear in ListArtifacts before the beam-map (a
+        // pathless JSON). With the fix, beam-status files are excluded from allCandidates and
+        // the pathless beam-map is sorted to the front, so it is found on the first download.
+        it('finds the beam-map even when beam-status files appear before it in ListArtifacts', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    ...zipArtifacts('bob'),
+                    ...zipArtifacts('carol'),
+                    { artifactId: 'bs-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                    { artifactId: 'bs-2', fileMetadata: { path: 'beam-status-job-1-bob.json' } },
+                    { artifactId: 'bs-3', fileMetadata: { path: 'beam-status-job-1-carol.json' } },
+                    // Pathless beam-map listed last — without the sort it would consume 3 budget
+                    // slots on the beam-status files before reaching it. With the fix it is first.
+                    { artifactId: 'beammap-1', fileMetadata: { path: '' } },
+                ],
+            })
+            const mapStub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                repos: [
+                    {
+                        repoName: 'alice',
+                        stepId: 's-alice',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-a',
+                    },
+                    { repoName: 'bob', stepId: 's-bob', generateIntegrationTests: true, originalArtifactId: 'orig-b' },
+                    {
+                        repoName: 'carol',
+                        stepId: 's-carol',
+                        generateIntegrationTests: true,
+                        originalArtifactId: 'orig-c',
+                    },
+                ],
+            })
+
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+            // All 3 repos found from beam-map, not beam-status
+            expect(result.map((r: any) => r.RepositoryName).sort()).to.deep.equal(['alice', 'bob', 'carol'])
+            for (const repo of result) {
+                expect(repo.GenerateIntegrationTests).to.be.true
+                expect(repo.OriginalArtifactId).to.not.be.empty
+            }
+            // The beam-map (beammap-1, pathless) was downloaded first, not the beam-status files
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'beammap-1')).to.be.true
+            expect(mapStub.calledWith(sinon.match.any, sinon.match.any, 'bs-1')).to.be.false
+            expect((handler as any).itGenJobs.isKnownItGenJob('job-1')).to.be.true
+        })
+
+        it('never attempts beam-status artifacts and finds beam-map on first download even with 8 beam-status files listed first', async () => {
+            // Job 401bf8f4 shape: 8 beam-status-* files listed before the one pathless beam-map.
+            // Old code (no filter): all 9 were candidates; each download "took" 2 s; the 15 s budget
+            // was exhausted after 7 downloads, the beam-map was never reached.
+            // Fix: beam-status files are excluded, only 1 candidate (the pathless beam-map) remains.
+            const clock = sinon.useFakeTimers({ toFake: ['Date'] })
+            try {
+                sendStub.resolves({
+                    artifacts: [
+                        ...zipArtifacts('alice'), // transformed-source zip so alice has an artifactId
+                        ...Array.from({ length: 8 }, (_, i) => ({
+                            artifactId: `bs-${i}`,
+                            fileMetadata: { path: `beam-status-job-401-repo${i}.json` },
+                        })),
+                        { artifactId: 'beammap-1', fileMetadata: { path: '' } }, // pathless
+                    ],
+                })
+                const mapContent = {
+                    repos: [
+                        {
+                            repoName: 'alice',
+                            stepId: 's-alice',
+                            generateIntegrationTests: true,
+                            originalArtifactId: 'orig-a',
+                        },
+                    ],
+                }
+                const downloadStub = sinon
+                    .stub(handler as any, 'downloadJsonArtifact')
+                    .callsFake(async (...args: unknown[]) => {
+                        clock.tick(2000) // each call "takes" 2 s of wall time
+                        return args[2] === 'beammap-1' ? mapContent : null
+                    })
+
+                const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+                // Beam-map found, alice returned with ITGen fields
+                expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+                expect(result[0].GenerateIntegrationTests).to.be.true
+                expect(downloadStub.calledWith(sinon.match.any, sinon.match.any, 'beammap-1')).to.be.true
+                // No beam-status file was ever a download candidate
+                for (let i = 0; i < 8; i++) {
+                    expect(
+                        downloadStub.calledWith(sinon.match.any, sinon.match.any, `bs-${i}`),
+                        `bs-${i} must not be attempted`
+                    ).to.be.false
+                }
+                // Exactly 1 download (the beam-map) — scan not cut short
+                expect(downloadStub.callCount).to.equal(1)
+            } finally {
+                clock.restore()
+            }
+        })
+
+        it('rejects malformed beam-map entries (no usable repo name)', async () => {
+            sendStub.resolves({
+                artifacts: [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+            })
+            sinon
+                .stub(handler as any, 'downloadJsonArtifact')
+                .resolves({ repos: [{ repoName: 'alice' }, { junk: true }, null, 'not-an-object'] })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            // Only the well-formed 'alice' entry survives validation.
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('falls back to beam-status filenames when no beam-map is present', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+            expect(result[0].BeamArtifactId).to.equal('zip-alice')
+        })
+
+        it('strips the -<8hex> suffix on beam-status filenames to resolve the repo', async () => {
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: 'beam-status-job-1-alice-0a1b2c3d.json' } },
+                ],
+            })
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('does not throw or mismatch when the jobId contains regex metacharacters', async () => {
+            const jobId = 'job.(v1)+[x]'
+            sendStub.resolves({
+                artifacts: [
+                    ...zipArtifacts('alice'),
+                    { artifactId: 'status-1', fileMetadata: { path: `beam-status-${jobId}-alice.json` } },
+                ],
+            })
+            // Without escaping, `new RegExp` would throw or mismatch on these metachars.
+            const result = await handler.listBeamedRepos('ws-1', jobId)
+            expect(result.map((r: any) => r.RepositoryName)).to.deep.equal(['alice'])
+        })
+
+        it('returns [] and logs on send failure (no throw)', async () => {
+            sendStub.rejects(new Error('FES down'))
+            const result = await handler.listBeamedRepos('ws-1', 'job-1')
+            expect(result).to.deep.equal([])
+            expect((logging.error as sinon.SinonStub).called).to.be.true
+        })
+    })
+
+    // --- downloadBeamArtifact: destDir path validation (zip-slip defense) ---
+    describe('downloadBeamArtifact', () => {
+        it('rejects a relative destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', 'relative/dir')
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+            expect(result.ErrorCode).to.equal('InvalidDestination')
+        })
+
+        it('rejects a destDir containing ".." traversal', async () => {
+            // Absolute but with an un-normalized ".." segment — must be rejected.
+            const bad = `${path.sep}root${path.sep}ws${path.sep}..${path.sep}evil`
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', bad)
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/Invalid destination directory/)
+        })
+
+        it('rejects an empty destDir', async () => {
+            const result = await handler.downloadBeamArtifact('ws-1', 'job-1', 'art-1', '')
+            expect(result.Success).to.be.false
+        })
+
+        it('surfaces the error name when no download URL could be created', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.rejects(
+                Object.assign(new Error('denied for https://example.invalid/secret?sig=1'), {
+                    name: 'AccessDeniedException',
+                    $metadata: { httpStatusCode: 403 },
+                })
+            )
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(
+                /^Could not get a download URL for the beam artifact \(AccessDeniedException: /
+            )
+            expect(result.Error).to.not.include('https://')
+            expect(sendStub.callCount).to.equal(1)
+        })
+
+        it('keeps an earlier error as the reason when the last attempt returns no URL', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.onFirstCall().rejects(
+                Object.assign(new Error('oops'), {
+                    name: 'InternalServerException',
+                    $metadata: { httpStatusCode: 500 },
+                })
+            )
+            sendStub.resolves({})
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Error).to.equal(
+                'The service returned no download URL for the beam artifact (after an earlier error: InternalServerException: oops)'
+            )
+            expect(result.ErrorCode).to.be.undefined
+        })
+
+        it('says the service returned no URL when the response has none', async () => {
+            ;(handler as any).downloadUrlBackoffBaseMs = 0
+            sendStub.resolves({})
+
+            const result = await handler.downloadBeamArtifact(
+                'ws-1',
+                'job-1',
+                'art-1',
+                path.resolve(os.tmpdir(), 'beam')
+            )
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.equal('The service returned no download URL for the beam artifact')
+        })
+    })
+
+    // --- downloadOriginalCode: ITGen original source by artifact id (row 15, contract C6) ---
+    describe('downloadOriginalCode', () => {
+        let root: string
+        const workspaceDir = () => path.join(root, workspaceFolderName)
+        const originalDir = () => path.join(workspaceDir(), 'before')
+        const marker = () => path.join(originalDir(), '.atx-itgen-job')
+        const readMarker = () => JSON.parse(fs.readFileSync(marker(), 'utf8'))
+        const ideMarker = () => path.join(originalDir(), '.atx-job-id')
+        // A complete copy has both markers: the LS's and the plain job id the VS coordinator checks.
+        const writeMarker = (jobId: string, codeArtifactId: string) => {
+            fs.writeFileSync(marker(), JSON.stringify({ jobId, codeArtifactId }))
+            fs.writeFileSync(ideMarker(), jobId)
+        }
+        // Staging (before.partial-*) and moved-aside (before.old-*) folders left next to before.
+        const leftovers = () =>
+            fs.existsSync(workspaceDir()) ? fs.readdirSync(workspaceDir()).filter(n => n.startsWith('before.')) : []
+        const presigned = () =>
+            sinon
+                .stub(handler, 'createArtifactDownloadUrl')
+                .resolves({ s3PresignedUrl: 'https://s3/original.zip', requestHeaders: {} } as any)
+        // Stand-in for the real download+extract: writes what extractArchiveFromBuffer leaves
+        // behind (the extracted tree plus the downloaded zip itself) into the target folder.
+        const fakeExtract =
+            (files: Record<string, string>) =>
+            async (...args: any[]): Promise<string> => {
+                const [, , dir, name] = args as [string, any, string, string]
+                for (const [rel, content] of Object.entries(files)) {
+                    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
+                    fs.writeFileSync(path.join(dir, rel), content)
+                }
+                fs.writeFileSync(path.join(dir, name), 'PK-zip-bytes')
+                return dir
+            }
+        const stubExtract = (files: Record<string, string> = { 'App.sln': '' }) =>
+            sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive').callsFake(fakeExtract(files))
+
+        beforeEach(() => {
+            ;(handler as any).itGenJobs.rememberFlag('job-0', true)
+            ;(handler as any).itGenJobs.rememberFlag('job-1', true)
+            root = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-original-'))
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('refuses for a job without generate_integration_tests and touches nothing', async () => {
+            ;(handler as any).itGenJobs.rememberFlag('job-1', false)
+            sinon.stub(handler as any, 'readBeamOptIn').resolves(false) // no beamed repo opts in either
+            const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.match(/requires a job with generate_integration_tests/)
+            expect(urlStub.called).to.be.false
+            expect(fs.existsSync(workspaceDir())).to.be.false
+        })
+
+        it('rejects a relative or traversing solution root', async () => {
+            for (const bad of ['relative/dir', `${path.sep}root${path.sep}..${path.sep}evil`, '']) {
+                const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', bad)
+                expect(result.Success).to.be.false
+                expect(result.Error).to.match(/Invalid solution root/)
+            }
+        })
+
+        it("accepts a folder name that merely contains '..'", async () => {
+            presigned()
+            stubExtract()
+            const dotted = path.join(root, 'Foo..Bar')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', dotted)
+
+            expect(result.Success).to.be.true
+            expect(result.OriginalPath).to.equal(path.join(dotted, workspaceFolderName, 'before'))
+        })
+
+        it('rejects a job id that is not a plain id', async () => {
+            for (const bad of ['../x', 'a/b', 'a\\b', '', '.hidden', 'job id']) {
+                const result = await handler.downloadOriginalCode('ws-1', bad, 'orig-1', root)
+                expect(result.Success).to.be.false
+                expect(result.Error).to.match(/Invalid job id/)
+            }
+        })
+
+        it('downloads and extracts into artifactWorkspace/before, dropping the zip and staging folder', async () => {
+            const urlStub = presigned()
+            stubExtract({ 'App/App.csproj': '<Project/>', 'App/Program.cs': 'class P {}' })
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: false })
+            expect(urlStub.calledOnceWith('ws-1', 'job-1', 'orig-1')).to.be.true
+            expect(fs.readFileSync(path.join(originalDir(), 'App', 'Program.cs'), 'utf8')).to.equal('class P {}')
+            expect(fs.existsSync(path.join(originalDir(), 'original-source.zip'))).to.be.false
+            expect(leftovers()).to.deep.equal([])
+            expect(readMarker()).to.deep.equal({ jobId: 'job-1', codeArtifactId: 'orig-1' })
+            // Exactly the job id, no newline or BOM: what OriginalCodeBackup writes and the coordinator compares.
+            expect(fs.readFileSync(ideMarker())).to.deep.equal(Buffer.from('job-1', 'utf8'))
+        })
+
+        it("downloads again over a copy that has only the LS's marker (written before the IDE's marker existed)", async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(marker(), JSON.stringify({ jobId: 'job-1', codeArtifactId: 'orig-1' }))
+            const urlStub = presigned()
+            stubExtract()
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.AlreadyPresent).to.be.false
+            expect(urlStub.calledOnce).to.be.true
+            expect(fs.readFileSync(ideMarker(), 'utf8')).to.equal('job-1')
+        })
+
+        it("downloads for a beamed repo's parent web job once its beam-map opts in", async () => {
+            ;(handler as any).itGenJobs.forget('job-1')
+            sinon.stub(handler, 'getJob').resolves({ objective: '{}' } as any)
+            const listStub = sinon.stub(handler as any, 'readBeamOptIn').resolves(true)
+            presigned()
+            stubExtract()
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.true
+            expect(listStub.calledOnceWith('ws-1', 'job-1')).to.be.true
+            expect(fs.readFileSync(ideMarker(), 'utf8')).to.equal('job-1')
+        })
+
+        it('stubs the MSBuild walk-up files the original lacks and keeps the ones it has', async () => {
+            presigned()
+            stubExtract({ 'App.sln': '', 'Directory.Build.props': '<Project><!-- repo --></Project>' })
+
+            await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            const read = (name: string) => fs.readFileSync(path.join(originalDir(), name), 'utf8')
+            expect(read('Directory.Build.props')).to.contain('repo')
+            expect(read('Directory.Build.targets')).to.contain('AWS Transform')
+            expect(read('Directory.Packages.props')).to.contain('AWS Transform')
+        })
+
+        it('reuses the copy only when both the job and the original-code artifact match', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(path.join(originalDir(), 'App.sln'), '')
+            writeMarker('job-1', 'orig-1')
+            const urlStub = sinon.stub(handler, 'createArtifactDownloadUrl')
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: true })
+            expect(urlStub.called).to.be.false
+        })
+
+        it('cleans up leftovers from an interrupted call even when the copy is reused, and nothing else', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            writeMarker('job-1', 'orig-1')
+            for (const name of ['before.partial-1234', 'before.old-5678', 'before.partialbackup', 'before.notes']) {
+                fs.mkdirSync(path.join(workspaceDir(), name))
+            }
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.AlreadyPresent).to.be.true
+            expect(leftovers().sort()).to.deep.equal(['before.notes', 'before.partialbackup'])
+        })
+
+        it('downloads again for the same job when the original-code artifact differs (another repo, or re-saved)', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(path.join(originalDir(), 'OtherRepo.sln'), '')
+            writeMarker('job-1', 'orig-other-repo')
+            const urlStub = presigned()
+            stubExtract({ 'App.sln': '' })
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.AlreadyPresent).to.be.false
+            expect(urlStub.calledOnceWith('ws-1', 'job-1', 'orig-1')).to.be.true
+            expect(fs.existsSync(path.join(originalDir(), 'OtherRepo.sln'))).to.be.false
+            expect(readMarker()).to.deep.equal({ jobId: 'job-1', codeArtifactId: 'orig-1' })
+        })
+
+        it("replaces another job's copy, an older plain-text marker, and a copy with no marker", async () => {
+            presigned()
+            stubExtract()
+            const previousMarkers: Array<(() => void) | null> = [
+                () => writeMarker('job-0', 'orig-1'),
+                () => fs.writeFileSync(marker(), 'job-1'), // format written before the artifact id was added
+                null,
+            ]
+            for (const writePrevious of previousMarkers) {
+                fs.rmSync(originalDir(), { recursive: true, force: true })
+                fs.mkdirSync(originalDir(), { recursive: true })
+                fs.writeFileSync(path.join(originalDir(), 'Stale.cs'), '')
+                writePrevious?.()
+
+                const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+                expect(result.Success).to.be.true
+                expect(result.AlreadyPresent).to.be.false
+                expect(fs.existsSync(path.join(originalDir(), 'Stale.cs'))).to.be.false
+                expect(readMarker()).to.deep.equal({ jobId: 'job-1', codeArtifactId: 'orig-1' })
+            }
+            expect(leftovers()).to.deep.equal([])
+        })
+
+        it('never reuses an old copy whose replacement failed partway, and the next call downloads again', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(path.join(originalDir(), 'Old.cs'), '')
+            writeMarker('job-0', 'orig-0')
+            const urlStub = presigned()
+            stubExtract()
+            // Moving the old copy aside fails, as it does on Windows when the IDE holds a file in it open.
+            const realRename = fs.promises.rename
+            const rename = sinon.stub(fs.promises, 'rename').callsFake((from: fs.PathLike, to: fs.PathLike) => {
+                if (String(to).includes('before.old-')) {
+                    throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
+                }
+                return realRename(from, to)
+            })
+
+            const failed = await handler.downloadOriginalCode('ws-1', 'job-0', 'orig-0', root)
+            expect(failed.Success).to.be.true // job-0's own copy is still valid and reused
+            expect(failed.AlreadyPresent).to.be.true
+
+            const replaced = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            expect(replaced.Success).to.be.false
+            expect(fs.existsSync(marker())).to.be.false // the old copy can no longer pass as complete
+
+            rename.restore()
+            const reused = await handler.downloadOriginalCode('ws-1', 'job-0', 'orig-0', root)
+            expect(reused.AlreadyPresent).to.be.false // downloaded again rather than trusting a half-replaced copy
+            expect(urlStub.callCount).to.equal(2)
+            expect(leftovers()).to.deep.equal([])
+        })
+
+        it('restores the old copy (without its marker) when the new one cannot be moved into place', async () => {
+            fs.mkdirSync(originalDir(), { recursive: true })
+            fs.writeFileSync(path.join(originalDir(), 'Old.cs'), '')
+            writeMarker('job-0', 'orig-0')
+            presigned()
+            stubExtract()
+            const realRename = fs.promises.rename
+            sinon.stub(fs.promises, 'rename').callsFake((from: fs.PathLike, to: fs.PathLike) => {
+                if (String(from).includes('before.partial-')) {
+                    throw Object.assign(new Error('EBUSY: resource busy, rename'), { code: 'EBUSY' })
+                }
+                return realRename(from, to)
+            })
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.false
+            expect(fs.existsSync(path.join(originalDir(), 'Old.cs'))).to.be.true
+            expect(fs.existsSync(marker())).to.be.false
+            expect(leftovers()).to.deep.equal([])
+        })
+
+        it('queues two calls for the same solution: one download, one complete copy', async () => {
+            const urlStub = presigned()
+            let release!: () => void
+            const gate = new Promise<void>(r => (release = r))
+            sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive').callsFake(async (...args: any[]) => {
+                await gate // hold the first extract open while the second call arrives
+                return fakeExtract({ 'App.sln': '', 'App/Program.cs': 'class P {}' })(...args)
+            })
+
+            const first = handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            const second = handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            release()
+            const [a, b] = await Promise.all([first, second])
+
+            expect(a).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: false })
+            expect(b).to.deep.equal({ Success: true, OriginalPath: originalDir(), AlreadyPresent: true })
+            expect(urlStub.calledOnce).to.be.true
+            expect(fs.readFileSync(path.join(originalDir(), 'App', 'Program.cs'), 'utf8')).to.equal('class P {}')
+            expect(leftovers()).to.deep.equal([])
+        })
+
+        it('fails without creating an original folder when there is no presigned URL', async () => {
+            sinon.stub(handler, 'createArtifactDownloadUrl').resolves(null)
+
+            const result = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+
+            expect(result.Success).to.be.false
+            expect(result.Error).to.equal('The service returned no download URL for the original code artifact')
+            expect(fs.existsSync(originalDir())).to.be.false
+        })
+
+        it('never leaves a half-extracted original behind, and a retry starts clean', async () => {
+            presigned()
+            const extract = sinon.stub(require('../utils').Utils, 'downloadAndExtractArchive')
+            extract.onFirstCall().callsFake(async (...args: any[]) => {
+                const dir = args[2] as string
+                fs.mkdirSync(dir, { recursive: true })
+                fs.writeFileSync(path.join(dir, 'half-written.cs'), '')
+                throw new Error('socket hang up')
+            })
+            extract.onSecondCall().callsFake(fakeExtract({ 'App.sln': '' }))
+
+            const failed = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            expect(failed.Success).to.be.false
+            expect(fs.existsSync(originalDir())).to.be.false
+            expect(leftovers()).to.deep.equal([])
+
+            const retried = await handler.downloadOriginalCode('ws-1', 'job-1', 'orig-1', root)
+            expect(retried.Success).to.be.true
+            expect(fs.existsSync(path.join(originalDir(), 'App.sln'))).to.be.true
+            expect(fs.existsSync(path.join(originalDir(), 'half-written.cs'))).to.be.false
+        })
+    })
+})
+
+describe('ATXTransformHandler - isRepoLbvOpen: repo node terminal with no LBV child', () => {
+    // Both directions are asserted deliberately. The gate here reads correctly either way, so a
+    // one-sided test cannot tell a working gate from an unreachable one: removing the branch and
+    // inverting it produce different failures, and only covering both catches both.
+    let handler: ATXTransformHandler
+
+    const planWith = (repoStatus: string, lbvChild?: { StepName: string; Status: string }) => ({
+        StepName: 'root',
+        Status: 'IN_PROGRESS',
+        Children: [
+            {
+                StepName: 'alice (beamed)',
+                Status: repoStatus,
+                Children: lbvChild ? [lbvChild] : [],
+            },
+        ],
+    })
+
+    const isOpen = (plan: any) => (handler as any).isRepoLbvOpen(plan, 'alice', 'job-1') as boolean
+
+    beforeEach(() => {
+        handler = new ATXTransformHandler(
+            sinon.createStubInstance(AtxTokenServiceManager) as any,
+            {} as Workspace,
+            { log: sinon.stub(), error: sinon.stub() } as any,
+            {} as Runtime
+        )
+    })
+
+    afterEach(() => sinon.restore())
+
+    it('CLOSED when the repo node is terminal and has no LBV child — a reaped beam must drop off', () => {
+        // Fails if the branch is removed: without it this returns the default OPEN and the repo
+        // sits in the Transferred list forever with a disabled Load button.
+        expect(isOpen(planWith('STOPPED'))).to.be.false
+    })
+
+    it('CLOSED on a cancelled repo node with no LBV child', () => {
+        expect(isOpen(planWith('CANCELLED'))).to.be.false
+    })
+
+    it('OPEN when the repo node is still live and has no LBV child — a fresh transfer must stay', () => {
+        // Fails if the branch fires on the wrong side: over-gating here hides every repo whose
+        // sub-agent has not yet created its HITL, which is the normal state right after a beam.
+        expect(isOpen(planWith('IN_PROGRESS'))).to.be.true
+    })
+
+    it('still defers to the LBV child when one exists, terminal repo node notwithstanding', () => {
+        // The new branch must not shadow the original signal: with an LBV child present its status
+        // decides, so a repo whose build is still running stays visible even if the parent node has
+        // been marked terminal early.
+        const plan = planWith('SUCCEEDED', { StepName: 'Local Build Verification', Status: 'IN_PROGRESS' })
+        expect(isOpen(plan)).to.be.true
+    })
+})
+
+describe('ATXTransformHandler - source files manifest skips directories', () => {
+    let handler: ATXTransformHandler
+    let tmpRoot: string
+
+    beforeEach(() => {
+        const serviceManager = sinon.createStubInstance(AtxTokenServiceManager) as any
+        const logging = { log: sinon.stub(), error: sinon.stub(), info: sinon.stub() } as any
+        handler = new ATXTransformHandler(serviceManager, {} as Workspace, logging, {} as Runtime)
+        tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atx-manifest-dirs-'))
+    })
+
+    afterEach(() => {
+        sinon.restore()
+        fs.rmSync(tmpRoot, { recursive: true, force: true })
+    })
+
+    function readManifest(jobId: string): any {
+        const p = path.join(tmpRoot, workspaceFolderName, jobId, 'checkpoints', 'source-files.json')
+        return JSON.parse(fs.readFileSync(p, 'utf-8'))
+    }
+
+    it('leaves a Web Site folder out of source-files.json and keeps its files', async () => {
+        // A Web Site project's ProjectPath is its folder; listed as a file it shows up as a
+        // modified file and breaks the review uplink zip.
+        const site = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(site, { recursive: true })
+        const page = path.join(site, 'Default.aspx')
+        fs.writeFileSync(page, '<%@ Page %>')
+        const lib = path.join(tmpRoot, 'Lib', 'Lib.csproj')
+        fs.mkdirSync(path.dirname(lib), { recursive: true })
+        fs.writeFileSync(lib, '<Project />')
+        const sln = path.join(tmpRoot, 'App.sln')
+        fs.writeFileSync(sln, '')
+        await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-1', {
+            ProjectMetadata: [
+                { ProjectPath: site, SourceCodeFilePaths: [page] },
+                { ProjectPath: lib, SourceCodeFilePaths: [] },
+            ],
+            SolutionFilePath: sln,
+        })
+
+        const files: string[] = readManifest('job-1').sourceFiles
+        expect(files).to.include.members([page, lib, sln])
+        expect(files).to.not.include(site)
+    })
+
+    it('writes the manifest without a blocking stat', async () => {
+        // The check runs on the startTransform request path, so it must not call fs.statSync.
+        const statSync = sinon.spy(fs, 'statSync')
+        await (handler as any).writeSourceFilesManifest(tmpRoot, 'job-2', {
+            ProjectMetadata: [{ ProjectPath: path.join(tmpRoot, 'Missing.csproj'), SourceCodeFilePaths: [] }],
+        })
+        expect(statSync.called).to.be.false
+        expect(readManifest('job-2').sourceFiles).to.deep.equal([path.join(tmpRoot, 'Missing.csproj')])
+    })
+
+    it('never reports a folder a checkpoint added as modified', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        const page = path.join(dir, 'New.aspx')
+        fs.writeFileSync(page, '')
+        const checkpointsDir = path.join(tmpRoot, workspaceFolderName, 'job-4', 'checkpoints')
+        fs.mkdirSync(checkpointsDir, { recursive: true })
+        const past = new Date(Date.now() - 60_000)
+        fs.writeFileSync(
+            path.join(checkpointsDir, 'source-files.json'),
+            JSON.stringify({ createdAt: past.toISOString(), lastAppliedTimestamp: past.getTime(), sourceFiles: [] })
+        )
+        ;(handler as any).updateSourceFilesManifest(tmpRoot, 'job-4', ['WebSite1', path.join('WebSite1', 'New.aspx')])
+        fs.writeFileSync(path.join(dir, 'Added.aspx'), '')
+        fs.writeFileSync(page, 'changed')
+
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-4')).to.deep.equal([page])
+    })
+
+    it('never reports a directory as modified, also from a manifest written before the skip', () => {
+        const dir = path.join(tmpRoot, 'WebSite1')
+        fs.mkdirSync(dir, { recursive: true })
+        const page = path.join(dir, 'Default.aspx')
+        fs.writeFileSync(page, '')
+        const checkpointsDir = path.join(tmpRoot, workspaceFolderName, 'job-3', 'checkpoints')
+        fs.mkdirSync(checkpointsDir, { recursive: true })
+        const past = new Date(Date.now() - 60_000)
+        fs.writeFileSync(
+            path.join(checkpointsDir, 'source-files.json'),
+            JSON.stringify({
+                createdAt: past.toISOString(),
+                lastAppliedTimestamp: past.getTime(),
+                sourceFiles: [dir, page],
+            })
+        )
+        // Both the folder and the page change after the baseline.
+        fs.writeFileSync(path.join(dir, 'Added.aspx'), '')
+        fs.writeFileSync(page, 'changed')
+
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3')).to.deep.equal([page])
+        expect((handler as any).getModifiedFilesSinceCheckpoint(tmpRoot, 'job-3', true)).to.deep.equal([page])
     })
 })
