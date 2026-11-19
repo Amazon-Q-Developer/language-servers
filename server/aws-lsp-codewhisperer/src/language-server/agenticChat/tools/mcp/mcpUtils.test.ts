@@ -1771,6 +1771,83 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
         )
     })
 
+    it('returns the number of entries that a workspace config cannot grant with the errors of that file', async () => {
+        await writeJson(wsAgentPath, { tools: ['@demo/denied_tool'], allowedTools: ['@demo/denied_tool'] })
+
+        const { errors } = await load()
+
+        expect(errors.get(wsAgentPath)).to.equal(
+            'Ignored 1 permission entry: a workspace config grants permissions only for the MCP servers that it defines, without wildcards. The log lists each entry.'
+        )
+    })
+
+    it('does not copy the text of an ignored entry into the errors', async () => {
+        await writeJson(wsAgentPath, { tools: ['MCP Registry: *'], allowedTools: ['@demo/MCP Registry: x'] })
+
+        const { errors } = await load()
+
+        expect(errors.get(wsAgentPath)).to.match(/^Ignored 2 permission entries: /)
+        expect([...errors.values()].join('\n')).to.not.include('MCP Registry:')
+    })
+
+    it('reports many ignored entries with one short error', async () => {
+        await writeJson(wsAgentPath, { tools: Array.from({ length: 2000 }, (_, i) => `tool${i}*`) })
+
+        const { errors } = await load()
+
+        expect(errors.get(wsAgentPath)).to.match(/^Ignored 2000 permission entries: /)
+        expect(errors.get(wsAgentPath)!.length).to.be.below(200)
+    })
+
+    it('ignores a wildcard that starts with "@" in a workspace config with one warning, and returns it', async () => {
+        await writeJson(wsAgentPath, { tools: ['@demo/*'], allowedTools: ['@*'] })
+
+        const { agentConfig, errors } = await load()
+
+        expect(agentConfig.tools).to.not.include('@demo/*')
+        expect(agentConfig.allowedTools).to.not.include('@*')
+        expect(permissions(agentConfig).isToolEnabled('demo', 'denied_tool')).to.be.false
+        const ignored = [
+            `Ignoring wildcard permission "@demo/*" in 'tools' of workspace agent config at ${wsAgentPath}`,
+            `Ignoring wildcard permission "@*" in 'allowedTools' of workspace agent config at ${wsAgentPath}`,
+        ]
+        const lines: string[] = logger.warn.args.map((args: unknown[]) => String(args[0]))
+        expect(lines.filter(line => line.includes('"@demo/*"') || line.includes('"@*"'))).to.deep.equal(ignored)
+        expect(errors.get(wsAgentPath)).to.match(/^Ignored 2 permission entries: /)
+    })
+
+    it('does not return the "*" that a workspace config limits to its own servers as an error', async () => {
+        await writeJson(wsAgentPath, { tools: ['*'] })
+
+        const { errors } = await load()
+
+        expect(errors.has(wsAgentPath)).to.be.false
+    })
+
+    it('treats a path of the global agent config that differs only in case as the global config on Windows', async () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'win32' })
+        try {
+            // A path of the same file on Windows, where file names do not depend on case
+            const globalPathInOtherCase = path.join(path.dirname(globalAgentPath), 'DEFAULT.json')
+            await writeJson(globalPathInOtherCase, { tools: ['*'] })
+
+            const { agentConfig, errors } = await loadAgentConfig(
+                workspace,
+                logger,
+                [globalPathInOtherCase],
+                null,
+                false
+            )
+
+            expect(agentConfig.tools).to.include('*')
+            expect(errors.has(globalPathInOtherCase)).to.be.false
+            sinon.assert.neverCalledWithMatch(logger.warn, /wildcard permission/)
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
+        }
+    })
+
     it('logs each ignored permission entry and server name quoted, on a single line', async () => {
         const serverName = 'demo\nsecond line'
         const entry = `@${serverName}/tool`
@@ -2216,6 +2293,15 @@ describe('removeUntrustedPermissionSources()', () => {
 
         expect(remaining(pending)).to.deep.equal({ '@removed/tool': [wsAgent] })
         sinon.assert.notCalled(logger.warn)
+    })
+
+    it('returns each source that it removes, with the warning that it logged', () => {
+        const loaded = servers({ user: globalAgent })
+        const pending = new Map([['@user/tool', new Set([wsAgent, globalAgent])]])
+
+        const removed = removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+
+        expect(removed).to.deep.equal([{ source: wsAgent, message: logger.warn.firstCall.args[0] }])
     })
 
     it('uses the key of a server that the name mapping does not list as its name', () => {

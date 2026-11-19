@@ -329,6 +329,14 @@ export async function loadAgentConfig(
         sources.add(source)
         pending.set(entry, sources)
     }
+    // The permission entries of each config file that were ignored, as their log messages. The config errors, which
+    // the MCP server list shows, report how many there are; the log names each one.
+    const ignoredPermissions = new Map<string, Set<string>>()
+    const reportIgnoredPermission = (configPath: string, message: string) => {
+        const messages = ignoredPermissions.get(configPath) ?? new Set<string>()
+        messages.add(message)
+        ignoredPermissions.set(configPath, messages)
+    }
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -403,8 +411,9 @@ export async function loadAgentConfig(
         }
 
         // 4) Process permissions (tools and allowedTools). In a workspace file, a '*' in tools enables only
-        // the servers that the file defines (step 6), and its other wildcards are ignored.
-        const isWorkspaceFile = fsPath !== globalConfigPath
+        // the servers that the file defines (step 6), and its other wildcards, also those that start with '@', are
+        // ignored.
+        const isWorkspaceFile = permissionPathKey(fsPath) !== permissionPathKey(globalConfigPath)
         let enablesOwnServers = false
         for (const key of PERMISSION_KEYS) {
             if (!Array.isArray(json[key])) {
@@ -413,16 +422,18 @@ export async function loadAgentConfig(
             for (const tool of json[key]) {
                 if (typeof tool !== 'string') {
                     logging.warn(`Ignoring a '${key}' entry that is not a string in agent config at ${fsPath}`)
-                } else if (tool.startsWith('@')) {
-                    stash(pendingServerEntries[key], tool, fsPath)
                 } else if (isWorkspaceFile && isWildcardPermission(tool)) {
                     const appliesToOwnServers = key === 'tools' && tool === '*'
                     enablesOwnServers ||= appliesToOwnServers
-                    logging.warn(
-                        appliesToOwnServers
-                            ? `Limiting wildcard permission '*' in workspace agent config at ${fsPath} to the MCP servers that file defines`
-                            : `Ignoring wildcard permission ${JSON.stringify(tool)} in '${key}' of workspace agent config at ${fsPath}`
-                    )
+                    const message = appliesToOwnServers
+                        ? `Limiting wildcard permission '*' in workspace agent config at ${fsPath} to the MCP servers that file defines`
+                        : `Ignoring wildcard permission ${JSON.stringify(tool)} in '${key}' of workspace agent config at ${fsPath}`
+                    logging.warn(message)
+                    if (!appliesToOwnServers) {
+                        reportIgnoredPermission(fsPath, message)
+                    }
+                } else if (tool.startsWith('@')) {
+                    stash(pendingServerEntries[key], tool, fsPath)
                 } else if (!agentConfig[key].includes(tool)) {
                     agentConfig[key].push(tool)
                 }
@@ -687,12 +698,21 @@ export async function loadAgentConfig(
     // A workspace file can grant only the servers that it owns, so drop its entries that reach other
     // servers before they are applied.
     for (const key of PERMISSION_KEYS) {
-        removeUntrustedPermissionSources(
+        const ignored = removeUntrustedPermissionSources(
             pendingServerEntries[key],
             servers,
             serverNameMapping,
             [globalConfigPath, getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())],
             logging
+        )
+        for (const { source, message } of ignored) {
+            reportIgnoredPermission(source, message)
+        }
+    }
+    for (const [configPath, messages] of ignoredPermissions) {
+        configErrors.set(
+            configPath,
+            `Ignored ${messages.size} permission ${messages.size === 1 ? 'entry' : 'entries'}: a workspace config grants permissions only for the MCP servers that it defines, without wildcards. The log lists each entry.`
         )
     }
 
@@ -1580,6 +1600,8 @@ function permissionFileKey(configPath: string): string {
  * A source is the agent config that lists the entry, or the `mcp.json` that declares the server for its default
  * enablement. Sources in `globalConfigPaths`, which only the user writes, are kept. restoreServerScopedPermissions
  * then applies the entries that a remaining source owns.
+ *
+ * @returns The removed sources, each with the warning that was logged for it
  */
 export function removeUntrustedPermissionSources(
     pending: Map<string, Set<string>>,
@@ -1587,7 +1609,7 @@ export function removeUntrustedPermissionSources(
     serverNameMapping: Map<string, string>,
     globalConfigPaths: string[],
     logging: Logger
-): void {
+): { source: string; message: string }[] {
     // The agent config that holds the permissions of each loaded server, by its original name
     const permissionFiles = new Map<string, string>()
     for (const [sanitizedName, cfg] of servers) {
@@ -1621,12 +1643,15 @@ export function removeUntrustedPermissionSources(
             : undefined
     }
 
+    const removed: { source: string; message: string }[] = []
     for (const [entry, sources] of [...pending]) {
         for (const source of [...sources]) {
             const reason = refusal(entry, source)
             if (reason) {
                 // Quote the entry and the server names, so that a newline in them cannot start another log line
-                logging.warn(`Ignoring permission ${JSON.stringify(entry)} in ${source}: ${reason}`)
+                const message = `Ignoring permission ${JSON.stringify(entry)} in ${source}: ${reason}`
+                logging.warn(message)
+                removed.push({ source, message })
                 sources.delete(source)
             }
         }
@@ -1634,6 +1659,7 @@ export function removeUntrustedPermissionSources(
             pending.delete(entry)
         }
     }
+    return removed
 }
 
 /**
