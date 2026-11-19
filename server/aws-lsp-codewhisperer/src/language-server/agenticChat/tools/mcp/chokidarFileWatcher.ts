@@ -10,7 +10,7 @@ export class ChokidarFileWatcher {
         this.logger = logger
     }
 
-    watchPaths(paths: string[], callback: (changedPath: string) => void): void {
+    watchPaths(paths: string[], callback: (changedPath: string) => void, options?: { includeUnlink?: boolean }): void {
         if (this.watcher) {
             this.close()
         }
@@ -35,6 +35,13 @@ export class ChokidarFileWatcher {
             this.logger.info(`MCP config file changed: ${path}`)
             callback(path)
         })
+
+        if (options?.includeUnlink) {
+            this.watcher.on('unlink', path => {
+                this.logger.info(`Watched file removed: ${path}`)
+                callback(path)
+            })
+        }
 
         this.watcher.on('error', error => {
             this.logger.warn(`File watcher error: ${error instanceof Error ? error.message : String(error)}`)
