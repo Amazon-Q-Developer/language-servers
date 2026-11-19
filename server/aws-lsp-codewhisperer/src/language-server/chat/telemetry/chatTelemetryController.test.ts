@@ -5,6 +5,10 @@ import { CONVERSATION_ID_METRIC_KEY, ChatTelemetryController } from './chatTelem
 import assert = require('assert')
 import { ChatUIEventName } from './clientTelemetry'
 import { TelemetryService } from '../../../shared/telemetry/telemetryService'
+import {
+    INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED,
+    INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING,
+} from '../../agenticChat/constants/constants'
 
 describe('TelemetryController', () => {
     const mockTabId = 'mockTabId'
@@ -160,6 +164,60 @@ describe('TelemetryController', () => {
                 credentialStartUrl: undefined,
                 result: 'Succeeded',
             },
+        })
+    })
+
+    describe('emitAgencticLoop_InvokeLLM reason', () => {
+        // The `reason` field lets downstream metrics tell a transient, self-recovering agent-loop
+        // failure apart from a terminal one, so it must survive the emit unchanged.
+        const emitInvokeLLM = (reason?: string) =>
+            telemetryController.emitAgencticLoop_InvokeLLM(
+                'mockRequestId',
+                mockConversationId,
+                'AgenticChatWithToolUse',
+                undefined,
+                undefined,
+                'Failed',
+                '1.0.0',
+                'mockModelId',
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                reason
+            )
+
+        it('forwards the reason when one is supplied', () => {
+            emitInvokeLLM(INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING)
+
+            sinon.assert.calledOnce(testFeatures.telemetry.emitMetric)
+            const emitted = testFeatures.telemetry.emitMetric.firstCall.firstArg
+            assert.strictEqual(emitted.name, ChatTelemetryEventName.AgencticLoop_InvokeLLM)
+            assert.strictEqual(emitted.data.reason, INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING)
+            // `result` must stay 'Failed' so raw failure counts are unchanged for diagnostics.
+            assert.strictEqual(emitted.data.result, 'Failed')
+        })
+
+        it('distinguishes the terminal give-up from the retrying case', () => {
+            emitInvokeLLM(INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED)
+
+            const emitted = testFeatures.telemetry.emitMetric.firstCall.firstArg
+            assert.strictEqual(emitted.data.reason, INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED)
+            assert.notStrictEqual(
+                INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_EXHAUSTED,
+                INVOKE_LLM_REASON_INCOMPLETE_TOOL_USE_RETRYING
+            )
+        })
+
+        it('leaves reason undefined for failures with no specific classification', () => {
+            emitInvokeLLM(undefined)
+
+            const emitted = testFeatures.telemetry.emitMetric.firstCall.firstArg
+            assert.strictEqual(emitted.data.reason, undefined)
+            assert.strictEqual(emitted.data.result, 'Failed')
         })
     })
 
