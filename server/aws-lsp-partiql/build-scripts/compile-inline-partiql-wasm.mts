@@ -6,8 +6,10 @@ import { $, fs, os, path } from 'zx'
 //
 // The release archive must match PLAYGROUND_ARCHIVE_SHA256 before any file in it is used. The PartiQL team
 // builds the archive from the tagged commit with a pinned toolchain and Cargo.lock (scripts/package-web.sh
-// in that repository), so it can be rebuilt from source to check it. To use another release, check its
-// .sha256 file and its build-info.json, then change both values below.
+// in that repository). A rebuild of that commit with the wasm-pack version in the build-info.json of the
+// release is meant to give the same files, but the archive itself can differ (gzip bytes), so compare the
+// files to check a release. To use another release, check its .sha256 file and its build-info.json, then
+// change both values below.
 const PLAYGROUND_VERSION = '0.3.0'
 const PLAYGROUND_ARCHIVE_SHA256 = '0aedd0df190d218aac9e10469daceea17ef7330dae44ddcd933b1c368205fee8'
 
@@ -44,6 +46,12 @@ try {
 
     for (const file of ['partiql_playground.js', 'partiql_playground.d.ts']) {
         await fs.copyFile(path.join(release, file), path.join(outputFolder, file))
+    }
+
+    // Keep the third-party crate licenses next to the binary they describe, when the release has them.
+    const thirdPartyLicenses = 'THIRD_PARTY_LICENSES.txt'
+    if (await fs.pathExists(path.join(release, thirdPartyLicenses))) {
+        await fs.copyFile(path.join(release, thirdPartyLicenses), path.join(outputFolder, thirdPartyLicenses))
     }
 
     const binarySha256 = createHash('sha256').update(binary).digest('hex')
