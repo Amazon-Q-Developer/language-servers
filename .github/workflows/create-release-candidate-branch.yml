@@ -53,9 +53,13 @@ jobs:
               id: release-version
               env:
                   VERSION_FILE: app/aws-lsp-codewhisperer-runtimes/src/version.json
+                  # Bind workflow inputs via env so they are passed as data, not
+                  # expanded into the script source (prevents script injection).
+                  CUSTOM_VERSION: ${{ inputs.customVersion }}
+                  VERSION_INCREMENT: ${{ inputs.versionIncrement }}
               run: |
-                  customVersion="${{ inputs.customVersion }}"
-                  versionIncrement="${{ inputs.versionIncrement }}"
+                  customVersion="$CUSTOM_VERSION"
+                  versionIncrement="$VERSION_INCREMENT"
 
                   # Read current version
                   currentVersion=$(jq -r '.agenticChat' "$VERSION_FILE")

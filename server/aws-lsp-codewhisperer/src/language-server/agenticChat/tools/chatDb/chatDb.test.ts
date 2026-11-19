@@ -65,6 +65,33 @@ describe('ChatDatabase', () => {
         sinon.restore()
     })
 
+    describe('pinned context', () => {
+        beforeEach(async () => {
+            await chatDb.databaseInitialize(0)
+        })
+
+        it('does not mutate the shared DEFAULT_PINNED_CONTEXT when pinning in a tab', () => {
+            const defaultLengthBefore = util.DEFAULT_PINNED_CONTEXT.length
+            const customContext = { id: 'custom-folder-ctx', command: 'myFolder', label: 'folder' } as any
+
+            // Create the tab first (with tabContext but no pinnedContext yet) so that
+            // addPinnedContext initializes pinnedContext from the shared default — the
+            // code path that previously aliased and then mutated DEFAULT_PINNED_CONTEXT.
+            chatDb.setRules('tab-1', { folders: {}, rules: {} } as any)
+            chatDb.addPinnedContext('tab-1', customContext)
+
+            // The shared module-level default must not be polluted by pinning in a tab,
+            // otherwise every new chat window would inherit the custom pinned item.
+            assert.strictEqual(util.DEFAULT_PINNED_CONTEXT.length, defaultLengthBefore)
+            assert.ok(!util.DEFAULT_PINNED_CONTEXT.some((c: any) => c.id === 'custom-folder-ctx'))
+
+            // A brand-new tab must only receive the default pinned context, not the item
+            // that was pinned in a different tab.
+            const freshTabPinned = chatDb.getPinnedContext('tab-2-fresh')
+            assert.ok(!freshTabPinned.some((c: any) => c.id === 'custom-folder-ctx'))
+        })
+    })
+
     describe('replaceWithSummary', () => {
         it('should create a new history with summary message', async () => {
             await chatDb.databaseInitialize(0)

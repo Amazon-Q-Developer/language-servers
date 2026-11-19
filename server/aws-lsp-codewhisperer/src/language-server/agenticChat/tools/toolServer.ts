@@ -23,15 +23,20 @@ import {
     normalizePathFromUri,
 } from './mcp/mcpUtils'
 import { FsReplace, FsReplaceParams } from './fsReplace'
+import { recordFileUpdate, requireResolvedTarget, requireResolvedTargets } from './toolShared'
 import { CodeReviewUtils } from './qCodeAnalysis/codeReviewUtils'
 import { DEFAULT_AWS_Q_ENDPOINT_URL, DEFAULT_AWS_Q_REGION } from '../../../shared/constants'
 import { getUserAgent, makeUserContextObject } from '../../../shared/telemetryUtils'
 import { DisplayFindings } from './qCodeAnalysis/displayFindings'
 import { ProfileStatusMonitor } from './mcp/profileStatusMonitor'
+import { WorkspaceTrustState, getInitialWorkspaceTrust, readWorkspaceTrustUpdate } from './mcp/mcpWorkspaceTrust'
+import type { UpdateConfigurationParams } from '@aws/language-server-runtimes/protocol'
 import { AmazonQTokenServiceManager } from '../../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 import { SERVICE_MANAGER_TIMEOUT_MS, SERVICE_MANAGER_POLL_INTERVAL_MS } from '../constants/constants'
+import { getReservedBuiltInToolNames } from '../constants/toolConstants'
 import { isUsingIAMAuth } from '../../../shared/utils'
 
+/** Register handlers for inputs prepared with withResolvedTargets after acceptance. */
 export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     const fsReadTool = new FsRead({ workspace, lsp, logging })
     const fsWriteTool = new FsWrite({ workspace, lsp, logging })
@@ -39,11 +44,14 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     const fileSearchTool = new FileSearch({ workspace, lsp, logging })
     const fsReplaceTool = new FsReplace({ workspace, lsp, logging })
 
+    // Validation and execution consume the same checked targets once, without re-resolving input paths.
+
     agent.addTool(
         fsReadTool.getSpec(),
         async (input: FsReadParams) => {
-            await fsReadTool.validate(input)
-            return await fsReadTool.invoke(input)
+            const targets = requireResolvedTargets(input, 'fsRead', input.paths?.length ?? 0)
+            await fsReadTool.validate(input, targets)
+            return await fsReadTool.invoke(input, targets)
         },
         ToolClassification.BuiltIn
     )
@@ -51,8 +59,11 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fsWriteTool.getSpec(),
         async (input: FsWriteParams) => {
-            await fsWriteTool.validate(input)
-            return await fsWriteTool.invoke(input)
+            const target = requireResolvedTarget(input, 'fsWrite')
+            await fsWriteTool.validate(input, target)
+            const { output, fileUpdate } = await fsWriteTool.invoke(input, target)
+            recordFileUpdate(input, fileUpdate)
+            return { output }
         },
         ToolClassification.BuiltInCanWrite
     )
@@ -60,8 +71,11 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fsReplaceTool.getSpec(),
         async (input: FsReplaceParams) => {
-            await fsReplaceTool.validate(input)
-            return await fsReplaceTool.invoke(input)
+            const target = requireResolvedTarget(input, 'fsReplace')
+            await fsReplaceTool.validate(input, target)
+            const { output, fileUpdate } = await fsReplaceTool.invoke(input, target)
+            recordFileUpdate(input, fileUpdate)
+            return { output }
         },
         ToolClassification.BuiltInCanWrite
     )
@@ -69,8 +83,9 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         listDirectoryTool.getSpec(),
         async (input: ListDirectoryParams, token?: CancellationToken) => {
-            await listDirectoryTool.validate(input)
-            return await listDirectoryTool.invoke(input, token)
+            const target = requireResolvedTarget(input, 'listDirectory').path
+            await listDirectoryTool.validate(input, target)
+            return await listDirectoryTool.invoke(input, target, token)
         },
         ToolClassification.BuiltIn
     )
@@ -78,8 +93,9 @@ export const FsToolsServer: Server = ({ workspace, logging, agent, lsp }) => {
     agent.addTool(
         fileSearchTool.getSpec(),
         async (input: FileSearchParams, token?: CancellationToken) => {
-            await fileSearchTool.validate(input)
-            return await fileSearchTool.invoke(input, token)
+            const target = requireResolvedTarget(input, 'fileSearch').path
+            await fileSearchTool.validate(input, target)
+            return await fileSearchTool.invoke(input, target, token)
         },
         ToolClassification.BuiltIn
     )
@@ -279,11 +295,45 @@ export const McpToolsServer: Server = ({
     const registered: Record<string, string[]> = {}
     const allNamespacedTools = new Set<string>()
     let profileStatusMonitor: ProfileStatusMonitor | undefined
+    let workspaceTrust: WorkspaceTrustState | undefined
+
+    lsp.workspace.onUpdateConfiguration(async (params: UpdateConfigurationParams) => {
+        const state = readWorkspaceTrustUpdate(params)
+        if (state === undefined) {
+            return
+        }
+        if (state === 'invalid') {
+            logging.warn(`MCP: ignoring workspace trust update with an unknown state`)
+            return
+        }
+        workspaceTrust = state
+        if (McpManager.isInitialized()) {
+            // Starting servers can wait on a folder prompt, so don't hold the client's request open
+            McpManager.instance
+                .setWorkspaceTrust(state)
+                .catch(e => logging.error(`MCP: failed to apply workspace trust '${state}': ${e}`))
+        }
+    })
+
+    lsp.workspace.onDidChangeWorkspaceFolders(() => {
+        // The runtime updates the folder list before notifying servers
+        if (McpManager.isInitialized()) {
+            McpManager.instance
+                .onWorkspaceFoldersChanged()
+                .catch(e => logging.error(`MCP: failed to apply workspace folder changes: ${e}`))
+        }
+    })
 
     function removeAllMcpTools(): void {
         logging.info('Removing all MCP tools due to admin configuration')
+        const builtInToolNames = getReservedBuiltInToolNames(agent.getBuiltInToolNames())
         for (const [server, toolNames] of Object.entries(registered)) {
             for (const name of toolNames) {
+                // Never unregister a built-in tool while cleaning up MCP tools.
+                if (builtInToolNames.has(name)) {
+                    logging.warn(`MCP: refusing to remove built-in tool name ${name}`)
+                    continue
+                }
                 agent.removeTool(name)
                 allNamespacedTools.delete(name)
                 logging.info(`MCP: removed tool ${name}`)
@@ -315,8 +365,16 @@ export const McpToolsServer: Server = ({
     }
 
     function registerServerTools(server: string, defs: McpToolDefinition[]) {
+        // Built-in tool names are reserved: an MCP tool must never register under
+        // one, and cleanup must never unregister one.
+        const builtInToolNames = getReservedBuiltInToolNames(agent.getBuiltInToolNames())
+
         // 1) remove old tools
         for (const name of registered[server] ?? []) {
+            if (builtInToolNames.has(name)) {
+                logging.warn(`MCP: refusing to remove built-in tool name ${name}`)
+                continue
+            }
             agent.removeTool(name)
             allNamespacedTools.delete(name)
         }
@@ -339,7 +397,8 @@ export const McpToolsServer: Server = ({
                 def.serverName,
                 def.toolName,
                 allNamespacedTools,
-                toolNameMapping
+                toolNameMapping,
+                builtInToolNames
             )
             const tool = new McpTool({ logging, workspace, lsp }, def)
 
@@ -422,6 +481,7 @@ export const McpToolsServer: Server = ({
             )
 
             McpManager.instance.clearToolNameMapping()
+            await McpManager.instance.setWorkspaceTrust(workspaceTrust ?? 'prompt')
         } catch (e) {
             logging.error(`Failed to initialize MCP Manager: ${e}`)
         }
@@ -450,6 +510,8 @@ export const McpToolsServer: Server = ({
                 logging.warn('MCP is currently not supported')
                 return
             }
+            // A trust update that arrived before initialization wins over the initial value
+            workspaceTrust ??= getInitialWorkspaceTrust(lsp.getClientInitializeParams())
 
             // Initialize McpManager first, before profile monitor
             await initializeMcpManager()

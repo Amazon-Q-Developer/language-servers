@@ -9,7 +9,11 @@ import type { Workspace, Logging } from '@aws/language-server-runtimes/server-in
 import type { MCPServerConfig } from './mcpTypes'
 
 const APPROVALS_FILE = 'mcp-approvals.json'
-const STORE_VERSION = 1
+// v2: the fingerprint now covers the fully-merged spawn environment and headers
+// (see fingerprintServerConfig). Bumping the version discards v1 approvals, which
+// were computed over a narrower field set, so every workspace-scoped server is
+// re-consented once after upgrade.
+const STORE_VERSION = 2
 
 interface Approval {
     serverName: string
@@ -23,17 +27,49 @@ interface ApprovalStore {
     approvals: Approval[]
 }
 
+function sortedRecord(rec?: Record<string, string>): Record<string, string> {
+    return rec ? Object.fromEntries(Object.entries(rec).sort(([a], [b]) => a.localeCompare(b))) : {}
+}
+
+/**
+ * The environment the stdio transport will actually spawn the server with, as far
+ * as the config controls it. Mirrors the merge in McpManager (`cfg.env` overlaid by
+ * `cfg.__additionalEnv__`).
+ *
+ * `__additionalEnv__` carries workspace/agent-level `env` for registry servers and is
+ * NOT folded into `cfg.env`, so it must be merged here or it escapes the fingerprint.
+ */
+export function effectiveEnv(cfg: MCPServerConfig): Record<string, string> {
+    return sortedRecord({ ...(cfg.env ?? {}), ...(cfg.__additionalEnv__ ?? {}) })
+}
+
+/**
+ * The headers the HTTP/SSE transport will actually send, as far as the config
+ * controls it. Mirrors the merge in McpManager (`cfg.headers` overlaid by
+ * `cfg.__additionalHeaders__`).
+ */
+export function effectiveHeaders(cfg: MCPServerConfig): Record<string, string> {
+    return sortedRecord({ ...(cfg.headers ?? {}), ...(cfg.__additionalHeaders__ ?? {}) })
+}
+
 /**
  * SHA-256 of a canonical JSON form of the server's execution-relevant fields.
- * Any change to command/args/env/url yields a new fingerprint, invalidating
+ * Any change to command/args/env/url/headers yields a new fingerprint, invalidating
  * prior approvals — so mutation of the config re-prompts.
+ *
+ * `env` and `headers` are hashed in their *merged* form (see effectiveEnv /
+ * effectiveHeaders) so every field that reaches the spawned process is covered by
+ * consent. Two configs that spawn an identical process share a fingerprint regardless
+ * of which field supplied a value: consent is about what will execute, not how the
+ * config is spelled.
  */
 export function fingerprintServerConfig(cfg: MCPServerConfig): string {
     const canonical = {
         command: cfg.command ?? null,
         args: cfg.args ?? [],
-        env: cfg.env ? Object.fromEntries(Object.entries(cfg.env).sort(([a], [b]) => a.localeCompare(b))) : {},
+        env: effectiveEnv(cfg),
         url: cfg.url ?? null,
+        headers: effectiveHeaders(cfg),
     }
     return 'sha256:' + createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }

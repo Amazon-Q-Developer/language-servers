@@ -52,6 +52,17 @@ describe('ChokidarFileWatcher', () => {
             })
         })
 
+        it('reports removed files only when asked to', () => {
+            const callback = stub()
+            fileWatcher.watchPaths(['/path'], callback)
+            expect((mockWatcher.on as any).calledWith('unlink')).to.be.false
+
+            fileWatcher.watchPaths(['/path'], callback, { includeUnlink: true })
+            const unlink = (mockWatcher.on as any).getCalls().find((c: any) => c.args[0] === 'unlink')
+            unlink.args[1]('/path')
+            expect(callback.calledWith('/path')).to.be.true
+        })
+
         it('should register event handlers', () => {
             const callback = stub()
             fileWatcher.watchPaths(['/path'], callback)
