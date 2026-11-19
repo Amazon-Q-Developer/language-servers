@@ -62,6 +62,7 @@ for (const implementation of ['native', 'fallback'] as const) {
                 { info: () => {}, warn: () => {} } as any,
                 { window: { showDocument } } as any
             )
+            sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
 
             // Retain real network timers while cleaning up the existing PKCE timeout after each test.
             const realSetTimeout = globalThis.setTimeout
@@ -213,7 +214,6 @@ for (const implementation of ['native', 'fallback'] as const) {
         }
 
         it('does not send the refresh token to a loopback token endpoint of a public MCP server', async () => {
-            sinon.stub(OAuthClient as any, 'lookupHost').resolves([{ address: '93.184.216.34', family: 4 }])
             const refresh = (OAuthClient as any).refreshGrant(
                 { authorization_endpoint: 'https://auth.example.com/authorize', token_endpoint: endpointUrl },
                 { client_id: 'test-client', client_secret: 'test-secret', redirect_uri: 'http://localhost:1/cb' },

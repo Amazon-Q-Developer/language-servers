@@ -375,11 +375,13 @@ export class OAuthClient {
             const header = h.headers.get('www-authenticate') || ''
             const m = /resource_metadata=(?:"([^"]+)"|([^,\s]+))/i.exec(header)
             if (m) {
-                const metaUrl = new URL(m[1] || m[2], rs).toString()
-                // The resource_metadata link comes from a server-supplied header; require a secure transport.
-                this.assertSecureEndpoint(metaUrl, 'resource metadata')
-                const raw = await this.json<any>(metaUrl, rs, 'resource metadata')
-                return await this.fetchASFromResourceMeta(raw, metaUrl, rs)
+                const metaUrl = new URL(m[1] || m[2], rs)
+                // Match well-known discovery on the configured origin; other origins keep the HTTPS/loopback rule.
+                if (metaUrl.origin !== rs.origin) {
+                    this.assertSecureEndpoint(metaUrl.toString(), 'resource metadata')
+                }
+                const raw = await this.json<any>(metaUrl.toString(), rs, 'resource metadata')
+                return await this.fetchASFromResourceMeta(raw, metaUrl.toString(), rs)
             }
         } catch (e) {
             this.logger.info(`OAuth: WWW-Authenticate discovery failed — ${e instanceof Error ? e.message : String(e)}`)
@@ -588,6 +590,7 @@ export class OAuthClient {
         const state = this.b64url(crypto.randomBytes(16))
 
         const authz = this.validateAuthorizationEndpoint(meta.authorization_endpoint)
+        await this.assertAllowedTarget(authz, rs, 'authorization endpoint')
         authz.search = new URLSearchParams({
             client_id: reg.client_id,
             response_type: 'code',
