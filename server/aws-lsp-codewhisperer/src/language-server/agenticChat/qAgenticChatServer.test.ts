@@ -245,8 +245,10 @@ describe('QAgenticChatServer', () => {
             )
         })
 
-        it('creates a saved prompt when a rule is requested with no workspace folder open', async () => {
+        it('shows a message and creates no saved prompt when a rule is requested with no workspace folder open', async () => {
             testFeatures.workspace.getAllWorkspaceFolders.returns([])
+            const showMessageStub = sinon.stub().resolves()
+            testFeatures.lsp.window.showMessage = showMessageStub
             const handler = testFeatures.chat.onCreatePrompt.firstCall.firstArg
 
             handler({ promptName: 'no-folder-rule', isRule: true })
@@ -256,10 +258,11 @@ describe('QAgenticChatServer', () => {
                 testFeatures.logging.error as sinon.SinonStub,
                 sinon.match(createPromptNotificationType.method)
             )
-            sinon.assert.calledWithMatch(
+            sinon.assert.neverCalledWithMatch(
                 testFeatures.workspace.fs.writeFile as sinon.SinonStub,
                 sinon.match(/no-folder-rule\.md$/)
             )
+            sinon.assert.calledOnce(showMessageStub)
         })
     })
 })

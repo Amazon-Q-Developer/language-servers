@@ -2232,13 +2232,20 @@ describe('AgenticChatController', () => {
             sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
         })
 
-        it('creates a saved prompt file when a rule is requested with no workspace folder open', async () => {
+        it('creates no file and asks for a folder when a rule is requested with no workspace folder open', async () => {
             sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([])
-            const expectedPath = path.join(getUserPromptsDirectory(), `testRule${promptFileExtension}`)
+            const showMessageStub = sinon.stub().resolves()
+            testFeatures.lsp.window.showMessage = showMessageStub
 
             await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
 
-            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+            sinon.assert.neverCalledWith(testFeatures.workspace.fs.mkdir as sinon.SinonStub, getUserPromptsDirectory())
+            sinon.assert.notCalled(fsWriteFileStub)
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.calledOnceWithExactly(showMessageStub, {
+                type: MessageType.Warning,
+                message: 'Open a folder to create a rule.',
+            })
         })
 
         it('creates a rule file in the rules folder of the first workspace folder', async () => {

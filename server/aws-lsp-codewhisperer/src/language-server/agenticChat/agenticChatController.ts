@@ -766,21 +766,27 @@ export class AgenticChatController implements ChatHandlers {
 
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
-            let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            // Rules live in a workspace folder. With no folder open, the request creates a saved prompt below.
-            if (workspaceFolders.length > 0) {
-                const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
-                const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
-                const newFileContent = ''
-                try {
-                    await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
-                    await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
-                    await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
-                } catch (e) {
-                    this.#features.logging.warn(`Error creating rule file: ${e}`)
-                }
+            const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+            // A rule is a file in the rules folder of the first workspace folder, so it needs an open folder.
+            if (workspaceFolders.length === 0) {
+                this.#features.logging.warn('Not creating a rule: no workspace folder is open')
+                await this.#features.lsp.window.showMessage({
+                    type: MessageType.Warning,
+                    message: 'Open a folder to create a rule.',
+                })
                 return
             }
+            const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
+            const newFileContent = ''
+            try {
+                await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
+                await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
+                await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
+            } catch (e) {
+                this.#features.logging.warn(`Error creating rule file: ${e}`)
+            }
+            return
         }
 
         const newFilePath = getNewPromptFilePath(params.promptName)
