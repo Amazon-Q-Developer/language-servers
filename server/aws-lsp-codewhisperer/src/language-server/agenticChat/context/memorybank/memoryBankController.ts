@@ -5,7 +5,8 @@
 
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { MemoryBankPrompts } from './memoryBankPrompts'
-import { isInsideFolder, normalizePathFromUri } from '../../tools/mcp/mcpUtils'
+import { normalizePathFromUri } from '../../tools/mcp/mcpUtils'
+import { isInsideFolder } from '../../tools/toolShared'
 import { MAX_NUMBER_OF_FILES_FOR_MEMORY_BANK_RANKING } from '../../constants/constants'
 
 const MEMORY_BANK_DIRECTORY = '.amazonq/rules/memory-bank'

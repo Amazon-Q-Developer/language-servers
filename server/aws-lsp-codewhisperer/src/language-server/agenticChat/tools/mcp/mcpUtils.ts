@@ -17,11 +17,10 @@ import {
     isRegistryServerConfig,
 } from './mcpTypes'
 import path = require('path')
-import { workspaceUtils } from '@aws/lsp-core'
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
-import { canonicalizeWorkspaceFolders, resolveCanonicalPath } from '../toolShared'
+import { hasAdditionalHardLinks, isInsideFolder, isSamePath, resolveCanonicalPath } from '../toolShared'
 
 /**
  * Load, validate, and parse MCP server configurations from JSON files.
@@ -1128,70 +1127,85 @@ export async function migrateToAgentConfig(workspace: Workspace, logging: Logger
 }
 
 /**
- * Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. A part of the path that
- * does not exist yet is resolved as written. False if it cannot tell, for example for links that point at each
- * other or a folder that cannot be read.
- */
-export async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
-    try {
-        const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
-        return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))
-    } catch {
-        return false
-    }
-}
-
-/**
  * Which agent config a migration writes: the global agent config, or the agent config of a workspace folder, which
  * must stay inside that folder after symbolic links are followed. Every caller states which one, so that no caller
  * can skip the folder check by leaving out the folder.
  */
 export type AgentConfigLocation = { kind: 'global' } | { kind: 'workspace'; folderPath: string }
 
+/** Whether `agentPath` is the global agent config, which only the user writes */
+function isGlobalAgentConfigPath(workspace: Workspace, agentPath: string): boolean {
+    return isSamePath(
+        normalizePathFromUri(agentPath),
+        normalizePathFromUri(getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()))
+    )
+}
+
 /**
- * Whether a migration may write the agent config at `agentPath`: the global one always, and the one of a workspace
- * folder only inside that folder, after symbolic links are followed. Logs a warning if not.
+ * Why a write to the agent config of a workspace folder at `agentPath` is refused, or undefined if it may go ahead.
+ * After every symbolic link in it is followed, `agentPath` must be inside one of `folderPaths`, and a file that is
+ * already there must have no other name on disk, because the write would change the file under that name too.
+ */
+async function workspaceAgentConfigWriteRefusal(folderPaths: string[], agentPath: string): Promise<string | undefined> {
+    for (const folderPath of folderPaths) {
+        if (await isInsideFolder(folderPath, agentPath)) {
+            try {
+                return (await hasAdditionalHardLinks(await resolveCanonicalPath(agentPath)))
+                    ? 'it is also reachable under another name on disk'
+                    : undefined
+            } catch {
+                return 'it could not be resolved'
+            }
+        }
+    }
+    return 'it is outside the workspace folder after symbolic links are followed, or could not be resolved'
+}
+
+/**
+ * Whether a migration may write the agent config at `agentPath`: the global agent config when the location says
+ * so and the path is that file, and the agent config of a workspace folder only as workspaceAgentConfigWriteRefusal
+ * allows. Logs a warning if not.
  */
 async function mayMigrateAgentConfig(
+    workspace: Workspace,
     logging: Logger,
     agentPath: string,
     location: AgentConfigLocation,
     action: 'create' | 'update'
 ): Promise<boolean> {
-    if (location.kind === 'global' || (await isInsideFolder(location.folderPath, agentPath))) {
-        return true
+    let refusal: string | undefined
+    if (location.kind === 'global') {
+        refusal = isGlobalAgentConfigPath(workspace, agentPath) ? undefined : 'it is not the global agent config'
+    } else {
+        refusal = await workspaceAgentConfigWriteRefusal([location.folderPath], agentPath)
     }
-    logging.warn(
-        `Did not ${action} the agent config ${JSON.stringify(agentPath)} because it is not inside the workspace folder, or could not be resolved, after symbolic links are followed`
-    )
-    return false
+    if (refusal) {
+        logging.warn(`Did not ${action} the agent config ${JSON.stringify(agentPath)} because ${refusal}`)
+        return false
+    }
+    return true
 }
 
 /**
- * Whether a save of the agent config at `agentPath` may go ahead. The global agent config always may; a workspace
- * folder's agent config may only when `agentPath`, after every symbolic link in it is followed, stays inside one of
- * the open workspace folders. Logs a warning and returns false otherwise. The agent-config save functions call this
- * before writing, so a server add, remove, or permission change does not write the agent config to a location
- * outside the workspace folder.
+ * Throws if a save may not write the agent config at `agentPath`. The global agent config may always be written,
+ * and the agent config of a workspace folder only as workspaceAgentConfigWriteRefusal allows for the open workspace
+ * folders. The save functions call this before they write and throw its error, so the caller of a refused server
+ * add, remove, or permission change reports the error instead of a saved change. A change that removes a server
+ * before it saves the new one, such as an edit, calls it first for the new location.
  */
-async function mayWriteAgentConfig(workspace: Workspace, logging: Logger, agentPath: string): Promise<boolean> {
-    const normalizedPath = normalizePathFromUri(agentPath, logging)
-    const globalPath = normalizePathFromUri(getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()))
-    // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
-    const pathKey = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
-    if (pathKey(normalizedPath) === pathKey(globalPath)) {
-        return true
+export async function checkAgentConfigWrite(workspace: Workspace, logging: Logger, agentPath: string): Promise<void> {
+    if (isGlobalAgentConfigPath(workspace, agentPath)) {
+        return
     }
-    const wsUris = workspace.getAllWorkspaceFolders()?.map(folder => folder.uri) ?? []
-    for (const uri of wsUris) {
-        if (await isInsideFolder(normalizePathFromUri(uri, logging), normalizedPath)) {
-            return true
-        }
+    const folderPaths =
+        workspace.getAllWorkspaceFolders()?.map(folder => normalizePathFromUri(folder.uri, logging)) ?? []
+    const refusal = await workspaceAgentConfigWriteRefusal(folderPaths, normalizePathFromUri(agentPath, logging))
+    if (refusal) {
+        // The message does not repeat the path: handleError reads some error words in a message, which a path
+        // could contain, as a dropped connection
+        logging.warn(`The agent config ${JSON.stringify(agentPath)} was not saved because ${refusal}`)
+        throw new Error(`The agent config was not saved because ${refusal}`)
     }
-    logging.warn(
-        `Did not save the agent config ${JSON.stringify(agentPath)} because it is not inside a workspace folder, or could not be resolved, after symbolic links are followed`
-    )
-    return false
 }
 
 /**
@@ -1222,7 +1236,7 @@ async function migrateConfigToAgent(
         return
     }
 
-    if (!(await mayMigrateAgentConfig(logging, agentPath, location, 'create'))) {
+    if (!(await mayMigrateAgentConfig(workspace, logging, agentPath, location, 'create'))) {
         return
     }
 
@@ -1306,9 +1320,7 @@ export async function saveAgentConfig(
     configPath: string
 ): Promise<void> {
     try {
-        if (!(await mayWriteAgentConfig(workspace, logging, configPath))) {
-            return
-        }
+        await checkAgentConfigWrite(workspace, logging, configPath)
         await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
         // Save the whole config
         await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
@@ -1334,9 +1346,7 @@ export async function saveServerSpecificAgentConfig(
     skipMcpServerConfig: boolean = false
 ): Promise<void> {
     try {
-        if (!(await mayWriteAgentConfig(workspace, logging, configPath))) {
-            return
-        }
+        await checkAgentConfigWrite(workspace, logging, configPath)
         await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
 
         // Read existing config
@@ -1412,7 +1422,7 @@ export async function migrateAgentConfigToCLIFormat(
     try {
         const exists = await workspace.fs.exists(configPath)
         if (!exists) return
-        if (!(await mayMigrateAgentConfig(logging, configPath, location, 'update'))) return
+        if (!(await mayMigrateAgentConfig(workspace, logging, configPath, location, 'update'))) return
 
         const raw = await workspace.fs.readFile(configPath)
         const config = JSON.parse(raw.toString())

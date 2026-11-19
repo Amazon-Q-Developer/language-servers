@@ -400,6 +400,162 @@ describe('McpEventHandler error handling', () => {
             expect(result.list.map(group => group.groupName)).to.deep.equal(['Disabled'])
         })
 
+        describe('saving an edit that cannot be applied', () => {
+            it('stays on the edit page with the reason and does not add or clean up a server', async () => {
+                await setupServers(new Map([['srv', { command: 'npx', disabled: false }]]), {
+                    srv: McpServerStatus.ENABLED,
+                })
+                const mgr = McpManager.instance
+                const reason =
+                    'The agent config "default.json" was not saved because it is outside the workspace folder'
+                sinon.stub(mgr, 'removeServer').rejects(new Error(reason))
+                const addServer = sinon.stub(mgr, 'addServer').resolves()
+                const removeFromFile = sinon.stub(mgr, 'removeServerFromConfigFile').resolves()
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'srv' })
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'srv',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'global',
+                    },
+                } as any)
+
+                sinon.assert.notCalled(addServer)
+                sinon.assert.notCalled(removeFromFile)
+                expect(result.id).to.equal('edit-mcp')
+                expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
+            })
+
+            it('does not remove the server when the edited server cannot be saved where it goes', async () => {
+                await setupServers(new Map([['srv', { command: 'npx', disabled: false }]]), {
+                    srv: McpServerStatus.ENABLED,
+                })
+                const mgr = McpManager.instance
+                const reason =
+                    'The agent config "default.json" was not saved because it is outside the workspace folder'
+                const check = sinon.stub(mcpUtils, 'checkAgentConfigWrite').rejects(new Error(reason))
+                const removeServer = sinon.stub(mgr, 'removeServer').resolves()
+                const addServer = sinon.stub(mgr, 'addServer').resolves()
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'srv' })
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'srv',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'workspace',
+                    },
+                } as any)
+
+                sinon.assert.calledOnce(check)
+                sinon.assert.notCalled(removeServer)
+                sinon.assert.notCalled(addServer)
+                expect(result.id).to.equal('edit-mcp')
+                expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
+            })
+
+            it('checks the agent config next to the mcp.json when a legacy server is edited', async () => {
+                await setupServers(
+                    new Map([['srv', { command: 'npx', disabled: false, __configPath__: 'ws/.amazonq/mcp.json' }]]),
+                    { srv: McpServerStatus.ENABLED }
+                )
+                const mgr = McpManager.instance
+                const check = sinon.stub(mcpUtils, 'checkAgentConfigWrite').rejects(new Error('not saved'))
+                const removeServer = sinon.stub(mgr, 'removeServer').resolves()
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'srv' })
+                await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'srv',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'global',
+                    },
+                } as any)
+
+                sinon.assert.calledOnceWithMatch(
+                    check,
+                    sinon.match.any,
+                    sinon.match.any,
+                    mcpUtils.getAgentConfigPathForMcpConfig(
+                        mcpUtils.getGlobalMcpConfigPath(features.workspace.fs.getUserHomeDir())
+                    )
+                )
+                sinon.assert.notCalled(removeServer)
+            })
+
+            it('does not remove a registry server when the updated server cannot be saved where it goes', async () => {
+                await setupServers(new Map([['srv', { url: 'https://example.com/mcp', disabled: false }]]), {
+                    srv: McpServerStatus.ENABLED,
+                })
+                const mgr = McpManager.instance
+                sinon.stub(mgr, 'getRegistryService').returns({
+                    isRegistryActive: () => true,
+                    getServerByName: () => ({
+                        name: 'srv',
+                        version: '1.0.0',
+                        remotes: [{ type: 'streamable-http', url: 'https://example.com/mcp' }],
+                    }),
+                } as any)
+                const reason = 'The agent config was not saved because it is outside the workspace folder'
+                const check = sinon.stub(mcpUtils, 'checkAgentConfigWrite').rejects(new Error(reason))
+                const removeServer = sinon.stub(mgr, 'removeServer').resolves()
+                const addRegistryServer = sinon.stub(mgr, 'addRegistryServer').resolves()
+
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    title: 'srv',
+                    optionsValues: { name: 'srv', timeout: '60', scope: 'workspace', additional_headers: [] },
+                } as any)
+
+                sinon.assert.calledOnce(check)
+                sinon.assert.notCalled(removeServer)
+                sinon.assert.notCalled(addRegistryServer)
+                expect(result.header.status.title).to.include(reason)
+            })
+
+            it('stays on the add form with the reason and does not add a server that cannot be saved', async () => {
+                await setupServers(new Map(), {})
+                const mgr = McpManager.instance
+                const reason =
+                    'The agent config "default.json" was not saved because it is outside the workspace folder'
+                const check = sinon.stub(mcpUtils, 'checkAgentConfigWrite').rejects(new Error(reason))
+                const addServer = sinon.stub(mgr, 'addServer').resolves()
+
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'my server',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'workspace',
+                    },
+                } as any)
+
+                sinon.assert.calledOnce(check)
+                sinon.assert.notCalled(addServer)
+                expect(result.id).to.equal('add-new-mcp')
+                expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
+            })
+        })
+
         describe('servers held back by the workspace trust check', () => {
             const trustHoldCases = [
                 {

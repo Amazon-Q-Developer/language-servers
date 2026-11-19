@@ -43,6 +43,16 @@ import {
 } from './mcpUtils'
 import { getReservedBuiltInToolNames, STATIC_BUILT_IN_TOOL_NAMES } from '../../constants/toolConstants'
 import type { MCPServerConfig } from './mcpTypes'
+
+/** The error that `promise` rejects with. Fails the test if the promise resolves. */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+    try {
+        await promise
+    } catch (error) {
+        return error as Error
+    }
+    throw new Error('Expected the promise to reject')
+}
 import { McpPermissionType } from './mcpTypes'
 import { pathToFileURL } from 'url'
 import * as sinon from 'sinon'
@@ -487,8 +497,8 @@ describe('saveAgentConfig', () => {
             // A link on Windows may need a privilege the test does not have
             this.skip()
         }
-        const warnings: string[] = []
-        logger.warn = (message: string) => warnings.push(message)
+        const errors: string[] = []
+        logger.error = (message: string) => errors.push(message)
         const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
         const config = {
             name: 'test-agent',
@@ -501,10 +511,11 @@ describe('saveAgentConfig', () => {
             resources: [],
         }
 
-        await saveAgentConfig(workspace, logger, config, configPath)
+        const error = await rejectionOf(saveAgentConfig(workspace, logger, config, configPath))
 
+        expect(error.message).to.include('was not saved because it is outside the workspace folder')
         expect(fs.readdirSync(outsideDir)).to.deep.equal([])
-        expect(warnings.filter(warning => warning.includes('Did not save the agent config'))).to.have.length(1)
+        expect(errors.filter(message => message.includes('was not saved'))).to.have.length(1)
     })
 })
 
@@ -1369,6 +1380,39 @@ describe('migrateToAgentConfig', () => {
             const leftOut: Parameters<typeof migrateAgentConfigToCLIFormat> = [workspace, logger, agentPath]
             expect(leftOut).to.have.length(3)
         })
+
+        it('does not update a workspace agent config that is also reachable under another name', async function () {
+            if (process.platform === 'win32') {
+                this.skip()
+            }
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            const outsideFile = path.join(outsideDir, 'settings.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(outsideFile, legacyAgentConfig)
+            fs.linkSync(outsideFile, agentPath)
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            expect(fs.readFileSync(outsideFile, 'utf-8')).to.equal(legacyAgentConfig)
+            expect(
+                warnings.filter(warning => warning.includes(updateRefusal) && warning.includes('another name'))
+            ).to.have.length(1)
+        })
+
+        it('does not update a workspace agent config that a caller calls the global one', async () => {
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(agentPath, legacyAgentConfig)
+
+            await migrateAgentConfigToCLIFormat(workspace, logger, agentPath, { kind: 'global' })
+
+            expect(fs.readFileSync(agentPath, 'utf-8')).to.equal(legacyAgentConfig)
+            expect(
+                warnings.filter(
+                    warning => warning.includes(updateRefusal) && warning.includes('it is not the global agent config')
+                )
+            ).to.have.length(1)
+        })
     })
 })
 describe('loadAgentConfig with registry support', () => {
@@ -1744,22 +1788,81 @@ describe('saveServerSpecificAgentConfig', () => {
             // A link on Windows may need a privilege the test does not have
             this.skip()
         }
-        const warnings: string[] = []
-        logger.warn = (message: string) => warnings.push(message)
+        const errors: string[] = []
+        logger.error = (message: string) => errors.push(message)
         const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
 
-        await saveServerSpecificAgentConfig(
-            workspace,
-            logger,
-            'testServer',
-            { command: 'c' },
-            ['@testServer'],
-            [],
-            configPath
+        const error = await rejectionOf(
+            saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
         )
 
+        expect(error.message).to.include('was not saved because it is outside the workspace folder')
         expect(fs.readdirSync(outsideDir)).to.deep.equal([])
-        expect(warnings.filter(warning => warning.includes('Did not save the agent config'))).to.have.length(1)
+        expect(errors.filter(message => message.includes('was not saved'))).to.have.length(1)
+    })
+
+    it('does not write an agent config that is also reachable under another name', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+        }
+        const wsDir = path.join(tmpDir, 'repo')
+        const outsideFile = path.join(tmpDir, 'outside.json')
+        const original = JSON.stringify({ name: 'other file', mcpServers: {}, tools: [], allowedTools: [] })
+        fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'), { recursive: true })
+        fs.writeFileSync(outsideFile, original)
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+        // default.json and a file outside the workspace folder are the same file on disk
+        fs.linkSync(outsideFile, configPath)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+
+        const error = await rejectionOf(
+            saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+        )
+
+        expect(error.message).to.include('was not saved because it is also reachable under another name')
+        expect(fs.readFileSync(outsideFile, 'utf-8')).to.equal(original)
+    })
+
+    it('writes the global agent config when its path differs only in letter case on macOS', async () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'darwin' })
+        try {
+            const wsDir = path.join(tmpDir, 'repo')
+            fs.mkdirSync(wsDir, { recursive: true })
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+            // getUserHomeDir() is tmpDir/home (set in beforeEach); this path differs from it only in letter case
+            const configPath = getGlobalAgentConfigPath(path.join(tmpDir, 'HOME'))
+
+            await saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+
+            expect(fs.existsSync(configPath)).to.be.true
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
+        }
     })
 
     it('writes the agent config of a workspace folder with no links', async () => {

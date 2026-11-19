@@ -28,6 +28,7 @@ import {
 import {
     isEmptyEnv,
     loadAgentConfig,
+    checkAgentConfigWrite,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
@@ -1455,6 +1456,21 @@ export class McpManager {
             throw new Error(`MCP: server '${serverName}' not found`)
         }
 
+        // Check if this is a legacy MCP server (from MCP config file)
+        const isLegacyMcpServer = cfg.__configPath__?.endsWith('mcp.json')
+        const agentPath = isLegacyMcpServer ? getAgentConfigPathForMcpConfig(cfg.__configPath__) : cfg.__configPath__
+        const removesFromAgentConfig = !skipAgentConfigRemoval && !!unsanitizedName && !!this.agentConfig
+
+        // Report an agent config that may not be written before anything changes, so the server stays as it was
+        if (removesFromAgentConfig) {
+            try {
+                await checkAgentConfigWrite(this.features.workspace, this.features.logging, agentPath)
+            } catch (err) {
+                this.handleError(serverName, err)
+                throw err
+            }
+        }
+
         const client = this.clients.get(serverName)
         if (client) {
             await client.close()
@@ -1470,10 +1486,6 @@ export class McpManager {
             await removeApproval(this.features.workspace, this.features.logging, serverName, normalizedPath)
         }
 
-        // Check if this is a legacy MCP server (from MCP config file)
-        const isLegacyMcpServer = cfg.__configPath__?.endsWith('mcp.json')
-        let agentPath: string | undefined
-
         if (isLegacyMcpServer && unsanitizedName) {
             // Remove from MCP config file
             await this.mutateConfigFile(cfg.__configPath__, (json: any) => {
@@ -1481,14 +1493,12 @@ export class McpManager {
                     delete json.mcpServers[unsanitizedName]
                 }
             })
-
-            agentPath = getAgentConfigPathForMcpConfig(cfg.__configPath__)
         }
 
         // Remove from agent config (unless skipAgentConfigRemoval is true)
-        if (!skipAgentConfigRemoval && unsanitizedName && this.agentConfig) {
+        if (removesFromAgentConfig) {
             // Remove server from mcpServers
-            delete this.agentConfig.mcpServers[unsanitizedName]
+            delete this.agentConfig.mcpServers[unsanitizedName!]
 
             // Remove server tools from tools list
             this.agentConfig.tools = this.agentConfig.tools.filter(tool => {
@@ -1520,11 +1530,11 @@ export class McpManager {
             await saveServerSpecificAgentConfig(
                 this.features.workspace,
                 this.features.logging,
-                unsanitizedName,
+                unsanitizedName!,
                 null, // null indicates server should be removed
                 [],
                 [],
-                isLegacyMcpServer ? agentPath! : cfg.__configPath__,
+                agentPath,
                 isLegacyMcpServer
             )
         }
@@ -1754,6 +1764,15 @@ export class McpManager {
 
             // Check if this is a legacy MCP server (from MCP config file)
             const isLegacyMcpServer = serverConfig.__configPath__?.endsWith('mcp.json')
+
+            // The agent config that the permissions are saved to. Report one that may not be written before
+            // anything changes, so the server keeps its permissions and state.
+            const permissionAgentPath = isLegacyMcpServer
+                ? getAgentConfigPathForMcpConfig(serverConfig.__configPath__!)
+                : perm.__configPath__
+            if (permissionAgentPath) {
+                await checkAgentConfigWrite(this.features.workspace, this.features.logging, permissionAgentPath)
+            }
 
             // For agent config servers, use the permission manager
             for (const [toolName, permission] of Object.entries(perm.toolPerms || {})) {

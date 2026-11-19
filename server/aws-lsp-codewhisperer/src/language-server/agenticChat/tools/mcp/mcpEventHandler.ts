@@ -14,6 +14,8 @@ import {
 } from '@aws/language-server-runtimes/protocol'
 
 import {
+    checkAgentConfigWrite,
+    getAgentConfigPathForMcpConfig,
     getGlobalAgentConfigPath,
     getWorkspaceAgentConfigPaths,
     sanitizeName,
@@ -947,6 +949,12 @@ export class McpEventHandler {
                 const isLegacyMcpServer = serverConfig?.__configPath__?.endsWith('mcp.json') ?? false
                 const configPath = isLegacyMcpServer ? await this.#getMcpConfigPath(isGlobal) : agentPath
                 try {
+                    // The edited server must be savable where it goes before the old one is removed
+                    await checkAgentConfigWrite(
+                        this.#features.workspace,
+                        this.#features.logging,
+                        isLegacyMcpServer ? getAgentConfigPathForMcpConfig(configPath) : configPath
+                    )
                     await McpManager.instance.removeServer(serverToRemove)
                     await McpManager.instance.addServer(serverName, config, configPath, isLegacyMcpServer)
                 } catch (error) {
@@ -956,6 +964,8 @@ export class McpEventHandler {
             } else {
                 // Create new server
                 try {
+                    // A new server that cannot be saved where it goes is not added
+                    await checkAgentConfigWrite(this.#features.workspace, this.#features.logging, agentPath)
                     await McpManager.instance.addServer(serverName, config, agentPath)
                 } catch (error) {
                     this.#features.logging.error(`McpManager not initialized for addServer: ${error}`)
@@ -965,6 +975,16 @@ export class McpEventHandler {
             }
         } catch (error) {
             this.#features.logging.error(`Failed to enable MCP server: ${error}`)
+            // The change did not go through, for example because the agent config may not be written where the server
+            // is saved: stay on the form and show why, as for an invalid form
+            const message = error instanceof Error ? error.message : String(error)
+            this.#releaseProgrammaticAfterDebounce()
+            if (isEditMode && originalServerName) {
+                params.id = 'edit-mcp'
+                return this.#handleEditMcpServer({ ...params, title: originalServerName }, message)
+            }
+            params.id = 'add-new-mcp'
+            return this.#handleAddNewMcp(params, message)
         }
 
         this.#currentEditingServerName = undefined
@@ -2269,6 +2289,8 @@ export class McpEventHandler {
         this.#isProgrammaticChange = true
 
         try {
+            // The updated server must be savable where it goes before the old one is removed
+            await checkAgentConfigWrite(this.#features.workspace, this.#features.logging, agentPath)
             await McpManager.instance.removeServer(sanitizedServerName)
             await McpManager.instance.addRegistryServer(
                 sanitizedServerName,

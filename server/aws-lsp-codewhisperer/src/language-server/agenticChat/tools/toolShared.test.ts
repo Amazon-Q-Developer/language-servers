@@ -5,6 +5,7 @@ import * as path from 'path'
 import sinon from 'ts-sinon'
 import {
     hasAdditionalHardLinks,
+    isInsideFolder,
     isPathApproved,
     isRegularFile,
     requiresPathAcceptance,
@@ -1183,6 +1184,58 @@ describe('toolShared', () => {
             assert.strictEqual(await isRegularFile(file), true)
             assert.strictEqual(await isRegularFile(dir), false)
             assert.strictEqual(await isRegularFile(path.join(dir, 'missing.txt')), false)
+        })
+    })
+
+    describe('isInsideFolder', () => {
+        let root: string
+        let folder: string
+        let outside: string
+
+        beforeEach(async () => {
+            root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'inside-folder-'))
+            folder = path.join(root, 'repo')
+            outside = path.join(root, 'outside')
+            await fs.promises.mkdir(folder)
+            await fs.promises.mkdir(outside)
+        })
+
+        afterEach(async () => {
+            await fs.promises.rm(root, { recursive: true, force: true })
+        })
+
+        it('is true for a path in the folder, also one that does not exist yet', async () => {
+            await fs.promises.writeFile(path.join(folder, 'a.json'), '{}')
+
+            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'a.json')), true)
+            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'new', 'b.json')), true)
+        })
+
+        it('is false for the folder itself and for a path next to it', async () => {
+            assert.strictEqual(await isInsideFolder(folder, folder), false)
+            assert.strictEqual(await isInsideFolder(folder, path.join(outside, 'a.json')), false)
+        })
+
+        it('follows a folder link: false when it leads out of the folder, true when it stays in', async () => {
+            const type = process.platform === 'win32' ? 'junction' : 'dir'
+            await fs.promises.mkdir(path.join(folder, 'inner'))
+            await fs.promises.symlink(outside, path.join(folder, 'out-link'), type)
+            await fs.promises.symlink(path.join(folder, 'inner'), path.join(folder, 'in-link'), type)
+
+            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'out-link', 'a.json')), false)
+            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'in-link', 'a.json')), true)
+        })
+
+        it('is false when the links in the path cannot be resolved', async function (this: Context) {
+            try {
+                await fs.promises.symlink(path.join(folder, 'b'), path.join(folder, 'a'), 'file')
+                await fs.promises.symlink(path.join(folder, 'a'), path.join(folder, 'b'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'a')), false)
         })
     })
 
