@@ -20,6 +20,9 @@ jobs:
               run: |
                   npm ci
                   npm run check:formatting
+            - name: Webworker Test
+              run: |
+                  npm run test -w app/aws-lsp-codewhisperer-runtimes
             - name: Test with Coverage
               run: |
                   npm run test:coverage
