@@ -7,7 +7,7 @@ import { MessageType } from '@aws/language-server-runtimes/protocol'
 import { Logging, Notification } from '@aws/language-server-runtimes/server-interface'
 import * as assert from 'assert'
 import * as sinon from 'sinon'
-import { createQDevAccessBlockedNotifier } from './qDevAccessBlockedNotifier'
+import { createQDevAccessBlockedNotifier, Q_DEV_ACCESS_BLOCKED_NOTIFICATION_ID } from './qDevAccessBlockedNotifier'
 
 describe('createQDevAccessBlockedNotifier', function () {
     let showNotification: sinon.SinonStub
@@ -40,6 +40,8 @@ describe('createQDevAccessBlockedNotifier', function () {
         const params = showNotification.firstCall.args[0]
         assert.strictEqual(params.type, MessageType.Error)
         assert.strictEqual(params.content.text, serviceMessage)
+        // Clients key off the id rather than the message text, which is service-owned copy.
+        assert.strictEqual(params.id, Q_DEV_ACCESS_BLOCKED_NOTIFICATION_ID)
     })
 
     it('notifies at most once, since every request from a blocked identity fails', function () {
