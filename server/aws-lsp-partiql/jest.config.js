@@ -13,4 +13,12 @@ module.exports = {
 
     // The glob patterns Jest uses to detect test files
     testMatch: ['**/*.test.ts?(x)'],
+
+    // Coverage (npm run test:coverage) leaves out the generated parser code and the inline binaries
+    coveragePathIgnorePatterns: [
+        '/node_modules/',
+        '/src/antlr-generated/',
+        '/src/partiql-parser-wasm/',
+        '/src/tree-sitter-wasm/',
+    ],
 }
