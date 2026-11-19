@@ -1428,6 +1428,38 @@ describe('saveServerSpecificAgentConfig', () => {
         expect(content.tools).to.include('fs_read')
     })
 
+    it('keeps the entries that are not strings when it replaces the entries of a server', async () => {
+        const configPath = path.join(tmpDir, 'agent-config.json')
+        fs.writeFileSync(
+            configPath,
+            JSON.stringify({
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: { testServer: { command: 'old-cmd' } },
+                tools: ['fs_read', 42, '@testServer/oldTool', { name: 'fs_write' }],
+                allowedTools: [null, '@testServer/oldAllowedTool'],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            })
+        )
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'new-cmd' },
+            ['@testServer'],
+            ['@testServer/newTool'],
+            configPath
+        )
+
+        const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        expect(content.tools).to.deep.equal(['fs_read', 42, { name: 'fs_write' }, '@testServer'])
+        expect(content.allowedTools).to.deep.equal([null, '@testServer/newTool'])
+        expect(content.mcpServers.testServer).to.deep.equal({ command: 'new-cmd' })
+    })
+
     it('creates parent directories if they do not exist', async () => {
         const configPath = path.join(tmpDir, 'nested', 'dir', 'agent-config.json')
         const serverConfig = { command: 'test-cmd' }

@@ -1304,14 +1304,11 @@ export async function saveServerSpecificAgentConfig(
             existingConfig = JSON.parse(DEFAULT_AGENT_RAW)
         }
 
-        // Remove existing server tools from arrays
-        const serverPrefix = `@${serverName}`
-        existingConfig.tools = existingConfig.tools.filter(
-            tool => tool !== serverPrefix && !tool.startsWith(`${serverPrefix}/`)
-        )
-        existingConfig.allowedTools = existingConfig.allowedTools.filter(
-            tool => tool !== serverPrefix && !tool.startsWith(`${serverPrefix}/`)
-        )
+        // Remove existing server tools from arrays. An entry that is not a string stays as it is: loading skips it,
+        // and this save changes only the entries of the server.
+        const isServerEntry = (tool: unknown) => typeof tool === 'string' && isPermissionForServer(tool, serverName)
+        existingConfig.tools = existingConfig.tools.filter(tool => !isServerEntry(tool))
+        existingConfig.allowedTools = existingConfig.allowedTools.filter(tool => !isServerEntry(tool))
 
         if (!isLegacyMcpServer && !skipMcpServerConfig) {
             if (serverConfig === null) {
