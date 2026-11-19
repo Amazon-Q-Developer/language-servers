@@ -4,7 +4,7 @@ import * as os from 'os'
 import * as path from 'path'
 import * as sinon from 'sinon'
 import { chmod } from 'fs/promises'
-import { ChildProcess, ChildProcessResult, ChildProcessTracker, eof } from './processUtils'
+import { ChildProcess, ChildProcessResult, ChildProcessTracker, eof, parseCimProcessStats } from './processUtils'
 import { waitUntil } from './timeoutUtils'
 import { TestFolder } from '../test/testFolder'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
@@ -392,6 +392,33 @@ describe('ChildProcessTracker', function () {
             assert.strictEqual(warnings.length, 1)
             assert.ok(warnings[0].includes('1'))
         })
+    })
+})
+
+describe('parseCimProcessStats', function () {
+    it('parses a single-object JSON result', function () {
+        const output = '{\r\n    "PercentProcessorTime":  42,\r\n    "WorkingSet":  157286400\r\n}\r\n'
+        assert.deepStrictEqual(parseCimProcessStats(output), { cpu: 42, memory: 157286400 })
+    })
+
+    it('uses the first entry of an array result', function () {
+        const output =
+            '[{"PercentProcessorTime": 7, "WorkingSet": 1048576}, {"PercentProcessorTime": 99, "WorkingSet": 2097152}]'
+        assert.deepStrictEqual(parseCimProcessStats(output), { cpu: 7, memory: 1048576 })
+    })
+
+    it('returns zero usage for empty output (process already exited)', function () {
+        assert.deepStrictEqual(parseCimProcessStats(''), { cpu: 0, memory: 0 })
+        assert.deepStrictEqual(parseCimProcessStats('\r\n'), { cpu: 0, memory: 0 })
+    })
+
+    it('returns zero usage when properties are missing', function () {
+        assert.deepStrictEqual(parseCimProcessStats('{}'), { cpu: 0, memory: 0 })
+        assert.deepStrictEqual(parseCimProcessStats('null'), { cpu: 0, memory: 0 })
+    })
+
+    it('throws on malformed output so the caller can log it', function () {
+        assert.throws(() => parseCimProcessStats('not json'))
     })
 })
 
