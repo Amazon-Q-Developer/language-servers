@@ -66,6 +66,31 @@ export const getUserPromptsDirectory = (): string => {
 }
 
 /**
+ * Truncates context content (e.g. an `@file` or pinned file) to `maxLength` characters.
+ *
+ * When the content is cut, an explicit marker is appended so the model knows it is only
+ * seeing the beginning of the file and should read the rest via tools instead of assuming
+ * the file ends where the excerpt ends. The returned string never exceeds `maxLength`.
+ *
+ * @param content - Full content of the context item
+ * @param maxLength - Maximum number of characters allowed for the returned string
+ * @returns The original content if it fits, otherwise a truncated prefix followed by a marker
+ */
+export function truncateContextContent(content: string, maxLength: number): string {
+    if (content.length <= maxLength) {
+        return content
+    }
+
+    const marker = `\n\n[Content truncated: this file has ${content.length} characters, only the beginning is included above. Read the file directly to see the rest.]`
+
+    if (marker.length >= maxLength) {
+        return content.substring(0, maxLength)
+    }
+
+    return content.substring(0, maxLength - marker.length) + marker
+}
+
+/**
  * Creates a secure file path for a new prompt file.
  *
  * @param promptName - The user-provided name for the prompt
