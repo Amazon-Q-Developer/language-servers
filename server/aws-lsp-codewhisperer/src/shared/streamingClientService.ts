@@ -18,7 +18,7 @@ import {
     Logging,
     IamCredentials,
 } from '@aws/language-server-runtimes/server-interface'
-import { getBearerTokenFromProvider, isUsageLimitError } from './utils'
+import { getBearerTokenFromProvider, isUsageLimitError, isQDevPluginAccessBlockedError } from './utils'
 import { CLIENT_TIMEOUT_MS, MAX_REQUEST_ATTEMPTS } from '../language-server/agenticChat/constants/constants'
 
 import { AmazonQUsageLimitError } from './amazonQServiceManager/errors'
@@ -72,6 +72,12 @@ export abstract class StreamingClientServiceBase {
 }
 
 export class StreamingClientServiceToken extends StreamingClientServiceBase {
+    /**
+     * Observes Q Developer plugin access-blocked rejections. Assigned by the service manager after
+     * construction, so the middleware below reads it at call time rather than capturing it.
+     */
+    public onAccessBlocked?: (error: unknown) => void
+
     client: CodeWhispererStreaming
     public profileArn?: string
     private retryClassifier: QRetryClassifier
@@ -130,6 +136,37 @@ export class StreamingClientServiceToken extends StreamingClientServiceBase {
             },
             {
                 step: 'build',
+            }
+        )
+
+        // Observe access-blocked rejections without altering behaviour: the error is always rethrown
+        // so callers see it exactly as before. Registered on the outermost (initialize) step so it
+        // fires once per operation, after the SDK's retries are exhausted, rather than once per
+        // attempt. Chat runs through this client, so without it a blocked identity goes unnoticed
+        // unless some other client happens to be called.
+        this.client.middlewareStack.add(
+            next => async args => {
+                try {
+                    return await next(args)
+                } catch (e) {
+                    if (isQDevPluginAccessBlockedError(e)) {
+                        try {
+                            this.onAccessBlocked?.(e)
+                        } catch (observerError) {
+                            logging.debug(
+                                `onAccessBlocked observer threw, ignoring: ${(observerError as Error)?.message}`
+                            )
+                        }
+                    }
+                    throw e
+                }
+            },
+            {
+                step: 'initialize',
+                // Named so a second registration replaces this one rather than stacking another
+                // observer, and so the middleware is identifiable in SDK stack introspection. Matches
+                // the token client's registration.
+                name: 'detectQDevPluginAccessBlocked',
             }
         )
     }
