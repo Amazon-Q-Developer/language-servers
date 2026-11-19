@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.24](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-partiql/v0.0.23...lsp-partiql/v0.0.24) (2026-08-18)
+
+
+### Bug Fixes
+
+* repoint CODEOWNERS and package repository URLs to the new org ([#2838](https://github.com/Amazon-Q-Developer/language-servers/issues/2838)) ([43e44dc](https://github.com/Amazon-Q-Developer/language-servers/commit/43e44dc5af94703f51456cd8a913f0d61af7570e))
+
 ## [0.0.23](https://github.com/aws/language-servers/compare/lsp-partiql/v0.0.22...lsp-partiql/v0.0.23) (2026-02-17)
 
 
