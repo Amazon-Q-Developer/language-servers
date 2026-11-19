@@ -13,6 +13,7 @@
     "scripts": {
         "compile": "tsc --build",
         "test": "jest",
+        "test:coverage": "jest",
         "postcompile": "npm run copy-empty-binary",
         "copy-empty-binary": "tsx build-scripts/create-empty-wasm-file.mts",
         "update-parser-binary": "tsx build-scripts/compile-inline-partiql-wasm.mts",
