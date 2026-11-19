@@ -1168,6 +1168,33 @@ async function mayMigrateAgentConfig(
 }
 
 /**
+ * Whether a save of the agent config at `agentPath` may go ahead. The global agent config always may; a workspace
+ * folder's agent config may only when `agentPath`, after every symbolic link in it is followed, stays inside one of
+ * the open workspace folders. Logs a warning and returns false otherwise. The agent-config save functions call this
+ * before writing, so a server add, remove, or permission change does not write the agent config to a location
+ * outside the workspace folder.
+ */
+async function mayWriteAgentConfig(workspace: Workspace, logging: Logger, agentPath: string): Promise<boolean> {
+    const normalizedPath = normalizePathFromUri(agentPath, logging)
+    const globalPath = normalizePathFromUri(getGlobalAgentConfigPath(workspace.fs.getUserHomeDir()))
+    // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
+    const pathKey = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
+    if (pathKey(normalizedPath) === pathKey(globalPath)) {
+        return true
+    }
+    const wsUris = workspace.getAllWorkspaceFolders()?.map(folder => folder.uri) ?? []
+    for (const uri of wsUris) {
+        if (await isInsideFolder(normalizePathFromUri(uri, logging), normalizedPath)) {
+            return true
+        }
+    }
+    logging.warn(
+        `Did not save the agent config ${JSON.stringify(agentPath)} because it is not inside a workspace folder, or could not be resolved, after symbolic links are followed`
+    )
+    return false
+}
+
+/**
  * Migrate a specific config and persona to an agent config
  * @param location The global agent config, or a workspace folder that the agent config must be written in
  */
@@ -1279,6 +1306,9 @@ export async function saveAgentConfig(
     configPath: string
 ): Promise<void> {
     try {
+        if (!(await mayWriteAgentConfig(workspace, logging, configPath))) {
+            return
+        }
         await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
         // Save the whole config
         await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
@@ -1304,6 +1334,9 @@ export async function saveServerSpecificAgentConfig(
     skipMcpServerConfig: boolean = false
 ): Promise<void> {
     try {
+        if (!(await mayWriteAgentConfig(workspace, logging, configPath))) {
+            return
+        }
         await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
 
         // Read existing config
