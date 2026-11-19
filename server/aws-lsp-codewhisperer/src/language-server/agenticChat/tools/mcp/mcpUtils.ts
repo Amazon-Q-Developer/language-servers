@@ -12,6 +12,7 @@ import {
     MCPServerPermission,
     McpPermissionType,
     AgentConfig,
+    AgentResourceSource,
     McpRegistryData,
     isRegistryServerConfig,
 } from './mcpTypes'
@@ -232,6 +233,15 @@ const DEFAULT_PERSONA_RAW = `{
   }
 }`
 
+/** True for a file:// resource with an absolute path, such as file:///abs/path or file://C:/path */
+function isAbsoluteFileResource(resource: string): boolean {
+    if (!resource.startsWith('file://')) {
+        return false
+    }
+    const resourcePath = resource.slice('file://'.length)
+    return path.isAbsolute(resourcePath) || resourcePath.startsWith('/') || /^[a-zA-Z]:/.test(resourcePath)
+}
+
 /**
  * Load, validate, and parse agent configurations from JSON files.
  * - If both global and workspace files are missing, create a default global.
@@ -252,11 +262,14 @@ export async function loadAgentConfig(
     serverNameMapping: Map<string, string>
     errors: Map<string, string>
     agentConfig: AgentConfig
+    /** The agent configs that list each resource in agentConfig.resources */
+    resourceSources?: Map<string, AgentResourceSource>
 }> {
     // Initialize return values similar to loadMcpServerConfigs
     const servers = new Map<string, MCPServerConfig>()
     const serverNameMapping = new Map<string, string>()
     const configErrors = new Map<string, string>()
+    const resourceSources = new Map<string, AgentResourceSource>()
 
     // Create base agent config
     const agentConfig: AgentConfig = {
@@ -295,6 +308,16 @@ export async function loadAgentConfig(
 
     // Track useLegacyMcpJson value - workspace takes precedence over global
     let useLegacyMcpJsonValue: boolean | undefined
+
+    // Server-scoped permission entries ('@server', '@server/tool'), keyed by entry, with the agent
+    // config files that listed them. Applied once every server is known.
+    const pendingServerTools = new Map<string, Set<string>>()
+    const pendingServerAllowedTools = new Map<string, Set<string>>()
+    const stash = (pending: Map<string, Set<string>>, entry: string, source: string) => {
+        const sources = pending.get(entry) ?? new Set<string>()
+        sources.add(source)
+        pending.set(entry, sources)
+    }
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
@@ -371,16 +394,24 @@ export async function loadAgentConfig(
         // 4) Process permissions (tools and allowedTools)
         if (Array.isArray(json.tools)) {
             for (const tool of json.tools) {
-                if (!tool.startsWith('@') && !agentConfig.tools.includes(tool)) {
-                    agentConfig.tools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.tools.includes(tool)) {
+                        agentConfig.tools.push(tool)
+                    }
+                } else {
+                    stash(pendingServerTools, tool, fsPath)
                 }
             }
         }
 
         if (Array.isArray(json.allowedTools)) {
             for (const tool of json.allowedTools) {
-                if (!tool.startsWith('@') && !agentConfig.allowedTools.includes(tool)) {
-                    agentConfig.allowedTools.push(tool)
+                if (!tool.startsWith('@')) {
+                    if (!agentConfig.allowedTools.includes(tool)) {
+                        agentConfig.allowedTools.push(tool)
+                    }
+                } else {
+                    stash(pendingServerAllowedTools, tool, fsPath)
                 }
             }
         }
@@ -393,10 +424,27 @@ export async function loadAgentConfig(
             }
         }
 
-        // 5b) Process resources
+        // 5b) Process resources. Files outside the workspace can only come from the global config.
         if (Array.isArray(json.resources)) {
             for (const resource of json.resources) {
-                if (typeof resource === 'string' && !agentConfig.resources!.includes(resource)) {
+                if (typeof resource !== 'string') {
+                    continue
+                }
+                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                    logging.warn(
+                        `Ignoring absolute resource path ${JSON.stringify(resource)} in agent config at ${fsPath}. Add it to the global agent config instead.`
+                    )
+                    continue
+                }
+                // A resource from a workspace folder's agent config applies to that folder only
+                const source = resourceSources.get(resource) ?? { global: false, configPaths: [] }
+                if (fsPath === globalConfigPath) {
+                    source.global = true
+                } else if (!source.configPaths.includes(fsPath)) {
+                    source.configPaths.push(fsPath)
+                }
+                resourceSources.set(resource, source)
+                if (!agentConfig.resources!.includes(resource)) {
                     agentConfig.resources!.push(resource)
                 }
             }
@@ -566,29 +614,6 @@ export async function loadAgentConfig(
                 agentEntry.disabled = cfg.disabled
                 agentConfig.mcpServers[name] = agentEntry
 
-                // Add MCP server-specific tools and allowedTools after server is successfully added
-                if (Array.isArray(json.tools)) {
-                    for (const tool of json.tools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.tools.includes(tool)
-                        ) {
-                            agentConfig.tools.push(tool)
-                        }
-                    }
-                }
-
-                if (Array.isArray(json.allowedTools)) {
-                    for (const tool of json.allowedTools) {
-                        if (
-                            (tool === `@${name}` || tool.startsWith(`@${name}/`)) &&
-                            !agentConfig.allowedTools.includes(tool)
-                        ) {
-                            agentConfig.allowedTools.push(tool)
-                        }
-                    }
-                }
-
                 logging.info(
                     `Loaded MCP server with sanitizedName: '${sanitizedName}' and originalName: '${name}' from ${fsPath}`
                 )
@@ -633,6 +658,15 @@ export async function loadAgentConfig(
         logging.info(`Loaded ${mcpResult.servers.size} servers from legacy MCP configs`)
     }
 
+    // Apply server-scoped permissions now that the final config of every server is known.
+    restoreServerScopedPermissions(
+        agentConfig,
+        serverNameMapping,
+        servers,
+        pendingServerTools,
+        pendingServerAllowedTools
+    )
+
     // Return the agent config, servers, server name mapping, and errors
     logging.info(
         `Successfully processed ${uniquePaths.length} agent config files and ${agentConfig.useLegacyMcpJson ? 'legacy MCP configs' : 'no legacy MCP configs'}`
@@ -642,6 +676,7 @@ export async function loadAgentConfig(
         serverNameMapping,
         errors: configErrors,
         agentConfig,
+        resourceSources,
     }
 }
 
@@ -900,6 +935,95 @@ export function convertPersonaToAgent(
     }
 
     return agent
+}
+
+/** MCP form fields whose values are logged as they are */
+const PLAIN_FORM_FIELDS = ['name', 'transport', 'scope', 'timeout', 'command']
+/** MCP form fields that hold env variable name and value pairs */
+const ENV_FORM_FIELDS = ['env_variables', 'additional_env_variables']
+/** MCP form fields that hold header key and value pairs */
+const HEADER_FORM_FIELDS = ['headers', 'additional_headers']
+const PERMISSION_VALUES: string[] = Object.values(McpPermissionType)
+
+/**
+ * Log text for MCP server arguments. An argument that is only a flag name is kept, and `--name=value` keeps only
+ * `--name`. Every other argument can be or contain a value, such as a token, so it is counted instead of logged.
+ * Empty arguments are skipped.
+ */
+export function describeArgsForLog(args: string[] | undefined): string {
+    const kept: string[] = []
+    let hidden = 0
+    for (const arg of args ?? []) {
+        const text = String(arg)
+        const flagName = text.split('=')[0]
+        if (text === '') {
+            continue
+        } else if (/^--[A-Za-z0-9][A-Za-z0-9._-]*$/.test(flagName)) {
+            kept.push(flagName)
+        } else if (/^-[A-Za-z]$/.test(text) || text === '--') {
+            kept.push(text)
+        } else {
+            hidden++
+        }
+    }
+    if (hidden > 0) {
+        kept.push(`(${hidden} ${hidden === 1 ? 'value' : 'values'} hidden)`)
+    }
+    return kept.join(' ')
+}
+
+/**
+ * Copy of the MCP form values for logging. A field's value is logged only when the field is known not to hold a
+ * token. The URL keeps only its origin, arguments keep only flag names, env variables and headers keep only their
+ * names, and the value of any other field is hidden.
+ */
+export function describeMcpFormValuesForLog(optionsValues: Record<string, any> | undefined): Record<string, any> {
+    const result: Record<string, any> = {}
+    const namesOf = (value: any, nameKey: string) =>
+        Array.isArray(value) ? value.map(item => item?.[nameKey]) : '(hidden)'
+    for (const [field, value] of Object.entries(optionsValues ?? {})) {
+        if (PLAIN_FORM_FIELDS.includes(field)) {
+            result[field] = value
+        } else if (field === 'url') {
+            result[field] = describeUrlForLog(typeof value === 'string' ? value : undefined)
+        } else if (field === 'args') {
+            result[field] = Array.isArray(value)
+                ? describeArgsForLog(value.map(item => item?.arg_key ?? ''))
+                : '(hidden)'
+        } else if (ENV_FORM_FIELDS.includes(field)) {
+            result[field] = namesOf(value, 'env_var_name')
+        } else if (HEADER_FORM_FIELDS.includes(field)) {
+            result[field] = namesOf(value, 'key')
+        } else if (typeof value === 'string' && PERMISSION_VALUES.includes(value)) {
+            // Tool permission choices from the permission settings
+            result[field] = value
+        } else {
+            result[field] = '(hidden)'
+        }
+    }
+    return result
+}
+
+/**
+ * Log text for starting a stdio MCP server: the command, the argument flag names and the env variable names.
+ */
+export function describeStdioLaunchForLog(command: string, args: string[] | undefined, env: Record<string, string>) {
+    const argsText = describeArgsForLog(args)
+    const envKeys = Object.keys(env)
+    const envInfo = envKeys.length > 0 ? ` (env: ${envKeys.join(', ')})` : ''
+    return `${command}${argsText ? ` ${argsText}` : ''}${envInfo}`
+}
+
+/**
+ * Log text for an MCP server URL. Any part after the host can hold a token, so only the origin is included.
+ */
+export function describeUrlForLog(url: string | undefined): string {
+    try {
+        const parsed = new URL(url ?? '')
+        return parsed.origin
+    } catch {
+        return '(invalid URL)'
+    }
 }
 
 /**
@@ -1269,17 +1393,28 @@ export function findServerInRegistry(registry: McpRegistryData, serverName: stri
  * Create a namespaced tool name from server and tool names.
  * Handles truncation and conflicts according to specific rules.
  * Also stores the mapping from namespaced name back to original names.
+ *
+ * `reservedNames` holds names an MCP tool must never occupy (the built-in tool
+ * names). Without it an MCP server could advertise e.g. `fsRead` and win the
+ * bare name, so the request would be routed through the built-in permission
+ * branch instead of the MCP one.
  */
 export function createNamespacedToolName(
     serverName: string,
     toolName: string,
     allNamespacedTools: Set<string>,
-    toolNameMapping: Map<string, { serverName: string; toolName: string }>
+    toolNameMapping: Map<string, { serverName: string; toolName: string }>,
+    reservedNames: Set<string>
 ): string {
     // First, check if this server/tool combination already has a mapping
     // If it does, reuse that name to maintain consistency across reinitializations
     for (const [existingName, mapping] of toolNameMapping.entries()) {
         if (mapping.serverName === serverName && mapping.toolName === toolName) {
+            // Never reuse a stale mapping that points at a reserved built-in name.
+            if (reservedNames.has(existingName)) {
+                toolNameMapping.delete(existingName)
+                break
+            }
             // If the name is already in the set, it's already registered
             // If not, add it to the set
             if (!allNamespacedTools.has(existingName)) {
@@ -1292,8 +1427,13 @@ export function createNamespacedToolName(
     // Sanitize the tool name
     const sanitizedToolName = sanitizeName(toolName)
 
-    // First try to use just the tool name if it's not already in use and fits within length limit
-    if (sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(sanitizedToolName)) {
+    // First try to use just the tool name if it's not already in use, is not a
+    // reserved built-in name, and fits within length limit
+    if (
+        sanitizedToolName.length <= MAX_TOOL_NAME_LENGTH &&
+        !allNamespacedTools.has(sanitizedToolName) &&
+        !reservedNames.has(sanitizedToolName)
+    ) {
         allNamespacedTools.add(sanitizedToolName)
         toolNameMapping.set(sanitizedToolName, { serverName, toolName })
         return sanitizedToolName
@@ -1304,7 +1444,7 @@ export function createNamespacedToolName(
     const fullName = `${serverName}${sep}${sanitizedToolName}`
 
     // If the full name fits and is unique, use it
-    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName)) {
+    if (fullName.length <= MAX_TOOL_NAME_LENGTH && !allNamespacedTools.has(fullName) && !reservedNames.has(fullName)) {
         allNamespacedTools.add(fullName)
         toolNameMapping.set(fullName, { serverName, toolName })
         return fullName
@@ -1317,7 +1457,7 @@ export function createNamespacedToolName(
             const truncatedServer = serverName.substring(0, maxServerLength)
             const namespacedName = `${truncatedServer}${sep}${sanitizedToolName}`
 
-            if (!allNamespacedTools.has(namespacedName)) {
+            if (!allNamespacedTools.has(namespacedName) && !reservedNames.has(namespacedName)) {
                 allNamespacedTools.add(namespacedName)
                 toolNameMapping.set(namespacedName, { serverName, toolName })
                 return namespacedName
@@ -1345,7 +1485,7 @@ export function createNamespacedToolName(
             candidateName = `${truncatedTool}${suffix}`
         }
 
-        if (!allNamespacedTools.has(candidateName)) {
+        if (!allNamespacedTools.has(candidateName) && !reservedNames.has(candidateName)) {
             allNamespacedTools.add(candidateName)
             toolNameMapping.set(candidateName, { serverName, toolName })
             return candidateName
@@ -1353,4 +1493,110 @@ export function createNamespacedToolName(
 
         duplicateNum++
     }
+}
+
+/**
+ * True when a permission entry is scoped to the given MCP server, i.e. it is either the
+ * server-wide prefix ('@server') or a single tool on that server ('@server/tool').
+ */
+export function isPermissionForServer(entry: string, serverName: string): boolean {
+    return entry === `@${serverName}` || entry.startsWith(`@${serverName}/`)
+}
+
+/**
+ * The agent config that holds permissions for servers declared in a legacy `mcp.json`:
+ * the `agents/default.json` in the same folder. Other paths are returned unchanged.
+ */
+export function getAgentConfigPathForMcpConfig(configPath: string): string {
+    const suffix = path.sep + 'mcp.json'
+    return configPath.endsWith(suffix)
+        ? configPath.slice(0, -suffix.length) + path.sep + 'agents' + path.sep + 'default.json'
+        : configPath
+}
+
+/**
+ * Apply server-scoped permission entries ('@server', '@server/tool') collected from agent config
+ * files to the servers that loaded.
+ *
+ * An entry applies only when it comes from the agent config that McpManager writes that server's
+ * permissions to: the file that declares the server, or for a legacy `mcp.json` server the
+ * `agents/default.json` next to it. Entries for servers that did not load are dropped.
+ */
+export function restoreServerScopedPermissions(
+    agentConfig: AgentConfig,
+    serverNameMapping: Map<string, string>,
+    servers: Map<string, MCPServerConfig>,
+    pendingServerTools: Map<string, Set<string>>,
+    pendingServerAllowedTools: Map<string, Set<string>>
+): void {
+    // Windows paths are case-insensitive, and URI parsing lowercases the drive letter.
+    const key = (p: string) => (process.platform === 'win32' ? path.normalize(p).toLowerCase() : path.normalize(p))
+
+    const permissionFileFor = (cfg: MCPServerConfig | undefined): string | undefined => {
+        const cfgPath = cfg?.__configPath__
+        return cfgPath ? key(getAgentConfigPathForMcpConfig(path.normalize(cfgPath))) : undefined
+    }
+
+    const applies = (entry: string, sources: Set<string>): boolean => {
+        for (const [sanitized, original] of serverNameMapping) {
+            if (!isPermissionForServer(entry, original)) {
+                continue
+            }
+            const owner = permissionFileFor(servers.get(sanitized))
+            for (const source of sources) {
+                const src = key(source)
+                if (src === owner) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    for (const [entry, sources] of pendingServerTools) {
+        if (applies(entry, sources) && !agentConfig.tools.includes(entry)) {
+            agentConfig.tools.push(entry)
+        }
+    }
+
+    for (const [entry, sources] of pendingServerAllowedTools) {
+        if (applies(entry, sources) && !agentConfig.allowedTools.includes(entry)) {
+            agentConfig.allowedTools.push(entry)
+        }
+    }
+}
+
+/**
+ * Default MCP tool execution timeout, in milliseconds, used when a server config
+ * does not specify one (or specifies an unusable value).
+ */
+export const DEFAULT_TOOL_EXEC_TIMEOUT_MS = 60_000
+
+/**
+ * Largest delay that can be handed to `setTimeout` without the runtime clamping it
+ * back to 1ms and firing immediately (2^31 - 1 ms, roughly 24.8 days). The MCP SDK
+ * arms its request deadline with `setTimeout`, so an "unbounded" tool call has to be
+ * expressed as a large finite value rather than `Infinity`/`Number.MAX_SAFE_INTEGER`.
+ */
+export const MAX_TOOL_EXEC_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * A configured timeout is usable when it is a finite, positive number of milliseconds
+ * that `setTimeout` will honour. `0` is handled separately — it means "no timeout".
+ */
+export function isUsableToolExecTimeout(timeout: number | undefined): boolean {
+    return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TOOL_EXEC_TIMEOUT_MS
+}
+
+/**
+ * Resolve the timeout, in milliseconds, to hand to the MCP SDK for a tool call.
+ * - `0` (documented as "no timeout") maps to the maximum timer value, because the SDK
+ *   always applies its own 60s default when no timeout is supplied.
+ * - `undefined`, negative, non-finite, or over-large values fall back to the default.
+ */
+export function resolveMcpRequestTimeoutMs(timeout: number | undefined): number {
+    if (timeout === 0) {
+        return MAX_TOOL_EXEC_TIMEOUT_MS
+    }
+    return isUsableToolExecTimeout(timeout) ? (timeout as number) : DEFAULT_TOOL_EXEC_TIMEOUT_MS
 }

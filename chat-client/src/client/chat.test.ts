@@ -29,6 +29,7 @@ import {
 import { MynahUI } from '@aws/mynah-ui'
 import { TabFactory } from './tabs/tabFactory'
 import { ChatClientAdapter } from '../contracts/chatClientAdapter'
+import { deprecationCard } from './texts/deprecation'
 
 describe('Chat', () => {
     const sandbox = sinon.createSandbox()
@@ -74,11 +75,8 @@ describe('Chat', () => {
             window.removeEventListener('message', messageHandler as EventListener)
             messageHandler = undefined
         }
+        mynahUi.destroy()
         sandbox.restore()
-
-        Object.keys(mynahUi.getAllTabs()).forEach(tabId => {
-            mynahUi.removeTab(tabId, (mynahUi as any).lastEventId)
-        })
     })
 
     after(() => {
@@ -115,6 +113,19 @@ describe('Chat', () => {
             command: 'aws/chat/listAvailableModels',
             params: { tabId: initialTabId },
         })
+    })
+
+    it('hides the deprecation notice when it was previously acknowledged', () => {
+        mynahUi.destroy()
+        mynahUi = createChat(clientApi, {
+            agenticMode: true,
+            deprecationNoticeAcknowledged: true,
+        })
+
+        const tabId = mynahUi.getSelectedTabId()
+        const chatItems = tabId ? mynahUi.getTabData(tabId).getStore()?.chatItems : undefined
+
+        assert.match(chatItems?.some(item => item.messageId === deprecationCard.messageId) ?? false, false)
     })
 
     it('publishes telemetry event, when send to prompt is triggered', () => {
@@ -397,6 +408,33 @@ describe('Chat', () => {
     })
 
     describe('chatOptions', () => {
+        it('preserves the deprecation notice presentation when chat notifications are added', () => {
+            const chatOptionsRequest = createInboundEvent({
+                command: CHAT_OPTIONS,
+                params: {
+                    chatNotifications: [
+                        {
+                            messageId: 'server-notification',
+                            type: 'answer',
+                            body: 'Server notification',
+                        },
+                    ],
+                },
+            })
+
+            window.dispatchEvent(chatOptionsRequest)
+
+            const chatItems = mynahUi.getTabData(initialTabId).getStore()?.chatItems
+            const notice = chatItems?.find(item => item.messageId === deprecationCard.messageId)
+
+            assert.match(chatItems?.[0].messageId, 'server-notification')
+            assert.match(notice?.title, deprecationCard.title)
+            assert.match(notice?.status, deprecationCard.status)
+            assert.match(notice?.border, deprecationCard.border)
+            assert.match(notice?.fullWidth, deprecationCard.fullWidth)
+            assert.match(notice?.canBeDismissed, deprecationCard.canBeDismissed)
+        })
+
         it('enables history and export features support', () => {
             const chatOptionsRequest = createInboundEvent({
                 command: CHAT_OPTIONS,
@@ -432,6 +470,7 @@ describe('Chat', () => {
         it('enables MCP when params.mcpServers is true and config.agenticMode is true', function () {
             // Create a separate sandbox for this test
             const testSandbox = sinon.createSandbox()
+            let localMynahUi: MynahUI | undefined
 
             // Save original window functions
             const originalAddEventListener = window.addEventListener
@@ -452,7 +491,7 @@ describe('Chat', () => {
                 }
 
                 // Create a new chat instance specifically for this test
-                const localMynahUi = createChat(localClientApi, { agenticMode: true })
+                localMynahUi = createChat(localClientApi, { agenticMode: true })
 
                 // Create a new event
                 const chatOptionsRequest = createInboundEvent({
@@ -474,6 +513,7 @@ describe('Chat', () => {
                 // Restore window functions
                 window.addEventListener = originalAddEventListener
                 window.dispatchEvent = originalDispatchEvent
+                localMynahUi?.destroy()
                 testSandbox.restore()
             }
         })
@@ -481,6 +521,7 @@ describe('Chat', () => {
         it('does not enable MCP when params.mcpServers is true but config.agenticMode is false', function () {
             // Create a separate sandbox for this test
             const testSandbox = sinon.createSandbox()
+            let localMynahUi: MynahUI | undefined
 
             // Save original window functions
             const originalAddEventListener = window.addEventListener
@@ -501,7 +542,7 @@ describe('Chat', () => {
                 }
 
                 // Create a new chat instance specifically for this test
-                const localMynahUi = createChat(localClientApi, { agenticMode: false })
+                localMynahUi = createChat(localClientApi, { agenticMode: false })
 
                 // Create a new event
                 const chatOptionsRequest = createInboundEvent({
@@ -523,6 +564,7 @@ describe('Chat', () => {
                 // Restore window functions
                 window.addEventListener = originalAddEventListener
                 window.dispatchEvent = originalDispatchEvent
+                localMynahUi?.destroy()
                 testSandbox.restore()
             }
         })
@@ -530,6 +572,7 @@ describe('Chat', () => {
         it('does not enable MCP when params.mcpServers is false and config.agenticMode is true', function () {
             // Create a separate sandbox for this test
             const testSandbox = sinon.createSandbox()
+            let localMynahUi: MynahUI | undefined
 
             // Save original window functions
             const originalAddEventListener = window.addEventListener
@@ -550,7 +593,7 @@ describe('Chat', () => {
                 }
 
                 // Create a new chat instance specifically for this test
-                const localMynahUi = createChat(localClientApi, { agenticMode: true })
+                localMynahUi = createChat(localClientApi, { agenticMode: true })
 
                 // Create a new event
                 const chatOptionsRequest = createInboundEvent({
@@ -572,6 +615,7 @@ describe('Chat', () => {
                 // Restore window functions
                 window.addEventListener = originalAddEventListener
                 window.dispatchEvent = originalDispatchEvent
+                localMynahUi?.destroy()
                 testSandbox.restore()
             }
         })
@@ -579,6 +623,7 @@ describe('Chat', () => {
         it('does not enable MCP when params.mcpServers is undefined and config.agenticMode is true', function () {
             // Create a separate sandbox for this test
             const testSandbox = sinon.createSandbox()
+            let localMynahUi: MynahUI | undefined
 
             // Save original window functions
             const originalAddEventListener = window.addEventListener
@@ -599,7 +644,7 @@ describe('Chat', () => {
                 }
 
                 // Create a new chat instance specifically for this test
-                const localMynahUi = createChat(localClientApi, { agenticMode: true })
+                localMynahUi = createChat(localClientApi, { agenticMode: true })
 
                 // Create a new event
                 const chatOptionsRequest = createInboundEvent({
@@ -620,6 +665,7 @@ describe('Chat', () => {
                 // Restore window functions
                 window.addEventListener = originalAddEventListener
                 window.dispatchEvent = originalDispatchEvent
+                localMynahUi?.destroy()
                 testSandbox.restore()
             }
         })
@@ -675,6 +721,7 @@ describe('Chat', () => {
                 handleMessageReceive: handleMessageReceiveStub,
                 isSupportedTab: () => false,
             }
+            mynahUi.destroy()
             mynahUi = createChat(
                 clientApi,
                 {
