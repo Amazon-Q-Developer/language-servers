@@ -9,6 +9,7 @@ import { ChatHistoryMaintainer } from './chatHistoryMaintainer'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { Tab } from './util'
 import * as Loki from 'lokijs'
+import * as fs from 'fs'
 
 /**
  * Helper function to create a mock tab with multiple conversations and messages
@@ -239,6 +240,75 @@ describe('ChatHistoryMaintainer', () => {
                 1,
                 'calculateAllHistorySize should be called once'
             )
+        })
+    })
+
+    describe('empty file deletion', () => {
+        let unlinkStub: sinon.SinonStub
+        let emptyCollection: any
+        let emptyDb: any
+
+        beforeEach(() => {
+            unlinkStub = sinon.stub(fs.promises, 'unlink').resolves()
+
+            // Create empty collection mock
+            emptyCollection = {
+                find: sinon.stub().returns([]),
+                findOne: sinon.stub().returns(null),
+                update: sinon.stub(),
+                remove: sinon.stub(),
+            }
+
+            // Create empty database mock
+            emptyDb = {
+                getCollection: sinon.stub().returns(emptyCollection),
+                saveDatabase: sinon.stub().callsArg(0),
+                close: sinon.stub(),
+            }
+        })
+
+        afterEach(() => {
+            unlinkStub.restore()
+        })
+
+        it('should delete empty database files during loading', async () => {
+            const deleteEmptyDbFilesStub = sinon.stub(historyMaintainer, 'deleteEmptyDbFiles' as any)
+
+            // Call the original method through the stub
+            await deleteEmptyDbFilesStub.wrappedMethod.call(historyMaintainer, [
+                'chat-history-empty.json',
+                'chat-history-another.json',
+            ])
+
+            assert.strictEqual(unlinkStub.callCount, 2, 'fs.unlink should be called twice')
+            assert.strictEqual(unlinkStub.firstCall.args[0], '/tmp/.aws/amazonq/history/chat-history-empty.json')
+            assert.strictEqual(unlinkStub.secondCall.args[0], '/tmp/.aws/amazonq/history/chat-history-another.json')
+            assert.strictEqual(
+                (mockFeatures.logging.info as sinon.SinonStub).callCount,
+                2,
+                'Success message should be logged twice'
+            )
+        })
+
+        it('should not delete current workspace database even if empty', async () => {
+            const deleteEmptyDbFilesStub = sinon.stub(historyMaintainer, 'deleteEmptyDbFiles' as any)
+
+            // Call deleteEmptyDbFiles with current workspace DB name
+            // The current workspace DB name is 'chat-history-test.json' as set in the constructor
+            await deleteEmptyDbFilesStub.wrappedMethod.call(historyMaintainer, ['chat-history-test.json'])
+
+            assert.strictEqual(unlinkStub.callCount, 0, 'fs.unlink should not be called for current workspace DB')
+        })
+
+        it('should handle file deletion errors gracefully', async () => {
+            unlinkStub.rejects(new Error('Permission denied'))
+            const deleteEmptyDbFilesStub = sinon.stub(historyMaintainer, 'deleteEmptyDbFiles' as any)
+
+            // Should not throw error
+            await deleteEmptyDbFilesStub.wrappedMethod.call(historyMaintainer, ['chat-history-empty.json'])
+
+            assert.strictEqual(unlinkStub.callCount, 1, 'fs.unlink should be called once')
+            assert.strictEqual((mockFeatures.logging.error as sinon.SinonStub).called, true, 'Error should be logged')
         })
     })
 })
