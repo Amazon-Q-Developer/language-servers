@@ -16,6 +16,7 @@ export interface AtxPlanStep {
     Status: PlanStepStatus
     Children: AtxPlanStep[]
     HasCheckpoint?: boolean
+    IsStatusOnly?: boolean
 }
 
 /**
@@ -73,6 +74,18 @@ export interface AtxListOrCreateWorkspaceResponse {
 }
 
 /**
+ * Result of aws/atxTransform/validateSession: one read-only ListWorkspaces call that confirms the active
+ * credentials, tenant URL and permission work. On failure, Reason is one of AtxSessionValidationReason
+ * (see atxSessionValidation.ts); ErrorCode is the service error name. Never contains credential values.
+ */
+export interface AtxValidateSessionResponse {
+    Valid: boolean
+    Reason?: string
+    ErrorCode?: string
+    HttpStatus?: number
+}
+
+/**
  * Defines the interactive mode for transformation operations.
  * Matches C# InteractiveMode enum.
  */
@@ -118,6 +131,18 @@ export interface AtxGetTransformInfoRequest extends ExecuteCommandParams {
     SolutionRootPath: string
     GetCheckpoints?: boolean
     useOrchestratorAgent?: boolean
+    // Beam-to-IDE: when true, this job was beamed to the IDE and its source is
+    // ALREADY the transformed output. The prior transform job's per-step
+    // checkpoint diffs must NOT be re-applied (they're baked into the beamed
+    // source, and their checkpoint folders aren't in the beam bundle) — doing so
+    // produces "Checkpoint folder not available for step" + DiffApplyFailed and
+    // stalls the LBV loop. When set, getTransformInfo skips the completed-step
+    // artifact download/apply pass and only surfaces NEW LBV-round diffs.
+    IsBeam?: boolean
+    // Beam-to-IDE: comma-separated plan-step ids of the LOADED beamed repo's subtree. Used to
+    // select THIS repo's local-build-verification HITL instead of the first LBV HITL in the list
+    // (which may be a sibling's, shadowing the loaded repo's own). Empty/absent = first-match.
+    beamScopeStepIds?: string
 }
 
 export interface AtxGetTransformInfoResponse {
@@ -128,12 +153,42 @@ export interface AtxGetTransformInfoResponse {
     TransformationPlan?: AtxTransformationPlan | null
     ArtifactPath?: string | null
     ErrorString?: string | null
+    // When GetJob failed: the service error code (e.g. AccessDeniedException) and HTTP status. Never the message.
+    ErrorCode?: string
+    StatusCode?: number
     StepInformation?: AtxStepInformation | null
     HitlTag?: string | null
     HitlTaskId?: string | null
     MissingPackageJsonPath?: string | null
     DiffApplyFailed?: boolean
     DiffApplyFailedStepIds?: string[]
+    // Interactive mode as resolved from the backend job objective (interactive_mode).
+    // Surfaced so the IDE can restore the correct mode instead of relying on its local
+    // settings store, which may be missing/stale (e.g. cold restart on another machine).
+    InteractiveMode?: InteractiveMode
+    // ITGen (jobs with generate_integration_tests only): every HITL open this poll, so a test-run HITL can't be
+    // hidden behind the one HitlTag/HitlTaskId picks. Absent when the poll didn't list HITLs.
+    OpenHitls?: AtxOpenHitl[]
+}
+
+/**
+ * One open HITL task (contract v0 §3). Matches C# AtxOpenHitl class.
+ */
+export interface AtxOpenHitl {
+    TaskId: string
+    Tag?: string
+    // The plan step the task belongs to (for ITGen: the test project's step)
+    StepId?: string
+    ExpiryTimestampUTC?: string
+    // integ-app-launch / integ-test-run only: absolute path of the downloaded request.json
+    // (artifactWorkspace/<job>/hitl/<taskId>/request.json). Absent when the request is missing,
+    // can't be downloaded, or is rejected (RequestError says why).
+    RequestPath?: string
+    RequestError?: string
+    // integ-test-run only: absolute path of the extracted repo artifact holding the generated test
+    // projects (artifactWorkspace/<job>/itgen/<project>/<runId>/tests); the request's tests.projectPath is
+    // relative to it. Downloaded again for every test-run task.
+    TestsPath?: string
 }
 
 /**
@@ -262,8 +317,39 @@ export interface AtxCompleteLocalBuildHitlRequest extends ExecuteCommandParams {
     SolutionRootPath: string
 }
 
+/**
+ * Completes an integ-test-run HITL (contract v0 §5: summary.json, plus trx/<project>/<runId>.trx
+ * or build-errors.json) or an integ-app-launch HITL (§6: launch-result.json, plus the startup
+ * log): uploads the result ZIP and submits the task by ID.
+ * ResultZipPath may be absolute or relative to SolutionRootPath.
+ */
+export interface AtxCompleteHitlWithTestResultsRequest extends ExecuteCommandParams {
+    WorkspaceId: string
+    TransformationJobId: string
+    TaskId: string
+    ResultZipPath: string
+    SolutionRootPath: string
+}
+
 export interface AtxCompleteLocalBuildHitlResponse {
     Success: boolean
+    Error?: string
+}
+
+// ITGen: download the original (pre-transformation) source by artifact id (contract C6)
+export interface AtxDownloadOriginalCodeRequest extends ExecuteCommandParams {
+    WorkspaceId: string
+    TransformationJobId: string
+    CodeArtifactId: string
+    SolutionRootPath: string
+}
+
+export interface AtxDownloadOriginalCodeResponse {
+    Success: boolean
+    // <SolutionRootPath>/artifactWorkspace/before
+    OriginalPath?: string
+    // true when this job's copy was already there (no download)
+    AlreadyPresent?: boolean
     Error?: string
 }
 
@@ -327,4 +413,154 @@ export interface AtxLoadOlderWorklogsRequest extends ExecuteCommandParams {
     jobId: string
     solutionRootPath: string
     nextToken?: string
+}
+
+// ITGen test-run HITL payloads (ITGen–IDE contract v0, schema 1.1). Draft: names follow the v0
+// proposal and match C# AtxTestRunRequest / AtxTestRunSummary / AtxAppLaunchRequest /
+// AtxAppLaunchResult in the VS extension.
+
+// 1.1 (10/26) added launch-result launchedBy and dropped NOT_LOCALHOST; 1.0 payloads are still accepted
+export const ATX_TEST_RUN_SCHEMA_VERSION = '1.1'
+export const ATX_TEST_RUN_BASE_URL_ENV = 'AB_BASE_URL'
+
+export type AtxTestRunSide = 'original' | 'transformed'
+
+// NOT_LOCALHOST was removed in 1.1: published URLs are allowed on the original side
+export type AtxTestRunStatus = 'COMPLETED' | 'TEST_BUILD_FAILED' | 'TIMED_OUT'
+
+/**
+ * Request from the Transform agent to run one test project (request.json of an integ-test-run HITL)
+ * against the app the IDE started for the preceding integ-app-launch. Only what the IDE can't work
+ * out itself is sent: the IDE sets ATX_TEST_RUN_BASE_URL_ENV, AB_SIDE, AB_RUN_ID,
+ * AB_SCREENSHOTS_DIR and AB_TEST_ORDER for the test process, and the language server picks the
+ * download folder.
+ * Matches C# AtxTestRunRequest class.
+ */
+export interface AtxTestRunRequest {
+    schemaVersion: string
+    // Names the TRX file (trx/<project>/<runId>.trx) and is echoed in the summary
+    runId: string
+    // Also says where the app runs from: original = the copy of the original solution the IDE takes
+    // at job start (artifactWorkspace/before/), transformed = the customer's solution
+    side: AtxTestRunSide
+    project: string
+    // The repo artifact the agent rewrites, holding the generated test projects: one per repo,
+    // rewritten under the same id, so download it again for every request
+    artifactId: string
+    // projectPath is inside the artifact, relative to the repo root
+    tests: {
+        projectPath: string
+    }
+    limits: {
+        projectTimeoutSeconds: number
+    }
+    // 1.1, optional: the order to run the tests in, set in AB_TEST_ORDER. 'default' (by name),
+    // 'reverse' or 'shuffle:<seed>'. The agent asks for a second order before it freezes a suite
+    testOrder?: string
+}
+
+/**
+ * App to start for an app-launch request. The IDE picks the host from the project type and a free
+ * localhost port. Matches C# AtxAppLaunchApp class.
+ */
+export interface AtxAppLaunchApp {
+    webProject: string
+    // Default ['/']: connection refused or HTTP 5xx means not started
+    healthCheckPaths?: string[]
+    // Default 120
+    startTimeoutSeconds?: number
+    // Build configuration to build and start in, e.g. 'Debug - SQLite'. Matched against the ones the
+    // project declares without case, and the project's own spelling is built: MSBuild compares a
+    // condition's $(Configuration) without case but substitutes it verbatim into bin\$(Configuration).
+    // Left out when the project declares one configuration, and Debug is then built. The agent sends it
+    // once it has asked the customer which to use, which it does when a project declares several: the
+    // configuration can decide how the app behaves, not just how it is compiled (mojoPortal picks its
+    // database provider that way, so the wrong one starts an app with no database)
+    configuration?: string
+}
+
+export type AtxAppLaunchStatus = 'STARTED' | 'APP_NOT_STARTED'
+
+// Who started the app: the IDE, or the customer (who started it themselves or gave a URL)
+export type AtxAppLaunchedBy = 'ide' | 'customer'
+
+/**
+ * Request from the Transform agent to start one web project (request.json of an integ-app-launch HITL),
+ * one per launch attempt. Contract v0 defines only the result, so this shape is a proposal. Like LBV's
+ * rounds, the number of attempts is the agent's decision, so there's no limit field.
+ * Matches C# AtxAppLaunchRequest class.
+ */
+export interface AtxAppLaunchRequest {
+    schemaVersion: string
+    side: AtxTestRunSide
+    project: string
+    attempt: number
+    app: AtxAppLaunchApp
+}
+
+/**
+ * Result of one launch attempt (launch-result.json), with the startup log uploaded as logFile.
+ * Matches C# AtxAppLaunchResult class.
+ */
+export interface AtxAppLaunchResult {
+    schemaVersion: string
+    side: AtxTestRunSide
+    project: string
+    attempt: number
+    status: AtxAppLaunchStatus
+    // Since 1.1; absent means ide. For customer, appUrl is the URL the customer gave: localhost or
+    // published on the original side, localhost only on the transformed side
+    launchedBy?: AtxAppLaunchedBy
+    appUrl?: string
+    // The last health check; httpStatus is absent when the app didn't answer
+    healthCheck?: {
+        path: string
+        httpStatus?: number
+    }
+    error?: string
+    logFile?: string
+    // The configuration the IDE built, in the project's own spelling: what the request asked for, or
+    // Debug when it asked for none. Absent when the IDE started nothing
+    configuration?: string
+    durationSeconds: number
+}
+
+/**
+ * Result of one project run (summary.json in the result ZIP; the TRX is at trx/<project>/<runId>.trx).
+ * Matches C# AtxTestRunSummary class.
+ */
+export interface AtxTestRunSummary {
+    schemaVersion: string
+    runId: string
+    side: AtxTestRunSide
+    project: string
+    status: AtxTestRunStatus
+    // The request's testOrder, when it asked for one: EVALUATE_PRE_RUN tells the two orders apart by it
+    testOrder?: string
+    appUrl?: string
+    startedAt?: string
+    finishedAt?: string
+    durationSeconds: number
+    counts: {
+        total: number
+        passed: number
+        failed: number
+        pending: number
+    }
+    failingTests: {
+        name: string
+        message: string
+    }[]
+}
+
+/**
+ * True when a test-run payload's schemaVersion has the same major version as
+ * ATX_TEST_RUN_SCHEMA_VERSION; minor versions only add optional fields.
+ */
+export function isSupportedAtxTestRunSchemaVersion(schemaVersion: unknown): boolean {
+    if (typeof schemaVersion !== 'string') {
+        return false
+    }
+    const match = /^(\d+)\.\d+$/.exec(schemaVersion)
+    return match !== null && match[1] === ATX_TEST_RUN_SCHEMA_VERSION.split('.')[0]
 }

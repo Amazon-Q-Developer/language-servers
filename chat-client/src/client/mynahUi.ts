@@ -60,6 +60,7 @@ import { disclaimerAcknowledgeButtonId, disclaimerCard } from './texts/disclaime
 import { ChatClientAdapter, ChatEventHandler } from '../contracts/chatClientAdapter'
 import { withAdapter } from './withAdapter'
 import {
+    classifyChatLink,
     contextListToHeader,
     prepareChatItemFromMessage,
     toMynahButtons,
@@ -69,7 +70,8 @@ import {
     toMynahIcon,
 } from './utils'
 import { ChatHistory, ChatHistoryList } from './features/history'
-import { pairProgrammingModeOff, pairProgrammingModeOn, programmerModeCard } from './texts/pairProgramming'
+import { pairProgrammingModeOff, pairProgrammingModeOn } from './texts/pairProgramming'
+import { deprecationCard } from './texts/deprecation'
 import { ContextRule, RulesList } from './features/rules'
 import { getModelSelectionChatItem, modelUnavailableBanner, modelThrottledBanner } from './texts/modelSelection'
 import { getWelcomeTabHeader } from './texts/welcome'
@@ -323,7 +325,7 @@ export const createMynahUi = (
     messager: Messager,
     tabFactory: TabFactory,
     disclaimerAcknowledged: boolean,
-    pairProgrammingCardAcknowledged: boolean,
+    deprecationNoticeAcknowledged: boolean,
     customChatClientAdapter?: ChatClientAdapter,
     featureConfig?: Map<string, any>,
     agenticMode?: boolean,
@@ -331,7 +333,7 @@ export const createMynahUi = (
     os?: string
 ): [MynahUI, InboundChatApi] => {
     let disclaimerCardActive = !disclaimerAcknowledged
-    let programmingModeCardActive = !pairProgrammingCardAcknowledged
+    let deprecationCardActive = !deprecationNoticeAcknowledged
     let contextCommandGroups: ContextCommandGroups | undefined
     let lastFilterTabId: string | undefined
 
@@ -437,7 +439,7 @@ export const createMynahUi = (
             // We check if tabMetadata.openTabKey exists - if it does and is set to true, we skip showing welcome messages
             // since this indicates we're loading a previous chat session rather than starting a new one.
             if (!tabStore?.tabMetadata || !tabStore.tabMetadata.openTabKey) {
-                defaultTabConfig.chatItems = tabFactory.getChatItems(true, programmingModeCardActive, [])
+                defaultTabConfig.chatItems = tabFactory.getChatItems(true, deprecationCardActive, [])
                 // Roll a fresh "Did you know?" tip for every new tab. The
                 // mynah-ui defaults.store is built once at startup, so without
                 // this override every new tab would inherit the same cached tip.
@@ -527,7 +529,18 @@ export const createMynahUi = (
                 link,
                 eventId,
             }
-            messager.onLinkClick(payload)
+            const target = classifyChatLink(link)
+            if (target.kind === 'link') {
+                messager.onLinkClick(payload)
+                return
+            }
+            messager.onLinkClickTelemetry(payload)
+            if (target.kind === 'file') {
+                // The answer's messageId is not a tool use id, so it is left out of the file click.
+                messager.onFileClick({ tabId, filePath: target.filePath, fullPath: target.fullPath })
+            } else {
+                notifyUnsupportedLink()
+            }
         },
         onSourceLinkClick: (tabId, messageId, link, mouseEvent, eventId) => {
             mouseEvent?.preventDefault()
@@ -552,7 +565,17 @@ export const createMynahUi = (
                 link,
                 eventId,
             }
-            messager.onInfoLinkClick(payload)
+            const target = classifyChatLink(link)
+            if (target.kind === 'link') {
+                messager.onInfoLinkClick(payload)
+                return
+            }
+            messager.onInfoLinkClickTelemetry(payload)
+            if (target.kind === 'file') {
+                messager.onFileClick({ tabId, filePath: target.filePath, fullPath: target.fullPath })
+            } else {
+                notifyUnsupportedLink()
+            }
         },
         onInBodyButtonClicked: (tabId, messageId, action, eventId) => {
             if (action.id === disclaimerAcknowledgeButtonId) {
@@ -715,14 +738,24 @@ export const createMynahUi = (
             messager.onPromptInputButtonClick(payload)
         },
         onMessageDismiss: (tabId, messageId) => {
-            if (messageId === programmerModeCard.messageId) {
-                programmingModeCardActive = false
+            if (messageId === deprecationCard.messageId) {
+                deprecationCardActive = false
                 messager.onChatPromptOptionAcknowledged(messageId)
 
-                // Update the tab defaults to hide the programmer mode card for new tabs
+                // Mynah removes the dismissed item from the active tab. Remove
+                // any remaining copies from the other open tabs as well.
+                Object.entries(mynahUi.getAllTabs()).forEach(([storeTabId, tabData]) => {
+                    const chatItems = tabData.store?.chatItems
+                    const updatedChatItems = chatItems?.filter(item => item.messageId !== deprecationCard.messageId)
+                    if (updatedChatItems && updatedChatItems.length !== chatItems?.length) {
+                        mynahUi.updateStore(storeTabId, { chatItems: updatedChatItems })
+                    }
+                })
+
+                // Update the tab defaults to hide the acknowledged card for new tabs.
                 mynahUi.updateTabDefaults({
                     store: {
-                        chatItems: tabFactory.getChatItems(true, false),
+                        chatItems: tabFactory.getChatItems(true, deprecationCardActive),
                     },
                 })
             }
@@ -826,7 +859,7 @@ export const createMynahUi = (
                 isSelected: true,
                 store: {
                     ...tabFactory.createTab(disclaimerCardActive),
-                    chatItems: tabFactory.getChatItems(true, programmingModeCardActive),
+                    chatItems: tabFactory.getChatItems(true, deprecationCardActive),
                 },
             },
         },
@@ -903,6 +936,14 @@ export const createMynahUi = (
         const tabId = mynahUi.getSelectedTabId()
 
         return tabId ?? createTabId()
+    }
+
+    const notifyUnsupportedLink = () => {
+        mynahUi.notify({
+            type: NotificationType.WARNING,
+            title: 'Link not opened',
+            content: 'Chat opens only web (http or https) links and local file paths.',
+        })
     }
 
     const getImageContextCount = (tabId: string) => {
@@ -1406,8 +1447,13 @@ ${params.message}`,
             const messages = params.newTabOptions?.data?.messages
             const tabId = createTabId(true)
             if (tabId) {
+                const needWelcomeMessages = !messages
                 mynahUi.updateStore(tabId, {
-                    chatItems: tabFactory.getChatItems(messages ? false : true, programmingModeCardActive, messages),
+                    chatItems: tabFactory.getChatItems(
+                        needWelcomeMessages,
+                        needWelcomeMessages && deprecationCardActive,
+                        messages
+                    ),
                     // onTabAdd suppresses the welcome splash whenever
                     // openTabKey is true (which createTabId(true) sets), so
                     // re-establish it here for the no-messages case so a
