@@ -1,0 +1,30 @@
+name: License Check
+
+on:
+    pull_request:
+        branches: [main]
+
+jobs:
+    license-check:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '20'
+
+            - name: Install dependencies
+              run: |
+                  npm install -g license-checker
+
+            - name: Run license check
+              run: |
+                  #!/bin/bash
+                  set -euo pipefail
+
+                  EXCLUDED_LICENSES="MIT,Apache-2.0,BSD-2-Clause,BSD-3-Clause,ISC,0BSD,Python-2.0,BlueOak-1.0.0"
+
+                  license-checker --production --exclude "$EXCLUDED_LICENSES" --excludePackages "*"
