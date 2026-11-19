@@ -404,24 +404,9 @@ export class TransformHandler {
     }
 
     async extractAllEntriesTo(pathContainingArchive: string, zipEntries: AdmZip.IZipEntry[]) {
-        for (const entry of zipEntries) {
-            try {
-                const entryPath = path.join(pathContainingArchive, entry.entryName)
-                if (entry.isDirectory) {
-                    await fs.promises.mkdir(entryPath, { recursive: true })
-                } else {
-                    const parentDir = path.dirname(entryPath)
-                    await fs.promises.mkdir(parentDir, { recursive: true })
-                    await fs.promises.writeFile(entryPath, entry.getData())
-                }
-            } catch (extractError: any) {
-                if (extractError instanceof Error && 'code' in extractError && extractError.code === 'ENOENT') {
-                    this.logging.log(`Attempted to extract a file that does not exist : ${entry.entryName}`)
-                } else {
-                    throw extractError
-                }
-            }
-        }
+        // Use the shared extractor: it skips any entry that would land outside pathContainingArchive (zip slip).
+        // This copy used to write every entry wherever its name pointed, including ../ paths.
+        await Utils.extractAllEntriesTo(pathContainingArchive, zipEntries, this.logging)
     }
 
     async archivePathGenerator(exportId: string, buffer: Uint8Array[], saveToDir: string) {
