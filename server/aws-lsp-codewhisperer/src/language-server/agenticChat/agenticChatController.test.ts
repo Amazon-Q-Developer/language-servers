@@ -2279,7 +2279,7 @@ describe('AgenticChatController', () => {
             assert.ok(!rejections.includes(failure), 'the failed update was left as an unhandled rejection')
             sinon.assert.calledOnce(maybeUpdateCodeSymbolsStub)
             sinon.assert.calledWithMatch(
-                testFeatures.logging.log as sinon.SinonStub,
+                testFeatures.logging.error as sinon.SinonStub,
                 sinon.match('Error updating code symbols').and(sinon.match('code symbols failed'))
             )
             sinon.assert.neverCalledWithMatch(
@@ -2296,7 +2296,7 @@ describe('AgenticChatController', () => {
             await unhandledRejectionsDuring(() => chatController.onReady())
 
             sinon.assert.calledWithMatch(
-                testFeatures.logging.log as sinon.SinonStub,
+                testFeatures.logging.error as sinon.SinonStub,
                 sinon.match('Error updating code symbols')
             )
         })

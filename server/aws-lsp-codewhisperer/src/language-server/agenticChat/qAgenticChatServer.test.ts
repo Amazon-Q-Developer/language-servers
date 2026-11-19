@@ -167,26 +167,62 @@ describe('QAgenticChatServer', () => {
         sinon.assert.calledOnce(tabBarActionStub)
     })
 
-    describe('request handler results', () => {
-        // The chat registrations that the runtime binds to JSON-RPC requests. They must return the controller's
-        // result, because the JSON-RPC layer sends it as the response.
-        const requestRegistrations = [
-            'onEndChat',
-            'onChatPrompt',
-            'onOpenFileDialog',
-            'onInlineChatPrompt',
-            'onQuickAction',
-            'onListConversations',
-            'onListRules',
-            'onConversationClick',
-            'onRuleClick',
-            'onListMcpServers',
-            'onMcpServerClick',
-            'onTabBarAction',
-            'onButtonClick',
-            'onListAvailableModels',
-        ] as const
+    // The chat registrations that the runtime binds to JSON-RPC requests. They must return the controller's
+    // result, because the JSON-RPC layer sends it as the response.
+    const requestRegistrations = [
+        'onEndChat',
+        'onChatPrompt',
+        'onOpenFileDialog',
+        'onInlineChatPrompt',
+        'onQuickAction',
+        'onListConversations',
+        'onListRules',
+        'onConversationClick',
+        'onRuleClick',
+        'onListMcpServers',
+        'onMcpServerClick',
+        'onTabBarAction',
+        'onButtonClick',
+        'onListAvailableModels',
+    ] as const
 
+    // The chat registrations that the runtime binds to JSON-RPC notifications, with their method names. Each
+    // registration has the same name as the controller method that it calls.
+    const notificationRegistrations = [
+        ['onTabAdd', tabAddNotificationType.method],
+        ['onReady', readyNotificationType.method],
+        ['onTabChange', tabChangeNotificationType.method],
+        ['onTabRemove', tabRemoveNotificationType.method],
+        ['onSendFeedback', feedbackNotificationType.method],
+        ['onCodeInsertToCursorPosition', insertToCursorPositionNotificationType.method],
+        ['onCreatePrompt', createPromptNotificationType.method],
+        ['onFileClicked', fileClickNotificationType.method],
+        ['onFollowUpClicked', followUpClickNotificationType.method],
+        ['onPromptInputOptionChange', promptInputOptionChangeNotificationType.method],
+        ['onInlineChatResult', inlineChatResultNotificationType.method],
+        ['onActiveEditorChanged', activeEditorChangedNotificationType.method],
+        ['onPinnedContextAdd', onPinnedContextAddNotificationType.method],
+        ['onPinnedContextRemove', onPinnedContextRemoveNotificationType.method],
+    ] as const
+
+    it('lists every chat handler that the server registers as a request or a notification', () => {
+        // A handler that is in neither list would have no test of its result or of its failures. The context
+        // commands provider of the controller registers onFilterContextCommands, a request handler, itself.
+        const registered = Object.entries(testFeatures.chat)
+            .filter(([name, stub]) => name.startsWith('on') && (stub as sinon.SinonStub).called)
+            .map(([name]) => name)
+
+        assert.deepStrictEqual(
+            registered.sort(),
+            [
+                ...requestRegistrations,
+                ...notificationRegistrations.map(([name]) => name),
+                'onFilterContextCommands',
+            ].sort()
+        )
+    })
+
+    describe('request handler results', () => {
         for (const name of requestRegistrations) {
             it(`returns the controller result from the ${name} handler`, () => {
                 const result = { marker: name }
@@ -199,25 +235,6 @@ describe('QAgenticChatServer', () => {
     })
 
     describe('notification handler failures', () => {
-        // The chat registrations that the runtime binds to JSON-RPC notifications, with their method names. Each
-        // registration has the same name as the controller method that it calls.
-        const notificationRegistrations = [
-            ['onTabAdd', tabAddNotificationType.method],
-            ['onReady', readyNotificationType.method],
-            ['onTabChange', tabChangeNotificationType.method],
-            ['onTabRemove', tabRemoveNotificationType.method],
-            ['onSendFeedback', feedbackNotificationType.method],
-            ['onCodeInsertToCursorPosition', insertToCursorPositionNotificationType.method],
-            ['onCreatePrompt', createPromptNotificationType.method],
-            ['onFileClicked', fileClickNotificationType.method],
-            ['onFollowUpClicked', followUpClickNotificationType.method],
-            ['onPromptInputOptionChange', promptInputOptionChangeNotificationType.method],
-            ['onInlineChatResult', inlineChatResultNotificationType.method],
-            ['onActiveEditorChanged', activeEditorChangedNotificationType.method],
-            ['onPinnedContextAdd', onPinnedContextAddNotificationType.method],
-            ['onPinnedContextRemove', onPinnedContextRemoveNotificationType.method],
-        ] as const
-
         for (const [name, method] of notificationRegistrations) {
             it(`logs a rejected ${name} handler and leaves no unhandled rejection`, async () => {
                 const failure = new Error(`${name} failed`)
