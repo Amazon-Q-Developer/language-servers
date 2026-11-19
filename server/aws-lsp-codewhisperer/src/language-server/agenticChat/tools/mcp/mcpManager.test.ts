@@ -1799,11 +1799,12 @@ describe('Registry Synchronization', () => {
                 command: 'npx',
                 args: ['-y', '@test/server@1.0.0'],
                 disabled: false,
+                __registryServer__: true,
                 __configPath__: '/test/config.json',
             })
             ;(mgr as any).serverNameMapping.set('test-server', 'test-server')
             ;(mgr as any).agentConfig = {
-                mcpServers: { 'test-server': { type: 'registry' } },
+                mcpServers: { 'test-server': { command: 'npx', args: ['-y', '@test/server@1.0.0'] } },
                 tools: ['@test-server'],
                 allowedTools: [],
                 toolsSettings: {},
@@ -1873,6 +1874,9 @@ describe('Registry Synchronization', () => {
 
             const config = (mgr as any).mcpServers.get('manual-server')
             expect(config.disabled).to.be.false
+            // A broken gate would run the sync body on this manual server and, finding it absent from the empty
+            // registry, mark it FAILED. The skip must leave its state untouched.
+            expect(mgr.getServerState('manual-server')?.status).to.not.equal('FAILED')
         })
     })
 
@@ -1889,12 +1893,13 @@ describe('Registry Synchronization', () => {
                 args: ['-y', '@test/server@1.0.0'],
                 disabled: false,
                 __cachedVersion__: '1.0.0',
+                __registryServer__: true,
                 // A registry server lives in the global agent config, so the reinstall asks with the registry prompt
                 __configPath__: mcpUtils.getGlobalAgentConfigPath(mockFeatures.workspace.fs.getUserHomeDir()),
             })
             ;(mgr as any).serverNameMapping.set('test-server', 'test-server')
             ;(mgr as any).agentConfig = {
-                mcpServers: { 'test-server': { type: 'registry' } },
+                mcpServers: { 'test-server': { command: 'npx', args: ['-y', '@test/server@1.0.0'] } },
                 tools: [],
                 allowedTools: [],
                 toolsSettings: {},
@@ -2444,6 +2449,67 @@ describe('consent gate for MCP registry servers', () => {
         })
     }
 
+    it('shows a package index set through a variable other than the npm and PyPI ones', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            ...localCfg(),
+            env: { PIP_INDEX_URL: 'https://pip.example.com/simple' },
+        }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Package index: https://pip.example.com/simple\n')
+    })
+
+    it('shows a package index whose variable name is in another case', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        const cfg: MCPServerConfig = {
+            ...localCfg(),
+            env: { npm_config_registry: 'https://npm.example.com/' },
+        }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Package index: https://npm.example.com/\n')
+    })
+
+    it('shows every URL in a multi-URL package index without its user name and password', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        // PIP_EXTRA_INDEX_URL holds a whitespace-separated list of index URLs, each with credentials
+        const cfg: MCPServerConfig = {
+            ...localCfg(),
+            env: {
+                PIP_EXTRA_INDEX_URL:
+                    'https://a-user:a-pass@a.example.com/simple https://b-user:b-pass@b.example.com/simple',
+            },
+        }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include('Package index: https://a.example.com/simple https://b.example.com/simple\n')
+        expect(message).to.not.match(/a-user|a-pass|b-user|b-pass/)
+    })
+
+    it('shows the whole command of a registry server, which has no action to see the configuration in full', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        // Longer than the 200-character preview limit that truncates a workspace prompt
+        const longArgument = 'a'.repeat(300)
+        const cfg: MCPServerConfig = { ...localCfg(), args: ['-y', longArgument] }
+
+        await (mgr as any).initOneServerInternal('docs-server', cfg)
+
+        const message = showMessageStub.firstCall.args[0].message as string
+        expect(message).to.include(`Command: npx -y ${longArgument}\n`)
+        expect(message).to.not.include('{ ... }')
+    })
+
     it('shows the URLs in the command without their user name and password', async () => {
         const mgr = await buildMgr()
         showMessageStub.resolves({ title: 'Deny' })
@@ -2902,8 +2968,19 @@ describe('registry sync of a new version of an installed registry server', () =>
         expect(error?.message).to.equal('PASSED_THE_GATE')
         sinon.assert.calledOnce(showMessageStub)
         sinon.assert.calledOnce(removeServerSpy)
-        // The server records the version that the prompt asked about
-        sinon.assert.calledOnceWithExactly(addRegistryServerSpy, 'docs-server', newCfg, globalAgent)
+        // The server records the version that the prompt asked about. The trailing arguments carry the user's
+        // preserved environment, headers, "always allow" tools and enabled-tool entries; this server has only the
+        // whole-server entry and none of the rest.
+        sinon.assert.calledOnceWithExactly(
+            addRegistryServerSpy,
+            'docs-server',
+            newCfg,
+            globalAgent,
+            undefined,
+            undefined,
+            [],
+            ['@docs-server']
+        )
         expect(removeServerSpy.calledBefore(addRegistryServerSpy)).to.be.true
         // Only the new configuration is approved now
         expect([...approvals]).to.deep.equal([
@@ -2967,6 +3044,176 @@ describe('registry sync of a new version of an installed registry server', () =>
         sinon.assert.notCalled(removeServerSpy)
         sinon.assert.notCalled(addRegistryServerSpy)
         expect((mgr as any).mcpServers.get('docs-server')).to.equal(saved)
+    })
+
+    it('keeps the approved configuration when a periodic sync prompt is not answered in time', async () => {
+        const mgr = await buildMgr()
+        // A background (periodic) sync must not stall on an unanswered prompt
+        ;(mgr as any).isPeriodicSync = true
+        const running = (mgr as any).mcpServers.get('docs-server')
+        // The user never answers the prompt
+        showMessageStub.returns(new Promise(() => {}))
+
+        const clock = sinon.useFakeTimers()
+        try {
+            let settled = false
+            const reinstall = (mgr as any)
+                .reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+                .then((r: boolean) => {
+                    settled = true
+                    return r
+                })
+            // Just before the one-minute timeout the sync is still waiting on the shown prompt
+            await clock.tickAsync(59_999)
+            sinon.assert.calledOnce(showMessageStub)
+            expect(settled).to.be.false
+            // Past the timeout, the unanswered prompt counts as a denial
+            await clock.tickAsync(2)
+            expect(await reinstall).to.be.false
+            expect(settled).to.be.true
+        } finally {
+            clock.restore()
+        }
+
+        sinon.assert.notCalled(removeServerSpy)
+        sinon.assert.notCalled(addRegistryServerSpy)
+        expect((mgr as any).mcpServers.get('docs-server')).to.equal(running)
+        expect(approvals.size).to.equal(1)
+    })
+
+    it('does not time out an interactive (non-periodic) consent prompt', async () => {
+        const mgr = await buildMgr()
+        ;(mgr as any).isPeriodicSync = false
+        showMessageStub.returns(new Promise(() => {}))
+
+        const clock = sinon.useFakeTimers()
+        try {
+            let settled = false
+            void (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4')).then(() => {
+                settled = true
+            })
+            await clock.tickAsync(120_000)
+            // The interactive path waits for a real answer; the timeout only applies to a background sync
+            sinon.assert.calledOnce(showMessageStub)
+            expect(settled).to.be.false
+        } finally {
+            clock.restore()
+        }
+    })
+
+    it('does not open a second prompt in the same session after a periodic sync prompt timed out', async () => {
+        const mgr = await buildMgr()
+        ;(mgr as any).isPeriodicSync = true
+        showMessageStub.returns(new Promise(() => {}))
+
+        const clock = sinon.useFakeTimers()
+        try {
+            const first = (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+            await clock.tickAsync(60_001)
+            expect(await first).to.be.false
+            sinon.assert.calledOnce(showMessageStub)
+
+            // A later periodic sync of the same version must honour the "won't be asked again" promise
+            const second = (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+            await clock.tickAsync(60_001)
+            expect(await second).to.be.false
+            sinon.assert.calledOnce(showMessageStub)
+        } finally {
+            clock.restore()
+        }
+
+        sinon.assert.notCalled(removeServerSpy)
+        sinon.assert.notCalled(addRegistryServerSpy)
+    })
+
+    it('preserves the user environment, headers and allowed tools across a reinstall', async () => {
+        const mgr = await buildMgr()
+        const running = (mgr as any).mcpServers.get('docs-server')
+        running.__additionalEnv__ = { API_KEY: 'secret' }
+        running.__additionalHeaders__ = { Authorization: 'Bearer tok' }
+        // One tool this server may always run, plus an unrelated server's tool that must not be carried over
+        ;(mgr as any).agentConfig.allowedTools = ['@docs-server/search', '@other-server/tool']
+        showMessageStub.resolves({ title: 'Allow for this server' })
+
+        let error: Error | undefined
+        try {
+            await (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+        } catch (e: any) {
+            error = e
+        }
+
+        expect(error?.message).to.equal('PASSED_THE_GATE')
+        // Exactly one prompt: carrying the env and headers onto candidate makes the recorded approval match what
+        // addRegistryServer starts, so its own consent gate does not prompt a second time.
+        sinon.assert.calledOnce(showMessageStub)
+        const newCfg: MCPServerConfig = {
+            ...new McpServerConfigConverter().convertRegistryServer(registryServer('1.2.4')),
+            __cachedVersion__: '1.2.4',
+        }
+        // The reinstall carries the user's own env and headers and only this server's "always allow" tool onto
+        // addRegistryServer, so the upgraded server keeps its credentials and approved tools.
+        sinon.assert.calledOnceWithExactly(
+            addRegistryServerSpy,
+            'docs-server',
+            newCfg,
+            globalAgent,
+            { Authorization: 'Bearer tok' },
+            { API_KEY: 'secret' },
+            ['@docs-server/search'],
+            ['@docs-server']
+        )
+    })
+
+    it('passes the user environment to the converter so an OCI server keeps its container -e flags on reinstall', async () => {
+        const mgr = await buildMgr()
+        const running = (mgr as any).mcpServers.get('docs-server')
+        running.__additionalEnv__ = { API_KEY: 'secret' }
+        showMessageStub.resolves({ title: 'Allow for this server' })
+        const ociServer = {
+            name: 'docs-server',
+            description: 'Searches the team docs',
+            version: '2.0.0',
+            packages: [{ registryType: 'oci', identifier: 'example/docs-server', transport: { type: 'stdio' } }],
+        }
+
+        try {
+            await (mgr as any).reinstallServer('docs-server', 'docs-server', ociServer)
+        } catch {}
+
+        // The container only receives env passed as -e flags, which the converter builds only when given the env
+        const passedCfg = addRegistryServerSpy.firstCall.args[1] as MCPServerConfig
+        expect(passedCfg.args).to.include('-e')
+        expect(passedCfg.args).to.include('API_KEY=secret')
+    })
+
+    it('keeps a request timeout the user set on the server when it reinstalls', async () => {
+        const mgr = await buildMgr()
+        const running = (mgr as any).mcpServers.get('docs-server')
+        running.timeout = 12345
+        showMessageStub.resolves({ title: 'Allow for this server' })
+
+        try {
+            await (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+        } catch {}
+
+        const passedCfg = addRegistryServerSpy.firstCall.args[1] as MCPServerConfig
+        expect(passedCfg.timeout).to.equal(12345)
+    })
+
+    it('keeps the user tool enable state on reinstall and does not re-enable a disabled tool', async () => {
+        const mgr = await buildMgr()
+        // The user enabled only one tool; the whole-server entry is absent, so the other tools are denied
+        ;(mgr as any).agentConfig.tools = ['@docs-server/search']
+        showMessageStub.resolves({ title: 'Allow for this server' })
+
+        try {
+            await (mgr as any).reinstallServer('docs-server', 'docs-server', registryServer('1.2.4'))
+        } catch {}
+
+        const tools = (mgr as any).agentConfig.tools
+        expect(tools).to.include('@docs-server/search')
+        // A reinstall that reset the entry to the whole server would re-enable every tool
+        expect(tools).to.not.include('@docs-server')
     })
 })
 

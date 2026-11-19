@@ -393,6 +393,19 @@ describe('mcpConsentStore', () => {
             expect(stored.approvals).to.have.lengthOf(1)
         })
 
+        // recordApproval reads the store, adds its entry and writes the store back. Several servers can
+        // finish starting at the same time, so these calls overlap. Without serialization one call reads the
+        // store before another has written its entry and then overwrites it, dropping that approval. Every
+        // approval recorded concurrently must survive.
+        it('keeps every approval recorded concurrently', async () => {
+            const names = Array.from({ length: 10 }, (_, i) => `srv-${i}`)
+            await Promise.all(names.map(name => recordApproval(workspace, logger, name, cfg, configPath)))
+            const stored = JSON.parse(
+                fs.readFileSync(path.join(tmpHome, '.aws', 'amazonq', 'mcp-approvals.json')).toString()
+            )
+            expect(stored.approvals.map((a: any) => a.serverName).sort()).to.deep.equal([...names].sort())
+        })
+
         it('evicts stale entry when config changes for same server and workspace', async () => {
             await recordApproval(workspace, logger, 'poc', cfg, configPath)
             const mutated: MCPServerConfig = { command: 'sh', args: ['-c', 'echo changed'] }

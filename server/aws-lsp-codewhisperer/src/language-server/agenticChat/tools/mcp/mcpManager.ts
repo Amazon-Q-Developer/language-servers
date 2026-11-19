@@ -23,7 +23,6 @@ import {
     AgentConfig,
     AgentResourceSource,
     isMCPServerConfig,
-    isRegistryServerConfig,
 } from './mcpTypes'
 import {
     isEmptyEnv,
@@ -90,15 +89,34 @@ export enum AuthIntent {
 const MCP_CONSENT_PREVIEW_MAX_LENGTH = 200
 const MCP_CONSENT_TRUNCATION_CUE = ' { ... }'
 
-function formatConsentPreview(value: string): string {
-    const truncated = value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
+// A registry consent prompt has no "View full configuration" action, so it shows its values in full (truncate
+// false). A workspace prompt can be truncated because it offers that action.
+function formatConsentPreview(value: string, truncate: boolean = true): string {
+    const truncated = truncate && value.length > MCP_CONSENT_PREVIEW_MAX_LENGTH
     // A line break or a bidirectional override in a value must not change how the rest of the prompt reads
     const shown = showHiddenCharacters(truncated ? value.slice(0, MCP_CONSENT_PREVIEW_MAX_LENGTH) : value)
     return truncated ? `${shown}${MCP_CONSENT_TRUNCATION_CUE}` : shown
 }
 
-/** The environment variables that set the package index of an npx or uvx server */
-const PACKAGE_INDEX_ENV_VARS = [MCP_REGISTRY_CONSTANTS.NPM.ENV_VAR, MCP_REGISTRY_CONSTANTS.PYPI.ENV_VAR]
+/**
+ * The environment variables that redirect where an npx or uvx server fetches its package, matched
+ * case-insensitively. Their values are URLs, so the prompt shows them without any user name or password; every
+ * other variable shows its name only, because a value can hold a token.
+ */
+const PACKAGE_INDEX_ENV_VARS = new Set(
+    [
+        MCP_REGISTRY_CONSTANTS.NPM.ENV_VAR,
+        MCP_REGISTRY_CONSTANTS.PYPI.ENV_VAR,
+        'UV_INDEX_URL',
+        'UV_EXTRA_INDEX_URL',
+        'PIP_INDEX_URL',
+        'PIP_EXTRA_INDEX_URL',
+    ].map(name => name.toLowerCase())
+)
+
+// How long a background registry sync waits for an answer to a version-change prompt before it keeps the approved
+// configuration and moves on, so an unanswered prompt cannot stall the rest of the sync.
+const REGISTRY_SYNC_CONSENT_TIMEOUT_MS = 60000
 
 /**
  * The user name and password of a URL in a text, with the scheme of the URL in group 1. The scheme has at most
@@ -725,7 +743,8 @@ export class McpManager {
 
         // A URL in the command, such as the package index of a PyPI server, is shown without a user name or password
         const cmdLine = formatConsentPreview(
-            [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').replace(URL_CREDENTIALS, '$1')
+            [cfg.command ?? cfg.url ?? '(none)', ...(cfg.args ?? [])].join(' ').replace(URL_CREDENTIALS, '$1'),
+            isWorkspaceScoped
         )
         // Surface the environment variables and headers the server will actually be
         // launched with. Names only, never values: a config may legitimately hold
@@ -736,14 +755,24 @@ export class McpManager {
         const headerNames = Object.keys(effectiveHeaders(cfg))
         const envLine =
             envKeys.length > 0
-                ? `Environment variables: ${formatConsentPreview(envKeys.join(', '))}\n`
+                ? `Environment variables: ${formatConsentPreview(envKeys.join(', '), isWorkspaceScoped)}\n`
                 : `Environment variables: (none)\n`
-        const headerLine = headerNames.length > 0 ? `Headers: ${formatConsentPreview(headerNames.join(', '))}\n` : ''
-        // The exception is a package index, whose URL is shown without a user name or password.
-        const packageIndexes = PACKAGE_INDEX_ENV_VARS.map(name => env[name]).filter(value => !!value)
+        const headerLine =
+            headerNames.length > 0
+                ? `Headers: ${formatConsentPreview(headerNames.join(', '), isWorkspaceScoped)}\n`
+                : ''
+        // The exception is a package index, whose URL is shown without a user name or password. A variable such as
+        // PIP_EXTRA_INDEX_URL can hold a whitespace-separated list of URLs, so strip the credentials from every URL
+        // in the value, not only the first.
+        const packageIndexes = Object.entries(env)
+            .filter(([name]) => PACKAGE_INDEX_ENV_VARS.has(name.toLowerCase()))
+            .map(([, value]) => value)
+            .filter(value => !!value)
+        const indexValueWithoutCredentials = (value: string): string =>
+            value.split(/\s+/).filter(Boolean).map(urlWithoutCredentials).join(' ')
         const packageIndexLine =
             packageIndexes.length > 0
-                ? `Package index: ${formatConsentPreview(packageIndexes.map(urlWithoutCredentials).join(', '))}\n`
+                ? `Package index: ${formatConsentPreview(packageIndexes.map(indexValueWithoutCredentials).join(', '), isWorkspaceScoped)}\n`
                 : ''
         const allowBtn = { title: 'Allow for this server' }
         const denyBtn = { title: 'Deny' }
@@ -1343,7 +1372,9 @@ export class McpManager {
         cfg: MCPServerConfig,
         configPath: string,
         additionalHeaders?: Record<string, string>,
-        additionalEnv?: Record<string, string>
+        additionalEnv?: Record<string, string>,
+        allowedTools: string[] = [],
+        serverTools?: string[]
     ): Promise<void> {
         const sanitizedName = sanitizeName(serverName)
         if (
@@ -1377,8 +1408,19 @@ export class McpManager {
         this.agentConfig.mcpServers[serverName] = registryServerConfig
 
         const serverPrefix = `@${serverName}`
-        if (!this.agentConfig.tools.includes(serverPrefix)) {
-            this.agentConfig.tools.push(serverPrefix)
+        // A plain install enables the whole server; a registry reinstall passes the exact tool entries the user
+        // had, so a tool the user turned off stays off.
+        const toolsToRegister = serverTools ?? [serverPrefix]
+        for (const tool of toolsToRegister) {
+            if (!this.agentConfig.tools.includes(tool)) {
+                this.agentConfig.tools.push(tool)
+            }
+        }
+        // Re-apply any tools the caller preserved as "always allow" for this server (a plain install passes none).
+        for (const tool of allowedTools) {
+            if (!this.agentConfig.allowedTools.includes(tool)) {
+                this.agentConfig.allowedTools.push(tool)
+            }
         }
 
         await saveServerSpecificAgentConfig(
@@ -1386,8 +1428,8 @@ export class McpManager {
             this.features.logging,
             serverName,
             registryServerConfig,
-            [serverPrefix],
-            [],
+            toolsToRegister,
+            allowedTools,
             configPath
         )
 
@@ -2646,8 +2688,11 @@ export class McpManager {
                 // Only sync during periodic updates, not at startup
                 if (isPeriodicSync) {
                     this.isPeriodicSync = true
-                    await this.syncWithRegistry()
-                    this.isPeriodicSync = false
+                    try {
+                        await this.syncWithRegistry()
+                    } finally {
+                        this.isPeriodicSync = false
+                    }
                 }
             }
         } catch (error) {
@@ -2678,10 +2723,10 @@ export class McpManager {
 
         for (const [sanitizedName, config] of configuredServers) {
             const unsanitizedName = this.serverNameMapping.get(sanitizedName) || sanitizedName
-            const agentConfig = this.agentConfig.mcpServers[unsanitizedName]
 
-            // Skip non-registry servers
-            if (!agentConfig || !isRegistryServerConfig(agentConfig)) {
+            // A registry server carries the __registryServer__ mark on its config. The agent-config entry does not
+            // keep a registry type after loadAgentConfig rewrites it to the converted fields, so gate on the mark.
+            if (config.__registryServer__ !== true) {
                 continue
             }
 
@@ -2693,7 +2738,13 @@ export class McpManager {
                 // Close client and mark as failed, but keep in agent config
                 const client = this.clients.get(sanitizedName)
                 if (client) {
-                    await client.close()
+                    try {
+                        await client.close()
+                    } catch (e: any) {
+                        this.features.logging.warn(
+                            `MCP Registry: Failed to close client for '${unsanitizedName}': ${e?.message}`
+                        )
+                    }
                     this.clients.delete(sanitizedName)
                 }
                 this.mcpTools = this.mcpTools.filter(t => t.serverName !== sanitizedName)
@@ -2774,19 +2825,79 @@ export class McpManager {
         const configPath =
             running?.__configPath__ || getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())
 
+        // A registry version bump replaces only the package version. The user's own additions to the server must
+        // survive the reinstall: the extra environment variables and headers they configured (an API key, for
+        // example) and the tools they marked "always allow". Capture them before removeServer discards them.
+        // Filter out empty entries, matching how addRegistryServer builds the started configuration, so the
+        // consent fingerprint of candidate equals what the server runs and a hand-edited empty value does not
+        // force a second, un-timed prompt inside the reinstall.
+        const nonEmptyRecord = (record?: Record<string, string>): Record<string, string> | undefined => {
+            const filtered = Object.fromEntries(
+                Object.entries(record ?? {}).filter(([key, value]) => key.trim() && value.trim())
+            )
+            return Object.keys(filtered).length > 0 ? filtered : undefined
+        }
+        const additionalEnv = nonEmptyRecord(running?.__additionalEnv__)
+        const additionalHeaders = nonEmptyRecord(running?.__additionalHeaders__)
+        const serverPrefix = `@${unsanitizedName}`
+
         const converter = new (await import('./mcpServerConfigConverter')).McpServerConfigConverter()
-        // The version of the entry that the prompt asks about, not the one in a registry that a later sync loads
+        // The version of the entry that the prompt asks about, not the one in a registry that a later sync loads.
+        // Pass the user's env so an OCI (container) server keeps its -e flags, matching how the loader builds it.
         const newConfig: MCPServerConfig = {
-            ...converter.convertRegistryServer(registryServer),
+            ...converter.convertRegistryServer(registryServer, additionalEnv),
             __cachedVersion__: registryServer.version,
         }
+        // Keep a request timeout the user set on the server; the converter does not carry one.
+        if (typeof running?.timeout === 'number') {
+            newConfig.timeout = running.timeout
+        }
 
-        // The configuration that addRegistryServer starts the server with
+        // The configuration that addRegistryServer starts the server with. It carries the user's own environment
+        // and headers so the consent prompt and the recorded approval cover what will actually run.
         const candidate: MCPServerConfig = { ...newConfig, __configPath__: configPath, __registryServer__: true }
+        if (additionalEnv) {
+            candidate.__additionalEnv__ = additionalEnv
+        }
+        if (additionalHeaders) {
+            candidate.__additionalHeaders__ = additionalHeaders
+        }
         const scope = this.consentScope(candidate)
-        // The sync waits for the answer before it checks the next server
-        const consent = scope ? await this.askForServerConsent(sanitizedName, candidate, scope) : 'approved'
+        // The sync waits for the answer before it checks the next server, but only for a bounded time: an
+        // unanswered prompt then keeps the approved configuration so the sync moves on to the next server.
+        let consent: 'approved' | 'allowed' | 'denied' | 'failed'
+        if (!scope) {
+            consent = 'approved'
+        } else if (this.isPeriodicSync) {
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const timeout = new Promise<'denied'>(resolve => {
+                timer = setTimeout(() => {
+                    // Remember the unanswered prompt as a denial for this session, so a later sync keeps the
+                    // approved configuration and does not open a second prompt for the same version. This honours
+                    // the prompt's own promise that the user will not be asked again for this configuration.
+                    this.sessionDeniedConsent.add(
+                        `${sanitizedName}|${scope.configPath}|${fingerprintServerConfig(candidate)}`
+                    )
+                    this.features.logging.info(
+                        `MCP Registry: Consent prompt for '${unsanitizedName}' version ${registryServer.version} was not answered in time; keeping the approved configuration`
+                    )
+                    resolve('denied')
+                }, REGISTRY_SYNC_CONSENT_TIMEOUT_MS)
+            })
+            try {
+                consent = await Promise.race([this.askForServerConsent(sanitizedName, candidate, scope), timeout])
+            } finally {
+                if (timer) {
+                    clearTimeout(timer)
+                }
+            }
+        } else {
+            consent = await this.askForServerConsent(sanitizedName, candidate, scope)
+        }
         if (consent === 'denied' || consent === 'failed') {
+            // A timeout records the denial for the session (above), so an unanswered prompt is not reopened on the
+            // next sync. A user who answers the timed-out prompt late has no effect: the server stays on its
+            // approved version until the session restarts. This keeps the sync non-blocking and fails safe.
             this.features.logging.info(
                 `MCP Registry: Kept server '${unsanitizedName}' at its approved configuration; version ${registryServer.version} from the registry was not allowed`
             )
@@ -2800,6 +2911,17 @@ export class McpManager {
             )
             return false
         }
+
+        // Read the tool enable/disable state and the "always allow" tools now, after the prompt, so a permission
+        // the user changed while the prompt was open is preserved rather than reverted. The enable state lives in
+        // which @server and @server/tool entries are listed, so resetting them to the whole server would silently
+        // re-enable a tool the user had turned off.
+        const preservedServerTools = this.agentConfig.tools.filter(
+            tool => tool === serverPrefix || tool.startsWith(`${serverPrefix}/`)
+        )
+        const preservedAllowedTools = this.agentConfig.allowedTools.filter(
+            tool => tool === serverPrefix || tool.startsWith(`${serverPrefix}/`)
+        )
 
         this.features.logging.info(
             `MCP Registry: Reinstalling server '${unsanitizedName}' with version ${registryServer.version}`
@@ -2817,7 +2939,17 @@ export class McpManager {
                 scope.configPath
             )
         }
-        await this.addRegistryServer(unsanitizedName, newConfig, configPath)
+        // Restore the user's own environment, headers, enabled tools and "always allow" tools onto the reinstalled
+        // server, so a version bump does not drop the server's credentials or reset its tool permissions.
+        await this.addRegistryServer(
+            unsanitizedName,
+            newConfig,
+            configPath,
+            additionalHeaders,
+            additionalEnv,
+            preservedAllowedTools,
+            preservedServerTools
+        )
         return true
     }
 }

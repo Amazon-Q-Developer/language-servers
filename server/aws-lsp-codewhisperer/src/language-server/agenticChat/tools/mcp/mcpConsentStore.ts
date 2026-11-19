@@ -7,6 +7,7 @@ import { createHash } from 'crypto'
 import * as path from 'path'
 import type { Workspace, Logging } from '@aws/language-server-runtimes/server-interface'
 import type { MCPServerConfig } from './mcpTypes'
+import { Mutex } from 'async-mutex'
 
 const APPROVALS_FILE = 'mcp-approvals.json'
 // v2: the fingerprint now covers the fully-merged spawn environment and headers
@@ -143,6 +144,10 @@ function getStorePath(workspace: Workspace): string {
     return path.join(workspace.fs.getUserHomeDir(), '.aws', 'amazonq', APPROVALS_FILE)
 }
 
+// Serializes the read-modify-write of the approval store. Several servers can start at once, so without this a
+// concurrent recordApproval could read the store before another wrote it and drop that approval on write.
+const storeMutex = new Mutex()
+
 async function readStore(workspace: Workspace, logging: Logging): Promise<ApprovalStore> {
     const file = getStorePath(workspace)
     try {
@@ -208,19 +213,21 @@ export async function recordApproval(
     cfg: MCPServerConfig,
     configPath: string
 ): Promise<void> {
-    const store = await readStore(workspace, logging)
-    const fp = fingerprintServerConfig(cfg)
-    const wh = fingerprintWorkspace(configPath)
-    // Replace any prior approval for the same (server, workspace) — this evicts
-    // stale entries when the config changes (fingerprint differs).
-    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
-    store.approvals.push({
-        serverName,
-        fingerprint: fp,
-        workspaceHash: wh,
-        approvedAt: new Date().toISOString(),
+    return storeMutex.runExclusive(async () => {
+        const store = await readStore(workspace, logging)
+        const fp = fingerprintServerConfig(cfg)
+        const wh = fingerprintWorkspace(configPath)
+        // Replace any prior approval for the same (server, workspace) — this evicts
+        // stale entries when the config changes (fingerprint differs).
+        store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
+        store.approvals.push({
+            serverName,
+            fingerprint: fp,
+            workspaceHash: wh,
+            approvedAt: new Date().toISOString(),
+        })
+        await writeStore(workspace, logging, store)
     })
-    await writeStore(workspace, logging, store)
 }
 
 export async function removeApproval(
@@ -229,15 +236,17 @@ export async function removeApproval(
     serverName: string,
     configPath: string
 ): Promise<void> {
-    const store = await readStore(workspace, logging)
-    const wh = fingerprintWorkspace(configPath)
-    const before = store.approvals.length
-    // Scope removal to the (serverName, workspace) that requested it, mirroring how
-    // recordApproval keys entries. Removing a server in one workspace must not
-    // revoke consent for an identically-named server in a different workspace.
-    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
-    if (store.approvals.length < before) {
-        await writeStore(workspace, logging, store)
-        logging.info(`MCP consent store: removed approval for '${serverName}'`)
-    }
+    return storeMutex.runExclusive(async () => {
+        const store = await readStore(workspace, logging)
+        const wh = fingerprintWorkspace(configPath)
+        const before = store.approvals.length
+        // Scope removal to the (serverName, workspace) that requested it, mirroring how
+        // recordApproval keys entries. Removing a server in one workspace must not
+        // revoke consent for an identically-named server in a different workspace.
+        store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
+        if (store.approvals.length < before) {
+            await writeStore(workspace, logging, store)
+            logging.info(`MCP consent store: removed approval for '${serverName}'`)
+        }
+    })
 }
