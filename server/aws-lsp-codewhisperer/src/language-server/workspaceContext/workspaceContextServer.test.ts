@@ -1,7 +1,9 @@
 import { InitializeParams, Server } from '@aws/language-server-runtimes/server-interface'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
-import sinon from 'ts-sinon'
+import sinon, { stubInterface } from 'ts-sinon'
 import { WorkspaceContextServer } from './workspaceContextServer'
+import { WorkspaceFolderManager } from './workspaceFolderManager'
+import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 
 describe('WorkspaceContext Server', () => {
     let features: TestFeatures
@@ -9,7 +11,13 @@ describe('WorkspaceContext Server', () => {
     let disposeServer: () => void
 
     beforeEach(() => {
+        // The server reads the Amazon Q service manager when it is initialized, and creates the workspace
+        // folder manager once per process
+        sinon.stub(AmazonQTokenServiceManager, 'getInstance').returns(stubInterface<AmazonQTokenServiceManager>())
+        ;(WorkspaceFolderManager as any).instance = undefined
         features = new TestFeatures()
+        // No tools are registered
+        ;(features.agent.getTools as sinon.SinonStub).returns([])
         server = WorkspaceContextServer()
         disposeServer = server(features)
     })
