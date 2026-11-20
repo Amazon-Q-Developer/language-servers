@@ -4587,6 +4587,8 @@ export class AgenticChatController implements ChatHandlers {
         const sessionResult = this.#chatSessionManagementService.createSession(params.tabId)
         const { data: session, success } = sessionResult
         if (!success) {
+            // tabAdd is a notification, so the JSON-RPC layer discards this result and nobody else reports it
+            this.#features.logging.error(`Chat tab ${params.tabId} has no session: ${sessionResult.error}`)
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 

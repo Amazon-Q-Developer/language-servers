@@ -379,6 +379,24 @@ describe('AgenticChatController', () => {
         })
     })
 
+    it('logs an error when a tab add cannot create a session', () => {
+        // tabAdd is registered as a notification, so the JSON-RPC layer discards the returned ResponseError and
+        // logNotificationErrors sees no rejection. Without this log the failure is reported nowhere.
+        sinon.stub(chatSessionManagementService, 'createSession').returns({
+            success: false,
+            error: 'session store is full',
+        })
+
+        const result = chatController.onTabAdd({ tabId: mockTabId })
+
+        assert.ok(result instanceof ResponseError, 'the return value is still a ResponseError')
+        assert.strictEqual(result.message, 'session store is full')
+        sinon.assert.calledWithMatch(
+            testFeatures.logging.error as sinon.SinonStub,
+            sinon.match(mockTabId).and(sinon.match('session store is full'))
+        )
+    })
+
     it('deletes a session by tab id when a tab remove notifcation is received', () => {
         chatController.onTabAdd({ tabId: mockTabId })
 
