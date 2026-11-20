@@ -43,6 +43,11 @@ import {
 } from './mcpUtils'
 import { getReservedBuiltInToolNames, STATIC_BUILT_IN_TOOL_NAMES } from '../../constants/toolConstants'
 import type { MCPServerConfig } from './mcpTypes'
+import { McpPermissionType } from './mcpTypes'
+import { pathToFileURL } from 'url'
+import * as sinon from 'sinon'
+import { URI } from 'vscode-uri'
+import { sanitizeInput } from '../../../../shared/utils'
 
 /** The error that `promise` rejects with. Fails the test if the promise resolves. */
 async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
@@ -53,11 +58,6 @@ async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
     }
     throw new Error('Expected the promise to reject')
 }
-import { McpPermissionType } from './mcpTypes'
-import { pathToFileURL } from 'url'
-import * as sinon from 'sinon'
-import { URI } from 'vscode-uri'
-import { sanitizeInput } from '../../../../shared/utils'
 
 describe('loadMcpServerConfigs', () => {
     let tmpDir: string
