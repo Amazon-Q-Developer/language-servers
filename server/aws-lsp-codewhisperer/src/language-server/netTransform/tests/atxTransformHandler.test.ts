@@ -5641,13 +5641,22 @@ describe('ATXTransformHandler - final coverage push', () => {
             expect(result).to.be.null
         })
 
-        it('reads every page for the step', async () => {
-            sendStub.onFirstCall().resolves({ artifacts: [{ artifactId: 'a1' }], nextToken: 'p2' })
-            sendStub.onSecondCall().resolves({ artifacts: [{ artifactId: 'a2' }] })
+        it('pages past empty pages and stops at the first page that has an artifact', async () => {
+            sendStub.onFirstCall().resolves({ artifacts: [], nextToken: 'p2' })
+            sendStub.onSecondCall().resolves({ artifacts: [{ artifactId: 'a2' }], nextToken: 'p3' })
+            sendStub.onThirdCall().resolves({ artifacts: [{ artifactId: 'a3' }] })
             const result = await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
-            expect(result.map((a: any) => a.artifactId)).to.deep.equal(['a1', 'a2'])
+            expect(result.map((a: any) => a.artifactId)).to.deep.equal(['a2'])
+            expect(sendStub.callCount).to.equal(2)
             expect(sendStub.secondCall.args[0].input.nextToken).to.equal('p2')
             expect(sendStub.secondCall.args[0].input.jobFilter.planStepId).to.equal('step-1')
+        })
+
+        it('does not start the beam throttle cooldown when a step listing is throttled', async () => {
+            sendStub.onFirstCall().resolves({ artifacts: [], nextToken: 'p2' })
+            sendStub.onSecondCall().rejects(Object.assign(new Error('Rate exceeded'), { name: 'ThrottlingException' }))
+            await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
+            expect((handler as any).isBeamThrottleCooldownActive()).to.be.false
         })
     })
 
@@ -6388,6 +6397,84 @@ describe('ATXTransformHandler - Beam to IDE', () => {
 
                 await handler.listBeamedRepos('ws-1', 'job-1')
                 expect((handler as any).isBeamThrottleCooldownActive()).to.be.true
+            })
+
+            it('finds the beam-map behind 150 pathless ZIP artifacts and beam-status files (run 7b)', async () => {
+                const pathlessZips = Array.from({ length: 150 }, (_, i) => ({
+                    artifactId: `pz-${i}`,
+                    artifactType: { categoryType: 'CUSTOMER_OUTPUT', fileType: 'ZIP' },
+                    fileMetadata: { path: '' },
+                }))
+                pagedSend([
+                    pathlessZips.slice(0, 100),
+                    [...pathlessZips.slice(100), ...beamStatus(50)],
+                    [
+                        ...zipArtifacts('alice'),
+                        {
+                            artifactId: 'beammap-1',
+                            artifactType: { categoryType: 'CUSTOMER_OUTPUT', fileType: 'JSON' },
+                            fileMetadata: { path: '' },
+                        },
+                    ],
+                ])
+                const download = sinon
+                    .stub(handler as any, 'downloadJsonArtifact')
+                    .callsFake(async (_ws: any, _job: any, id: any) =>
+                        id === 'beammap-1'
+                            ? { repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }] }
+                            : null
+                    )
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+                // The beam-map is the first artifact read: no ZIP and no beam-status file is tried.
+                expect(download.firstCall.args[2]).to.equal('beammap-1')
+                expect(download.getCalls().some((c: any) => /^(pz|bs)-/.test(c.args[2]))).to.be.false
+            })
+
+            it('ranks a declared-JSON artifact ahead of one with no declared type', async () => {
+                pagedSend([
+                    [
+                        ...Array.from({ length: 30 }, (_, i) => ({
+                            artifactId: `untyped-${i}`,
+                            fileMetadata: { path: '' },
+                        })),
+                        {
+                            artifactId: 'beammap-1',
+                            artifactType: { categoryType: 'CUSTOMER_OUTPUT', fileType: 'JSON' },
+                            fileMetadata: { path: '' },
+                        },
+                    ],
+                ])
+                const download = sinon.stub(handler as any, 'downloadJsonArtifact').resolves(null)
+                await handler.listBeamedRepos('ws-1', 'job-1')
+                expect(download.firstCall.args[2]).to.equal('beammap-1')
+            })
+
+            it('labels a listing stopped by the page cap as cut short, not throttled', async () => {
+                let n = 0
+                sendStub.callsFake(async (cmd: any) =>
+                    isList(cmd) ? { artifacts: [], nextToken: `p${++n}` } : { artifacts: [] }
+                )
+                await handler.listBeamedRepos('ws-1', 'job-1')
+                const summary = (logging.log as sinon.SinonStub)
+                    .getCalls()
+                    .map((c: any) => String(c.args[0]))
+                    .find(m => m.includes('scan-summary'))
+                expect(summary).to.include('result=listing-cut-short')
+                expect(summary).to.not.include('throttled-during-scan')
+            })
+
+            it('a lightweight poll reads only the first page while the throttle cooldown is active', async () => {
+                ;(handler as any).noteBeamThrottled()
+                pagedSend([beamStatus(1), beamStatus(1), beamStatus(1)])
+                await handler.listBeamedRepos('ws-1', 'job-1', true)
+                expect(listCalls()).to.have.length(1)
+            })
+
+            it('a lightweight poll reads every page when no cooldown is active', async () => {
+                pagedSend([beamStatus(1), beamStatus(1), beamStatus(1)])
+                await handler.listBeamedRepos('ws-1', 'job-1', true)
+                expect(listCalls()).to.have.length(3)
             })
 
             it('still returns [] when the first page fails, as before', async () => {

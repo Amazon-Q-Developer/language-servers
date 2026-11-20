@@ -1087,7 +1087,12 @@ export class ATXTransformHandler {
             // Every page, not just the first: a large multi-repo job has hundreds of artifacts and the
             // beam-map (and later repos' transformed bundles) can be far down the list. Reading one page
             // left a 50-repo job (927 artifacts, beam-map at #926) out of the Beamed tab entirely.
-            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, parentJobId)
+            // A lightweight poll during a throttle cooldown reads only the first page: it must not add
+            // to the pressure the cooldown exists to relieve. Only the beam scan starts the cooldown.
+            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, parentJobId, {
+                noteThrottle: true,
+                maxPages: lightweight && this.isBeamThrottleCooldownActive() ? 1 : undefined,
+            })
             const artifacts: any[] = listing.artifacts
             // A listing that stopped early may have missed the beam-map: the answer is "unconfirmed",
             // never "not opted in" (see scanFinished / scanAborted below).
@@ -1102,7 +1107,7 @@ export class ATXTransformHandler {
             )
             for (const a of artifacts.slice(0, BEAM_ARTIFACT_LOG_MAX)) {
                 this.logging.log(
-                    `[BEAM-PKG]   artifact | id=${a.artifactId} fileType=${a.fileType} ` +
+                    `[BEAM-PKG]   artifact | id=${a.artifactId} fileType=${a.artifactType?.fileType} ` +
                         `name=${a.name ?? a.fileName ?? ''} path=${a.fileMetadata?.path ?? ''} category=${a.categoryType ?? a.category ?? ''}`
                 )
             }
@@ -1167,7 +1172,8 @@ export class ATXTransformHandler {
             // .zip path, so a plain !endsWith('.zip') filter skipped it entirely → fell back
             // to zip-discovery with empty stepId). Instead, exclude only the transformed-
             // source bundles, whose paths match "<repo>_<hash>/<repo>.zip" (ZIP_RE). Anything
-            // else (including an unnamed/empty-path zip = the beam-map) is a candidate.
+            // else (including an unnamed/empty-path artifact = the beam-map) is a candidate, unless its
+            // declared artifactType.fileType says it isn't JSON (see the type filter below).
             let beamMapRepos: BeamMapRepo[] | null = null
             const beamMaps: { repos: BeamMapRepo[]; createdAt: number }[] = []
             // Lightweight (poll refresh): skip the beam-map download scan (throttle-safe) — use only
@@ -1178,19 +1184,26 @@ export class ATXTransformHandler {
             // beam-map and each one wastes scan budget). A multi-repo beam has N beam-status-*
             // files plus one pathless beam-map; without this ordering the beam-map may fall
             // outside the 15 s budget or be throttled before it is reached.
+            // Type filter: the web uploads the beam-map with artifactType.fileType JSON (FES may store
+            // the bytes zipped, which downloadJsonArtifact handles, but the declared type stays JSON). An
+            // artifact declared as any other type (ZIP bundles, reports) can't be the beam-map. Without
+            // this, a large job's pathless ZIP artifacts (150 in a 50-repo job) sorted first and filled
+            // the candidate cap before the beam-map was reached. An artifact with no declared type is
+            // kept, ranked after declared JSON.
+            const declaredType = (a: any): string => String(a?.artifactType?.fileType ?? '').toUpperCase()
             const allCandidates = lightweight
                 ? []
                 : artifacts
                       .filter(a => {
                           const p = (a.fileMetadata?.path || '').toLowerCase()
-                          return !ZIP_RE.test(p) && !/beam-status-/.test(p)
+                          const t = declaredType(a)
+                          return !ZIP_RE.test(p) && !/beam-status-/.test(p) && (t === '' || t === 'JSON')
                       })
                       .sort((a, b) => {
-                          // Pathless = 0, has-path = 1. Beam-map is pathless; everything else
-                          // has a path. Within each group the order is arbitrary.
-                          const aPathless = a.fileMetadata?.path ? 1 : 0
-                          const bPathless = b.fileMetadata?.path ? 1 : 0
-                          return aPathless - bPathless
+                          // Declared JSON first, then no declared type; within each, pathless first
+                          // (the beam-map is pathless). Otherwise the order is arbitrary.
+                          const rank = (x: any) => (declaredType(x) === 'JSON' ? 0 : 2) + (x.fileMetadata?.path ? 1 : 0)
+                          return rank(a) - rank(b)
                       })
             // Bound the scan: each candidate is a serial download+parse, so an artifact-heavy
             // job (logs, metadata) could otherwise stall the IDE's discovery UI. Cap the number
@@ -1479,7 +1492,9 @@ export class ATXTransformHandler {
                   : scanAborted
                     ? scanCutShort
                         ? 'timed-out'
-                        : 'throttled-during-scan'
+                        : throttledDuringScan
+                          ? 'throttled-during-scan'
+                          : 'listing-cut-short'
                     : scanFinished
                       ? 'not-opted-in'
                       : 'no-scan'
@@ -1590,13 +1605,23 @@ export class ATXTransformHandler {
      * was reached, the service repeated a page token, or a page after the first failed. The caller then
      * has a partial list and must treat anything it didn't find as unknown, not absent. A failure on the
      * first page throws, as the single-page call did, so callers keep their existing error handling.
-     * A throttle on any page also starts the beam throttle cooldown.
+     * With noteThrottle (the beam scan), a throttle on any page also starts the beam throttle cooldown.
      */
     private async listJobCustomerOutputArtifacts(
         workspaceId: string,
         jobId: string,
-        planStepId?: string
+        options: {
+            planStepId?: string
+            /** Start the beam throttle cooldown on a throttle (the beam scan only). */
+            noteThrottle?: boolean
+            /** Read at most this many pages (default BEAM_ARTIFACT_LIST_MAX_PAGES). */
+            maxPages?: number
+            /** Stop after the first page that has at least one artifact. */
+            stopAtFirstArtifact?: boolean
+        } = {}
     ): Promise<{ artifacts: any[]; complete: boolean; pages: number }> {
+        const { planStepId, noteThrottle = false, stopAtFirstArtifact = false } = options
+        const maxPages = Math.min(options.maxPages ?? BEAM_ARTIFACT_LIST_MAX_PAGES, BEAM_ARTIFACT_LIST_MAX_PAGES)
         const artifacts: any[] = []
         const seenTokens = new Set<string>()
         const deadline = Date.now() + BEAM_ARTIFACT_LIST_BUDGET_MS
@@ -1610,8 +1635,8 @@ export class ATXTransformHandler {
             return { artifacts, complete: false, pages }
         }
         do {
-            if (pages >= BEAM_ARTIFACT_LIST_MAX_PAGES) {
-                return stop(`page cap (${BEAM_ARTIFACT_LIST_MAX_PAGES}) reached`)
+            if (pages >= maxPages) {
+                return stop(`page cap (${maxPages}) reached`)
             }
             if (pages > 0 && Date.now() > deadline) {
                 return stop(`time budget (${BEAM_ARTIFACT_LIST_BUDGET_MS}ms) exceeded`)
@@ -1630,7 +1655,7 @@ export class ATXTransformHandler {
             try {
                 result = await this.atxClient!.send(command)
             } catch (error) {
-                if (classifyDownloadUrlError(error) === 'throttle') {
+                if (noteThrottle && classifyDownloadUrlError(error) === 'throttle') {
                     this.noteBeamThrottled()
                 }
                 if (pages === 0) {
@@ -1641,6 +1666,9 @@ export class ATXTransformHandler {
             pages++
             artifacts.push(...(result?.artifacts || []))
             nextToken = result?.nextToken || undefined
+            if (stopAtFirstArtifact && artifacts.length > 0) {
+                return { artifacts, complete: !nextToken, pages }
+            }
             if (nextToken) {
                 if (seenTokens.has(nextToken)) {
                     return stop('the service returned a page token it already returned')
@@ -5530,7 +5558,11 @@ export class ATXTransformHandler {
                 return null
             }
 
-            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, jobId, stepId)
+            // The caller uses only the first artifact, so stop at the first page that has one.
+            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, jobId, {
+                planStepId: stepId,
+                stopAtFirstArtifact: true,
+            })
 
             this.logging.log(
                 `ATX: Found ${listing.artifacts.length} artifacts for step: ${stepId} in ${listing.pages} page(s)` +
