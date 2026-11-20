@@ -12,9 +12,11 @@ import {
     effectiveHeaders,
     fingerprintServerConfig,
     fingerprintWorkspace,
+    formatServerConfigForReview,
     hasApproval,
     recordApproval,
     removeApproval,
+    showHiddenCharacters,
 } from './mcpConsentStore'
 import type { MCPServerConfig } from './mcpTypes'
 
@@ -143,6 +145,163 @@ describe('mcpConsentStore', () => {
         })
     })
 
+    describe('formatServerConfigForReview', () => {
+        it('shows the command, arguments and merged environment of a stdio server as JSON', () => {
+            const cfg: MCPServerConfig = {
+                command: 'npx',
+                args: ['-y', '@example/server@1.0.0', '--flag=a b'],
+                env: { B_VAR: 'b', A_VAR: 'a' },
+                __additionalEnv__: { B_VAR: 'override' },
+                url: 'https://ignored.example.com',
+                timeout: 60000,
+            }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(JSON.parse(text)).to.deep.equal({
+                command: 'npx',
+                args: ['-y', '@example/server@1.0.0', '--flag=a b'],
+                env: { A_VAR: 'a', B_VAR: 'override' },
+            })
+            expect(text).to.equal(
+                '{\n "command": "npx",\n "args": [\n  "-y",\n  "@example/server@1.0.0",\n  "--flag=a b"\n ],\n "env": {\n  "A_VAR": "a",\n  "B_VAR": "override"\n }\n}'
+            )
+        })
+
+        it('shows the URL and merged headers of an HTTP server as JSON', () => {
+            const cfg: MCPServerConfig = {
+                url: 'https://mcp.example.com/path?x=1',
+                headers: { 'X-Team': 'docs' },
+                __additionalHeaders__: { Authorization: 'Bearer abc' },
+            }
+
+            expect(JSON.parse(formatServerConfigForReview(cfg))).to.deep.equal({
+                url: 'https://mcp.example.com/path?x=1',
+                headers: { Authorization: 'Bearer abc', 'X-Team': 'docs' },
+            })
+        })
+
+        it('leaves out empty arguments, environment variables and headers', () => {
+            expect(JSON.parse(formatServerConfigForReview({ command: 'uvx', args: [], env: {} }))).to.deep.equal({
+                command: 'uvx',
+            })
+            expect(
+                JSON.parse(formatServerConfigForReview({ url: 'https://mcp.example.com', headers: {} }))
+            ).to.deep.equal({
+                url: 'https://mcp.example.com',
+            })
+        })
+
+        it('writes characters that a reader would not see as escapes, and keeps the exact values', () => {
+            const hidden = [
+                '\u202E',
+                '\u2066',
+                '\u200B',
+                '\u200D',
+                '\u2028',
+                '\u2029',
+                '\u00AD',
+                '\uFEFF',
+                '\uFE0F',
+                '\u0085',
+                '\u001B',
+                '\u{E0041}',
+                // A format character that is not default ignorable
+                '\uFFF9',
+            ]
+            const cfg: MCPServerConfig = {
+                command: 'npx',
+                args: hidden.map(character => `a${character}b`),
+                env: { [`NAME\u202E`]: `x\ny\tz` },
+            }
+
+            const text = formatServerConfigForReview(cfg)
+
+            for (const character of hidden) {
+                expect(text).to.not.include(character)
+            }
+            expect(text).to.include('a\\u202eb')
+            expect(text).to.include('a\\udb40\\udc41b')
+            expect(text).to.include('"NAME\\u202e": "x\\ny\\tz"')
+            expect(JSON.parse(text)).to.deep.equal({
+                command: 'npx',
+                args: hidden.map(character => `a${character}b`),
+                env: { [`NAME\u202E`]: `x\ny\tz` },
+            })
+        })
+
+        it('writes <, > and & as escapes, and keeps the exact values', () => {
+            const values = ['<span>', '--verbose', '</span>', 'a&quot;, "b', '<b ', 'c&#x3A;d', '&lt;i&gt;']
+            const cfg: MCPServerConfig = { command: 'npx', args: values, env: { 'A<B': 'x&y' } }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(text).to.not.match(/[<>&]/)
+            expect(text).to.include('"\\u003cspan\\u003e"')
+            expect(text).to.include('"a\\u0026quot;, \\"b"')
+            expect(text).to.include('"A\\u003cB": "x\\u0026y"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args: values, env: { 'A<B': 'x&y' } })
+        })
+
+        it('writes <, > and & in a URL and headers as escapes', () => {
+            const cfg: MCPServerConfig = { url: 'https://mcp.example.com/?a=1&b=<2>', headers: { 'X-A&B': '<c>' } }
+
+            const text = formatServerConfigForReview(cfg)
+
+            expect(text).to.not.match(/[<>&]/)
+            expect(text).to.include('"https://mcp.example.com/?a=1\\u0026b=\\u003c2\\u003e"')
+            expect(JSON.parse(text)).to.deep.equal({ url: cfg.url, headers: cfg.headers })
+        })
+
+        it('writes spaces other than U+0020 as escapes', () => {
+            const spaces = ['\u00A0', '\u1680', '\u2003', '\u202F', '\u205F', '\u3000']
+            const args = [...spaces.map(space => `a${space}b`), 'a   b']
+
+            const text = formatServerConfigForReview({ command: 'npx', args })
+
+            for (const space of spaces) {
+                expect(text).to.not.include(space)
+            }
+            expect(text).to.include('"a\\u00a0b"')
+            expect(text).to.include('"a\\u3000b"')
+            expect(text).to.include('"a   b"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args })
+        })
+
+        it('keeps visible non-ASCII characters', () => {
+            const text = formatServerConfigForReview({ command: 'npx', args: ['Größe', 'データ', '✓'] })
+
+            expect(text).to.include('"Größe"')
+            expect(text).to.include('"データ"')
+            expect(text).to.include('"✓"')
+        })
+
+        it('writes the braille blank, private use and unassigned code points as escapes', () => {
+            const args = ['a\u2800b', 'a\uE000b', 'a\u0378b']
+
+            const text = formatServerConfigForReview({ command: 'npx', args })
+
+            expect(text).to.include('"a\\u2800b"')
+            expect(text).to.include('"a\\ue000b"')
+            expect(text).to.include('"a\\u0378b"')
+            expect(JSON.parse(text)).to.deep.equal({ command: 'npx', args })
+        })
+    })
+
+    describe('showHiddenCharacters', () => {
+        it('writes line breaks, bidirectional overrides and other hidden characters as escapes', () => {
+            const text = showHiddenCharacters('a\nb\r\tc\u202Ed\u200Be\u00A0f\u2800g\u2028h\uE000i\uD800j')
+
+            expect(text).to.equal('a\\u000ab\\u000d\\u0009c\\u202ed\\u200be\\u00a0f\\u2800g\\u2028h\\ue000i\\ud800j')
+        })
+
+        it('keeps U+0020, <, > and & and visible non-ASCII characters', () => {
+            const text = 'npx -y @scope/pkg --url https://example.com/?a=1&b=<2> Größe データ ✓'
+
+            expect(showHiddenCharacters(text)).to.equal(text)
+        })
+    })
+
     describe('fingerprintWorkspace', () => {
         it('is keyed on the directory of the config, not the filename', () => {
             const a = fingerprintWorkspace('/foo/bar/.amazonq/mcp.json')
@@ -232,6 +391,19 @@ describe('mcpConsentStore', () => {
                 fs.readFileSync(path.join(tmpHome, '.aws', 'amazonq', 'mcp-approvals.json')).toString()
             )
             expect(stored.approvals).to.have.lengthOf(1)
+        })
+
+        // recordApproval reads the store, adds its entry and writes the store back. Several servers can
+        // finish starting at the same time, so these calls overlap. Without serialization one call reads the
+        // store before another has written its entry and then overwrites it, dropping that approval. Every
+        // approval recorded concurrently must survive.
+        it('keeps every approval recorded concurrently', async () => {
+            const names = Array.from({ length: 10 }, (_, i) => `srv-${i}`)
+            await Promise.all(names.map(name => recordApproval(workspace, logger, name, cfg, configPath)))
+            const stored = JSON.parse(
+                fs.readFileSync(path.join(tmpHome, '.aws', 'amazonq', 'mcp-approvals.json')).toString()
+            )
+            expect(stored.approvals.map((a: any) => a.serverName).sort()).to.deep.equal([...names].sort())
         })
 
         it('evicts stale entry when config changes for same server and workspace', async () => {

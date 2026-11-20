@@ -7,6 +7,7 @@ import { createHash } from 'crypto'
 import * as path from 'path'
 import type { Workspace, Logging } from '@aws/language-server-runtimes/server-interface'
 import type { MCPServerConfig } from './mcpTypes'
+import { Mutex } from 'async-mutex'
 
 const APPROVALS_FILE = 'mcp-approvals.json'
 // v2: the fingerprint now covers the fully-merged spawn environment and headers
@@ -74,6 +75,64 @@ export function fingerprintServerConfig(cfg: MCPServerConfig): string {
     return 'sha256:' + createHash('sha256').update(JSON.stringify(canonical)).digest('hex')
 }
 
+/** `text` with each UTF-16 code unit written as a \u escape */
+function unicodeEscapes(text: string): string {
+    return Array.from({ length: text.length }, (_, i) => `\\u${text.charCodeAt(i).toString(16).padStart(4, '0')}`).join(
+        ''
+    )
+}
+
+/**
+ * Characters that formatServerConfigForReview writes as \u escapes:
+ * - control and format characters (such as bidirectional overrides and zero-width characters), line and paragraph
+ *   separators, and the other default ignorable characters
+ * - spaces other than U+0020, and the braille blank U+2800, which also shows as a space
+ * - private use and unassigned code points, whose look depends on the font
+ * - <, > and &, as JSON encoders that make text safe to put in HTML escape them
+ * Line feeds and U+0020 are left alone: JSON.stringify uses them for the layout, it already escapes a line feed in a
+ * string, and U+0020 in a string is shown as it is. The other characters can occur only in strings, where a \u escape
+ * keeps the value.
+ */
+const ESCAPED_CHARACTERS =
+    /(?![\n ])[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Co}\p{Cn}\u2800<>&]/gu
+
+/**
+ * Characters that showHiddenCharacters writes as \u escapes: the ones in ESCAPED_CHARACTERS except <, > and &, and
+ * also line feeds and lone surrogates. U+0020 is left alone.
+ */
+const HIDDEN_CHARACTERS =
+    /(?! )[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Co}\p{Cn}\p{Cs}\u2800]/gu
+
+/**
+ * `text` with the characters that a person cannot see or tell apart written as \u escapes, for plain text that a
+ * person reads, such as a prompt. A line break or a bidirectional override in a value can then not change how the
+ * rest of the text reads.
+ */
+export function showHiddenCharacters(text: string): string {
+    return text.replace(HIDDEN_CHARACTERS, unicodeEscapes)
+}
+
+/**
+ * The fields of a server config that fingerprintServerConfig covers, as JSON in the format of mcp.json, for a person
+ * to review: the command, arguments and environment variables of a stdio server, or the URL and headers of an HTTP
+ * server. The characters in ESCAPED_CHARACTERS are written as \u escapes, so the text shows and parses to the
+ * exact values.
+ */
+export function formatServerConfigForReview(cfg: MCPServerConfig): string {
+    const env = effectiveEnv(cfg)
+    const headers = effectiveHeaders(cfg)
+    const args = cfg.args ?? []
+    // As in McpManager, a config with a command starts a stdio server
+    const reviewed = cfg.command
+        ? {
+              command: cfg.command,
+              ...(args.length > 0 ? { args } : {}),
+              ...(Object.keys(env).length > 0 ? { env } : {}),
+          }
+        : { url: cfg.url ?? '', ...(Object.keys(headers).length > 0 ? { headers } : {}) }
+    return JSON.stringify(reviewed, undefined, 1).replace(ESCAPED_CHARACTERS, unicodeEscapes)
+}
+
 /** Hash of the workspace path so approval is scoped to (workspace, config).
  *  Normalizes the path to forward slashes for cross-platform consistency. */
 export function fingerprintWorkspace(configPath: string): string {
@@ -84,6 +143,10 @@ export function fingerprintWorkspace(configPath: string): string {
 function getStorePath(workspace: Workspace): string {
     return path.join(workspace.fs.getUserHomeDir(), '.aws', 'amazonq', APPROVALS_FILE)
 }
+
+// Serializes the read-modify-write of the approval store. Several servers can start at once, so without this a
+// concurrent recordApproval could read the store before another wrote it and drop that approval on write.
+const storeMutex = new Mutex()
 
 async function readStore(workspace: Workspace, logging: Logging): Promise<ApprovalStore> {
     const file = getStorePath(workspace)
@@ -150,19 +213,21 @@ export async function recordApproval(
     cfg: MCPServerConfig,
     configPath: string
 ): Promise<void> {
-    const store = await readStore(workspace, logging)
-    const fp = fingerprintServerConfig(cfg)
-    const wh = fingerprintWorkspace(configPath)
-    // Replace any prior approval for the same (server, workspace) — this evicts
-    // stale entries when the config changes (fingerprint differs).
-    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
-    store.approvals.push({
-        serverName,
-        fingerprint: fp,
-        workspaceHash: wh,
-        approvedAt: new Date().toISOString(),
+    return storeMutex.runExclusive(async () => {
+        const store = await readStore(workspace, logging)
+        const fp = fingerprintServerConfig(cfg)
+        const wh = fingerprintWorkspace(configPath)
+        // Replace any prior approval for the same (server, workspace) — this evicts
+        // stale entries when the config changes (fingerprint differs).
+        store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
+        store.approvals.push({
+            serverName,
+            fingerprint: fp,
+            workspaceHash: wh,
+            approvedAt: new Date().toISOString(),
+        })
+        await writeStore(workspace, logging, store)
     })
-    await writeStore(workspace, logging, store)
 }
 
 export async function removeApproval(
@@ -171,15 +236,17 @@ export async function removeApproval(
     serverName: string,
     configPath: string
 ): Promise<void> {
-    const store = await readStore(workspace, logging)
-    const wh = fingerprintWorkspace(configPath)
-    const before = store.approvals.length
-    // Scope removal to the (serverName, workspace) that requested it, mirroring how
-    // recordApproval keys entries. Removing a server in one workspace must not
-    // revoke consent for an identically-named server in a different workspace.
-    store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
-    if (store.approvals.length < before) {
-        await writeStore(workspace, logging, store)
-        logging.info(`MCP consent store: removed approval for '${serverName}'`)
-    }
+    return storeMutex.runExclusive(async () => {
+        const store = await readStore(workspace, logging)
+        const wh = fingerprintWorkspace(configPath)
+        const before = store.approvals.length
+        // Scope removal to the (serverName, workspace) that requested it, mirroring how
+        // recordApproval keys entries. Removing a server in one workspace must not
+        // revoke consent for an identically-named server in a different workspace.
+        store.approvals = store.approvals.filter(a => !(a.serverName === serverName && a.workspaceHash === wh))
+        if (store.approvals.length < before) {
+            await writeStore(workspace, logging, store)
+            logging.info(`MCP consent store: removed approval for '${serverName}'`)
+        }
+    })
 }
