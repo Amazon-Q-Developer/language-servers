@@ -223,6 +223,15 @@ interface BeamedRepoInfo {
 // Bounds for the beam-map candidate scan (serial download+parse per candidate).
 const BEAM_MAP_SCAN_MAX_CANDIDATES = 25
 const BEAM_MAP_SCAN_BUDGET_MS = 15000
+// Bounds for listing a job's CUSTOMER_OUTPUT artifacts page by page (beam discovery). A large
+// multi-repo job has hundreds of artifacts (one transformed bundle, reports and several beam-status
+// files per repo), so the beam-map is often not on the first page. 100 pages is far more than any
+// job seen so far (927 artifacts for a 50-repo job); the time budget keeps a slow service from
+// stalling the Beamed tab.
+const BEAM_ARTIFACT_LIST_MAX_PAGES = 100
+const BEAM_ARTIFACT_LIST_BUDGET_MS = 20000
+// Per-artifact diagnostic lines are logged for at most this many artifacts per listing.
+const BEAM_ARTIFACT_LOG_MAX = 50
 // The most jobs whose undownloadable beam-map candidates are remembered, to warn once per job.
 const BEAM_MAP_UNREADABLE_WARNED_MAX = 200
 
@@ -1075,27 +1084,31 @@ export class ATXTransformHandler {
             // NOTE: beam artifacts must be uploaded by the web orchestrator as
             // CUSTOMER_OUTPUT — the FES client CategoryType enum does not expose
             // HITL_FROM_AGENT as a listable filter value.
-            const command = new ListArtifactsCommand({
-                workspaceId: workspaceId,
-                jobFilter: {
-                    jobId: parentJobId,
-                    categoryType: 'CUSTOMER_OUTPUT',
-                },
-            })
-            await this.addAuthToCommand(command)
-            const result = (await this.atxClient!.send(command)) as any
-            const artifacts: any[] = result.artifacts || []
+            // Every page, not just the first: a large multi-repo job has hundreds of artifacts and the
+            // beam-map (and later repos' transformed bundles) can be far down the list. Reading one page
+            // left a 50-repo job (927 artifacts, beam-map at #926) out of the Beamed tab entirely.
+            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, parentJobId)
+            const artifacts: any[] = listing.artifacts
+            // A listing that stopped early may have missed the beam-map: the answer is "unconfirmed",
+            // never "not opted in" (see scanFinished / scanAborted below).
+            const listingCutShort = !listing.complete
 
             // DIAGNOSTIC: dump exactly what ListArtifacts returned so we can tell
             // "artifact not in the list" from "filtered out by fileType/.json". Both
             // otherwise produce the same silent 'no beam-map' verdict.
             this.logging.log(
-                `[BEAM-PKG] listBeamedRepos: ListArtifacts returned ${artifacts.length} CUSTOMER_OUTPUT artifact(s) for job=${parentJobId}`
+                `[BEAM-PKG] listBeamedRepos: ListArtifacts returned ${artifacts.length} CUSTOMER_OUTPUT artifact(s) ` +
+                    `in ${listing.pages} page(s) for job=${parentJobId}${listingCutShort ? ' (listing cut short)' : ''}`
             )
-            for (const a of artifacts) {
+            for (const a of artifacts.slice(0, BEAM_ARTIFACT_LOG_MAX)) {
                 this.logging.log(
                     `[BEAM-PKG]   artifact | id=${a.artifactId} fileType=${a.fileType} ` +
                         `name=${a.name ?? a.fileName ?? ''} path=${a.fileMetadata?.path ?? ''} category=${a.categoryType ?? a.category ?? ''}`
+                )
+            }
+            if (artifacts.length > BEAM_ARTIFACT_LOG_MAX) {
+                this.logging.log(
+                    `[BEAM-PKG]   … ${artifacts.length - BEAM_ARTIFACT_LOG_MAX} more artifact(s) not logged individually`
                 )
             }
 
@@ -1287,7 +1300,8 @@ export class ATXTransformHandler {
             // makes it unfinished, like the throttle cooldown: retried, never counted.
             const leftOut = beamThrottleCoolingDown ? 0 : allCandidates.length - candidates.length
             const throttledDuringScan = this.beamThrottleCooldownUntilMs !== throttleMarkBeforeScan
-            const scanFinished = !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan
+            const scanFinished =
+                !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan && !listingCutShort
             const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
             const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
             // True when the scan ran but was cut short (time budget exhausted or a throttle arrived
@@ -1295,7 +1309,7 @@ export class ATXTransformHandler {
             // eventually gives up after beamMaxReadsThatCannotTell attempts, rather than retrying flat
             // every 60 s forever. Both causes are included because a throttle mid-scan is just as
             // incomplete as a budget timeout — the beam-map may not have been reached in either case.
-            const scanAborted = !lightweight && (scanCutShort || throttledDuringScan)
+            const scanAborted = !lightweight && (scanCutShort || throttledDuringScan || listingCutShort)
             const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
             if (unreadKey === undefined) {
                 // Only a finished scan with an answer ends the warning; a lightweight, throttled or
@@ -1567,6 +1581,74 @@ export class ATXTransformHandler {
             OriginalArtifactId: o.originalArtifactId ?? '',
             GenerateIntegrationTests: o.generateIntegrationTests === true,
         }
+    }
+
+    /**
+     * Every CUSTOMER_OUTPUT artifact of a job (or of one plan step), following nextToken page by page.
+     *
+     * complete is false when the listing stopped before the last page: the page cap or the time budget
+     * was reached, the service repeated a page token, or a page after the first failed. The caller then
+     * has a partial list and must treat anything it didn't find as unknown, not absent. A failure on the
+     * first page throws, as the single-page call did, so callers keep their existing error handling.
+     * A throttle on any page also starts the beam throttle cooldown.
+     */
+    private async listJobCustomerOutputArtifacts(
+        workspaceId: string,
+        jobId: string,
+        planStepId?: string
+    ): Promise<{ artifacts: any[]; complete: boolean; pages: number }> {
+        const artifacts: any[] = []
+        const seenTokens = new Set<string>()
+        const deadline = Date.now() + BEAM_ARTIFACT_LIST_BUDGET_MS
+        let nextToken: string | undefined
+        let pages = 0
+        const stop = (reason: string) => {
+            this.logging.warn(
+                `ATX: ListArtifacts for job=${jobId}${planStepId ? ` step=${planStepId}` : ''}: ` +
+                    `stopped after ${pages} page(s) and ${artifacts.length} artifact(s): ${reason}`
+            )
+            return { artifacts, complete: false, pages }
+        }
+        do {
+            if (pages >= BEAM_ARTIFACT_LIST_MAX_PAGES) {
+                return stop(`page cap (${BEAM_ARTIFACT_LIST_MAX_PAGES}) reached`)
+            }
+            if (pages > 0 && Date.now() > deadline) {
+                return stop(`time budget (${BEAM_ARTIFACT_LIST_BUDGET_MS}ms) exceeded`)
+            }
+            const command = new ListArtifactsCommand({
+                workspaceId: workspaceId,
+                jobFilter: {
+                    jobId: jobId,
+                    categoryType: 'CUSTOMER_OUTPUT',
+                    ...(planStepId && { planStepId }),
+                },
+                ...(nextToken && { nextToken }),
+            })
+            await this.addAuthToCommand(command)
+            let result: any
+            try {
+                result = await this.atxClient!.send(command)
+            } catch (error) {
+                if (classifyDownloadUrlError(error) === 'throttle') {
+                    this.noteBeamThrottled()
+                }
+                if (pages === 0) {
+                    throw error
+                }
+                return stop(`page ${pages + 1} failed: ${String(error)}`)
+            }
+            pages++
+            artifacts.push(...(result?.artifacts || []))
+            nextToken = result?.nextToken || undefined
+            if (nextToken) {
+                if (seenTokens.has(nextToken)) {
+                    return stop('the service returned a page token it already returned')
+                }
+                seenTokens.add(nextToken)
+            }
+        } while (nextToken)
+        return { artifacts, complete: true, pages }
     }
 
     /**
@@ -5448,20 +5530,13 @@ export class ATXTransformHandler {
                 return null
             }
 
-            const command = new ListArtifactsCommand({
-                workspaceId: workspaceId,
-                jobFilter: {
-                    jobId: jobId,
-                    categoryType: 'CUSTOMER_OUTPUT',
-                    planStepId: stepId,
-                },
-            })
+            const listing = await this.listJobCustomerOutputArtifacts(workspaceId, jobId, stepId)
 
-            await this.addAuthToCommand(command)
-            const result = await this.atxClient!.send(command)
-
-            this.logging.log(`ATX: Found ${result.artifacts?.length || 0} artifacts for step: ${stepId}`)
-            return result.artifacts || []
+            this.logging.log(
+                `ATX: Found ${listing.artifacts.length} artifacts for step: ${stepId} in ${listing.pages} page(s)` +
+                    (listing.complete ? '' : ' (listing cut short)')
+            )
+            return listing.artifacts
         } catch (error) {
             this.logging.error(`ATX: listArtifactsForStep error: ${String(error)}`)
             return null

@@ -5640,6 +5640,15 @@ describe('ATXTransformHandler - final coverage push', () => {
             const result = await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
             expect(result).to.be.null
         })
+
+        it('reads every page for the step', async () => {
+            sendStub.onFirstCall().resolves({ artifacts: [{ artifactId: 'a1' }], nextToken: 'p2' })
+            sendStub.onSecondCall().resolves({ artifacts: [{ artifactId: 'a2' }] })
+            const result = await (handler as any).listArtifactsForStep('ws-1', 'job-1', 'step-1')
+            expect(result.map((a: any) => a.artifactId)).to.deep.equal(['a1', 'a2'])
+            expect(sendStub.secondCall.args[0].input.nextToken).to.equal('p2')
+            expect(sendStub.secondCall.args[0].input.jobFilter.planStepId).to.equal('step-1')
+        })
     })
 
     describe('fetchAllSteps (private)', () => {
@@ -6273,6 +6282,122 @@ describe('ATXTransformHandler - Beam to IDE', () => {
         const zipArtifacts = (repo: string, hash = 'abc123') => [
             { artifactId: `zip-${repo}`, fileMetadata: { path: `${repo}_${hash}/${repo}.zip` } },
         ]
+
+        // A large multi-repo job spreads its artifacts over many ListArtifacts pages. Run 7 (50 repos):
+        // 927 artifacts with the beam-map at #926, so reading only the first page never found it.
+        describe('pagination', () => {
+            const isList = (cmd: any) => !!cmd?.input?.jobFilter
+            const beamStatus = (n: number) =>
+                Array.from({ length: n }, (_, i) => ({
+                    artifactId: `bs-${i}`,
+                    fileMetadata: { path: `beam-status-repo${i}.json` },
+                }))
+            // pages[i] is page i's artifacts; page i (i < last) returns nextToken `t${i + 1}`.
+            const pagedSend = (pages: any[][]) =>
+                sendStub.callsFake(async (cmd: any) => {
+                    if (!isList(cmd)) return { artifacts: [] }
+                    const token: string | undefined = cmd.input.nextToken
+                    const i = token ? Number(token.slice(1)) : 0
+                    return { artifacts: pages[i] ?? [], nextToken: i < pages.length - 1 ? `t${i + 1}` : undefined }
+                })
+            const listCalls = () => sendStub.getCalls().filter((c: any) => isList(c.args[0]))
+
+            it('finds a beam-map and a transformed bundle that are on later pages', async () => {
+                pagedSend([
+                    beamStatus(100),
+                    beamStatus(100),
+                    [...zipArtifacts('alice'), { artifactId: 'beammap-1', fileMetadata: { path: '' } }],
+                ])
+                sinon.stub(handler as any, 'downloadJsonArtifact').resolves({
+                    repos: [{ repoName: 'alice', stepId: 's1', generateIntegrationTests: true }],
+                })
+
+                const result = await handler.listBeamedRepos('ws-1', 'job-1')
+
+                expect(result.map((r: any) => [r.RepositoryName, r.BeamArtifactId])).to.deep.equal([
+                    ['alice', 'zip-alice'],
+                ])
+                expect(listCalls().map((c: any) => c.args[0].input.nextToken)).to.deep.equal([undefined, 't1', 't2'])
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal(true)
+            })
+
+            it('asks each later page for the same job and category', async () => {
+                pagedSend([beamStatus(2), beamStatus(2)])
+                await handler.listBeamedRepos('ws-1', 'job-1')
+                for (const c of listCalls()) {
+                    expect(c.args[0].input.jobFilter).to.deep.equal({ jobId: 'job-1', categoryType: 'CUSTOMER_OUTPUT' })
+                }
+                expect(listCalls()).to.have.length(2)
+            })
+
+            it('stops when the service repeats a page token, and says it cannot tell', async () => {
+                sendStub.callsFake(async (cmd: any) =>
+                    isList(cmd) ? { artifacts: beamStatus(1), nextToken: 'same' } : { artifacts: [] }
+                )
+                sinon.stub(handler as any, 'downloadJsonArtifact').resolves(null)
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+                expect(listCalls()).to.have.length(2)
+            })
+
+            it('stops at the page cap, and says it cannot tell', async () => {
+                let n = 0
+                sendStub.callsFake(async (cmd: any) =>
+                    isList(cmd) ? { artifacts: [], nextToken: `p${++n}` } : { artifacts: [] }
+                )
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+                expect(listCalls()).to.have.length(100)
+            })
+
+            it('stops when the time budget runs out mid-listing, and says it cannot tell (not "not opted in")', async () => {
+                const clock = sinon.useFakeTimers({ now: Date.now(), toFake: ['Date'] })
+                try {
+                    sendStub.callsFake(async (cmd: any) => {
+                        if (!isList(cmd)) return { artifacts: [] }
+                        clock.tick(21_000)
+                        return { artifacts: beamStatus(1), nextToken: `t${listCalls().length}` }
+                    })
+                    sinon.stub(handler as any, 'downloadJsonArtifact').resolves(null)
+
+                    expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+                    expect(listCalls()).to.have.length(1)
+                } finally {
+                    clock.restore()
+                }
+            })
+
+            it('keeps what it has when a later page fails, and says it cannot tell', async () => {
+                sendStub.callsFake(async (cmd: any) => {
+                    if (!isList(cmd)) return { artifacts: [] }
+                    if (cmd.input.nextToken) throw Object.assign(new Error('boom'), { name: 'InternalServerException' })
+                    return { artifacts: [...zipArtifacts('alice')], nextToken: 't1' }
+                })
+                sinon.stub(handler as any, 'downloadJsonArtifact').resolves(null)
+
+                expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+            })
+
+            it('starts the throttle cooldown when a later page is throttled', async () => {
+                sendStub.callsFake(async (cmd: any) => {
+                    if (!isList(cmd)) return { artifacts: [] }
+                    if (cmd.input.nextToken)
+                        throw Object.assign(new Error('Rate exceeded'), { name: 'ThrottlingException' })
+                    return { artifacts: beamStatus(1), nextToken: 't1' }
+                })
+
+                await handler.listBeamedRepos('ws-1', 'job-1')
+                expect((handler as any).isBeamThrottleCooldownActive()).to.be.true
+            })
+
+            it('still returns [] when the first page fails, as before', async () => {
+                sendStub.callsFake(async (cmd: any) => {
+                    if (isList(cmd)) throw new Error('first page down')
+                    return { artifacts: [] }
+                })
+                expect(await handler.listBeamedRepos('ws-1', 'job-1')).to.deep.equal([])
+            })
+        })
 
         it('returns [] when the job has no artifacts (never beamed)', async () => {
             sendStub.resolves({ artifacts: [] })
