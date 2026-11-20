@@ -1190,6 +1190,7 @@ export class ATXTransformHandler {
             // this, a large job's pathless ZIP artifacts (150 in a 50-repo job) sorted first and filled
             // the candidate cap before the beam-map was reached. An artifact with no declared type is
             // kept, ranked after declared JSON.
+            //
             const declaredType = (a: any): string => String(a?.artifactType?.fileType ?? '').toUpperCase()
             const allCandidates = lightweight
                 ? []
@@ -1227,6 +1228,19 @@ export class ATXTransformHandler {
                         `Beam-status discovery continues; the beam-map is optional enrichment.`
                 )
             }
+            // typeExcluded: artifacts that passed the path/beam-status filters but were removed by the type
+            // filter. If the web ever uploads the beam-map with a different declared type (or FES normalises
+            // it), the filter would silently miss it and report "not opted in" with false confidence.
+            // Counting these keeps the verdict honest: a non-zero typeExcluded propagates into
+            // beamMapUnconfirmed below, so the gate retries instead of caching "no" for the session.
+            const typeExcluded =
+                !lightweight && !beamThrottleCoolingDown
+                    ? artifacts.filter(a => {
+                          const p = (a.fileMetadata?.path || '').toLowerCase()
+                          const t = declaredType(a)
+                          return !ZIP_RE.test(p) && !/beam-status-/.test(p) && t !== '' && t !== 'JSON'
+                      }).length
+                    : 0
             const candidates = beamThrottleCoolingDown ? [] : allCandidates.slice(0, BEAM_MAP_SCAN_MAX_CANDIDATES)
             if (allCandidates.length > candidates.length) {
                 this.logging.log(
@@ -1316,14 +1330,17 @@ export class ATXTransformHandler {
             const scanFinished =
                 !lightweight && !beamThrottleCoolingDown && !scanCutShort && !throttledDuringScan && !listingCutShort
             const beamMapOptsIn = !!beamMapRepos?.some(r => this.normalizeBeamRepo(r).GenerateIntegrationTests)
-            const beamMapUnconfirmed = scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0)
+            const beamMapUnconfirmed =
+                scanFinished && !beamMapOptsIn && (unreadable.length > 0 || leftOut > 0 || typeExcluded > 0)
             // True when the scan ran but was cut short (time budget exhausted or a throttle arrived
             // mid-scan). The gate treats this as 'unconfirmed': retried with exponential back-off,
             // eventually gives up after beamMaxReadsThatCannotTell attempts, rather than retrying flat
             // every 60 s forever. Both causes are included because a throttle mid-scan is just as
             // incomplete as a budget timeout — the beam-map may not have been reached in either case.
             const scanAborted = !lightweight && (scanCutShort || throttledDuringScan || listingCutShort)
-            const unreadKey = beamMapUnconfirmed ? `${[...unreadable].sort().join(', ')}|${leftOut}` : undefined
+            const unreadKey = beamMapUnconfirmed
+                ? `${[...unreadable].sort().join(', ')}|${leftOut}|${typeExcluded}`
+                : undefined
             if (unreadKey === undefined) {
                 // Only a finished scan with an answer ends the warning; a lightweight, throttled or
                 // cut-short sweep says nothing about the unread candidates.
@@ -1342,6 +1359,9 @@ export class ATXTransformHandler {
                         : '',
                     leftOut > 0
                         ? `didn't read ${leftOut} candidate(s) past the ${BEAM_MAP_SCAN_MAX_CANDIDATES}-candidate cap`
+                        : '',
+                    typeExcluded > 0
+                        ? `${typeExcluded} artifact(s) skipped by declared type (not JSON/untyped; if one is the beam-map, its declared type changed)`
                         : '',
                 ].filter(Boolean)
                 this.logging.warn(

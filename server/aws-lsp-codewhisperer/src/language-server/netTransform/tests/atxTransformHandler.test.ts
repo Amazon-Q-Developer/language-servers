@@ -6450,6 +6450,30 @@ describe('ATXTransformHandler - Beam to IDE', () => {
                 expect(download.firstCall.args[2]).to.equal('beammap-1')
             })
 
+            it('a type-excluded beam-map candidate produces unconfirmed, not not-opted-in', async () => {
+                // If the web ever uploads the beam-map with a non-JSON declared type, the type filter
+                // would silently miss it. The scan finishes (nothing cut short), beamMapOptsIn=false,
+                // unreadable=0, leftOut=0 — without counting typeExcluded the verdict would be a confident
+                // "not opted in" and the gate would cache it for the session.
+                pagedSend([
+                    [
+                        // The beam-map with a hypothetical wrong declared type (e.g. FES normalises it)
+                        {
+                            artifactId: 'beammap-wrong-type',
+                            artifactType: { categoryType: 'CUSTOMER_OUTPUT', fileType: 'PDF' },
+                            fileMetadata: { path: '' },
+                        },
+                    ],
+                ])
+                const stub = sinon.stub(handler as any, 'downloadJsonArtifact').resolves(null)
+                try {
+                    // The gate should say 'unconfirmed', not false (which would cache "no" forever)
+                    expect(await (handler as any).readBeamOptIn('ws-1', 'job-1')).to.equal('unconfirmed')
+                } finally {
+                    stub.restore()
+                }
+            })
+
             it('labels a listing stopped by the page cap as cut short, not throttled', async () => {
                 let n = 0
                 sendStub.callsFake(async (cmd: any) =>
