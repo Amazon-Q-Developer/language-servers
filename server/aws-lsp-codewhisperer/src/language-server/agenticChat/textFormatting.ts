@@ -38,9 +38,33 @@ export function codeFence(text: string): string {
     return '`'.repeat(Math.max(3, longestRun + 1))
 }
 
+/**
+ * Characters that a command card shows as escapes: control characters other than line feeds and tabs, format
+ * characters (such as bidirectional overrides and isolates, zero-width characters and tag characters), line and
+ * paragraph separators, spaces other than U+0020, the braille blank U+2800, which also shows as a space, the other
+ * default ignorable characters, private use and unassigned code points, whose look depends on the font, and lone
+ * surrogates.
+ */
+const HIDDEN_COMMAND_CHARACTERS =
+    /(?![\n\t ])[\p{Cc}\p{Cf}\p{Zs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}\p{Co}\p{Cn}\p{Cs}\u2800]/gu
+
+/**
+ * The command as a card shows it, with each hidden character written as \uXXXX, or as \u{XXXXX} above U+FFFF. Only
+ * the shown copy changes: the command that runs is the original. An escape has no backticks, so the shown copy
+ * needs the same code fence as the command.
+ */
+function shownCommand(command: string): string {
+    return String(command).replace(HIDDEN_COMMAND_CHARACTERS, character => {
+        const codePoint = character.codePointAt(0)!
+        const hex = codePoint.toString(16).toUpperCase()
+        return codePoint > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, '0')}`
+    })
+}
+
 /** Start of a shell code block that shows the full command, for output to follow */
 export function shellCommandBlockStart(command: string): string {
-    return `${codeFence(command)}shell\n${command}`
+    const shown = shownCommand(command)
+    return `${codeFence(shown)}shell\n${shown}`
 }
 
 /** A shell code block that shows the full command */
