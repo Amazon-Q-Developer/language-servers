@@ -14,7 +14,9 @@ module.exports = {
     // The glob patterns Jest uses to detect test files
     testMatch: ['**/*.test.ts?(x)'],
 
-    // Coverage (npm run test:coverage) leaves out the generated parser code and the inline binaries
+    // Coverage (npm run test:coverage) counts every source file, also one that no test imports, and leaves out the
+    // generated parser code and the inline binaries
+    collectCoverageFrom: ['src/**/*.{ts,tsx}', '!src/**/*.test.{ts,tsx}', '!src/**/*.d.ts'],
     coveragePathIgnorePatterns: [
         '/node_modules/',
         '/src/antlr-generated/',
