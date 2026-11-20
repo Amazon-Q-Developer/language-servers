@@ -16,6 +16,11 @@ export class GitIgnoreFilter {
         this.acceptors = acceptors
     }
 
+    /**
+     * @param rootPath Root folder of the scan. Not used: each .gitignore file applies to the folder that contains
+     * it. The parameter stays so that existing callers keep working.
+     * @param gitIgnoreFiles Paths of the .gitignore files to apply.
+     */
     public static async build(
         rootPath: string,
         gitIgnoreFiles: string[],
@@ -27,8 +32,10 @@ export class GitIgnoreFilter {
             const fileContent = await workspace.fs.readFile(file)
             const gitIgnoreAcceptor = parser.compile(fileContent)
 
+            // As in Git, the patterns of a .gitignore file apply relative to the folder that contains it. Unlike Git, a
+            // pattern in a nested file cannot include again a file that a .gitignore file above it excludes.
             acceptors.push({
-                folderPath: rootPath,
+                folderPath: path.dirname(file),
                 acceptor: gitIgnoreAcceptor,
             })
         }
