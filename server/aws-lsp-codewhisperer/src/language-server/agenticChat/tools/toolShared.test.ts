@@ -5,7 +5,7 @@ import * as path from 'path'
 import sinon from 'ts-sinon'
 import {
     hasAdditionalHardLinks,
-    isInsideFolder,
+    resolvesStrictlyInsideFolder,
     isPathApproved,
     isRegularFile,
     requiresPathAcceptance,
@@ -1187,7 +1187,7 @@ describe('toolShared', () => {
         })
     })
 
-    describe('isInsideFolder', () => {
+    describe('resolvesStrictlyInsideFolder', () => {
         let root: string
         let folder: string
         let outside: string
@@ -1207,13 +1207,14 @@ describe('toolShared', () => {
         it('is true for a path in the folder, also one that does not exist yet', async () => {
             await fs.promises.writeFile(path.join(folder, 'a.json'), '{}')
 
-            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'a.json')), true)
-            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'new', 'b.json')), true)
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(folder, 'a.json')), true)
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(folder, 'new', 'b.json')), true)
         })
 
-        it('is false for the folder itself and for a path next to it', async () => {
-            assert.strictEqual(await isInsideFolder(folder, folder), false)
-            assert.strictEqual(await isInsideFolder(folder, path.join(outside, 'a.json')), false)
+        it("is false for the folder itself, for a path next to it, and for a name that starts with '..'", async () => {
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, folder), false)
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(outside, 'a.json')), false)
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(folder, '..notes.md')), false)
         })
 
         it('follows a folder link: false when it leads out of the folder, true when it stays in', async () => {
@@ -1222,8 +1223,11 @@ describe('toolShared', () => {
             await fs.promises.symlink(outside, path.join(folder, 'out-link'), type)
             await fs.promises.symlink(path.join(folder, 'inner'), path.join(folder, 'in-link'), type)
 
-            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'out-link', 'a.json')), false)
-            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'in-link', 'a.json')), true)
+            assert.strictEqual(
+                await resolvesStrictlyInsideFolder(folder, path.join(folder, 'out-link', 'a.json')),
+                false
+            )
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(folder, 'in-link', 'a.json')), true)
         })
 
         it('is false when the links in the path cannot be resolved', async function (this: Context) {
@@ -1235,7 +1239,7 @@ describe('toolShared', () => {
                 this.skip()
             }
 
-            assert.strictEqual(await isInsideFolder(folder, path.join(folder, 'a')), false)
+            assert.strictEqual(await resolvesStrictlyInsideFolder(folder, path.join(folder, 'a')), false)
         })
     })
 

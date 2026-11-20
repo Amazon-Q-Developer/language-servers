@@ -182,11 +182,13 @@ export async function hasAdditionalHardLinks(canonicalPath: string): Promise<boo
 }
 
 /**
- * Whether `filePath`, after every symbolic link in it is followed, is inside `folderPath`. A part of the path that
- * does not exist yet is resolved as written. False if it cannot tell, for example for links that point at each
- * other or a folder that cannot be read.
+ * Whether `filePath`, after every symbolic link in it is followed, is strictly inside `folderPath`. The folder itself
+ * is not inside it, and neither is a path whose first part inside the folder starts with '..', such as '..notes.md',
+ * which workspaceUtils.isParentFolder reads as a step out of the folder. A part of the path that does not exist yet
+ * is resolved as written. False if it cannot tell, for example for links that point at each other or a folder that
+ * cannot be read.
  */
-export async function isInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
+export async function resolvesStrictlyInsideFolder(folderPath: string, filePath: string): Promise<boolean> {
     try {
         const [canonicalFolder] = await canonicalizeWorkspaceFolders([folderPath])
         return workspaceUtils.isParentFolder(canonicalFolder, await resolveCanonicalPath(filePath))

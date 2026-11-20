@@ -7,13 +7,15 @@ import { expect } from 'chai'
 import * as sinon from 'sinon'
 import { McpEventHandler } from './mcpEventHandler'
 import { McpManager } from './mcpManager'
-import { MCPServerConfig, McpServerStatus } from './mcpTypes'
+import { MCPServerConfig, McpPermissionType, McpServerStatus } from './mcpTypes'
 import { ProfileStatusMonitor } from './profileStatusMonitor'
 import * as mcpUtils from './mcpUtils'
 import { getGlobalAgentConfigPath } from './mcpUtils'
 import { TelemetryService } from '../../../../shared/telemetry/telemetryService'
 import { ChokidarFileWatcher } from './chokidarFileWatcher'
 import { getFolderApprovalsPath } from './mcpWorkspaceTrust'
+import { MessageType } from '@aws/language-server-runtimes/protocol'
+import * as path from 'path'
 
 describe('McpEventHandler error handling', () => {
     // Mock getGlobalAgentConfigPath to return a test path
@@ -498,6 +500,47 @@ describe('McpEventHandler error handling', () => {
                 sinon.assert.notCalled(removeServer)
             })
 
+            it('checks the mcp.json where an edited legacy server goes before the old one is removed', async () => {
+                await setupServers(
+                    new Map([['srv', { command: 'npx', disabled: false, __configPath__: 'ws/.amazonq/mcp.json' }]]),
+                    { srv: McpServerStatus.ENABLED }
+                )
+                const mgr = McpManager.instance
+                const reason = 'The MCP config was not saved because it is outside the workspace folder'
+                const checkMcp = sinon
+                    .stub(mcpUtils, 'checkMcpConfigWrite')
+                    .rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+                const checkAgent = sinon.stub(mcpUtils, 'checkAgentConfigWrite').resolves()
+                const removeServer = sinon.stub(mgr, 'removeServer').resolves()
+                const addServer = sinon.stub(mgr, 'addServer').resolves()
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'srv' })
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'srv',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'workspace',
+                    },
+                } as any)
+
+                sinon.assert.calledOnceWithMatch(
+                    checkMcp,
+                    sinon.match.any,
+                    sinon.match.any,
+                    path.join('/fake/workspace', '.amazonq', 'mcp.json')
+                )
+                sinon.assert.notCalled(checkAgent)
+                sinon.assert.notCalled(removeServer)
+                sinon.assert.notCalled(addServer)
+                expect(result.id).to.equal('edit-mcp')
+                expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
+            })
+
             it('does not remove a registry server when the updated server cannot be saved where it goes', async () => {
                 await setupServers(new Map([['srv', { url: 'https://example.com/mcp', disabled: false }]]), {
                     srv: McpServerStatus.ENABLED,
@@ -554,6 +597,231 @@ describe('McpEventHandler error handling', () => {
                 expect(result.id).to.equal('add-new-mcp')
                 expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
             })
+        })
+
+        it('stays on the edit form with the reason and writes nothing when the old server cannot be removed', async () => {
+            // A rename together with a transport change renames the server in memory before the save, so the save
+            // cannot remove the server under its old name
+            sinon.stub(ProfileStatusMonitor, 'getMcpState').returns(true)
+            const agentPath = '/fake/home/.aws/amazonq/agents/default.json'
+            const save = sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+            sinon.stub(mcpUtils, 'checkAgentConfigWrite').resolves()
+            const mgr = await McpManager.init([], features)
+            ;(mgr as any).mcpServers.set('a', { command: 'npx', args: [], __configPath__: agentPath })
+            ;(mgr as any).serverNameMapping.set('a', 'a')
+            ;(mgr as any).setState('a', McpServerStatus.ENABLED, 0)
+            const addServer = sinon.spy(mgr, 'addServer')
+
+            await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'a' })
+            await eventHandler.onMcpServerClick({
+                id: 'change-transport',
+                title: 'b',
+                optionsValues: { name: 'b', transport: 'http', url: 'https://example.com/mcp' },
+            } as any)
+            const result: any = await eventHandler.onMcpServerClick({
+                id: 'save-mcp',
+                optionsValues: {
+                    name: 'b',
+                    transport: 'http',
+                    url: 'https://example.com/mcp',
+                    timeout: '60',
+                    scope: 'global',
+                },
+            } as any)
+
+            expect(result.id).to.equal('edit-mcp')
+            expect(result.header.status).to.include({ icon: 'cancel-circle', status: 'error' })
+            expect(result.header.status.title).to.include("'a'")
+            sinon.assert.notCalled(addServer)
+            sinon.assert.notCalled(save)
+            sinon.assert.notCalled(features.workspace.fs.writeFile)
+        })
+
+        describe('server changes that a config file refuses', () => {
+            const reason = 'The agent config was not saved because it is outside the workspace folder'
+            let showMessage: sinon.SinonStub
+
+            beforeEach(async () => {
+                await setupServers(new Map([['srv', { command: 'npx', disabled: false, __configPath__: 'c.json' }]]), {
+                    srv: McpServerStatus.ENABLED,
+                })
+                showMessage = sinon.stub().resolves()
+                features.lsp.window = { showMessage }
+            })
+
+            afterEach(() => {
+                delete features.lsp.window
+            })
+
+            it('tells the user why a server was not deleted', async () => {
+                sinon.stub(McpManager.instance, 'removeServer').rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+
+                const result = await eventHandler.onMcpServerClick({ id: 'mcp-delete-server', title: 'srv' })
+
+                expect(result).to.deep.equal({ id: 'mcp-delete-server' })
+                sinon.assert.calledOnceWithExactly(showMessage, { type: MessageType.Error, message: reason })
+            })
+
+            for (const id of ['mcp-enable-server', 'mcp-disable-server']) {
+                it(`tells the user why ${id} did not change the server`, async () => {
+                    sinon.stub(McpManager.instance, 'getMcpServerPermissions').returns({ enabled: true, toolPerms: {} })
+                    sinon
+                        .stub(McpManager.instance, 'updateServerPermission')
+                        .rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+
+                    await eventHandler.onMcpServerClick({ id, title: 'srv' })
+
+                    sinon.assert.calledOnceWithExactly(showMessage, { type: MessageType.Error, message: reason })
+                })
+            }
+
+            it('tells the user why a permission change was not saved', async () => {
+                sinon.stub(McpManager.instance, 'getToolPerm').returns(McpPermissionType.ask)
+                const update = sinon
+                    .stub(McpManager.instance, 'updateServerPermission')
+                    .rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+                await eventHandler.onMcpServerClick({
+                    id: 'mcp-permission-change',
+                    title: 'srv',
+                    optionsValues: { tool1: 'alwaysAllow' },
+                })
+
+                await eventHandler.onMcpServerClick({ id: 'save-permission-change' })
+
+                sinon.assert.calledOnce(update)
+                sinon.assert.calledOnceWithExactly(showMessage, { type: MessageType.Error, message: reason })
+            })
+
+            it('does not try a refused permission change again when an edit form opens', async () => {
+                sinon.stub(McpManager.instance, 'getToolPerm').returns(McpPermissionType.ask)
+                const update = sinon
+                    .stub(McpManager.instance, 'updateServerPermission')
+                    .rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+                await eventHandler.onMcpServerClick({
+                    id: 'mcp-permission-change',
+                    title: 'srv',
+                    optionsValues: { tool1: 'alwaysAllow' },
+                })
+                await eventHandler.onMcpServerClick({ id: 'save-permission-change' })
+
+                // Each edit form saves pending permission changes before it opens
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'srv' })
+                await eventHandler.onMcpServerClick({ id: 'save-permission-change' })
+
+                sinon.assert.calledOnce(update)
+                sinon.assert.calledOnce(showMessage)
+            })
+
+            it('still tries a permission change again that failed for another reason, as before', async () => {
+                sinon.stub(McpManager.instance, 'getToolPerm').returns(McpPermissionType.ask)
+                const update = sinon.stub(McpManager.instance, 'updateServerPermission')
+                update.onFirstCall().rejects(new Error('boom'))
+                update.onSecondCall().resolves()
+                await eventHandler.onMcpServerClick({
+                    id: 'mcp-permission-change',
+                    title: 'srv',
+                    optionsValues: { tool1: 'alwaysAllow' },
+                })
+                await eventHandler.onMcpServerClick({ id: 'save-permission-change' })
+
+                await eventHandler.onMcpServerClick({ id: 'save-permission-change' })
+
+                sinon.assert.calledTwice(update)
+                sinon.assert.notCalled(showMessage)
+            })
+
+            it('only logs a change that fails for another reason, as before', async () => {
+                sinon.stub(McpManager.instance, 'removeServer').rejects(new Error('boom'))
+
+                await eventHandler.onMcpServerClick({ id: 'mcp-delete-server', title: 'srv' })
+
+                sinon.assert.notCalled(showMessage)
+                expect(features.logging.error.calledWithMatch('Failed to delete MCP server')).to.be.true
+            })
+
+            it('logs the reason when it cannot be shown', async () => {
+                showMessage.rejects(new Error('no window'))
+                sinon.stub(McpManager.instance, 'removeServer').rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+
+                const result = await eventHandler.onMcpServerClick({ id: 'mcp-delete-server', title: 'srv' })
+
+                expect(result).to.deep.equal({ id: 'mcp-delete-server' })
+                expect(features.logging.error.calledWithMatch('Failed to show why the MCP server change')).to.be.true
+            })
+        })
+
+        describe('the old name of a server renamed on the edit form', () => {
+            const saveForm = (name: string) =>
+                eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name,
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'global',
+                    },
+                } as any)
+
+            /** Opens the edit form of server a and renames it to b while it changes the transport */
+            async function renameAToB() {
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'a' })
+                await eventHandler.onMcpServerClick({
+                    id: 'change-transport',
+                    title: 'b',
+                    optionsValues: { name: 'b', transport: 'http', url: 'https://example.com/mcp' },
+                } as any)
+            }
+
+            beforeEach(async () => {
+                // updateServerMap is stubbed, so these tests check only which server a save asks to remove
+                await setupServers(
+                    new Map([
+                        ['a', { command: 'npx', disabled: false }],
+                        ['b', { command: 'npx', disabled: false }],
+                        ['c', { command: 'npx', disabled: false }],
+                    ]),
+                    { a: McpServerStatus.ENABLED, b: McpServerStatus.ENABLED, c: McpServerStatus.ENABLED }
+                )
+                sinon.stub(McpManager.instance, 'updateServerMap')
+                sinon.stub(McpManager.instance, 'addServer').resolves()
+            })
+
+            it('is the server that a retry of that edit removes after a refused save', async () => {
+                const check = sinon.stub(mcpUtils, 'checkAgentConfigWrite')
+                check.onFirstCall().rejects(new mcpUtils.ConfigWriteRefusedError('The agent config was not saved'))
+                check.onSecondCall().resolves()
+                const removeServer = sinon.stub(McpManager.instance, 'removeServer').resolves()
+                await renameAToB()
+
+                const refused: any = await saveForm('b')
+                await saveForm('b')
+
+                expect(refused.id).to.equal('edit-mcp')
+                sinon.assert.calledTwice(check)
+                sinon.assert.calledOnceWithExactly(removeServer, 'a')
+            })
+
+            const ends = {
+                'the server list is shown': () => eventHandler.onListMcpServers({}),
+                'the add form is shown': () => eventHandler.onMcpServerClick({ id: 'add-new-mcp' }),
+                'nothing else is shown': async () => {},
+            }
+            for (const [end, show] of Object.entries(ends)) {
+                it(`is not removed by a save of another server when ${end} before its edit form`, async () => {
+                    sinon.stub(mcpUtils, 'checkAgentConfigWrite').resolves()
+                    const removeServer = sinon.stub(McpManager.instance, 'removeServer').resolves()
+                    await renameAToB()
+                    await show()
+
+                    await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'c' })
+                    await saveForm('c')
+
+                    sinon.assert.calledOnceWithExactly(removeServer, 'c')
+                })
+            }
         })
 
         describe('servers held back by the workspace trust check', () => {

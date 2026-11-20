@@ -29,6 +29,8 @@ import {
     isEmptyEnv,
     loadAgentConfig,
     checkAgentConfigWrite,
+    checkMcpConfigWrite,
+    ConfigWriteRefusedError,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
@@ -1447,6 +1449,8 @@ export class McpManager {
     /**
      * Remove a server: shutdown client, remove tools, and delete disk entry.
      * @param skipAgentConfigRemoval - If true, only removes from mcpManager but keeps in agent config
+     * @throws ConfigWriteRefusedError if a config file that the removal writes may not be written. The files are
+     * checked before anything changes, so the server keeps running with its state, and the caller tells the user.
      */
     public async removeServer(serverName: string, skipAgentConfigRemoval: boolean = false): Promise<void> {
         const cfg = this.mcpServers.get(serverName)
@@ -1461,14 +1465,13 @@ export class McpManager {
         const agentPath = isLegacyMcpServer ? getAgentConfigPathForMcpConfig(cfg.__configPath__) : cfg.__configPath__
         const removesFromAgentConfig = !skipAgentConfigRemoval && !!unsanitizedName && !!this.agentConfig
 
-        // Report an agent config that may not be written before anything changes, so the server stays as it was
+        // Check every config file that the removal writes before anything changes, so that a refused one leaves
+        // the server as it was
+        if (isLegacyMcpServer && unsanitizedName) {
+            await checkMcpConfigWrite(this.features.workspace, this.features.logging, cfg.__configPath__)
+        }
         if (removesFromAgentConfig) {
-            try {
-                await checkAgentConfigWrite(this.features.workspace, this.features.logging, agentPath)
-            } catch (err) {
-                this.handleError(serverName, err)
-                throw err
-            }
+            await checkAgentConfigWrite(this.features.workspace, this.features.logging, agentPath)
         }
 
         const client = this.clients.get(serverName)
@@ -1749,6 +1752,9 @@ export class McpManager {
 
     /**
      * Update permission for given server: if only tool permission changes, does not teardown and re-init.
+     * @throws ConfigWriteRefusedError if a config file that the change writes may not be written. The files are
+     * checked before this changes anything, so the server keeps its state, and the caller tells the user. Other
+     * errors are reported as the server state.
      */
     public async updateServerPermission(serverName: string, perm: MCPServerPermission): Promise<void> {
         try {
@@ -1765,8 +1771,12 @@ export class McpManager {
             // Check if this is a legacy MCP server (from MCP config file)
             const isLegacyMcpServer = serverConfig.__configPath__?.endsWith('mcp.json')
 
-            // The agent config that the permissions are saved to. Report one that may not be written before
-            // anything changes, so the server keeps its permissions and state.
+            // Check the config files that the change writes before this changes anything, so that a refused one
+            // leaves the tool permissions and the server state as they are: the mcp.json of a legacy server, and the
+            // agent config that the permissions are saved to
+            if (isLegacyMcpServer) {
+                await checkMcpConfigWrite(this.features.workspace, this.features.logging, serverConfig.__configPath__!)
+            }
             const permissionAgentPath = isLegacyMcpServer
                 ? getAgentConfigPathForMcpConfig(serverConfig.__configPath__!)
                 : perm.__configPath__
@@ -1882,6 +1892,10 @@ export class McpManager {
             this.features.logging.info(`Permissions updated for '${serverName}' in agent config`)
             this.emitToolsChanged(serverName)
         } catch (err) {
+            if (err instanceof ConfigWriteRefusedError) {
+                // Not a failure of the server, which keeps its state
+                throw err
+            }
             this.handleError(serverName, err)
             return
         }
@@ -2042,15 +2056,20 @@ export class McpManager {
     }
 
     /**
-     * Read, mutate, and write the MCP JSON config at the given path.
+     * Read, mutate, and write the MCP JSON config at the given path. Throws ConfigWriteRefusedError, before it reads
+     * or writes anything, if checkMcpConfigWrite refuses the file.
      * @private
      */
     private async mutateConfigFile(configPath: string, mutator: (json: any) => void): Promise<void> {
+        // The one file that is checked, read, and written. Only a file URI is parsed as a URI: a plain path parsed
+        // as one names another file if it has a '#', '?', or '%' in it, for example in a folder named C#.
+        const filePath = path.normalize(normalizePathFromUri(configPath, this.features.logging))
         return McpManager.configMutex
             .runExclusive(async () => {
+                await checkMcpConfigWrite(this.features.workspace, this.features.logging, filePath)
                 let json: any = { mcpServers: {} }
                 try {
-                    const raw = await this.features.workspace.fs.readFile(configPath)
+                    const raw = await this.features.workspace.fs.readFile(filePath)
                     this.features.logging.info(`Updating MCP config file: ${configPath}`)
                     const existing = JSON.parse(raw.toString())
                     json = { mcpServers: {}, ...existing }
@@ -2060,19 +2079,9 @@ export class McpManager {
                 }
                 mutator(json)
 
-                let fsPath: string
-                try {
-                    const uri = URI.parse(configPath)
-                    fsPath = uri.scheme === 'file' ? uri.fsPath : configPath
-                } catch {
-                    fsPath = configPath
-                }
-                fsPath = path.normalize(fsPath)
+                await this.features.workspace.fs.mkdir(path.dirname(filePath), { recursive: true })
 
-                const dir = path.dirname(fsPath)
-                await this.features.workspace.fs.mkdir(dir, { recursive: true })
-
-                await this.features.workspace.fs.writeFile(fsPath, JSON.stringify(json, null, 2))
+                await this.features.workspace.fs.writeFile(filePath, JSON.stringify(json, null, 2))
                 this.features.logging.debug(`MCP config file write complete: ${configPath}`)
             })
             .catch((e: any) => {

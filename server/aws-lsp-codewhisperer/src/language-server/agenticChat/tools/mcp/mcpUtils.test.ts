@@ -23,6 +23,8 @@ import {
     normalizePathFromUri,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
+    checkMcpConfigWrite,
+    ConfigWriteRefusedError,
     isEmptyEnv,
     describeStdioLaunchForLog,
     describeArgsForLog,
@@ -513,9 +515,94 @@ describe('saveAgentConfig', () => {
 
         const error = await rejectionOf(saveAgentConfig(workspace, logger, config, configPath))
 
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
         expect(error.message).to.include('was not saved because it is outside the workspace folder')
         expect(fs.readdirSync(outsideDir)).to.deep.equal([])
         expect(errors.filter(message => message.includes('was not saved'))).to.have.length(1)
+    })
+})
+
+describe('checkMcpConfigWrite', () => {
+    let tmpDir: string
+    let wsDir: string
+    let workspace: any
+    let warnings: string[]
+    let logger: any
+
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkMcpConfigWrite-'))
+        wsDir = path.join(tmpDir, 'repo')
+        fs.mkdirSync(wsDir)
+        workspace = {
+            fs: { getUserHomeDir: () => path.join(tmpDir, 'home') },
+            getAllWorkspaceFolders: () => [{ uri: URI.file(wsDir).toString() }],
+        }
+        warnings = []
+        logger = { warn: (message: string) => warnings.push(message), info: () => {}, error: () => {} }
+    })
+
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('allows the mcp.json of an open workspace folder, also before it exists', async () => {
+        await checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        fs.mkdirSync(path.join(wsDir, '.amazonq'))
+        fs.writeFileSync(path.join(wsDir, '.amazonq', 'mcp.json'), '{}')
+        await checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+
+        expect(warnings).to.deep.equal([])
+    })
+
+    it('refuses an mcp.json whose .amazonq folder links outside the workspace folder', async function () {
+        const outsideDir = path.join(tmpDir, 'outside')
+        fs.mkdirSync(outsideDir)
+        try {
+            fs.symlinkSync(outsideDir, path.join(wsDir, '.amazonq'), process.platform === 'win32' ? 'junction' : 'dir')
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+
+        const error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.equal(
+            'The MCP config was not saved because it is outside the workspace folder after symbolic links are ' +
+                'followed, or could not be resolved'
+        )
+        // The log names the file, and the message does not
+        expect(warnings).to.have.length(1)
+        expect(warnings[0]).to.include(JSON.stringify(mcpPath))
+    })
+
+    it('refuses an mcp.json that is also reachable under another name', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+        }
+        const outsideFile = path.join(tmpDir, 'outside.json')
+        fs.writeFileSync(outsideFile, '{}')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'))
+        fs.linkSync(outsideFile, path.join(wsDir, '.amazonq', 'mcp.json'))
+
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.include('it is also reachable under another name on disk')
+    })
+
+    it('allows the global mcp.json with no workspace folder open, and refuses another mcp.json', async () => {
+        workspace.getAllWorkspaceFolders = () => []
+
+        await checkMcpConfigWrite(workspace, logger, getGlobalMcpConfigPath(path.join(tmpDir, 'home')))
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
     })
 })
 

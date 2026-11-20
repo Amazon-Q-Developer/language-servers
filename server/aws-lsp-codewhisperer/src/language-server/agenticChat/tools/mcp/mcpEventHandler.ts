@@ -15,6 +15,8 @@ import {
 
 import {
     checkAgentConfigWrite,
+    checkMcpConfigWrite,
+    ConfigWriteRefusedError,
     getAgentConfigPathForMcpConfig,
     getGlobalAgentConfigPath,
     getWorkspaceAgentConfigPaths,
@@ -66,7 +68,11 @@ export class McpEventHandler {
     #isProgrammaticChange: boolean = false
     #debounceTimer: NodeJS.Timeout | null = null
     #lastProgrammaticState: boolean = false
-    #serverNameBeforeUpdate: string | undefined
+    /**
+     * A rename on the edit form, which renames the server in memory at once: the name before it and the name after
+     * it. Only the save of that edit uses it, as the name of the server to remove.
+     */
+    #renameInEdit: { from: string; to: string } | undefined
     #converter: McpServerConfigConverter = new McpServerConfigConverter()
 
     #releaseProgrammaticAfterDebounce(padMs = 500) {
@@ -116,7 +122,9 @@ export class McpEventHandler {
      * Handles the list MCP servers event
      */
     async onListMcpServers(params: ListMcpServersParams) {
+        // The list ends an edit
         this.#currentEditingServerName = undefined
+        this.#renameInEdit = undefined
         let mcpManager
         try {
             mcpManager = McpManager.instance
@@ -398,6 +406,7 @@ export class McpEventHandler {
         const handlers: Record<string, () => Promise<any>> = {
             'add-new-mcp': () => {
                 this.#currentEditingServerName = undefined
+                this.#renameInEdit = undefined
                 return this.#handleAddNewMcp(params)
             },
             'save-mcp': () => this.#handleSaveMcp(params),
@@ -938,7 +947,9 @@ export class McpEventHandler {
 
         try {
             if (isEditMode && originalServerName) {
-                const serverToRemove = this.#serverNameBeforeUpdate || originalServerName
+                // Only a rename on this edit form names another server to remove
+                const serverToRemove =
+                    this.#renameInEdit?.to === originalServerName ? this.#renameInEdit.from : originalServerName
                 let serverConfig
                 try {
                     serverConfig = McpManager.instance.getAllServerConfigs().get(serverToRemove)
@@ -950,6 +961,9 @@ export class McpEventHandler {
                 const configPath = isLegacyMcpServer ? await this.#getMcpConfigPath(isGlobal) : agentPath
                 try {
                     // The edited server must be savable where it goes before the old one is removed
+                    if (isLegacyMcpServer) {
+                        await checkMcpConfigWrite(this.#features.workspace, this.#features.logging, configPath)
+                    }
                     await checkAgentConfigWrite(
                         this.#features.workspace,
                         this.#features.logging,
@@ -988,7 +1002,7 @@ export class McpEventHandler {
         }
 
         this.#currentEditingServerName = undefined
-        this.#serverNameBeforeUpdate = undefined
+        this.#renameInEdit = undefined
 
         // need to check server state now, as there is possibility of error during server initialization
         const serverStatusError = this.#getServerStatusError(serverName)
@@ -1179,6 +1193,7 @@ export class McpEventHandler {
         } catch (error) {
             this.#features.logging.error(`Failed to enable MCP server: ${error}`)
             this.#releaseProgrammaticAfterDebounce()
+            await this.#showRefusedConfigWrite(error)
         }
         return { id: params.id }
     }
@@ -1212,6 +1227,7 @@ export class McpEventHandler {
         } catch (error) {
             this.#features.logging.error(`Failed to disable MCP server: ${error}`)
             this.#releaseProgrammaticAfterDebounce()
+            await this.#showRefusedConfigWrite(error)
         }
 
         return { id: params.id }
@@ -1241,6 +1257,7 @@ export class McpEventHandler {
         } catch (error) {
             this.#features.logging.error(`Failed to delete MCP server: ${error}`)
             this.#releaseProgrammaticAfterDebounce()
+            await this.#showRefusedConfigWrite(error)
             return { id: params.id }
         }
     }
@@ -1595,7 +1612,7 @@ export class McpEventHandler {
                 updatedServers.set(title, existingConfig)
                 await McpManager.instance.updateServerMap(updatedServers)
             }
-            this.#serverNameBeforeUpdate = editingServerName
+            this.#renameInEdit = { from: editingServerName, to: title }
         }
 
         params.id = editingServerName ? 'edit-mcp' : 'add-new-mcp'
@@ -1778,8 +1795,29 @@ export class McpEventHandler {
             return { id: params.id }
         } catch (error) {
             this.#features.logging.error(`Failed to save MCP permissions: ${error}`)
+            if (error instanceof ConfigWriteRefusedError) {
+                // The user is told once. The edit forms save pending changes first, which would try it again.
+                this.#pendingPermissionConfig = undefined
+            }
             this.#releaseProgrammaticAfterDebounce()
+            await this.#showRefusedConfigWrite(error)
             return { id: params.id }
+        }
+    }
+
+    /**
+     * Tells the user that a delete, enable, disable, or permission change was not made because a config file may not
+     * be written. The add and edit forms show such an error on the form, but these actions have no form, and the
+     * server keeps its state, so its status does not show the error either. Other errors are only logged.
+     */
+    async #showRefusedConfigWrite(error: unknown): Promise<void> {
+        if (!(error instanceof ConfigWriteRefusedError)) {
+            return
+        }
+        try {
+            await this.#features.lsp.window.showMessage({ type: MessageType.Error, message: error.message })
+        } catch (showError) {
+            this.#features.logging.error(`Failed to show why the MCP server change was not saved: ${showError}`)
         }
     }
 
