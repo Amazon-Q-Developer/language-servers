@@ -962,11 +962,398 @@ describe('sanitizeInput', () => {
         assert.strictEqual(sanitizeInput(once), once)
     })
 
+    it('removes joiners from the woman technologist and rainbow flag sequences', () => {
+        assert.strictEqual(sanitizeInput('👩\u200D💻'), '👩💻')
+        assert.strictEqual(sanitizeInput('🏳\uFE0F\u200D🌈'), '🏳\uFE0F🌈')
+    })
+
+    it('removes ideographic and standardized variation selectors from a Japanese name', () => {
+        assert.strictEqual(sanitizeInput('葛\u{E0100}'), '葛')
+        assert.strictEqual(sanitizeInput('葛\uFE00'), '葛')
+    })
+
+    it('removes a BOM from a source line and a soft hyphen from a word', () => {
+        assert.strictEqual(sanitizeInput('\uFEFFconst name = "葛"'), 'const name = "葛"')
+        assert.strictEqual(sanitizeInput('Sil\u00ADben'), 'Silben')
+    })
+
     it('keeps visible text in other scripts and the tab, newline and carriage return characters', () => {
         const text =
             'English, 中文, 日本語, 한국어, العربية, עברית, हिन्दी, Ελληνικά, Кириллица, \u{1F680}\u{1F44D}\u{1F3FD}\tline\r\n'
 
         assert.strictEqual(sanitizeInput(text), text)
+    })
+})
+
+describe('restorePropertyNames', () => {
+    it('gives each key back the property name of the schema that the model got in sanitized form', () => {
+        const schema = {
+            type: 'object',
+            properties: { 'note\u200Ctitle': { type: 'string' }, count: { type: 'number' } },
+            required: ['note\u200Ctitle'],
+        }
+        assert.deepStrictEqual(Object.keys(sanitizeRequestInput(schema).properties), ['notetitle', 'count'])
+
+        const result = restorePropertyNames({ notetitle: 'Plan', count: 2 }, schema)
+
+        assert.deepStrictEqual(result, { 'note\u200Ctitle': 'Plan', count: 2 })
+    })
+
+    describe('property-name map reuse', () => {
+        function countedProperties(properties: Record<string, unknown>) {
+            const ownKeys = sinon.spy(Reflect.ownKeys)
+            const get = sinon.spy(Reflect.get)
+            return { properties: new Proxy<Record<string, unknown>>(properties, { ownKeys, get }), ownKeys, get }
+        }
+
+        it('derives names once for repeated items and reads only matching property schemas', () => {
+            const counted = countedProperties(
+                Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`field${i}\u200B`, {}]))
+            )
+            const input = Array.from({ length: 20 }, (_, i) => ({ field0: i, unknown: 'kept' }))
+
+            const result = restorePropertyNames(input, { items: { properties: counted.properties } })
+
+            assert.deepStrictEqual(
+                result,
+                input.map((_, i) => ({ 'field0\u200B': i, unknown: 'kept' }))
+            )
+            assert.strictEqual(counted.ownKeys.callCount, 1)
+            assert.strictEqual(counted.get.callCount, input.length)
+            assert.deepStrictEqual(
+                input,
+                Array.from({ length: 20 }, (_, i) => ({ field0: i, unknown: 'kept' }))
+            )
+        })
+
+        it('derives a separate map once for each distinct nested properties object', () => {
+            const left = countedProperties({ 'na\u200Bme': {} })
+            const right = countedProperties({ 'na\u200Cme': {} })
+            const outer = countedProperties({
+                left: { properties: left.properties },
+                right: { properties: right.properties },
+            })
+            const input = Array.from({ length: 4 }, (_, i) => ({ left: { name: i }, right: { name: i + 1 } }))
+
+            const result = restorePropertyNames(input, { items: { properties: outer.properties } })
+
+            assert.deepStrictEqual(
+                result,
+                input.map((_, i) => ({ left: { 'na\u200Bme': i }, right: { 'na\u200Cme': i + 1 } }))
+            )
+            for (const counted of [outer, left, right]) {
+                assert.strictEqual(counted.ownKeys.callCount, 1)
+            }
+        })
+
+        for (const keyword of ['anyOf', 'allOf']) {
+            it(`reuses properties maps across ${keyword} members and combines matching child schemas`, () => {
+                const left = countedProperties({ 'le\u200Bft': {} })
+                const right = countedProperties({ 'ri\u200Bght': {} })
+                const shared = countedProperties({ 'va\u200Blue': { properties: left.properties } })
+                const other = countedProperties({ 'va\u200Blue': { properties: right.properties } })
+                const member = { properties: shared.properties }
+                const schema = {
+                    items: {
+                        [keyword]: [
+                            member,
+                            member,
+                            { properties: shared.properties },
+                            { properties: other.properties },
+                        ],
+                    },
+                }
+                const input = Array.from({ length: 6 }, (_, i) => ({ value: { left: i, right: i + 1 } }))
+
+                const result = restorePropertyNames(input, schema)
+
+                assert.deepStrictEqual(
+                    result,
+                    input.map((_, i) => ({ 'va\u200Blue': { 'le\u200Bft': i, 'ri\u200Bght': i + 1 } }))
+                )
+                for (const counted of [shared, other, left, right]) {
+                    assert.strictEqual(counted.ownKeys.callCount, 1)
+                }
+            })
+        }
+
+        it('derives fresh maps when the same properties object changes between calls', () => {
+            const counted = countedProperties({ 'x\u200B': {} })
+            const schema = { items: { properties: counted.properties } }
+            const input = [{ x: 1 }, { x: 2 }]
+
+            assert.deepStrictEqual(restorePropertyNames(input, schema), [{ 'x\u200B': 1 }, { 'x\u200B': 2 }])
+            assert.strictEqual(counted.ownKeys.callCount, 1)
+
+            counted.properties.x = {}
+            const collidingInput = [
+                { x: 3, 'x<U+200B>': 4 },
+                { x: 5, 'x<U+200B>': 6 },
+            ]
+            assert.deepStrictEqual(restorePropertyNames(collidingInput, schema), [
+                { x: 3, 'x\u200B': 4 },
+                { x: 5, 'x\u200B': 6 },
+            ])
+            assert.strictEqual(counted.ownKeys.callCount, 2)
+
+            delete counted.properties['x\u200B']
+            const unchanged = [
+                { x: 7, 'x<U+200B>': 8 },
+                { x: 9, 'x<U+200B>': 10 },
+            ]
+            assert.strictEqual(restorePropertyNames(unchanged, schema), unchanged)
+            assert.strictEqual(counted.ownKeys.callCount, 3)
+        })
+
+        it('reuses maps while preserving unchanged input identity and prototype-related keys', () => {
+            const counted = countedProperties(JSON.parse('{"":{},"__proto__":{},"constructor":{},"toString":{}}'))
+            const input = Array.from({ length: 3 }, () =>
+                JSON.parse('{"":0,"__proto__":{"kept":true},"constructor":1,"toString":2}')
+            )
+            Object.setPrototypeOf(input[1], null)
+
+            assert.strictEqual(restorePropertyNames(input, { items: { properties: counted.properties } }), input)
+            assert.strictEqual(Object.getPrototypeOf(input[0]), Object.prototype)
+            assert.strictEqual(Object.getPrototypeOf(input[1]), null)
+            assert.strictEqual(counted.ownKeys.callCount, 1)
+        })
+    })
+
+    it('follows nested properties, array items and tuple items', () => {
+        const named = (name: string) => ({ type: 'object', properties: { [name]: { type: 'string' } } })
+        const schema = {
+            type: 'object',
+            properties: {
+                'me\u200Dta': {
+                    type: 'object',
+                    properties: { 'ta\u00ADgs': { type: 'array', items: named('na\u200Bme') } },
+                },
+                pair: { type: 'array', prefixItems: [named('le\u200Cft')], items: named('re\u200Cst') },
+                legacyPair: { type: 'array', items: [named('fi\u200Crst')], additionalItems: named('mo\u200Cre') },
+            },
+        }
+
+        const result = restorePropertyNames(
+            {
+                meta: { tags: [{ name: 'a' }, { name: 'b' }] },
+                pair: [{ left: '1' }, { rest: '2' }, { rest: '3' }],
+                legacyPair: [{ first: '1' }, { more: '2' }],
+            },
+            schema
+        )
+
+        assert.deepStrictEqual(result, {
+            'me\u200Dta': { 'ta\u00ADgs': [{ 'na\u200Bme': 'a' }, { 'na\u200Bme': 'b' }] },
+            pair: [{ 'le\u200Cft': '1' }, { 're\u200Cst': '2' }, { 're\u200Cst': '3' }],
+            legacyPair: [{ 'fi\u200Crst': '1' }, { 'mo\u200Cre': '2' }],
+        })
+    })
+
+    it('follows $ref pointers, also recursive ones, and the members of anyOf, allOf and oneOf', () => {
+        const schema = {
+            $defs: {
+                Item: { type: 'object', properties: { 'ti\u200Ctle': { type: 'string' } } },
+                Node: {
+                    type: 'object',
+                    properties: { 'chil\u200Cdren': { type: 'array', items: { $ref: '#/$defs/Node' } } },
+                },
+            },
+            type: 'object',
+            properties: {
+                item: { anyOf: [{ $ref: '#/$defs/Item' }, { type: 'null' }] },
+                tree: { $ref: '#/$defs/Node' },
+                both: {
+                    allOf: [{ properties: { 'o\u200Cne': {} } }, { oneOf: [{ properties: { 'tw\u200Co': {} } }] }],
+                },
+            },
+        }
+
+        const result = restorePropertyNames(
+            { item: { title: 'x' }, tree: { children: [{ children: [] }] }, both: { one: 1, two: 2 } },
+            schema
+        )
+
+        assert.deepStrictEqual(result, {
+            item: { 'ti\u200Ctle': 'x' },
+            tree: { 'chil\u200Cdren': [{ 'chil\u200Cdren': [] }] },
+            both: { 'o\u200Cne': 1, 'tw\u200Co': 2 },
+        })
+    })
+
+    it('follows a $ref to the whole schema or a percent-encoded pointer, and no other kind of $ref', () => {
+        const schema = {
+            $defs: { Item: { properties: { 'ti\u200Ctle': {} } } },
+            properties: {
+                'na\u200Cme': {},
+                self: { $ref: '#' },
+                encoded: { $ref: '#/%24defs/It%65m' },
+                anchor: { $ref: '#Item' },
+                malformed: { $ref: '#/%E0%A4%A' },
+            },
+        }
+        const input = {
+            self: { name: 'n' },
+            encoded: { title: 't' },
+            anchor: { title: 'a' },
+            malformed: { title: 'm' },
+        }
+
+        const result = restorePropertyNames(input, schema)
+
+        assert.deepStrictEqual(result, {
+            self: { 'na\u200Cme': 'n' },
+            encoded: { 'ti\u200Ctle': 't' },
+            anchor: { title: 'a' },
+            malformed: { title: 'm' },
+        })
+        assert.strictEqual(result.anchor, input.anchor)
+        assert.strictEqual(result.malformed, input.malformed)
+    })
+
+    it('gives a key in the visible form of a colliding property name that property name', () => {
+        const schema = { type: 'object', properties: { ab: {}, 'a\u200Bb': {} } }
+        assert.deepStrictEqual(Object.keys(sanitizeRequestInput(schema).properties), ['ab', 'a<U+200B>b'])
+
+        const result = restorePropertyNames({ ab: 1, 'a<U+200B>b': 2 }, schema)
+
+        assert.deepStrictEqual(result, { ab: 1, 'a\u200Bb': 2 })
+    })
+
+    it('restores literal escape labels and colliding property names in any input order', () => {
+        const schema = {
+            type: 'object',
+            properties: {
+                'x\u200B': { type: 'string' },
+                'x\u200C': { type: 'string' },
+                'x<U+200B>': { type: 'string' },
+            },
+        }
+        const sanitizedSchema = sanitizeRequestInput(schema)
+        const keys = Object.keys(sanitizedSchema.properties)
+        assert.deepStrictEqual(keys, ['x<U+200B>', 'x<U+200C>', 'x<U+003C>U+200B>'])
+        const entries = keys.map((key, i) => [key, ['A', 'B', 'C'][i]] as const)
+        const expected = { 'x\u200B': 'A', 'x\u200C': 'B', 'x<U+200B>': 'C' }
+        const orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ]
+
+        for (const order of orders) {
+            const input = Object.fromEntries(order.map(i => entries[i]))
+            const restored = restorePropertyNames(input, schema)
+
+            assert.deepStrictEqual(restored, expected)
+            assert.deepStrictEqual(sanitizeRequestInput(restored), input)
+            assert.deepStrictEqual(sanitizeRequestInput(sanitizedSchema), sanitizedSchema)
+        }
+    })
+
+    it('restores nested property names after repeated schema and input sanitization', () => {
+        const leafSchema = { properties: { 'x\u200B': {}, 'x\u200C': {}, 'x<U+200B>': {} } }
+        const schema = { properties: { 'i\u200Btems': { items: leafSchema } } }
+        const original = { 'i\u200Btems': [{ 'x\u200B': 'A', 'x\u200C': 'B', 'x<U+200B>': 'C' }] }
+        const shownSchema = sanitizeRequestInput(schema)
+        const shownInput = sanitizeRequestInput(original)
+
+        assert.deepStrictEqual(Object.keys(shownSchema.properties.items.items.properties), [
+            'x<U+200B>',
+            'x<U+200C>',
+            'x<U+003C>U+200B>',
+        ])
+        assert.deepStrictEqual(sanitizeRequestInput(shownSchema), shownSchema)
+        assert.deepStrictEqual(sanitizeRequestInput(shownInput), shownInput)
+        assert.deepStrictEqual(restorePropertyNames(shownInput, schema), original)
+    })
+
+    it('keeps every value when a restoration chain ends at an existing property name', () => {
+        const schema = {
+            properties: { 'x\u200B': {}, 'x\u200C': {}, 'x<U+200B>': {}, 'x<U+003C>U+200B>': {} },
+        }
+        const input = {
+            'x<U+003C>U+003C>U+200B>': 'outer label',
+            'x<U+003C>U+200B>': 'inner label',
+            'x<U+200B>': 'sanitized name',
+            'x\u200B': 'existing name',
+        }
+
+        assert.strictEqual(restorePropertyNames(input, schema), input)
+    })
+
+    it('keeps a key that stands for more than one property name, or whose name another key already has', () => {
+        // In one member "ab" is a property name; in the other, it is the sanitized form of "a\u200Bb"
+        const ambiguous = { anyOf: [{ properties: { 'a\u200Bb': {} } }, { properties: { ab: {} } }] }
+        const ambiguousInput = { ab: 1 }
+        assert.strictEqual(restorePropertyNames(ambiguousInput, ambiguous), ambiguousInput)
+
+        const existing = { properties: { 'a\u200Bb': {} } }
+        const existingInput = { ab: 1, 'a\u200Bb': 2 }
+        assert.strictEqual(restorePropertyNames(existingInput, existing), existingInput)
+
+        // Both keys stand for "a\u200Bb": the first one gets the name, and no value replaces the other one
+        const twoForms = {
+            anyOf: [{ properties: { 'a\u200Bb': {} } }, { properties: { 'a\u200Bb': {}, 'a\u200Cb': {} } }],
+        }
+        assert.deepStrictEqual(restorePropertyNames({ ab: 1, 'a<U+200B>b': 2 }, twoForms), {
+            'a\u200Bb': 1,
+            'a<U+200B>b': 2,
+        })
+    })
+
+    it('keeps the keys of additionalProperties and follows their schema into the values', () => {
+        const schema = {
+            type: 'object',
+            properties: { 'na\u200Cme': {} },
+            additionalProperties: { type: 'object', properties: { 'va\u200Clue': {} } },
+        }
+
+        const result = restorePropertyNames({ name: 'n', anyKey: { value: 1 } }, schema)
+
+        assert.deepStrictEqual(result, { 'na\u200Cme': 'n', anyKey: { 'va\u200Clue': 1 } })
+    })
+
+    it('handles a key such as __proto__ as a property of the object', () => {
+        const schema = JSON.parse(
+            '{"type": "object", "properties": {"__proto__": {"type": "object"}, "na\\u200Cme": {}}}'
+        )
+
+        const result = restorePropertyNames(JSON.parse('{"__proto__": {"x": 1}, "name": "n"}'), schema)
+
+        assert.strictEqual(Object.getPrototypeOf(result), Object.prototype)
+        assert.strictEqual(JSON.stringify(result), '{"__proto__":{"x":1},"na\u200Cme":"n"}')
+    })
+
+    it('returns the input itself when no key changes', () => {
+        const input = { title: 'x', list: [{ a: 1 }] }
+
+        assert.strictEqual(restorePropertyNames(input, { properties: { title: {}, list: { items: {} } } }), input)
+        assert.strictEqual(restorePropertyNames(input, undefined), input)
+        assert.strictEqual(restorePropertyNames(input, { $ref: '#/$defs/Missing' }), input)
+        assert.strictEqual(restorePropertyNames(input, { $ref: 'https://example.com/schema.json' }), input)
+        assert.strictEqual(restorePropertyNames('text', { properties: { 'te\u200Cxt': {} } }), 'text')
+    })
+
+    it('applies at most 64 schemas to one value', () => {
+        const others = Array.from({ length: 64 }, (_, i) => ({ properties: { [`other${i}`]: {} } }))
+        const input = { name: 'n' }
+
+        const schema = { anyOf: [...others, { properties: { 'na\u200Cme': {} } }] }
+
+        assert.strictEqual(restorePropertyNames(input, schema), input)
+        assert.deepStrictEqual(restorePropertyNames(input, { anyOf: [others[0], schema.anyOf[64]] }), {
+            'na\u200Cme': 'n',
+        })
+    })
+
+    it('looks at a bounded number of schema entries, also repeated ones', () => {
+        const repeated = { properties: { other: {} } }
+        const input = { name: 'n' }
+        const schema = { anyOf: [...Array(200_000).fill(repeated), 1, { properties: { 'na\u200Cme': {} } }] }
+
+        assert.strictEqual(restorePropertyNames(input, schema), input)
     })
 })
 
@@ -987,6 +1374,59 @@ describe('sanitizeRequestInput', () => {
         })
 
         assert.deepStrictEqual(result.json, { a: 1, 'a<U+200B>': 2, 'b<U+200C>': 3, 'b<U+E0041>': 4, c: 5 })
+    })
+
+    it('keeps every value when an escaped key equals a literal escape label', () => {
+        const input = { 'x\u200B': 'A', 'x\u200C': 'B', 'x<U+200B>': 'C' }
+
+        const result = sanitizeRequestInput(input)
+
+        assert.deepStrictEqual(Object.values(result), Object.values(input))
+        assert.deepStrictEqual(result, { 'x<U+200B>': 'A', 'x<U+200C>': 'B', 'x<U+003C>U+200B>': 'C' })
+        assert.deepStrictEqual(sanitizeRequestInput(result), result)
+    })
+
+    it('leaves literal escape labels unchanged when the first pass has no collision', () => {
+        const input = { 'x\u200B': 1, 'literal<U+200B>': 2, '<U+003C>': 3, '<plain': 4 }
+
+        assert.deepStrictEqual(sanitizeRequestInput(input), { x: 1, 'literal<U+200B>': 2, '<U+003C>': 3, '<plain': 4 })
+    })
+
+    it('escapes original characters once and preserves nested values across repeated sanitization', () => {
+        const keyPairs = [
+            ['x\u200B', 'x<U+200B>'],
+            ['x\u200C', 'x<U+200C>'],
+            ['x<U+200B>', 'x<U+003C>U+200B>'],
+            ['x<U+003C>U+200B>', 'x<U+003C>U+003C>U+200B>'],
+            ['x<\u200B', 'x<U+003C><U+200B>'],
+            ['x<\u{E0041}', 'x<U+003C><U+E0041>'],
+            ['z\u00AD', 'z<U+00AD>'],
+            ['\u200B', '<U+200B>'],
+            ['\u200C', '<U+200C>'],
+            ['<U+200B>', '<U+003C>U+200B>'],
+            ['', ''],
+            ['⚠\uFE0F', '⚠\uFE0F'],
+            ['1\uFE0F\u20E3', '1\uFE0F\u20E3'],
+            ['__proto__', '__proto__'],
+        ]
+        const nested = Object.fromEntries(keyPairs.map(([key], i) => [key, i]))
+        const input = { items: [nested], other: { 'a\u200B': 'value' } }
+        const expected = {
+            items: [Object.fromEntries(keyPairs.map(([, key], i) => [key, i]))],
+            other: { a: 'value' },
+        }
+
+        const result = sanitizeRequestInput(input)
+
+        assert.deepStrictEqual(result, expected)
+        assert.strictEqual(Object.keys(result.items[0]).length, keyPairs.length)
+        assert.strictEqual(Object.getPrototypeOf(result.items[0]), Object.prototype)
+        assert.deepStrictEqual(
+            Object.keys(nested),
+            keyPairs.map(([key]) => key)
+        )
+        assert.deepStrictEqual(sanitizeRequestInput(result), result)
+        assert.deepStrictEqual(sanitizeRequestInput(sanitizeRequestInput(result)), result)
     })
 
     it('keeps a key that is or becomes __proto__ as a property of the object', () => {
@@ -1259,163 +1699,5 @@ describe('sanitizeRequestInput', () => {
             const result = sanitizeLogInput(input)
             assert.strictEqual(result, input)
         })
-    })
-})
-
-describe('restorePropertyNames', () => {
-    it('gives each key back the property name of the schema that the model got in sanitized form', () => {
-        const schema = {
-            type: 'object',
-            properties: { 'note\u200Ctitle': { type: 'string' }, count: { type: 'number' } },
-            required: ['note\u200Ctitle'],
-        }
-        assert.deepStrictEqual(Object.keys(sanitizeRequestInput(schema).properties), ['notetitle', 'count'])
-
-        const result = restorePropertyNames({ notetitle: 'Plan', count: 2 }, schema)
-
-        assert.deepStrictEqual(result, { 'note\u200Ctitle': 'Plan', count: 2 })
-    })
-
-    it('follows nested properties, array items and tuple items', () => {
-        const named = (name: string) => ({ type: 'object', properties: { [name]: { type: 'string' } } })
-        const schema = {
-            type: 'object',
-            properties: {
-                'me\u200Dta': {
-                    type: 'object',
-                    properties: { 'ta\u00ADgs': { type: 'array', items: named('na\u200Bme') } },
-                },
-                pair: { type: 'array', prefixItems: [named('le\u200Cft')], items: named('re\u200Cst') },
-                legacyPair: { type: 'array', items: [named('fi\u200Crst')], additionalItems: named('mo\u200Cre') },
-            },
-        }
-
-        const result = restorePropertyNames(
-            {
-                meta: { tags: [{ name: 'a' }, { name: 'b' }] },
-                pair: [{ left: '1' }, { rest: '2' }, { rest: '3' }],
-                legacyPair: [{ first: '1' }, { more: '2' }],
-            },
-            schema
-        )
-
-        assert.deepStrictEqual(result, {
-            'me\u200Dta': { 'ta\u00ADgs': [{ 'na\u200Bme': 'a' }, { 'na\u200Bme': 'b' }] },
-            pair: [{ 'le\u200Cft': '1' }, { 're\u200Cst': '2' }, { 're\u200Cst': '3' }],
-            legacyPair: [{ 'fi\u200Crst': '1' }, { 'mo\u200Cre': '2' }],
-        })
-    })
-
-    it('follows $ref pointers, also recursive ones, and the members of anyOf, allOf and oneOf', () => {
-        const schema = {
-            $defs: {
-                Item: { type: 'object', properties: { 'ti\u200Ctle': { type: 'string' } } },
-                Node: {
-                    type: 'object',
-                    properties: { 'chil\u200Cdren': { type: 'array', items: { $ref: '#/$defs/Node' } } },
-                },
-            },
-            type: 'object',
-            properties: {
-                item: { anyOf: [{ $ref: '#/$defs/Item' }, { type: 'null' }] },
-                tree: { $ref: '#/$defs/Node' },
-                both: {
-                    allOf: [{ properties: { 'o\u200Cne': {} } }, { oneOf: [{ properties: { 'tw\u200Co': {} } }] }],
-                },
-            },
-        }
-
-        const result = restorePropertyNames(
-            { item: { title: 'x' }, tree: { children: [{ children: [] }] }, both: { one: 1, two: 2 } },
-            schema
-        )
-
-        assert.deepStrictEqual(result, {
-            item: { 'ti\u200Ctle': 'x' },
-            tree: { 'chil\u200Cdren': [{ 'chil\u200Cdren': [] }] },
-            both: { 'o\u200Cne': 1, 'tw\u200Co': 2 },
-        })
-    })
-
-    it('gives a key in the visible form of a colliding property name that property name', () => {
-        const schema = { type: 'object', properties: { ab: {}, 'a\u200Bb': {} } }
-        assert.deepStrictEqual(Object.keys(sanitizeRequestInput(schema).properties), ['ab', 'a<U+200B>b'])
-
-        const result = restorePropertyNames({ ab: 1, 'a<U+200B>b': 2 }, schema)
-
-        assert.deepStrictEqual(result, { ab: 1, 'a\u200Bb': 2 })
-    })
-
-    it('keeps a key that stands for more than one property name, or whose name another key already has', () => {
-        // In one member "ab" is a property name; in the other, it is the sanitized form of "a\u200Bb"
-        const ambiguous = { anyOf: [{ properties: { 'a\u200Bb': {} } }, { properties: { ab: {} } }] }
-        const ambiguousInput = { ab: 1 }
-        assert.strictEqual(restorePropertyNames(ambiguousInput, ambiguous), ambiguousInput)
-
-        const existing = { properties: { 'a\u200Bb': {} } }
-        const existingInput = { ab: 1, 'a\u200Bb': 2 }
-        assert.strictEqual(restorePropertyNames(existingInput, existing), existingInput)
-
-        // Both keys stand for "a\u200Bb": the first one gets the name, and no value replaces the other one
-        const twoForms = {
-            anyOf: [{ properties: { 'a\u200Bb': {} } }, { properties: { 'a\u200Bb': {}, 'a\u200Cb': {} } }],
-        }
-        assert.deepStrictEqual(restorePropertyNames({ ab: 1, 'a<U+200B>b': 2 }, twoForms), {
-            'a\u200Bb': 1,
-            'a<U+200B>b': 2,
-        })
-    })
-
-    it('keeps the keys of additionalProperties and follows their schema into the values', () => {
-        const schema = {
-            type: 'object',
-            properties: { 'na\u200Cme': {} },
-            additionalProperties: { type: 'object', properties: { 'va\u200Clue': {} } },
-        }
-
-        const result = restorePropertyNames({ name: 'n', anyKey: { value: 1 } }, schema)
-
-        assert.deepStrictEqual(result, { 'na\u200Cme': 'n', anyKey: { 'va\u200Clue': 1 } })
-    })
-
-    it('handles a key such as __proto__ as a property of the object', () => {
-        const schema = JSON.parse(
-            '{"type": "object", "properties": {"__proto__": {"type": "object"}, "na\\u200Cme": {}}}'
-        )
-
-        const result = restorePropertyNames(JSON.parse('{"__proto__": {"x": 1}, "name": "n"}'), schema)
-
-        assert.strictEqual(Object.getPrototypeOf(result), Object.prototype)
-        assert.strictEqual(JSON.stringify(result), '{"__proto__":{"x":1},"na\u200Cme":"n"}')
-    })
-
-    it('returns the input itself when no key changes', () => {
-        const input = { title: 'x', list: [{ a: 1 }] }
-
-        assert.strictEqual(restorePropertyNames(input, { properties: { title: {}, list: { items: {} } } }), input)
-        assert.strictEqual(restorePropertyNames(input, undefined), input)
-        assert.strictEqual(restorePropertyNames(input, { $ref: '#/$defs/Missing' }), input)
-        assert.strictEqual(restorePropertyNames(input, { $ref: 'https://example.com/schema.json' }), input)
-        assert.strictEqual(restorePropertyNames('text', { properties: { 'te\u200Cxt': {} } }), 'text')
-    })
-
-    it('applies at most 64 schemas to one value', () => {
-        const others = Array.from({ length: 64 }, (_, i) => ({ properties: { [`other${i}`]: {} } }))
-        const input = { name: 'n' }
-
-        const schema = { anyOf: [...others, { properties: { 'na\u200Cme': {} } }] }
-
-        assert.strictEqual(restorePropertyNames(input, schema), input)
-        assert.deepStrictEqual(restorePropertyNames(input, { anyOf: [others[0], schema.anyOf[64]] }), {
-            'na\u200Cme': 'n',
-        })
-    })
-
-    it('looks at a bounded number of schema entries, also repeated ones', () => {
-        const repeated = { properties: { other: {} } }
-        const input = { name: 'n' }
-        const schema = { anyOf: [...Array(200_000).fill(repeated), 1, { properties: { 'na\u200Cme': {} } }] }
-
-        assert.strictEqual(restorePropertyNames(input, schema), input)
     })
 })

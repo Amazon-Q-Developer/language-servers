@@ -717,6 +717,7 @@ function replaceInvisibleCharacters(text: string, replacement: (char: string) =>
 /**
  * `keys` without the characters that `sanitizeInput` removes. A key that changes, and would then equal another key,
  * shows those characters as visible text such as <U+200B> instead, so that no value replaces another one.
+ * If those labels still collide, every original '<' and removed character is escaped in all keys.
  */
 function sanitizeKeys(keys: string[]): string[] {
     const sanitized = keys.map(key => sanitizeInput(key))
@@ -727,50 +728,22 @@ function sanitizeKeys(keys: string[]): string[] {
     for (const key of sanitized) {
         counts.set(key, (counts.get(key) ?? 0) + 1)
     }
-    return sanitized.map((key, i) =>
-        key !== keys[i] && (counts.get(key) ?? 0) > 1
-            ? replaceInvisibleCharacters(
-                  keys[i],
-                  char => `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}>`
-              )
-            : key
+    const escapeCharacter = (char: string) =>
+        `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}>`
+    const escaped = sanitized.map((key, i) =>
+        key !== keys[i] && (counts.get(key) ?? 0) > 1 ? replaceInvisibleCharacters(keys[i], escapeCharacter) : key
     )
-}
+    if (new Set(escaped).size === escaped.length) {
+        return escaped
+    }
 
-/**
- * Sanitizes input for logging to prevent log injection attacks
- * @param input The input string to sanitize
- * @returns The sanitized string with control characters replaced
- */
-export function sanitizeLogInput(input: string): string {
-    // Remove newlines, carriage returns, and other control characters
-    return input.replace(/[\r\n\t\x00-\x1f\x7f-\x9f]/g, '_')
-}
-
-/**
- * Recursively sanitizes the entire request input to prevent Unicode ASCII smuggling
- * @param input The request input to sanitize
- * @returns The sanitized request input
- */
-export function sanitizeRequestInput(input: any): any {
-    if (typeof input === 'string') {
-        return sanitizeInput(input)
-    }
-    if (input instanceof Uint8Array) {
-        // Don't sanitize binary data like images - return as-is
-        return input
-    }
-    if (Array.isArray(input)) {
-        return input.map(item => sanitizeRequestInput(item))
-    }
-    if (input && typeof input === 'object') {
-        const entries = Object.entries(input)
-        // Keys reach the model too, for example the property names of a JSON tool result
-        const keys = sanitizeKeys(entries.map(([key]) => key))
-        // Object.fromEntries defines each key as a property, also a key such as __proto__
-        return Object.fromEntries(entries.map(([, value], i) => [keys[i], sanitizeRequestInput(value)]))
-    }
-    return input
+    // Escape original characters in one pass. Generated labels must not be escaped again.
+    const charactersToEscape = new RegExp(`${INVISIBLE_CHARACTERS.source}|<`, 'gu')
+    return keys.map(key =>
+        key.replace(charactersToEscape, (char: string, offset: number, whole: string) =>
+            isPresentationSelectorOfEmoji(char, offset, whole) ? char : escapeCharacter(char)
+        )
+    )
 }
 
 type JsonObject = Record<string, unknown>
@@ -791,13 +764,19 @@ function isJsonObject(value: unknown): value is JsonObject {
  *
  * It follows properties, additionalProperties, items, prefixItems, allOf, anyOf, oneOf and $ref pointers within
  * `schema`. A key stays as it is when it stands for no property name or for more than one, or when another key of the
- * same object already has that property name. Returns `input` itself when no key changes.
+ * same object keeps that property name. Returns `input` itself when no key changes.
  */
 export function restorePropertyNames<T>(input: T, schema: unknown): T {
-    return restoreNames(input, [schema], schema) as T
+    // Schemas can change between calls, so derived name maps belong only to this invocation.
+    return restoreNames(input, [schema], schema, new WeakMap()) as T
 }
 
-function restoreNames(value: unknown, schemas: unknown[], root: unknown): unknown {
+function restoreNames(
+    value: unknown,
+    schemas: unknown[],
+    root: unknown,
+    propertyNames: WeakMap<JsonObject, Map<string, string>>
+): unknown {
     const applicable = applicableSchemas(schemas, root)
     if (applicable.length === 0) {
         return value
@@ -808,7 +787,8 @@ function restoreNames(value: unknown, schemas: unknown[], root: unknown): unknow
             const restored = restoreNames(
                 item,
                 applicable.flatMap(schema => itemSchemas(schema, index)),
-                root
+                root,
+                propertyNames
             )
             changed ||= restored !== item
             return restored
@@ -819,39 +799,69 @@ function restoreNames(value: unknown, schemas: unknown[], root: unknown): unknow
         return value
     }
 
-    // For each key that the model can use: the property names that it can stand for, with their schemas
-    const namesByKey = new Map<string, Map<string, unknown[]>>()
-    for (const schema of applicable) {
+    // Derive each properties object's name map once, even when many array items share it.
+    const propertyMaps = applicable.flatMap(schema => {
         const properties = schema.properties
         if (!isJsonObject(properties)) {
-            continue
+            return []
         }
-        const names = Object.keys(properties)
-        sanitizeKeys(names).forEach((key, i) => {
-            const schemasByName = namesByKey.get(key) ?? new Map<string, unknown[]>()
-            schemasByName.set(names[i], [...(schemasByName.get(names[i]) ?? []), properties[names[i]]])
-            namesByKey.set(key, schemasByName)
-        })
-    }
+        let names = propertyNames.get(properties)
+        if (!names) {
+            const keys = Object.keys(properties)
+            names = new Map(sanitizeKeys(keys).map((key, i) => [key, keys[i]]))
+            propertyNames.set(properties, names)
+        }
+        return [{ properties, names }]
+    })
     const additionalProperties = applicable.map(schema => schema.additionalProperties)
 
-    // The keys of the input, and the property names that it gets: a value never replaces another one
-    const usedNames = new Set(Object.keys(value))
+    // Only combine matches for input keys, not every property in every applicable schema.
+    const namesByKey = new Map<string, Map<string, unknown[]>>()
+    // Reserve unique destination names before restoring values. A literal escape label can reuse a name
+    // that another key will release, regardless of the order of the input keys.
+    const namesByInputKey = new Map<string, string>()
+    const keysByName = new Map<string, string>()
+    const unchangedKeys: string[] = []
+    for (const key of Object.keys(value)) {
+        const schemasByName = new Map<string, unknown[]>()
+        for (const { properties, names } of propertyMaps) {
+            const name = names.get(key)
+            if (name !== undefined) {
+                const propertySchemas = schemasByName.get(name) ?? []
+                propertySchemas.push(properties[name])
+                schemasByName.set(name, propertySchemas)
+            }
+        }
+        if (schemasByName.size > 0) {
+            namesByKey.set(key, schemasByName)
+        }
+        if (schemasByName.size === 1) {
+            const [name] = schemasByName.keys()
+            if (name !== key && !keysByName.has(name)) {
+                namesByInputKey.set(key, name)
+                keysByName.set(name, key)
+                continue
+            }
+        }
+        unchangedKeys.push(key)
+    }
+    // A key that keeps its name blocks any rename to that name, including a chain of renames.
+    for (let next = 0; next < unchangedKeys.length; next++) {
+        const key = keysByName.get(unchangedKeys[next])
+        if (key !== undefined && namesByInputKey.delete(key)) {
+            unchangedKeys.push(key)
+        }
+    }
+
     let changed = false
     const entries = Object.entries(value).map(([key, item]) => {
         const schemasByName = namesByKey.get(key)
-        let name = key
-        if (schemasByName?.size === 1) {
-            const [onlyName] = schemasByName.keys()
-            if (!usedNames.has(onlyName)) {
-                name = onlyName
-                usedNames.add(name)
-            }
-        }
+        const name = namesByInputKey.get(key) ?? key
         const restored = restoreNames(
             item,
             schemasByName ? (schemasByName.get(name) ?? []) : additionalProperties,
-            root
+            root,
+            propertyNames
         )
         changed ||= name !== key || restored !== item
         return [name, restored] as const
@@ -923,4 +933,40 @@ function resolveSchemaPointer(ref: string, root: unknown): unknown {
         node = (node as JsonObject)[key]
     }
     return node
+}
+
+/**
+ * Sanitizes input for logging to prevent log injection attacks
+ * @param input The input string to sanitize
+ * @returns The sanitized string with control characters replaced
+ */
+export function sanitizeLogInput(input: string): string {
+    // Remove newlines, carriage returns, and other control characters
+    return input.replace(/[\r\n\t\x00-\x1f\x7f-\x9f]/g, '_')
+}
+
+/**
+ * Recursively sanitizes the entire request input to prevent Unicode ASCII smuggling
+ * @param input The request input to sanitize
+ * @returns The sanitized request input
+ */
+export function sanitizeRequestInput(input: any): any {
+    if (typeof input === 'string') {
+        return sanitizeInput(input)
+    }
+    if (input instanceof Uint8Array) {
+        // Don't sanitize binary data like images - return as-is
+        return input
+    }
+    if (Array.isArray(input)) {
+        return input.map(item => sanitizeRequestInput(item))
+    }
+    if (input && typeof input === 'object') {
+        const entries = Object.entries(input)
+        // Keys reach the model too, for example the property names of a JSON tool result
+        const keys = sanitizeKeys(entries.map(([key]) => key))
+        // Object.fromEntries defines each key as a property, also a key such as __proto__
+        return Object.fromEntries(entries.map(([, value], i) => [keys[i], sanitizeRequestInput(value)]))
+    }
+    return input
 }

@@ -5844,6 +5844,7 @@ ${' '.repeat(8)}}
         const SERVER = 'notes'
         const TOOL = 'save_note'
         const REGISTERED = `${SERVER}___${TOOL}`
+        const NO_SCHEMA_MESSAGE = `MCP tool ${REGISTERED} has no input schema, so its input keeps the property names that the model sent`
         // U+200C is part of the name, as in words of some scripts. The request gives the model "notetitle".
         const PROPERTY = 'note\u200Ctitle'
         const inputSchema = {
@@ -5904,6 +5905,96 @@ ${' '.repeat(8)}}
             assert.deepStrictEqual(runToolStub.firstCall.args[1], { [PROPERTY]: 'Plan' })
             // The conversation keeps the input as the model wrote it
             assert.deepStrictEqual(toolUse.input, { notetitle: 'Plan' })
+            sinon.assert.neverCalledWith(testFeatures.logging.debug, NO_SCHEMA_MESSAGE)
+        })
+
+        const unavailableSchemas = [
+            { label: 'the schema disappears after the availability check', tools: [] },
+            { label: 'inputSchema is absent', tools: [{ toolSpecification: { name: REGISTERED } }] },
+            {
+                label: 'the JSON schema is absent',
+                tools: [{ toolSpecification: { name: REGISTERED, inputSchema: {} } }],
+            },
+            {
+                label: 'the JSON schema is null',
+                tools: [{ toolSpecification: { name: REGISTERED, inputSchema: { json: null } } }],
+            },
+        ]
+        for (const { label, tools } of unavailableSchemas) {
+            it(`logs a safe diagnostic and passes the input unchanged when ${label}`, async () => {
+                const getToolsStub = testFeatures.agent.getTools as sinon.SinonStub
+                getToolsStub.resetHistory()
+                getToolsStub
+                    .onFirstCall()
+                    .returns([{ toolSpecification: { name: REGISTERED, inputSchema: { json: inputSchema } } }])
+                getToolsStub.returns(tools)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+                const input = { notetitle: 'Private note\ntext', nested: { 'field\r\nname': 'unchanged' } }
+                const toolUse = { toolUseId: 'note-id', name: REGISTERED, input, stop: true }
+
+                const results = await chatController.processToolUses(
+                    [toolUse],
+                    makeStream() as any,
+                    makeSession(),
+                    'tabId',
+                    mockCancellationToken
+                )
+
+                assert.deepStrictEqual(
+                    results.filter(result => result.status === ToolResultStatus.ERROR),
+                    []
+                )
+                sinon.assert.calledOnce(runToolStub)
+                assert.strictEqual(runToolStub.firstCall.args[0], REGISTERED)
+                assert.strictEqual(runToolStub.firstCall.args[1], input)
+                assert.strictEqual(toolUse.input, input)
+                assert.deepStrictEqual(input, {
+                    notetitle: 'Private note\ntext',
+                    nested: { 'field\r\nname': 'unchanged' },
+                })
+                sinon.assert.calledOnceWithExactly(
+                    testFeatures.logging.debug.withArgs(NO_SCHEMA_MESSAGE),
+                    NO_SCHEMA_MESSAGE
+                )
+            })
+        }
+
+        it('runs the tool with every original property name after an escape-label collision', async () => {
+            const schema = {
+                type: 'object',
+                properties: {
+                    'x\u200B': { type: 'string' },
+                    'x\u200C': { type: 'string' },
+                    'x<U+200B>': { type: 'string' },
+                },
+            }
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: REGISTERED, inputSchema: { json: schema } } },
+            ])
+            const shownSchema = sharedUtils.sanitizeRequestInput(schema)
+            assert.deepStrictEqual(Object.keys(shownSchema.properties), ['x<U+200B>', 'x<U+200C>', 'x<U+003C>U+200B>'])
+            const input = { 'x<U+003C>U+200B>': 'C', 'x<U+200C>': 'B', 'x<U+200B>': 'A' }
+            const toolUse = { toolUseId: 'note-id', name: REGISTERED, input, stop: true }
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                makeStream() as any,
+                makeSession(),
+                'tabId',
+                mockCancellationToken
+            )
+
+            assert.deepStrictEqual(
+                results.filter(result => result.status === ToolResultStatus.ERROR),
+                []
+            )
+            sinon.assert.calledOnce(runToolStub)
+            assert.deepStrictEqual(runToolStub.firstCall.args[1], { 'x\u200B': 'A', 'x\u200C': 'B', 'x<U+200B>': 'C' })
+            assert.strictEqual(toolUse.input, input)
+            assert.deepStrictEqual(sharedUtils.sanitizeRequestInput(runToolStub.firstCall.args[1]), input)
         })
     })
 

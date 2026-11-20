@@ -2381,6 +2381,11 @@ export class AgenticChatController implements ChatHandlers {
                                 .getTools({ format: 'bedrock' })
                                 .find(tool => tool.toolSpecification.name === toolUse.name)?.toolSpecification
                                 .inputSchema?.json
+                            if (inputSchema === undefined || inputSchema === null) {
+                                this.#features.logging.debug(
+                                    `MCP tool ${toolUse.name} has no input schema, so its input keeps the property names that the model sent`
+                                )
+                            }
                             executionInput = restorePropertyNames(toolUse.input as object, inputSchema)
 
                             const { serverName, toolName } = originalNames
