@@ -12,29 +12,55 @@ export const freeTierLimitUserMsg = `Monthly request limit reached. Connect your
 // accepted, not its subdomains.
 const SUBSCRIPTION_UPGRADE_HOST = 'signin.aws.amazon.com'
 
+export type SubscriptionUpgradeUrlRejectionCategory =
+    | 'missing-input'
+    | 'malformed-url'
+    | 'unsupported-scheme'
+    | 'credentials'
+    | 'non-default-port'
+    | 'disallowed-host'
+
 /**
  * The subscription upgrade URL from the service response, in normalized form. The client opens it in the external
  * browser, so anything other than an https URL on the AWS sign-in host (another scheme or host, a user name or
  * password, a non-default port) is rejected, and the result is undefined.
+ * The optional rejection callback receives only a static category, never the input or URL components.
  */
-export function parseSubscriptionUpgradeUrl(uri: string | undefined): string | undefined {
-    if (!uri) {
+export function parseSubscriptionUpgradeUrl(
+    uri: string | undefined,
+    onRejected?: (category: SubscriptionUpgradeUrlRejectionCategory) => void
+): string | undefined {
+    const reject = (category: SubscriptionUpgradeUrlRejectionCategory): undefined => {
+        onRejected?.(category)
         return undefined
+    }
+
+    if (!uri) {
+        return reject('missing-input')
     }
 
     let url: URL
     try {
         url = new URL(uri)
     } catch {
-        return undefined
+        return reject('malformed-url')
     }
 
     // URL lowercases the host and reports the default https port as ''.
-    if (url.protocol !== 'https:' || url.username || url.password || url.port) {
-        return undefined
+    if (url.protocol !== 'https:') {
+        return reject('unsupported-scheme')
+    }
+    if (url.username || url.password) {
+        return reject('credentials')
+    }
+    if (url.port) {
+        return reject('non-default-port')
+    }
+    if (url.hostname !== SUBSCRIPTION_UPGRADE_HOST) {
+        return reject('disallowed-host')
     }
 
-    return url.hostname === SUBSCRIPTION_UPGRADE_HOST ? url.href : undefined
+    return url.href
 }
 
 export function onPaidTierLearnMore(lsp: awsLsp.Lsp, log: awsLsp.Logging) {

@@ -700,7 +700,9 @@ export function sanitizeRequestInput(input: any): any {
 
 /**
  * Whether `url` is an absolute http or https URL with a host name. The chat UI shows the source links of a
- * response and the IDE opens them, so a source link with any other URL is dropped.
+ * response and the IDE opens them, so a source link with any other URL is dropped. Only the scheme is checked:
+ * any host is accepted, also a loopback or private address, as for the other web links that chat opens
+ * (classifyChatLink in the chat client).
  */
 export function isWebUrl(url: string | undefined): boolean {
     if (!url) {

@@ -10,6 +10,7 @@ import {
     ReferenceTrackerInformation,
     SourceLink,
 } from '@aws/language-server-runtimes/protocol'
+import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { Result } from '../types'
 import { AddMessageEvent } from '../../shared/telemetry/types'
 import { Metric } from '../../shared/telemetry/metric'
@@ -35,6 +36,7 @@ export class ChatEventParser implements ChatResult {
     conversationId?: string
 
     #metric: Metric<AddMessageEvent>
+    #logging?: Features['logging']
     #lastChunkTime: number = 0
     #totalEvents = {
         followupPromptEvent: 0,
@@ -68,9 +70,10 @@ export class ChatEventParser implements ChatResult {
         }
     }
 
-    constructor(messageId: string, metric: Metric<AddMessageEvent>) {
+    constructor(messageId: string, metric: Metric<AddMessageEvent>, logging?: Features['logging']) {
         this.messageId = messageId
         this.#metric = metric
+        this.#logging = logging
     }
 
     public get totalEvents() {
@@ -130,6 +133,10 @@ export class ChatEventParser implements ChatResult {
             const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks
                 .filter(link => isWebUrl(link.url))
                 .map(ChatEventParser.mapRelatedData)
+            const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
+            if (droppedLinkCount > 0) {
+                this.#logging?.debug(`Source links dropped: ${droppedLinkCount}`)
+            }
 
             if (sourceLinks.length > 0) {
                 this.relatedContent = {

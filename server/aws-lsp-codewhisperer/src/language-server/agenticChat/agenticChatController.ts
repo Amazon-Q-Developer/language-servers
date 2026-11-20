@@ -4892,25 +4892,20 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     /**
-     * Handles when a builder-id (not IdC) user invoked "Manage Subscription" or "Upgrade Q".
+     * Handles when a builder-id (not IdC) user invoked "Manage Subscription" or "Upgrade Q". It acts only when
+     * `awsAccountId` is not given, and it gets the subscription status without waiting for it:
+     * - For a PAID-TIER user: opens the "Manage Subscription" AWS console page in the external browser.
+     * - For a FREE-TIER user: opens the "Upgrade Q" URL of the status response in the external browser if
+     *   parseSubscriptionUpgradeUrl accepts it, shows the "Waiting…" progress indicator, and updates the UI when the
+     *   subscription becomes active or the wait ends.
      *
-     * - Navigates to the "Manage Subscription" page for PAID-TIER user.
-     * - Starts the "Upgrade Q" flow for a FREE-TIER user:
-     *   1. `awsAccountId` was provided by the IDE extension.
-     *   2. Call `createSubscriptionToken(awsAccountId)`.
-     *   3. Set the UI to show "Waiting…" progress indicator.
-     *   4. Return result, and...
-     *   5. ASYNCHRONOUSLY poll subscription status until success.
-     *      - Update the UI on success/failure.
+     * A failed status request, a missing or rejected upgrade URL and a wait that ends without a subscription are
+     * shown through `showMessage`. A failed `showDocument` call and a failed wait are only logged.
      *
-     * If `awsAccountId` is not given:
-     * - For FREE-TIER user: prompts for AWS account.
-     * - For PAID-TIER user: navigates to the "Manage Subscription" AWS console page.
-     *
-     * @param awsAccountId AWS account ID to create subscription for
-     * @returns `undefined` on success, or error message on failure.
+     * @param awsAccountId The method acts only when this is not given
+     * @returns `undefined`, before the subscription interaction ends
      */
-    async onManageSubscription(tabId: string, awsAccountId?: string): Promise<string | undefined> {
+    async onManageSubscription(tabId: string, awsAccountId?: string): Promise<void> {
         const client = this.#serviceManager?.getCodewhispererService()
         if (!awsAccountId) {
             // If no awsAccountId was provided:
@@ -4939,13 +4934,11 @@ export class AgenticChatController implements ChatHandlers {
                     } else {
                         // Free-tier user: navigate them to "Upgrade Q" flow in AWS console.
                         // The client opens the URL in the external browser, so it must be on the AWS sign-in host.
-                        const uri = parseSubscriptionUpgradeUrl(o.encodedVerificationUrl)
+                        const uri = parseSubscriptionUpgradeUrl(o.encodedVerificationUrl, category => {
+                            this.#log(`onManageSubscription: subscription URL rejected: ${category}`)
+                        })
 
                         if (!uri) {
-                            const reason = o.encodedVerificationUrl
-                                ? 'encodedVerificationUrl in server response is not an https URL on the AWS sign-in host'
-                                : 'missing encodedVerificationUrl in server response'
-                            this.#log(`onManageSubscription: ${reason}`)
                             this.#features.lsp.window
                                 .showMessage({
                                     message: 'Subscription request failed.',
@@ -4954,7 +4947,7 @@ export class AgenticChatController implements ChatHandlers {
                                 .catch(e => {
                                     this.#log(`onManageSubscription: showMessage failed: ${(e as Error).message}`)
                                 })
-                            return reason
+                            return
                         }
 
                         this.#log(`onManageSubscription: createSubscriptionToken status: ${o.status}`)
@@ -4968,7 +4961,11 @@ export class AgenticChatController implements ChatHandlers {
                                 uri: uri,
                             })
                             .catch(e => {
-                                this.#log(`showDocument failed: ${(e as Error).message}`)
+                                // Log the error type only: the error text can repeat the URL, which contains an
+                                // activation token
+                                this.#log(
+                                    `onManageSubscription: showDocument failed: ${(e as Error)?.name ?? 'unknown error'}`
+                                )
                             })
 
                         // Now asynchronously wait for the user to complete the "Upgrade Q" flow.
@@ -5278,7 +5275,7 @@ export class AgenticChatController implements ChatHandlers {
         partialResultToken?: string | number
     ): Promise<Result<ChatResultWithMetadata, string>> {
         const requestId = response.$metadata.requestId!
-        const chatEventParser = new ChatEventParser(requestId, metric)
+        const chatEventParser = new ChatEventParser(requestId, metric, this.#features.logging)
 
         let chatEventStream = undefined
         if ('generateAssistantResponseResponse' in response) {

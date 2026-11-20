@@ -517,7 +517,7 @@ describe('AgenticChatController', () => {
         // Runs the "Upgrade Q" flow of a free-tier user whose subscription status response has this URL
         const manageSubscription = async (encodedVerificationUrl: string | undefined) => {
             getSubscriptionStatusStub.resolves({ status: 'none', encodedVerificationUrl })
-            await chatController.onManageSubscription(mockTabId)
+            assert.strictEqual(await chatController.onManageSubscription(mockTabId), undefined)
             // onManageSubscription handles the status response asynchronously
             await new Promise(resolve => setTimeout(resolve, 0))
         }
@@ -534,7 +534,7 @@ describe('AgenticChatController', () => {
             })
         }
 
-        beforeEach(() => {
+        beforeEach(async () => {
             getSubscriptionStatusStub = sinon.stub()
             waitUntilSubscriptionActiveStub = sinon.stub().resolves(true)
             getCodewhispererServiceStub = sinon
@@ -545,6 +545,11 @@ describe('AgenticChatController', () => {
                 } as any)
             ;(testFeatures.lsp.window.showDocument as sinon.SinonStub).resolves({ success: true })
             testFeatures.lsp.window.showMessage = sinon.stub().resolves()
+            // Let unrelated initialization finish before checking this operation's logs.
+            await new Promise(resolve => setTimeout(resolve, 0))
+            for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+                testFeatures.logging[level].resetHistory()
+            }
         })
 
         afterEach(() => {
@@ -561,6 +566,21 @@ describe('AgenticChatController', () => {
             sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
             sinon.assert.calledOnce(waitUntilSubscriptionActiveStub)
             assert.ok(!loggedText().includes(activationToken))
+        })
+
+        it('logs only the error type when the browser does not open, also when the error repeats the URL', async () => {
+            ;(testFeatures.lsp.window.showDocument as sinon.SinonStub).rejects(
+                new TypeError(`cannot open ${signInUrl}`)
+            )
+
+            await manageSubscription(signInUrl)
+
+            sinon.assert.calledOnce(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            assert.ok(loggedText().includes('onManageSubscription: showDocument failed: TypeError'))
+            assert.ok(!loggedText().includes(activationToken))
+            // The upgrade flow goes on: the user can finish it in a browser that they open
+            sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.calledOnce(waitUntilSubscriptionActiveStub)
         })
 
         it('opens the URL in its normalized form', async () => {
@@ -590,6 +610,77 @@ describe('AgenticChatController', () => {
             await manageSubscription(undefined)
 
             assertRequestFailedMessage()
+        })
+
+        const rejectionCases: Array<[string | undefined, string]> = [
+            [undefined, 'missing-input'],
+            ['', 'missing-input'],
+            [`not a url?activationToken=${activationToken}`, 'malformed-url'],
+            [
+                `custom-scheme://rejected.example:8443/private?activationToken=${activationToken}#fragment`,
+                'unsupported-scheme',
+            ],
+            [`https://user:password@signin.aws.amazon.com/private?activationToken=${activationToken}`, 'credentials'],
+            [`https://signin.aws.amazon.com:8443/private?activationToken=${activationToken}`, 'non-default-port'],
+            [`https://rejected.example/private?activationToken=${activationToken}#fragment`, 'disallowed-host'],
+        ]
+
+        for (const [uri, category] of rejectionCases) {
+            it(`logs only the static ${category} category when rejecting a subscription URL`, async () => {
+                await manageSubscription(uri)
+
+                assertRequestFailedMessage()
+                assert.strictEqual(
+                    loggedText(),
+                    `onManageSubscription: getSubscriptionStatus: none\nonManageSubscription: subscription URL rejected: ${category}`
+                )
+                assert.ok(!loggedText().includes(activationToken))
+            })
+        }
+
+        it('returns undefined before the status response and reports a rejected URL through showMessage', async () => {
+            let resolveStatus!: (response: { status: 'none'; encodedVerificationUrl: string }) => void
+            getSubscriptionStatusStub.returns(
+                new Promise(resolve => {
+                    resolveStatus = resolve
+                })
+            )
+
+            assert.strictEqual(await chatController.onManageSubscription(mockTabId), undefined)
+            sinon.assert.notCalled(testFeatures.lsp.window.showMessage as sinon.SinonStub)
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.notCalled(waitUntilSubscriptionActiveStub)
+
+            resolveStatus({
+                status: 'none',
+                encodedVerificationUrl: `https://rejected.example/?activationToken=${activationToken}`,
+            })
+            await new Promise(resolve => setTimeout(resolve, 0))
+
+            assertRequestFailedMessage()
+            assert.ok(!loggedText().includes(activationToken))
+        })
+
+        it('returns undefined without waiting for subscription activation', async () => {
+            let resolveActivation!: (active: boolean) => void
+            waitUntilSubscriptionActiveStub.returns(
+                new Promise(resolve => {
+                    resolveActivation = resolve
+                })
+            )
+
+            await manageSubscription(signInUrl)
+
+            sinon.assert.calledOnce(waitUntilSubscriptionActiveStub)
+            sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, upgradePendingUpdate)
+            sinon.assert.notCalled(testFeatures.lsp.window.showMessage as sinon.SinonStub)
+
+            resolveActivation(true)
+            await new Promise(resolve => setTimeout(resolve, 0))
+
+            sinon.assert.calledWithMatch(testFeatures.chat.sendChatUpdate as sinon.SinonStub, {
+                paidTierMode: 'paidtier',
+            })
         })
     })
 
@@ -2395,6 +2486,40 @@ describe('AgenticChatController', () => {
 
             sinon.assert.callCount(testFeatures.lsp.sendProgress, mockChatResponseList.length)
             assert.deepStrictEqual(chatResult, expectedCompleteInlineChatResult)
+        })
+
+        it('logs dropped source link counts for inline chat without logging link values', async () => {
+            generateAssistantResponseStub.resolves({
+                $metadata: { requestId: mockMessageId },
+                generateAssistantResponseResponse: createIterableResponse([
+                    ...mockChatResponseList,
+                    {
+                        supplementaryWebLinksEvent: {
+                            supplementaryWebLinks: [
+                                { url: 'https://example.com/guide', title: 'Guide' },
+                                { url: 'file:///private?token=TEST-TOKEN' },
+                            ],
+                        },
+                    },
+                ]),
+            })
+
+            const result = await chatController.onInlineChatPrompt(
+                { prompt: { prompt: 'Hello' } },
+                mockCancellationToken
+            )
+
+            assert.ok(!(result instanceof ResponseError))
+            assert.deepStrictEqual(result.relatedContent, {
+                content: [{ title: 'Guide', url: 'https://example.com/guide', body: undefined }],
+            })
+            sinon.assert.calledWithExactly(testFeatures.logging.debug, 'Source links dropped: 1')
+            for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+                sinon.assert.neverCalledWithMatch(
+                    testFeatures.logging[level] as sinon.SinonStub,
+                    sinon.match('TEST-TOKEN')
+                )
+            }
         })
 
         it('returns a ResponseError if generateAssistantResponse returns an error', async () => {

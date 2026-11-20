@@ -397,6 +397,14 @@ describe('AgenticChatEventParser', () => {
 
     describe('source links', () => {
         const webLink = (url: string | undefined, title = 'title') => ({ title, snippet: 'snippet', url })
+        const loggedCalls = () =>
+            (['log', 'info', 'warn', 'error', 'debug'] as const).flatMap(
+                level => (logging[level] as sinon.SinonStub).args
+            )
+
+        beforeEach(() => {
+            logging = new TestFeatures().logging
+        })
 
         it('keeps only http and https source links, in order and unchanged', () => {
             const chatEventParser = new AgenticChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
@@ -429,6 +437,7 @@ describe('AgenticChatEventParser', () => {
                 ],
             })
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 11']])
         })
 
         it('adds no related content when an event has no http or https link', () => {
@@ -442,6 +451,7 @@ describe('AgenticChatEventParser', () => {
 
             assert.strictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, undefined)
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 2']])
         })
 
         it('keeps the links of earlier events when a later event has no web link', () => {
@@ -462,6 +472,24 @@ describe('AgenticChatEventParser', () => {
                 ['https://a.example.com/', 'http://b.example.com/x']
             )
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 3)
+            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 1']])
         })
+
+        for (const urls of [[], ['https://docs.example.com/guide', 'http://example.com/page']]) {
+            it(`does not log when a list of ${urls.length} source links is unchanged`, () => {
+                const chatEventParser = new AgenticChatEventParser(
+                    mockMessageId,
+                    new Metric<AddMessageEvent>(),
+                    logging
+                )
+
+                chatEventParser.processPartialEvent({
+                    supplementaryWebLinksEvent: { supplementaryWebLinks: urls.map(url => webLink(url)) },
+                })
+
+                assert.deepStrictEqual(loggedCalls(), [])
+                assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, urls.length ? 1 : 0)
+            })
+        }
     })
 })

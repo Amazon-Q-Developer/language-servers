@@ -874,8 +874,15 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
             sinon.assert.calledTwice(notifySpy)
-            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
-            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
+            for (const call of notifySpy.getCalls()) {
+                deepStrictEqual(call.args, [
+                    {
+                        type: NotificationType.WARNING,
+                        title: 'Link not opened',
+                        content: 'Chat opens only web (http or https) links and local file paths.',
+                    },
+                ])
+            }
             strictEqual(telemetryNamed('linkClick').length, 1)
             strictEqual(telemetryNamed('infoLinkClick').length, 1)
         })
@@ -932,8 +939,15 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
             strictEqual(notifySpy.callCount, links.length)
-            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
-            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
+            for (const call of notifySpy.getCalls()) {
+                deepStrictEqual(call.args, [
+                    {
+                        type: NotificationType.WARNING,
+                        title: 'Link not opened',
+                        content: 'Chat opens only web (http or https) source links.',
+                    },
+                ])
+            }
             deepStrictEqual(
                 sourceLinkTelemetry().map(c => c.args[0].link),
                 links

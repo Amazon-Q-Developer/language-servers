@@ -184,6 +184,10 @@ export class AgenticChatEventParser implements ChatResult {
             const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks
                 .filter(link => isWebUrl(link.url))
                 .map(AgenticChatEventParser.mapRelatedData)
+            const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
+            if (droppedLinkCount > 0) {
+                this.#logging.debug(`Source links dropped: ${droppedLinkCount}`)
+            }
 
             if (sourceLinks.length > 0) {
                 this.relatedContent = {
