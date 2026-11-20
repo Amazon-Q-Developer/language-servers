@@ -10,6 +10,9 @@ import { $, fs, os, path } from 'zx'
 // release is meant to give the same files, but the archive itself can differ (gzip bytes), so compare the
 // files to check a release. To use another release, check its .sha256 file and its build-info.json, then
 // change both values below.
+//
+// The files in src/partiql-parser-wasm are older than this release (see the README there), so these values
+// name the release that the next run of this script installs, not the binary in the repository today.
 const PLAYGROUND_VERSION = '0.3.0'
 const PLAYGROUND_ARCHIVE_SHA256 = '0aedd0df190d218aac9e10469daceea17ef7330dae44ddcd933b1c368205fee8'
 
