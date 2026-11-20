@@ -36,8 +36,7 @@ import {
     describeUrlForLog,
     getGlobalAgentConfigPath,
     getWorkspaceMcpConfigPaths,
-    getGlobalMcpConfigPath,
-    getGlobalPersonaConfigPath,
+    isGlobalConfigPath,
     normalizePathFromUri,
     DEFAULT_TOOL_EXEC_TIMEOUT_MS,
     isUsableToolExecTimeout,
@@ -666,16 +665,13 @@ export class McpManager {
 
         // Consent gate for workspace-scoped MCP configs (P417451767).
         // Workspace-scoped configs live in a folder the user opened and may be attacker-controlled.
-        // Global configs (~/.aws/amazonq/...) are user-authored and trusted implicitly.
+        // Global configs (~/.aws/amazonq/...) are user-authored and trusted implicitly. The config loaders use the
+        // same check when they decide which permissions a config file can grant.
         const home = this.features.workspace.fs.getUserHomeDir()
         const configPath = cfg.__configPath__
             ? normalizePathFromUri(cfg.__configPath__, this.features.logging)
             : undefined
-        const globalMcp = getGlobalMcpConfigPath(home)
-        const globalAgent = getGlobalAgentConfigPath(home)
-        const globalPersona = getGlobalPersonaConfigPath(home)
-        const isWorkspaceScoped =
-            !!configPath && configPath !== globalMcp && configPath !== globalAgent && configPath !== globalPersona
+        const isWorkspaceScoped = !!configPath && !isGlobalConfigPath(configPath, home)
         if (isWorkspaceScoped && configPath) {
             const denyKey = `${serverName}|${configPath}|${fingerprintServerConfig(cfg)}`
             if (this.sessionDeniedConsent.has(denyKey)) {
@@ -2081,11 +2077,9 @@ export class McpManager {
      */
     public isServerGlobal(serverName: string): boolean {
         const config = this.mcpServers.get(serverName)
-        if (!config) return false
+        if (!config?.__configPath__) return false
 
-        const globalAgentPath = getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())
-        const globalMcpPath = getGlobalMcpConfigPath(this.features.workspace.fs.getUserHomeDir())
-        return config.__configPath__ === globalAgentPath || config.__configPath__ === globalMcpPath
+        return isGlobalConfigPath(config.__configPath__, this.features.workspace.fs.getUserHomeDir())
     }
 
     public setToolNameMapping(mapping: Map<string, { serverName: string; toolName: string }>): void {
