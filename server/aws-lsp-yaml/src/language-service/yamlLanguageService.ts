@@ -3,6 +3,7 @@ import { CompletionList, Diagnostic, Hover, Position, Range, TextEdit } from 'vs
 import { TextDocument } from 'vscode-languageserver-textdocument'
 import { LanguageService, LanguageSettings, getLanguageService } from 'yaml-language-server'
 import { YamlFormattingOptions } from './formattingOptions'
+import { SchemaUrlNotAllowedError, isAllowedSchemaUrl } from './schemaUrl'
 
 export type YamlLanguageServiceProps = {
     displayName: string
@@ -92,13 +93,18 @@ export class YamlLanguageService implements AwsLanguageService {
             }
             return content
         } catch (error) {
-            this.schemaLoadFailed = true
+            if (!(error instanceof SchemaUrlNotAllowedError)) {
+                this.schemaLoadFailed = true
+            }
             throw error
         }
     }
 
     private async fetchSchema(url: string): Promise<string> {
-        const response = await fetch(url)
+        if (!isAllowedSchemaUrl(url, this.props.defaultSchemaUri)) {
+            throw new SchemaUrlNotAllowedError(url)
+        }
+        const response = await fetch(url, { redirect: 'error' })
         if (!response.ok) {
             this.schemaLoadFailed = true
         }

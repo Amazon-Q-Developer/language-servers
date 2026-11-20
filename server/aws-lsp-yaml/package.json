@@ -22,6 +22,7 @@
     ],
     "scripts": {
         "compile": "tsc --build",
+        "test": "ts-mocha -b \"./src/**/*.test.ts\"",
         "prepack": "shx cp ../../LICENSE ../../NOTICE ../../SECURITY.md .",
         "postinstall": "node patchYamlPackage.js"
     },

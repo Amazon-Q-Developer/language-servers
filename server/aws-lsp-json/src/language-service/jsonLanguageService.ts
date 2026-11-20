@@ -2,6 +2,7 @@ import { AwsLanguageService, MutuallyExclusiveLanguageService, UriResolver } fro
 import { JSONDocument, LanguageService, getLanguageService } from 'vscode-json-languageservice'
 import { CompletionList, Diagnostic, FormattingOptions, Hover, Range } from 'vscode-languageserver'
 import { Position, TextDocument, TextEdit } from 'vscode-languageserver-textdocument'
+import { SchemaUrlNotAllowedError, isAllowedSchemaUrl } from './schemaUrl'
 
 export type JsonLanguageServiceProps = {
     defaultSchemaUri?: string
@@ -17,15 +18,10 @@ export class JsonLanguageService implements AwsLanguageService {
     private jsonService: LanguageService
 
     constructor(private readonly props: JsonLanguageServiceProps) {
-        let resolveUri: (url: string) => Promise<string>
+        const resolveUri = props.uriResolver ?? ((url: string) => fetchSchema(url, props.defaultSchemaUri))
 
-        if (props.uriResolver) {
-            resolveUri = props.uriResolver
-        } else {
-            resolveUri = getSchema
-        }
         this.jsonService = getLanguageService({
-            schemaRequestService: resolveUri?.bind(this),
+            schemaRequestService: resolveUri.bind(this),
         })
         const schemas = props.defaultSchemaUri ? [{ fileMatch: ['*'], uri: props.defaultSchemaUri }] : undefined
         this.jsonService.configure({ allowComments: props.allowComments ?? true, schemas })
@@ -71,8 +67,11 @@ export class JsonLanguageService implements AwsLanguageService {
     }
 }
 
-async function getSchema(url: string) {
-    const response = await fetch(url)
+async function fetchSchema(url: string, defaultSchemaUri: string | undefined): Promise<string> {
+    if (!isAllowedSchemaUrl(url, defaultSchemaUri)) {
+        throw new SchemaUrlNotAllowedError(url)
+    }
+    const response = await fetch(url, { redirect: 'error' })
     const schema = await (await response.blob()).text()
 
     return schema
