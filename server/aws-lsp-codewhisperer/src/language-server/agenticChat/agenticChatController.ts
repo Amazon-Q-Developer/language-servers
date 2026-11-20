@@ -766,20 +766,27 @@ export class AgenticChatController implements ChatHandlers {
 
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
-            let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            let workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
-            if (workspaceFolders.length > 0) {
-                const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
-                const newFileContent = ''
-                try {
-                    await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
-                    await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
-                    await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
-                } catch (e) {
-                    this.#features.logging.warn(`Error creating rule file: ${e}`)
-                }
+            const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+            // A rule is a file in the rules folder of the first workspace folder, so it needs an open folder.
+            if (workspaceFolders.length === 0) {
+                this.#features.logging.warn('Not creating a rule: no workspace folder is open')
+                await this.#features.lsp.window.showMessage({
+                    type: MessageType.Warning,
+                    message: 'Open a folder to create a rule.',
+                })
                 return
             }
+            const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
+            const newFileContent = ''
+            try {
+                await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
+                await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
+                await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
+            } catch (e) {
+                this.#features.logging.warn(`Error creating rule file: ${e}`)
+            }
+            return
         }
 
         const newFilePath = getNewPromptFilePath(params.promptName)
@@ -4534,7 +4541,16 @@ export class AgenticChatController implements ChatHandlers {
             const contextItems = await localProjectContextController.getContextCommandItems()
             this.#contextCommandsProvider.setFilesAndFoldersPending(false)
             await this.#contextCommandsProvider.processContextCommandUpdate(contextItems)
-            void this.#contextCommandsProvider.maybeUpdateCodeSymbols()
+            // This update runs in the background, so its failure must be handled here, not by the catch below
+            this.#contextCommandsProvider.maybeUpdateCodeSymbols().catch(error => {
+                try {
+                    this.#features.logging.error(
+                        `Error updating code symbols for context commands: ${loggingUtils.formatErr(error)}`
+                    )
+                } catch {
+                    // A failure that cannot be formatted must not become an unhandled rejection
+                }
+            })
         } catch (error) {
             this.#contextCommandsProvider.setFilesAndFoldersFailed(true)
             await this.#contextCommandsProvider.processContextCommandUpdate([])
@@ -4571,6 +4587,8 @@ export class AgenticChatController implements ChatHandlers {
         const sessionResult = this.#chatSessionManagementService.createSession(params.tabId)
         const { data: session, success } = sessionResult
         if (!success) {
+            // tabAdd is a notification, so the JSON-RPC layer discards this result and nobody else reports it
+            this.#features.logging.error(`Chat tab ${params.tabId} has no session: ${sessionResult.error}`)
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 

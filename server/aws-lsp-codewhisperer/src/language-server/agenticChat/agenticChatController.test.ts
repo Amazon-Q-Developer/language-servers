@@ -52,7 +52,11 @@ import {
 import { MessageType, Model } from '@aws/language-server-runtimes/protocol'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import * as assert from 'assert'
-import { createIterableResponse, setCredentialsForAmazonQTokenServiceManagerFactory } from '../../shared/testUtils'
+import {
+    createIterableResponse,
+    setCredentialsForAmazonQTokenServiceManagerFactory,
+    unhandledRejectionsDuring,
+} from '../../shared/testUtils'
 import sinon from 'ts-sinon'
 import { AgenticChatController } from './agenticChatController'
 import { ChatSessionManagementService } from '../chat/chatSessionManagementService'
@@ -373,6 +377,24 @@ describe('AgenticChatController', () => {
             success: true,
             data: sinon.match.instanceOf(ChatSessionService),
         })
+    })
+
+    it('logs an error when a tab add cannot create a session', () => {
+        // tabAdd is registered as a notification, so the JSON-RPC layer discards the returned ResponseError and
+        // logNotificationErrors sees no rejection. Without this log the failure is reported nowhere.
+        sinon.stub(chatSessionManagementService, 'createSession').returns({
+            success: false,
+            error: 'session store is full',
+        })
+
+        const result = chatController.onTabAdd({ tabId: mockTabId })
+
+        assert.ok(result instanceof ResponseError, 'the return value is still a ResponseError')
+        assert.strictEqual(result.message, 'session store is full')
+        sinon.assert.calledWithMatch(
+            testFeatures.logging.error as sinon.SinonStub,
+            sinon.match(mockTabId).and(sinon.match('session store is full'))
+        )
     })
 
     it('deletes a session by tab id when a tab remove notifcation is received', () => {
@@ -2226,6 +2248,89 @@ describe('AgenticChatController', () => {
             await chatController.onCreatePrompt({ promptName: '' })
 
             sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+        })
+
+        it('creates no file and asks for a folder when a rule is requested with no workspace folder open', async () => {
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([])
+            const showMessageStub = sinon.stub().resolves()
+            testFeatures.lsp.window.showMessage = showMessageStub
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.neverCalledWith(testFeatures.workspace.fs.mkdir as sinon.SinonStub, getUserPromptsDirectory())
+            sinon.assert.notCalled(fsWriteFileStub)
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.calledOnceWithExactly(showMessageStub, {
+                type: MessageType.Warning,
+                message: 'Open a folder to create a rule.',
+            })
+        })
+
+        it('creates a rule file in the rules folder of the first workspace folder', async () => {
+            const workspaceFolder = path.join(os.tmpdir(), 'create-rule-workspace')
+            const secondWorkspaceFolder = path.join(os.tmpdir(), 'create-rule-second-workspace')
+            sinon.stub(workspaceUtils, 'getWorkspaceFolderPaths').returns([workspaceFolder, secondWorkspaceFolder])
+            const rulesDirectory = path.join(workspaceFolder, '.amazonq', 'rules')
+            const expectedPath = path.join(rulesDirectory, `testRule${promptFileExtension}`)
+
+            await chatController.onCreatePrompt({ promptName: 'testRule', isRule: true })
+
+            sinon.assert.calledWithExactly(testFeatures.workspace.fs.mkdir as sinon.SinonStub, rulesDirectory, {
+                recursive: true,
+            })
+            sinon.assert.calledOnceWithExactly(fsWriteFileStub, expectedPath, '', { mode: 0o600 })
+            sinon.assert.calledWithMatch(testFeatures.lsp.window.showDocument as sinon.SinonStub, {
+                uri: URI.file(expectedPath).toString(),
+            })
+        })
+    })
+
+    describe('onReady', () => {
+        it('logs a failed background code symbol update and leaves no unhandled rejection', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            const failure = new Error('code symbols failed')
+            maybeUpdateCodeSymbolsStub.rejects(failure)
+
+            const rejections = await unhandledRejectionsDuring(() => chatController.onReady())
+
+            assert.ok(!rejections.includes(failure), 'the failed update was left as an unhandled rejection')
+            sinon.assert.calledOnce(maybeUpdateCodeSymbolsStub)
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.error as sinon.SinonStub,
+                sinon.match('Error updating code symbols').and(sinon.match('code symbols failed'))
+            )
+            sinon.assert.neverCalledWithMatch(
+                testFeatures.logging.log as sinon.SinonStub,
+                sinon.match('Error initializing context commands')
+            )
+        })
+
+        it('logs a failed background code symbol update whose reason has no string form', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            maybeUpdateCodeSymbolsStub.rejects(Object.create(null))
+
+            await unhandledRejectionsDuring(() => chatController.onReady())
+
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.error as sinon.SinonStub,
+                sinon.match('Error updating code symbols')
+            )
+        })
+
+        it('leaves no unhandled rejection when a failed background code symbol update cannot be logged', async () => {
+            const maybeUpdateCodeSymbolsStub = ContextCommandsProvider.prototype
+                .maybeUpdateCodeSymbols as sinon.SinonStub
+            // JSON serialization, which formatErr uses, throws a TypeError on a bigint
+            maybeUpdateCodeSymbolsStub.rejects(10n)
+
+            const rejections = await unhandledRejectionsDuring(() => chatController.onReady())
+
+            assert.ok(
+                !rejections.some(reason => reason instanceof TypeError && reason.message.includes('BigInt')),
+                'the failure to log the update was left as an unhandled rejection'
+            )
         })
     })
 
