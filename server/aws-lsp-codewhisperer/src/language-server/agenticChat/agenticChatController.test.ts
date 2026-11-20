@@ -635,6 +635,27 @@ describe('AgenticChatController', () => {
 
                 assert.strictEqual(await memoryBankFlagForPrompt('Create a memory bank'), false)
             })
+
+            it('removes invisible characters from the file ranking request without escaping HTML', async () => {
+                sinon
+                    .stub(MemoryBankController.prototype, 'prepareComprehensiveMemoryBankPrompt')
+                    .callsFake(async (_workspaceFolderUri, rankFiles) => {
+                        await rankFiles('Rank src/a&b\u00AD.ts \u{1F600}\u{E0100}\u{E0158} src/<c>.ts\u{E0041}')
+                        return 'Write the memory bank files'
+                    })
+
+                await chatController.onChatPrompt(
+                    { tabId: mockTabId, prompt: { prompt: 'Create a memory bank' } },
+                    mockCancellationToken
+                )
+
+                sinon.assert.calledOnce(sendMessageStub)
+                const rankingRequest: SendMessageCommandInput = sendMessageStub.firstCall.firstArg
+                assert.strictEqual(
+                    rankingRequest.conversationState?.currentMessage?.userInputMessage?.content,
+                    'Rank src/a&b.ts \u{1F600} src/<c>.ts'
+                )
+            })
         })
 
         it('read all the response streams and return compiled results', async () => {
@@ -683,6 +704,69 @@ describe('AgenticChatController', () => {
 
             const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
             assert.strictEqual(requestInput.conversationState?.conversationId, session.conversationId)
+        })
+
+        it('removes variation selectors from the prompt and keeps emoji', async () => {
+            chatController.onTabAdd({ tabId: mockTabId })
+
+            await chatController.onChatPrompt(
+                {
+                    tabId: mockTabId,
+                    prompt: { prompt: 'Fix the \u26A0\uFE0F warning \u{1F600}\u{E0100}\u{E0158}\u{E01EF}\uFE01' },
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                'Fix the \u26A0\uFE0F warning \u{1F600}'
+            )
+        })
+
+        it('removes variation selectors from the chat history in the request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt({ tabId: mockTabId, prompt: { prompt: 'Hello' } }, mockCancellationToken)
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
+        })
+
+        it('removes variation selectors from the chat history in the compaction request', async () => {
+            chatDbInitializedStub.returns(true)
+            getMessagesStub.returns([
+                {
+                    type: 'prompt',
+                    body: 'Previous question \u2764\uFE0F\u{E0100}\u{E0158}',
+                    userInputMessageContext: { toolResults: [] },
+                },
+                { type: 'answer', body: 'Previous answer\u{E01EF}\uFE01' },
+            ])
+
+            await chatController.onChatPrompt(
+                { tabId: mockTabId, prompt: { prompt: '', command: '/compact' } },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const history = requestInput.conversationState?.history
+            assert.strictEqual(
+                requestInput.conversationState?.currentMessage?.userInputMessage?.content,
+                constants.COMPACTION_PROMPT
+            )
+            assert.strictEqual(history?.[0].userInputMessage?.content, 'Previous question \u2764\uFE0F')
+            assert.strictEqual(history?.[1].assistantResponseMessage?.content, 'Previous answer')
         })
 
         it('invokes IdleWorkspaceManager recordActivityTimestamp', async () => {
@@ -2468,6 +2552,26 @@ describe('AgenticChatController', () => {
             )
 
             assert.deepStrictEqual(chatResult, new ResponseError(LSPErrorCodes.RequestFailed, 'invalid state'))
+        })
+
+        it('removes invisible characters from the prompt and the document text without escaping HTML', async () => {
+            testFeatures.openDocument(
+                TextDocument.create('file:///inline.ts', 'typescript', 1, 'const a = 1\u{E0041}\u{E0100}\u{E0158}\n')
+            )
+
+            await chatController.onInlineChatPrompt(
+                {
+                    prompt: { prompt: 'Make a < b \u26A0\uFE0F\u{E0041}\u{E0100}\uFE01' },
+                    textDocument: { uri: 'file:///inline.ts' },
+                    cursorState: [{ position: { line: 0, character: 0 } }],
+                },
+                mockCancellationToken
+            )
+
+            const requestInput: GenerateAssistantResponseCommandInput = generateAssistantResponseStub.firstCall.firstArg
+            const userInputMessage = requestInput.conversationState?.currentMessage?.userInputMessage
+            assert.strictEqual(userInputMessage?.content, 'Make a < b \u26A0\uFE0F')
+            assert.strictEqual(userInputMessage?.userInputMessageContext?.editorState?.document?.text, 'const a = 1\n')
         })
 
         describe('#extractDocumentContext', () => {
@@ -5618,6 +5722,37 @@ ${' '.repeat(8)}}
         })
     })
 
+    // A result stream and a session for the processToolUses tests below
+    function makeStream() {
+        return {
+            removeResultBlockAndUpdateUI: sinon.stub().resolves(),
+            writeResultBlock: sinon.stub().resolves(1),
+            overwriteResultBlock: sinon.stub().resolves(),
+            removeResultBlock: sinon.stub().resolves(),
+            getMessageBlockId: sinon.stub().returns(undefined),
+            hasMessage: sinon.stub().returns(false),
+            updateOngoingProgressResult: sinon.stub().resolves(),
+            getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
+            setMessageIdToUpdateForTool: sinon.stub(),
+            getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
+            addMessageOperation: sinon.stub(),
+            getMessageOperation: sinon.stub().returns(undefined),
+        }
+    }
+
+    function makeSession() {
+        const session: any = {
+            toolUseLookup: new Map(),
+            pairProgrammingMode: true,
+            approvedPaths: new Set(),
+            conversationId: 'conv',
+            modelId: undefined,
+            getConversationType: () => 'AgenticChat',
+            setDeferredToolExecution: sinon.stub(),
+        }
+        return session
+    }
+
     describe('processToolUses with an MCP tool named after a built-in tool', () => {
         // An MCP server advertises a tool called `fsRead`. Registration namespaces it
         // to `probe___fsRead`, but the controller still receives the server's
@@ -5639,36 +5774,6 @@ ${' '.repeat(8)}}
                 getToolNameMapping: () => new Map([[REGISTERED, { serverName: SERVER, toolName: ORIGINAL }]]),
                 ...overrides,
             }
-        }
-
-        function makeStream() {
-            return {
-                removeResultBlockAndUpdateUI: sinon.stub().resolves(),
-                writeResultBlock: sinon.stub().resolves(1),
-                overwriteResultBlock: sinon.stub().resolves(),
-                removeResultBlock: sinon.stub().resolves(),
-                getMessageBlockId: sinon.stub().returns(undefined),
-                hasMessage: sinon.stub().returns(false),
-                updateOngoingProgressResult: sinon.stub().resolves(),
-                getResult: sinon.stub().returns({ messageId: 'test', body: '' }),
-                setMessageIdToUpdateForTool: sinon.stub(),
-                getMessageIdToUpdateForTool: sinon.stub().returns(undefined),
-                addMessageOperation: sinon.stub(),
-                getMessageOperation: sinon.stub().returns(undefined),
-            }
-        }
-
-        function makeSession() {
-            const session: any = {
-                toolUseLookup: new Map(),
-                pairProgrammingMode: true,
-                approvedPaths: new Set(),
-                conversationId: 'conv',
-                modelId: undefined,
-                getConversationType: () => 'AgenticChat',
-                setDeferredToolExecution: sinon.stub(),
-            }
-            return session
         }
 
         // Cards written to the stream, excluding the `explanation` directive that
@@ -5837,6 +5942,164 @@ ${' '.repeat(8)}}
             // The MCP card is keyed by the plain toolUseId, not the shell tool's id scheme.
             const confirmation = toolCards(stream.writeResultBlock)[0]
             assert.strictEqual(confirmation.messageId, shellLike.toolUseId)
+        })
+    })
+
+    describe('processToolUses with an MCP tool whose property names have invisible characters', () => {
+        const SERVER = 'notes'
+        const TOOL = 'save_note'
+        const REGISTERED = `${SERVER}___${TOOL}`
+        const NO_SCHEMA_MESSAGE = `MCP tool ${REGISTERED} has no input schema, so its input keeps the property names that the model sent`
+        // U+200C is part of the name, as in words of some scripts. The request gives the model "notetitle".
+        const PROPERTY = 'note\u200Ctitle'
+        const inputSchema = {
+            type: 'object',
+            properties: {
+                [PROPERTY]: { type: 'string' },
+                explanation: { type: 'string', description: 'One sentence explanation' },
+            },
+            required: [PROPERTY],
+        }
+
+        beforeEach(() => {
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                {
+                    toolSpecification: {
+                        name: REGISTERED,
+                        description: 'Saves a note',
+                        inputSchema: { json: inputSchema },
+                    },
+                },
+            ])
+            mcpInstanceStub.get(() => ({
+                getAllTools: () => [{ serverName: SERVER, toolName: TOOL, description: 'Saves a note', inputSchema }],
+                getOriginalToolNames: (name: string) =>
+                    name === REGISTERED ? { serverName: SERVER, toolName: TOOL } : undefined,
+                requiresApproval: () => false,
+                clearToolNameMapping: () => {},
+                setToolNameMapping: () => {},
+                getToolNameMapping: () => new Map([[REGISTERED, { serverName: SERVER, toolName: TOOL }]]),
+            }))
+        })
+
+        it('runs the tool with the property names of its input schema', async () => {
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+            const toolUse = {
+                toolUseId: 'note-id',
+                name: REGISTERED,
+                input: { notetitle: 'Plan', explanation: 'Save the plan' },
+                stop: true,
+            }
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                makeStream() as any,
+                makeSession(),
+                'tabId',
+                mockCancellationToken
+            )
+
+            assert.deepStrictEqual(
+                results.filter(result => result.status === ToolResultStatus.ERROR),
+                [],
+                'no tool result is an error'
+            )
+            sinon.assert.calledOnce(runToolStub)
+            assert.strictEqual(runToolStub.firstCall.args[0], REGISTERED)
+            assert.deepStrictEqual(runToolStub.firstCall.args[1], { [PROPERTY]: 'Plan' })
+            // The conversation keeps the input as the model wrote it
+            assert.deepStrictEqual(toolUse.input, { notetitle: 'Plan' })
+            sinon.assert.neverCalledWith(testFeatures.logging.debug, NO_SCHEMA_MESSAGE)
+        })
+
+        const unavailableSchemas = [
+            { label: 'the schema disappears after the availability check', tools: [] },
+            { label: 'inputSchema is absent', tools: [{ toolSpecification: { name: REGISTERED } }] },
+            {
+                label: 'the JSON schema is absent',
+                tools: [{ toolSpecification: { name: REGISTERED, inputSchema: {} } }],
+            },
+            {
+                label: 'the JSON schema is null',
+                tools: [{ toolSpecification: { name: REGISTERED, inputSchema: { json: null } } }],
+            },
+        ]
+        for (const { label, tools } of unavailableSchemas) {
+            it(`logs a safe diagnostic and passes the input unchanged when ${label}`, async () => {
+                const getToolsStub = testFeatures.agent.getTools as sinon.SinonStub
+                getToolsStub.resetHistory()
+                getToolsStub
+                    .onFirstCall()
+                    .returns([{ toolSpecification: { name: REGISTERED, inputSchema: { json: inputSchema } } }])
+                getToolsStub.returns(tools)
+                const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+                runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+                const input = { notetitle: 'Private note\ntext', nested: { 'field\r\nname': 'unchanged' } }
+                const toolUse = { toolUseId: 'note-id', name: REGISTERED, input, stop: true }
+
+                const results = await chatController.processToolUses(
+                    [toolUse],
+                    makeStream() as any,
+                    makeSession(),
+                    'tabId',
+                    mockCancellationToken
+                )
+
+                assert.deepStrictEqual(
+                    results.filter(result => result.status === ToolResultStatus.ERROR),
+                    []
+                )
+                sinon.assert.calledOnce(runToolStub)
+                assert.strictEqual(runToolStub.firstCall.args[0], REGISTERED)
+                assert.strictEqual(runToolStub.firstCall.args[1], input)
+                assert.strictEqual(toolUse.input, input)
+                assert.deepStrictEqual(input, {
+                    notetitle: 'Private note\ntext',
+                    nested: { 'field\r\nname': 'unchanged' },
+                })
+                sinon.assert.calledOnceWithExactly(
+                    testFeatures.logging.debug.withArgs(NO_SCHEMA_MESSAGE),
+                    NO_SCHEMA_MESSAGE
+                )
+            })
+        }
+
+        it('runs the tool with every original property name after an escape-label collision', async () => {
+            const schema = {
+                type: 'object',
+                properties: {
+                    'x\u200B': { type: 'string' },
+                    'x\u200C': { type: 'string' },
+                    'x<U+200B>': { type: 'string' },
+                },
+            }
+            ;(testFeatures.agent.getTools as sinon.SinonStub).returns([
+                { toolSpecification: { name: REGISTERED, inputSchema: { json: schema } } },
+            ])
+            const shownSchema = sharedUtils.sanitizeRequestInput(schema)
+            assert.deepStrictEqual(Object.keys(shownSchema.properties), ['x<U+200B>', 'x<U+200C>', 'x<U+003C>U+200B>'])
+            const input = { 'x<U+003C>U+200B>': 'C', 'x<U+200C>': 'B', 'x<U+200B>': 'A' }
+            const toolUse = { toolUseId: 'note-id', name: REGISTERED, input, stop: true }
+            const runToolStub = testFeatures.agent.runTool as sinon.SinonStub
+            runToolStub.resolves({ output: { kind: 'text', content: 'saved' } })
+
+            const results = await chatController.processToolUses(
+                [toolUse],
+                makeStream() as any,
+                makeSession(),
+                'tabId',
+                mockCancellationToken
+            )
+
+            assert.deepStrictEqual(
+                results.filter(result => result.status === ToolResultStatus.ERROR),
+                []
+            )
+            sinon.assert.calledOnce(runToolStub)
+            assert.deepStrictEqual(runToolStub.firstCall.args[1], { 'x\u200B': 'A', 'x\u200C': 'B', 'x<U+200B>': 'C' })
+            assert.strictEqual(toolUse.input, input)
+            assert.deepStrictEqual(sharedUtils.sanitizeRequestInput(runToolStub.firstCall.args[1]), input)
         })
     })
 

@@ -642,9 +642,54 @@ export function getFileExtensionName(filepath: string): string {
 }
 
 /**
- * Sanitizes input by removing dangerous Unicode characters that could be used for ASCII smuggling
+ * Characters that sanitizeInput removes, except a presentation selector that belongs to an emoji.
+ * Default_Ignorable_Code_Point is the Unicode set of characters that renderers ignore by default. It includes the
+ * tag characters (U+E0000-U+E007F), the variation selectors (U+FE00-U+FE0F, U+E0100-U+E01EF), the zero-width and
+ * bidirectional format characters, the soft hyphen and the Hangul fillers. The explicit ranges also remove the line
+ * and paragraph separators, two spaces (U+202F, U+205F) and the rest of the specials block (U+FFF9-U+FFFF), which
+ * includes the object replacement character and the replacement character.
+ */
+const INVISIBLE_CHARACTERS =
+    /[\p{Default_Ignorable_Code_Point}\u{E0000}-\u{E007F}\u{200B}-\u{200F}\u{2028}-\u{202F}\u{205F}-\u{206F}\u{FFF0}-\u{FFFF}]/gu
+const PICTOGRAPH = /\p{Extended_Pictographic}/u
+const KEYCAP_BASE = /^[0-9#*]$/
+const TEXT_PRESENTATION_SELECTOR = '\uFE0E'
+const EMOJI_PRESENTATION_SELECTOR = '\uFE0F'
+const COMBINING_ENCLOSING_KEYCAP = '\u20E3'
+
+/** The code point that ends just before `offset` in `text`, or an empty string at the start of the text */
+function codePointBefore(text: string, offset: number): string {
+    const low = text.charCodeAt(offset - 1)
+    const high = text.charCodeAt(offset - 2)
+    const isSurrogatePair = low >= 0xdc00 && low <= 0xdfff && high >= 0xd800 && high <= 0xdbff
+    return text.slice(Math.max(isSurrogatePair ? offset - 2 : offset - 1, 0), offset)
+}
+
+/**
+ * Whether `char`, at `offset` in `text`, is a presentation selector that belongs to an emoji: directly after a
+ * pictograph, or the U+FE0F of a keycap sequence such as 1 U+FE0F U+20E3.
+ */
+function isPresentationSelectorOfEmoji(char: string, offset: number, text: string): boolean {
+    if (char !== TEXT_PRESENTATION_SELECTOR && char !== EMOJI_PRESENTATION_SELECTOR) {
+        return false
+    }
+    const before = codePointBefore(text, offset)
+    if (PICTOGRAPH.test(before)) {
+        return true
+    }
+    return (
+        char === EMOJI_PRESENTATION_SELECTOR &&
+        KEYCAP_BASE.test(before) &&
+        text[offset + 1] === COMBINING_ENCLOSING_KEYCAP
+    )
+}
+
+/**
+ * Removes the characters that do not show in text: the Unicode Default_Ignorable_Code_Point characters, the tag
+ * characters and the other ranges that it removed before. A presentation selector that belongs to an emoji stays.
  * @param input The input string to sanitize
- * @returns The sanitized string with dangerous characters removed
+ * @param enableEscapingHTML Whether to escape HTML in the input first
+ * @returns The input without those characters
  */
 export function sanitizeInput(input: string, enableEscapingHTML: boolean = false): string {
     if (!input) {
@@ -654,12 +699,240 @@ export function sanitizeInput(input: string, enableEscapingHTML: boolean = false
         input = escapeHTML(input)
     }
 
-    // Remove Unicode tag characters (U+E0000-U+E007F) used in ASCII smuggling
-    // Remove other invisible/control characters that could hide content
-    return input.replace(
-        /[\u{E0000}-\u{E007F}\u{200B}-\u{200F}\u{2028}-\u{202F}\u{205F}-\u{206F}\u{FFF0}-\u{FFFF}]/gu,
-        ''
+    // The model reads file text in this form, and a file edit must match the file exactly. So a presentation
+    // selector that belongs to an emoji is kept, and an emoji such as the warning sign (U+26A0 U+FE0F) does not
+    // change. In a run of variation selectors, at most the first one can be kept.
+    return replaceInvisibleCharacters(input, () => '')
+}
+
+/**
+ * Replaces each character in `text` that `sanitizeInput` removes with the result of `replacement` for it
+ */
+function replaceInvisibleCharacters(text: string, replacement: (char: string) => string): string {
+    return text.replace(INVISIBLE_CHARACTERS, (char: string, offset: number, whole: string) =>
+        isPresentationSelectorOfEmoji(char, offset, whole) ? char : replacement(char)
     )
+}
+
+/**
+ * `keys` without the characters that `sanitizeInput` removes. A key that changes, and would then equal another key,
+ * shows those characters as visible text such as <U+200B> instead, so that no value replaces another one.
+ * If those labels still collide, every original '<' and removed character is escaped in all keys.
+ */
+function sanitizeKeys(keys: string[]): string[] {
+    const sanitized = keys.map(key => sanitizeInput(key))
+    if (sanitized.every((key, i) => key === keys[i])) {
+        return keys
+    }
+    const counts = new Map<string, number>()
+    for (const key of sanitized) {
+        counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    const escapeCharacter = (char: string) =>
+        `<U+${(char.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}>`
+    const escaped = sanitized.map((key, i) =>
+        key !== keys[i] && (counts.get(key) ?? 0) > 1 ? replaceInvisibleCharacters(keys[i], escapeCharacter) : key
+    )
+    if (new Set(escaped).size === escaped.length) {
+        return escaped
+    }
+
+    // Escape original characters in one pass. Generated labels must not be escaped again.
+    const charactersToEscape = new RegExp(`${INVISIBLE_CHARACTERS.source}|<`, 'gu')
+    return keys.map(key =>
+        key.replace(charactersToEscape, (char: string, offset: number, whole: string) =>
+            isPresentationSelectorOfEmoji(char, offset, whole) ? char : escapeCharacter(char)
+        )
+    )
+}
+
+type JsonObject = Record<string, unknown>
+
+/** The most schemas that restorePropertyNames applies to one value */
+const MAX_SCHEMAS_PER_VALUE = 64
+/** The most schema entries that restorePropertyNames looks at for one value, repeated and non-schema ones included */
+const MAX_SCHEMA_ENTRIES_PER_VALUE = 16 * MAX_SCHEMAS_PER_VALUE
+
+function isJsonObject(value: unknown): value is JsonObject {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * `input` with each key changed back to the property name in `schema` that it stands for, after
+ * sanitizeRequestInput gave the model the property names of `schema` in their sanitized form. Use it for the input
+ * of a tool, with the input schema that the request sent for the tool.
+ *
+ * It follows properties, additionalProperties, items, prefixItems, allOf, anyOf, oneOf and $ref pointers within
+ * `schema`. A key stays as it is when it stands for no property name or for more than one, or when another key of the
+ * same object keeps that property name. Returns `input` itself when no key changes.
+ */
+export function restorePropertyNames<T>(input: T, schema: unknown): T {
+    // Schemas can change between calls, so derived name maps belong only to this invocation.
+    return restoreNames(input, [schema], schema, new WeakMap()) as T
+}
+
+function restoreNames(
+    value: unknown,
+    schemas: unknown[],
+    root: unknown,
+    propertyNames: WeakMap<JsonObject, Map<string, string>>
+): unknown {
+    const applicable = applicableSchemas(schemas, root)
+    if (applicable.length === 0) {
+        return value
+    }
+    if (Array.isArray(value)) {
+        let changed = false
+        const items = value.map((item, index) => {
+            const restored = restoreNames(
+                item,
+                applicable.flatMap(schema => itemSchemas(schema, index)),
+                root,
+                propertyNames
+            )
+            changed ||= restored !== item
+            return restored
+        })
+        return changed ? items : value
+    }
+    if (!isJsonObject(value)) {
+        return value
+    }
+
+    // Derive each properties object's name map once, even when many array items share it.
+    const propertyMaps = applicable.flatMap(schema => {
+        const properties = schema.properties
+        if (!isJsonObject(properties)) {
+            return []
+        }
+        let names = propertyNames.get(properties)
+        if (!names) {
+            const keys = Object.keys(properties)
+            names = new Map(sanitizeKeys(keys).map((key, i) => [key, keys[i]]))
+            propertyNames.set(properties, names)
+        }
+        return [{ properties, names }]
+    })
+    const additionalProperties = applicable.map(schema => schema.additionalProperties)
+
+    // Only combine matches for input keys, not every property in every applicable schema.
+    const namesByKey = new Map<string, Map<string, unknown[]>>()
+    // Reserve unique destination names before restoring values. A literal escape label can reuse a name
+    // that another key will release, regardless of the order of the input keys.
+    const namesByInputKey = new Map<string, string>()
+    const keysByName = new Map<string, string>()
+    const unchangedKeys: string[] = []
+    for (const key of Object.keys(value)) {
+        const schemasByName = new Map<string, unknown[]>()
+        for (const { properties, names } of propertyMaps) {
+            const name = names.get(key)
+            if (name !== undefined) {
+                const propertySchemas = schemasByName.get(name) ?? []
+                propertySchemas.push(properties[name])
+                schemasByName.set(name, propertySchemas)
+            }
+        }
+        if (schemasByName.size > 0) {
+            namesByKey.set(key, schemasByName)
+        }
+        if (schemasByName.size === 1) {
+            const [name] = schemasByName.keys()
+            if (name !== key && !keysByName.has(name)) {
+                namesByInputKey.set(key, name)
+                keysByName.set(name, key)
+                continue
+            }
+        }
+        unchangedKeys.push(key)
+    }
+    // A key that keeps its name blocks any rename to that name, including a chain of renames.
+    for (let next = 0; next < unchangedKeys.length; next++) {
+        const key = keysByName.get(unchangedKeys[next])
+        if (key !== undefined && namesByInputKey.delete(key)) {
+            unchangedKeys.push(key)
+        }
+    }
+
+    let changed = false
+    const entries = Object.entries(value).map(([key, item]) => {
+        const schemasByName = namesByKey.get(key)
+        const name = namesByInputKey.get(key) ?? key
+        const restored = restoreNames(
+            item,
+            schemasByName ? (schemasByName.get(name) ?? []) : additionalProperties,
+            root,
+            propertyNames
+        )
+        changed ||= name !== key || restored !== item
+        return [name, restored] as const
+    })
+    // Object.fromEntries defines each key as a property, also a key such as __proto__
+    return changed ? Object.fromEntries(entries) : value
+}
+
+/** `schemas`, the members of their allOf, anyOf and oneOf, and the schemas that their $ref pointers name */
+function applicableSchemas(schemas: unknown[], root: unknown): JsonObject[] {
+    const applicable: JsonObject[] = []
+    const pending = schemas.slice(0, MAX_SCHEMA_ENTRIES_PER_VALUE)
+    const add = (entry: unknown) => {
+        if (pending.length < MAX_SCHEMA_ENTRIES_PER_VALUE) {
+            pending.push(entry)
+        }
+    }
+    for (let next = 0; next < pending.length && applicable.length < MAX_SCHEMAS_PER_VALUE; next++) {
+        const schema = pending[next]
+        if (!isJsonObject(schema) || applicable.includes(schema)) {
+            continue
+        }
+        applicable.push(schema)
+        if (typeof schema.$ref === 'string') {
+            add(resolveSchemaPointer(schema.$ref, root))
+        }
+        for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
+            const members = schema[keyword]
+            if (Array.isArray(members)) {
+                members.slice(0, MAX_SCHEMA_ENTRIES_PER_VALUE).forEach(add)
+            }
+        }
+    }
+    return applicable
+}
+
+/** The schemas of the item at `index` of an array that `schema` describes */
+function itemSchemas(schema: JsonObject, index: number): unknown[] {
+    const { items, prefixItems, additionalItems } = schema
+    if (Array.isArray(prefixItems)) {
+        return [index < prefixItems.length ? prefixItems[index] : items]
+    }
+    if (Array.isArray(items)) {
+        return [index < items.length ? items[index] : additionalItems]
+    }
+    return [items]
+}
+
+/** The value that a $ref such as #/$defs/Item names within `root`, or undefined for another kind of reference */
+function resolveSchemaPointer(ref: string, root: unknown): unknown {
+    if (!ref.startsWith('#')) {
+        return undefined
+    }
+    let pointer: string
+    try {
+        pointer = decodeURIComponent(ref.slice(1))
+    } catch {
+        return undefined
+    }
+    if (pointer !== '' && !pointer.startsWith('/')) {
+        return undefined
+    }
+    let node = root
+    for (const token of pointer.split('/').slice(1)) {
+        const key = token.replace(/~1/g, '/').replace(/~0/g, '~')
+        if (typeof node !== 'object' || node === null || !Object.prototype.hasOwnProperty.call(node, key)) {
+            return undefined
+        }
+        node = (node as JsonObject)[key]
+    }
+    return node
 }
 
 /**
@@ -689,11 +962,11 @@ export function sanitizeRequestInput(input: any): any {
         return input.map(item => sanitizeRequestInput(item))
     }
     if (input && typeof input === 'object') {
-        const sanitized: any = {}
-        for (const [key, value] of Object.entries(input)) {
-            sanitized[key] = sanitizeRequestInput(value)
-        }
-        return sanitized
+        const entries = Object.entries(input)
+        // Keys reach the model too, for example the property names of a JSON tool result
+        const keys = sanitizeKeys(entries.map(([key]) => key))
+        // Object.fromEntries defines each key as a property, also a key such as __proto__
+        return Object.fromEntries(entries.map(([, value], i) => [keys[i], sanitizeRequestInput(value)]))
     }
     return input
 }
