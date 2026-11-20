@@ -1170,6 +1170,47 @@ describe('isServerDisabled()', () => {
     })
 })
 
+describe('isServerGlobal()', () => {
+    const home = path.join(os.tmpdir(), 'home')
+    const globalMcp = mcpUtils.getGlobalMcpConfigPath(home)
+
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('treats the servers of the global config files as global, with the check of the consent prompt', async () => {
+        stubAgentConfig()
+        const mgr = await McpManager.init([], {
+            ...features,
+            workspace: { ...fakeWorkspace, fs: { ...fakeWorkspace.fs, getUserHomeDir: () => home } },
+        })
+        const servers = (mgr as any).mcpServers as Map<string, MCPServerConfig>
+        const configPaths: Record<string, string | undefined> = {
+            globalMcp,
+            globalAgent: mcpUtils.getGlobalAgentConfigPath(home),
+            globalPersona: mcpUtils.getGlobalPersonaConfigPath(home),
+            // The global mcp.json spelled with a '.' segment
+            unnormalizedGlobalMcp: `${path.dirname(globalMcp)}${path.sep}.${path.sep}mcp.json`,
+            workspaceMcp: path.join(home, 'ws', '.amazonq', 'mcp.json'),
+            noConfigPath: undefined,
+        }
+        for (const [serverName, configPath] of Object.entries(configPaths)) {
+            servers.set(serverName, { command: 'c', args: [], __configPath__: configPath })
+        }
+
+        expect(Object.keys(configPaths).filter(serverName => mgr.isServerGlobal(serverName))).to.deep.equal([
+            'globalMcp',
+            'globalAgent',
+            'globalPersona',
+            'unnormalizedGlobalMcp',
+        ])
+        expect(mgr.isServerGlobal('unknown')).to.be.false
+    })
+})
+
 describe('close()', () => {
     let loadStub: sinon.SinonStub
 
@@ -2134,6 +2175,22 @@ describe('consent gate for workspace-scoped MCP servers (P417451767)', () => {
             await (mgr as any).initOneServerInternal('svc', cfg)
         } catch {}
         expect(showMessageStub.called).to.be.false
+    })
+
+    it('does not prompt for a global config path that is not normalized, which the config loaders treat as global', async () => {
+        const mgr = await buildMgr()
+        showMessageStub.resolves({ title: 'Deny' })
+        // The global mcp.json spelled with a '.' segment
+        const unnormalizedGlobalMcp = `${path.dirname(globalMcp)}${path.sep}.${path.sep}mcp.json`
+        const cfg: MCPServerConfig = { command: 'sh', args: [], __configPath__: unnormalizedGlobalMcp }
+        try {
+            await (mgr as any).initOneServerInternal('svc', cfg)
+        } catch {}
+
+        expect(showMessageStub.called).to.be.false
+        // The permission checks of the config loaders use the same check
+        expect(mcpUtils.isGlobalConfigPath(unnormalizedGlobalMcp, fakeHome)).to.be.true
+        expect(mcpUtils.isGlobalConfigPath(workspaceMcp, fakeHome)).to.be.false
     })
 
     it('prompts for workspace-scoped config when no prior approval', async () => {

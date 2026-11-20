@@ -43,7 +43,7 @@ export async function loadMcpServerConfigs(
     const serverNameMapping = new Map<string, string>()
     const configErrors = new Map<string, string>()
     const uniquePaths = Array.from(new Set(rawPaths))
-    const globalConfigPath = getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())
+    const homeDir = workspace.fs.getUserHomeDir()
     for (const raw of uniquePaths) {
         // 1) normalize file:/ URIs → real fs paths
         let fsPath: string
@@ -99,7 +99,7 @@ export async function loadMcpServerConfigs(
         }
 
         // 4) dedupe and validate
-        const isWorkspaceFile = permissionPathKey(fsPath) !== permissionPathKey(globalConfigPath)
+        const isWorkspaceFile = !isGlobalConfigPath(fsPath, homeDir)
         for (const [name, entryRaw] of Object.entries(json.mcpServers)) {
             const entry = entryRaw as any
 
@@ -148,8 +148,9 @@ export async function loadMcpServerConfigs(
             const sanitizedName = sanitizeName(name)
             if (servers.has(sanitizedName)) {
                 const existing = servers.get(sanitizedName)!
-                const existingIsGlobal = existing.__configPath__ === globalConfigPath
-                const currentIsGlobal = fsPath === globalConfigPath
+                const existingIsGlobal =
+                    !!existing.__configPath__ && isGlobalConfigPath(existing.__configPath__, homeDir)
+                const currentIsGlobal = !isWorkspaceFile
                 if (existingIsGlobal && !currentIsGlobal) {
                     logging.warn(
                         `Workspace override for MCP server '${name}' in ${fsPath}; replacing global configuration.`
@@ -307,14 +308,13 @@ export async function loadAgentConfig(
         )
     )
 
-    const globalConfigPath = getGlobalAgentConfigPath(workspace.fs.getUserHomeDir())
+    const homeDir = workspace.fs.getUserHomeDir()
+    const globalConfigPath = getGlobalAgentConfigPath(homeDir)
 
     // Sort paths to process global config last
-    const sortedPaths = uniquePaths.sort((a, b) => {
-        if (a === globalConfigPath) return 1
-        if (b === globalConfigPath) return -1
-        return 0
-    })
+    const sortedPaths = uniquePaths.sort(
+        (a, b) => Number(isGlobalConfigPath(a, homeDir)) - Number(isGlobalConfigPath(b, homeDir))
+    )
 
     // Track useLegacyMcpJson value - workspace takes precedence over global
     let useLegacyMcpJsonValue: boolean | undefined
@@ -340,6 +340,10 @@ export async function loadAgentConfig(
 
     // Process each path like loadMcpServerConfigs
     for (const fsPath of sortedPaths) {
+        // A config file of the user, which only the user writes. The agent paths are agent configs, so this is the
+        // global agent config; the other agent configs are in workspace folders.
+        const isGlobalFile = isGlobalConfigPath(fsPath, homeDir)
+
         // 1) Skip missing files or create default global
         let exists: boolean
         try {
@@ -352,8 +356,8 @@ export async function loadAgentConfig(
         }
 
         if (!exists) {
-            // Create default global agent file if this is the global path
-            if (fsPath === globalConfigPath) {
+            // Create the default agent config only at the path of the global agent config, not of another global file
+            if (permissionPathKey(fsPath) === permissionPathKey(globalConfigPath)) {
                 try {
                     await workspace.fs.mkdir(path.dirname(fsPath), { recursive: true })
                     await workspace.fs.writeFile(fsPath, DEFAULT_AGENT_RAW)
@@ -394,14 +398,14 @@ export async function loadAgentConfig(
         }
 
         // 3) Process agent config metadata
-        if (fsPath === globalConfigPath) {
+        if (isGlobalFile) {
             agentConfig.name = json.name || agentConfig.name
             agentConfig.description = json.description || agentConfig.description
         }
 
         // Track useLegacyMcpJson - workspace files take precedence
         if (json.useLegacyMcpJson !== undefined) {
-            if (fsPath !== globalConfigPath) {
+            if (!isGlobalFile) {
                 // Workspace file - always takes precedence
                 useLegacyMcpJsonValue = json.useLegacyMcpJson
             } else if (useLegacyMcpJsonValue === undefined) {
@@ -413,7 +417,7 @@ export async function loadAgentConfig(
         // 4) Process permissions (tools and allowedTools). In a workspace file, a '*' in tools enables only
         // the servers that the file defines (step 6), and its other wildcards, also those that start with '@', are
         // ignored.
-        const isWorkspaceFile = permissionPathKey(fsPath) !== permissionPathKey(globalConfigPath)
+        const isWorkspaceFile = !isGlobalFile
         let enablesOwnServers = false
         for (const key of PERMISSION_KEYS) {
             if (!Array.isArray(json[key])) {
@@ -454,7 +458,7 @@ export async function loadAgentConfig(
                 if (typeof resource !== 'string') {
                     continue
                 }
-                if (fsPath !== globalConfigPath && isAbsoluteFileResource(resource)) {
+                if (!isGlobalFile && isAbsoluteFileResource(resource)) {
                     logging.warn(
                         `Ignoring absolute resource path ${JSON.stringify(resource)} in agent config at ${fsPath}. Add it to the global agent config instead.`
                     )
@@ -462,7 +466,7 @@ export async function loadAgentConfig(
                 }
                 // A resource from a workspace folder's agent config applies to that folder only
                 const source = resourceSources.get(resource) ?? { global: false, configPaths: [] }
-                if (fsPath === globalConfigPath) {
+                if (isGlobalFile) {
                     source.global = true
                 } else if (!source.configPaths.includes(fsPath)) {
                     source.configPaths.push(fsPath)
@@ -613,8 +617,9 @@ export async function loadAgentConfig(
                 // Handle server conflicts (workspace overrides global)
                 if (servers.has(sanitizedName)) {
                     const existing = servers.get(sanitizedName)!
-                    const existingIsGlobal = existing.__configPath__ === globalConfigPath
-                    const currentIsGlobal = fsPath === globalConfigPath
+                    const existingIsGlobal =
+                        !!existing.__configPath__ && isGlobalConfigPath(existing.__configPath__, homeDir)
+                    const currentIsGlobal = isGlobalFile
 
                     if (existingIsGlobal && !currentIsGlobal) {
                         logging.warn(
@@ -702,7 +707,7 @@ export async function loadAgentConfig(
             pendingServerEntries[key],
             servers,
             serverNameMapping,
-            [globalConfigPath, getGlobalMcpConfigPath(workspace.fs.getUserHomeDir())],
+            homeDir,
             logging
         )
         for (const { source, message } of ignored) {
@@ -712,7 +717,7 @@ export async function loadAgentConfig(
     for (const [configPath, messages] of ignoredPermissions) {
         configErrors.set(
             configPath,
-            `Ignored ${messages.size} permission ${messages.size === 1 ? 'entry' : 'entries'}: a workspace config grants permissions only for the MCP servers that it defines, without wildcards. The log lists each entry.`
+            `Ignored ${messages.size} permission ${messages.size === 1 ? 'entry' : 'entries'}: a workspace config grants permissions only for the MCP servers that it defines; '*' in tools enables those servers, and other wildcards are ignored. Set permissions in the MCP server list instead. The log lists each entry.`
         )
     }
 
@@ -1323,14 +1328,24 @@ export async function saveServerSpecificAgentConfig(
             // If file doesn't exist, create minimal config
             existingConfig = JSON.parse(DEFAULT_AGENT_RAW)
         }
+        // A file that is not a JSON object has no lists to change, and writing it would not keep the change
+        if (!existingConfig || typeof existingConfig !== 'object' || Array.isArray(existingConfig)) {
+            throw new Error('The agent config is not a JSON object')
+        }
 
-        // Remove existing server tools from arrays. An entry that is not a string stays as it is: loading skips it,
-        // and this save changes only the entries of the server.
+        // Remove existing server tools from arrays. Loading skips a list that is not an array, so such a list is
+        // written again as an empty one. An entry that is not a string stays as it is: loading skips it, and this
+        // save changes only the entries of the server.
         const isServerEntry = (tool: unknown) => typeof tool === 'string' && isPermissionForServer(tool, serverName)
-        existingConfig.tools = existingConfig.tools.filter(tool => !isServerEntry(tool))
-        existingConfig.allowedTools = existingConfig.allowedTools.filter(tool => !isServerEntry(tool))
+        const otherEntries = (list: unknown) => (Array.isArray(list) ? list.filter(tool => !isServerEntry(tool)) : [])
+        existingConfig.tools = otherEntries(existingConfig.tools)
+        existingConfig.allowedTools = otherEntries(existingConfig.allowedTools)
 
         if (!isLegacyMcpServer && !skipMcpServerConfig) {
+            // Loading skips an mcpServers that is missing or not an object, and reads an array by index. Write an
+            // object with the same entries, because JSON.stringify drops the named properties of an array.
+            const servers = existingConfig.mcpServers
+            existingConfig.mcpServers = servers && typeof servers === 'object' ? { ...servers } : {}
             if (serverConfig === null) {
                 // Remove server entirely
                 delete existingConfig.mcpServers[serverName]
@@ -1583,6 +1598,21 @@ function permissionPathKey(configPath: string): string {
     return process.platform === 'win32' ? path.normalize(configPath).toLowerCase() : path.normalize(configPath)
 }
 
+/**
+ * True for the global MCP config, agent config, and persona config of the user, which only the user writes. The
+ * config loaders and the consent prompt of McpManager use this, so that they agree on which config files are the
+ * user's own. It compares the paths as text after path.normalize, and does not follow symbolic links, so it is for
+ * paths that the language server builds, such as those of getWorkspaceAgentConfigPaths.
+ */
+export function isGlobalConfigPath(configPath: string, homeDir: string): boolean {
+    const key = permissionPathKey(configPath)
+    return [
+        getGlobalMcpConfigPath(homeDir),
+        getGlobalAgentConfigPath(homeDir),
+        getGlobalPersonaConfigPath(homeDir),
+    ].some(globalPath => permissionPathKey(globalPath) === key)
+}
+
 /** The agent config that holds the permissions of a server, or of the servers that a config file declares */
 function permissionFileKey(configPath: string): string {
     return permissionPathKey(getAgentConfigPathForMcpConfig(path.normalize(configPath)))
@@ -1598,8 +1628,8 @@ function permissionFileKey(configPath: string): string {
  * server name with a glob character.
  *
  * A source is the agent config that lists the entry, or the `mcp.json` that declares the server for its default
- * enablement. Sources in `globalConfigPaths`, which only the user writes, are kept. restoreServerScopedPermissions
- * then applies the entries that a remaining source owns.
+ * enablement. The global config files of the user in `homeDir`, which only the user writes, are kept as sources.
+ * restoreServerScopedPermissions then applies the entries that a remaining source owns.
  *
  * @returns The removed sources, each with the warning that was logged for it
  */
@@ -1607,7 +1637,7 @@ export function removeUntrustedPermissionSources(
     pending: Map<string, Set<string>>,
     servers: Map<string, MCPServerConfig>,
     serverNameMapping: Map<string, string>,
-    globalConfigPaths: string[],
+    homeDir: string,
     logging: Logger
 ): { source: string; message: string }[] {
     // The agent config that holds the permissions of each loaded server, by its original name
@@ -1620,11 +1650,10 @@ export function removeUntrustedPermissionSources(
             )
         }
     }
-    const globalPaths = new Set(globalConfigPaths.map(permissionPathKey))
 
     // Why the config file cannot grant the entry, or undefined when it can or when the entry names no loaded server
     const refusal = (entry: string, source: string): string | undefined => {
-        if (globalPaths.has(permissionPathKey(source))) {
+        if (isGlobalConfigPath(source, homeDir)) {
             return undefined
         }
         const named = [...permissionFiles].filter(([serverName]) => isPermissionForServer(entry, serverName))
