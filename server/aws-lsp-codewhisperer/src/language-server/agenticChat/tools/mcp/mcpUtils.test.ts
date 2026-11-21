@@ -23,6 +23,9 @@ import {
     normalizePathFromUri,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
+    checkMcpConfigWrite,
+    ConfigWriteRefusedError,
+    setConfigPathsOfLoadedServers,
     isEmptyEnv,
     describeStdioLaunchForLog,
     describeArgsForLog,
@@ -31,6 +34,8 @@ import {
     sanitizeName,
     convertPersonaToAgent,
     migrateToAgentConfig,
+    migrateAgentConfigsToCLIFormat,
+    migrateAgentConfigToCLIFormat,
     restoreServerScopedPermissions,
     removeUntrustedPermissionSources,
     getAgentConfigPathForMcpConfig,
@@ -48,6 +53,16 @@ import { pathToFileURL } from 'url'
 import * as sinon from 'sinon'
 import { URI } from 'vscode-uri'
 import { sanitizeInput } from '../../../../shared/utils'
+
+/** The error that `promise` rejects with. Fails the test if the promise resolves. */
+async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
+    try {
+        await promise
+    } catch (error) {
+        return error as Error
+    }
+    throw new Error('Expected the promise to reject')
+}
 
 describe('loadMcpServerConfigs', () => {
     let tmpDir: string
@@ -419,6 +434,7 @@ describe('saveAgentConfig', () => {
                 mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
                 getUserHomeDir: () => tmpDir,
             },
+            getAllWorkspaceFolders: () => [{ uri: URI.file(tmpDir).toString() }],
         }
         logger = { warn: () => {}, info: () => {}, error: () => {} }
     })
@@ -467,6 +483,350 @@ describe('saveAgentConfig', () => {
 
         // Verify the file was created
         expect(fs.existsSync(configPath)).to.be.true
+    })
+
+    it('does not write the agent config through a link that leaves the workspace folder', async function () {
+        const wsDir = path.join(tmpDir, 'repo')
+        const outsideDir = path.join(tmpDir, 'outside')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'), { recursive: true })
+        fs.mkdirSync(outsideDir)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        try {
+            // .amazonq/agents is a directory link that points outside the workspace folder
+            fs.symlinkSync(
+                outsideDir,
+                path.join(wsDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const errors: string[] = []
+        logger.error = (message: string) => errors.push(message)
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+        const config = {
+            name: 'test-agent',
+            description: 'Test agent',
+            mcpServers: {},
+            tools: [],
+            allowedTools: [],
+            toolsSettings: {},
+            includedFiles: [],
+            resources: [],
+        }
+
+        const error = await rejectionOf(saveAgentConfig(workspace, logger, config, configPath))
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.include('was not saved because it is outside the workspace folder')
+        expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+        expect(errors.filter(message => message.includes('was not saved'))).to.have.length(1)
+    })
+
+    it('creates the folder and writes the file at the resolved path that it checked', async function () {
+        const wsDir = path.join(tmpDir, 'repo')
+        const shared = path.join(wsDir, 'shared')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'), { recursive: true })
+        fs.mkdirSync(shared)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        try {
+            // .amazonq/agents links to another folder inside the same workspace folder
+            fs.symlinkSync(
+                shared,
+                path.join(wsDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const usedPaths: string[] = []
+        for (const name of ['mkdir', 'writeFile']) {
+            const original = workspace.fs[name]
+            workspace.fs[name] = (p: string, ...rest: any[]) => {
+                usedPaths.push(p)
+                return original(p, ...rest)
+            }
+        }
+        const config = {
+            name: 'test-agent',
+            description: 'Test agent',
+            mcpServers: {},
+            tools: [],
+            allowedTools: [],
+            toolsSettings: {},
+            includedFiles: [],
+            resources: [],
+        }
+
+        await saveAgentConfig(workspace, logger, config, path.join(wsDir, '.amazonq', 'agents', 'default.json'))
+
+        const resolvedFile = path.join(fs.realpathSync.native(shared), 'default.json')
+        expect(usedPaths).to.deep.equal([path.dirname(resolvedFile), resolvedFile])
+        expect(JSON.parse(fs.readFileSync(resolvedFile, 'utf-8'))).to.deep.equal(config)
+    })
+})
+
+describe('checkMcpConfigWrite', () => {
+    let tmpDir: string
+    let wsDir: string
+    let workspace: any
+    let warnings: string[]
+    let logger: any
+
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkMcpConfigWrite-'))
+        wsDir = path.join(tmpDir, 'repo')
+        fs.mkdirSync(wsDir)
+        workspace = {
+            fs: { getUserHomeDir: () => path.join(tmpDir, 'home') },
+            getAllWorkspaceFolders: () => [{ uri: URI.file(wsDir).toString() }],
+        }
+        warnings = []
+        logger = { warn: (message: string) => warnings.push(message), info: () => {}, error: () => {} }
+    })
+
+    afterEach(() => {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('allows the mcp.json of an open workspace folder at its resolved path, also before it exists', async () => {
+        const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+        const resolvedPath = path.join(fs.realpathSync.native(wsDir), '.amazonq', 'mcp.json')
+
+        expect(await checkMcpConfigWrite(workspace, logger, mcpPath)).to.equal(resolvedPath)
+        fs.mkdirSync(path.join(wsDir, '.amazonq'))
+        fs.writeFileSync(mcpPath, '{}')
+        expect(await checkMcpConfigWrite(workspace, logger, mcpPath)).to.equal(resolvedPath)
+
+        expect(warnings).to.deep.equal([])
+    })
+
+    it('returns the target of a link that stays inside the workspace folder, so the write goes there', async function () {
+        const shared = path.join(wsDir, 'config', 'amazonq')
+        fs.mkdirSync(shared, { recursive: true })
+        try {
+            fs.symlinkSync(shared, path.join(wsDir, '.amazonq'), process.platform === 'win32' ? 'junction' : 'dir')
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+
+        const target = await checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+
+        expect(target).to.equal(path.join(fs.realpathSync.native(shared), 'mcp.json'))
+    })
+
+    it('refuses the mcp.json of one workspace folder whose .amazonq folder links into another open folder', async function () {
+        const otherDir = path.join(tmpDir, 'other-repo')
+        fs.mkdirSync(path.join(otherDir, 'config'), { recursive: true })
+        workspace.getAllWorkspaceFolders = () => [
+            { uri: URI.file(wsDir).toString() },
+            { uri: URI.file(otherDir).toString() },
+        ]
+        try {
+            fs.symlinkSync(
+                path.join(otherDir, 'config'),
+                path.join(wsDir, '.amazonq'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.include('it is outside the workspace folder after symbolic links are followed')
+        // The own mcp.json of the other folder stays writable
+        expect(await checkMcpConfigWrite(workspace, logger, path.join(otherDir, '.amazonq', 'mcp.json'))).to.equal(
+            path.join(fs.realpathSync.native(otherDir), '.amazonq', 'mcp.json')
+        )
+    })
+
+    it('takes the folder of a path with .. as written, so that a link before the .. does not change it', async function () {
+        const outsideDir = path.join(tmpDir, 'outside')
+        fs.mkdirSync(path.join(outsideDir, 'deep'), { recursive: true })
+        fs.mkdirSync(path.join(outsideDir, '.amazonq'))
+        const type = process.platform === 'win32' ? 'junction' : 'dir'
+        try {
+            // Followed before the .., wsDir/x/.. is the outside folder, which holds the target of wsDir/.amazonq
+            fs.symlinkSync(path.join(outsideDir, 'deep'), path.join(wsDir, 'x'), type)
+            fs.symlinkSync(path.join(outsideDir, '.amazonq'), path.join(wsDir, '.amazonq'), type)
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, [wsDir, 'x', '..', '.amazonq', 'mcp.json'].join(path.sep))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+    })
+
+    it('returns the global mcp.json as it was given', async () => {
+        const globalPath = getGlobalMcpConfigPath(path.join(tmpDir, 'home'))
+
+        expect(await checkMcpConfigWrite(workspace, logger, globalPath)).to.equal(globalPath)
+    })
+
+    it('refuses an mcp.json whose .amazonq folder links outside the workspace folder', async function () {
+        const outsideDir = path.join(tmpDir, 'outside')
+        fs.mkdirSync(outsideDir)
+        try {
+            fs.symlinkSync(outsideDir, path.join(wsDir, '.amazonq'), process.platform === 'win32' ? 'junction' : 'dir')
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+
+        const error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.equal(
+            `The MCP config ${JSON.stringify(mcpPath)} was not saved because it is outside the workspace folder ` +
+                'after symbolic links are followed'
+        )
+        // The user is told which file, and the log says the same
+        expect(warnings).to.deep.equal([error.message])
+    })
+
+    it('refuses an mcp.json whose location cannot be resolved, with the error code, not as outside', async function () {
+        try {
+            // Two links that point at each other, so the path cannot be resolved
+            fs.symlinkSync(path.join(wsDir, 'loop'), path.join(wsDir, '.amazonq'), 'dir')
+            fs.symlinkSync(path.join(wsDir, '.amazonq'), path.join(wsDir, 'loop'), 'dir')
+        } catch {
+            // A directory link on Windows needs a privilege that the test may not have
+            this.skip()
+        }
+        const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+
+        const error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.equal(
+            `The MCP config ${JSON.stringify(mcpPath)} was not saved because its location could not be resolved (ELOOP)`
+        )
+    })
+
+    it('refuses an mcp.json that is also reachable under another name', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+        }
+        const outsideFile = path.join(tmpDir, 'outside.json')
+        fs.writeFileSync(outsideFile, '{}')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'))
+        fs.linkSync(outsideFile, path.join(wsDir, '.amazonq', 'mcp.json'))
+
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.include('it is also reachable under another name on disk')
+    })
+
+    it('refuses an mcp.json whose location cannot be resolved for a reason without an error code', async () => {
+        const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+        const lstat = sinon.stub(fs.promises, 'lstat').rejects(new Error('no code'))
+        let error: Error
+        try {
+            error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+        } finally {
+            lstat.restore()
+        }
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(error.message).to.equal(
+            `The MCP config ${JSON.stringify(mcpPath)} was not saved because its location could not be resolved`
+        )
+    })
+
+    it('allows the global mcp.json with no workspace folder open, and refuses a file that no folder holds', async () => {
+        workspace.getAllWorkspaceFolders = () => []
+
+        await checkMcpConfigWrite(workspace, logger, getGlobalMcpConfigPath(path.join(tmpDir, 'home')))
+        // Not the mcp.json of a workspace folder, which is .amazonq/mcp.json in that folder
+        for (const mcpPath of [path.join(wsDir, 'mcp.json'), path.join(wsDir, '.amazonq', 'other', 'mcp.json')]) {
+            const error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+
+            expect(error, mcpPath).to.be.instanceOf(ConfigWriteRefusedError)
+        }
+    })
+
+    describe('of a workspace folder that was removed from the workspace', () => {
+        // McpManager keeps the servers of a folder that is removed from the workspace, and the user can still
+        // delete, enable, disable, or change the permissions of these servers
+        beforeEach(() => {
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(path.join(tmpDir, 'other')).toString() }]
+            // A server that McpManager loaded from the mcp.json of that folder
+            setConfigPathsOfLoadedServers(() => [path.join(wsDir, '.amazonq', 'mcp.json')])
+        })
+
+        afterEach(() => {
+            setConfigPathsOfLoadedServers(undefined)
+        })
+
+        it('refuses its own mcp.json when no loaded server comes from that folder', async () => {
+            setConfigPathsOfLoadedServers(() => [
+                path.join(tmpDir, 'other-repo', '.amazonq', 'mcp.json'),
+                undefined,
+                getGlobalMcpConfigPath(path.join(tmpDir, 'home')),
+            ])
+
+            const error = await rejectionOf(
+                checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+            )
+
+            expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+            expect(error.message).to.include('it is outside the workspace folder after symbolic links are followed')
+        })
+
+        it('refuses a path whose .. names another folder than the one that a loaded server comes from', async () => {
+            const mcpPath = [wsDir, '..', '.amazonq', 'mcp.json'].join(path.sep)
+
+            const error = await rejectionOf(checkMcpConfigWrite(workspace, logger, mcpPath))
+
+            expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        })
+
+        it('allows its own mcp.json, inside that folder', async () => {
+            const mcpPath = path.join(wsDir, '.amazonq', 'mcp.json')
+
+            expect(await checkMcpConfigWrite(workspace, logger, mcpPath)).to.equal(
+                path.join(fs.realpathSync.native(wsDir), '.amazonq', 'mcp.json')
+            )
+            expect(warnings).to.deep.equal([])
+        })
+
+        it('refuses its own mcp.json when its .amazonq folder links out of that folder', async function () {
+            const outsideDir = path.join(tmpDir, 'outside')
+            fs.mkdirSync(outsideDir)
+            try {
+                fs.symlinkSync(
+                    outsideDir,
+                    path.join(wsDir, '.amazonq'),
+                    process.platform === 'win32' ? 'junction' : 'dir'
+                )
+            } catch {
+                // A link on Windows may need a privilege the test does not have
+                this.skip()
+            }
+
+            const error = await rejectionOf(
+                checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+            )
+
+            expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+            expect(error.message).to.include('it is outside the workspace folder after symbolic links are followed')
+        })
     })
 })
 
@@ -1092,6 +1452,307 @@ describe('migrateToAgentConfig', () => {
         const agentConfig = JSON.parse(fs.readFileSync(agentPath, 'utf-8'))
         expect(agentConfig.mcpServers).to.have.property('testServer')
     })
+
+    describe('a workspace agent config path with symbolic links', () => {
+        let wsDir: string
+        let outsideDir: string
+        let warnings: string[]
+        const refusal = 'Did not create the agent config'
+        const updateRefusal = 'Did not update the agent config'
+        const legacyAgentConfig = JSON.stringify({ name: 'default-agent', mcpServers: {}, tools: [], allowedTools: [] })
+
+        // A directory link; on Windows a junction, which needs no extra privilege
+        const linkFolder = (target: string, linkPath: string) =>
+            fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+        const writeRepoMcpConfig = (folder: string) => {
+            fs.mkdirSync(folder, { recursive: true })
+            fs.writeFileSync(
+                path.join(folder, 'mcp.json'),
+                JSON.stringify({ mcpServers: { repoServer: { command: 'repo-cmd' } } })
+            )
+        }
+
+        beforeEach(() => {
+            wsDir = path.join(tmpDir, 'repo')
+            outsideDir = path.join(tmpDir, 'outside')
+            fs.mkdirSync(wsDir)
+            fs.mkdirSync(outsideDir)
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString(), name: 'repo' }]
+            warnings = []
+            logger.warn = (message: string) => warnings.push(message)
+        })
+
+        it('writes the agent config of a workspace with no links', async () => {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            const written = JSON.parse(fs.readFileSync(path.join(wsDir, '.amazonq', 'agents', 'default.json'), 'utf-8'))
+            expect(written.mcpServers).to.have.property('repoServer')
+            expect(warnings.filter(warning => warning.includes(refusal))).to.deep.equal([])
+        })
+
+        it('does not write through a default.json link whose target does not exist', async function () {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'))
+            const target = path.join(outsideDir, 'mcp.json')
+            try {
+                fs.symlinkSync(target, path.join(wsDir, '.amazonq', 'agents', 'default.json'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.existsSync(target)).to.be.false
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+        })
+
+        it('does not write when the links in the path cannot be resolved', async function () {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            const agentsDir = path.join(wsDir, '.amazonq', 'agents')
+            fs.mkdirSync(agentsDir)
+            try {
+                // Two links that point at each other
+                fs.symlinkSync(path.join(agentsDir, 'loop.json'), path.join(agentsDir, 'default.json'), 'file')
+                fs.symlinkSync(path.join(agentsDir, 'default.json'), path.join(agentsDir, 'loop.json'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+            // Neither link was replaced by a written file, and nothing else was written next to them
+            expect(fs.lstatSync(path.join(agentsDir, 'default.json')).isSymbolicLink()).to.be.true
+            expect(fs.lstatSync(path.join(agentsDir, 'loop.json')).isSymbolicLink()).to.be.true
+            expect(fs.readdirSync(agentsDir).sort()).to.deep.equal(['default.json', 'loop.json'])
+        })
+
+        it('checks each workspace folder against its own agent config', async () => {
+            // The first folder's agents folder links out; the second folder has no links
+            const otherDir = path.join(tmpDir, 'other-repo')
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+            writeRepoMcpConfig(path.join(otherDir, '.amazonq'))
+            workspace.getAllWorkspaceFolders = () => [
+                { uri: URI.file(wsDir).toString(), name: 'repo' },
+                { uri: URI.file(otherDir).toString(), name: 'other-repo' },
+            ]
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+            const written = JSON.parse(
+                fs.readFileSync(path.join(otherDir, '.amazonq', 'agents', 'default.json'), 'utf-8')
+            )
+            expect(written.mcpServers).to.have.property('repoServer')
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+        })
+
+        it('writes the global agent config through a linked global agents folder, as before', async () => {
+            // The link target is outside the home folder too, so any folder check on the global path would refuse it
+            const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'migrateGlobal-'))
+            try {
+                const globalDir = path.join(tmpDir, '.aws', 'amazonq')
+                fs.mkdirSync(globalDir, { recursive: true })
+                fs.writeFileSync(
+                    path.join(globalDir, 'mcp.json'),
+                    JSON.stringify({ mcpServers: { userServer: { command: 'user-cmd' } } })
+                )
+                linkFolder(elsewhere, path.join(globalDir, 'agents'))
+
+                await migrateToAgentConfig(workspace, logger, mockAgent)
+
+                const written = JSON.parse(fs.readFileSync(path.join(elsewhere, 'default.json'), 'utf-8'))
+                expect(written.mcpServers).to.have.property('userServer')
+                expect(warnings.filter(warning => warning.includes(refusal))).to.deep.equal([])
+
+                fs.writeFileSync(path.join(elsewhere, 'default.json'), legacyAgentConfig)
+                await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+                expect(JSON.parse(fs.readFileSync(path.join(elsewhere, 'default.json'), 'utf-8'))).to.include({
+                    name: 'q_ide_default',
+                    useLegacyMcpJson: true,
+                })
+                expect(warnings.filter(warning => warning.includes(updateRefusal))).to.deep.equal([])
+            } finally {
+                fs.rmSync(elsewhere, { recursive: true, force: true })
+            }
+        })
+
+        it('does not write into an agents folder that links out of the workspace', async () => {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+        })
+
+        it('does not write into a .amazonq folder that links out of the workspace', async () => {
+            writeRepoMcpConfig(outsideDir)
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq'))
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.readdirSync(outsideDir)).to.deep.equal(['mcp.json'])
+            expect(warnings.filter(warning => warning.includes(refusal))).to.have.length(1)
+        })
+
+        it('writes the agent config through a link that stays inside the workspace', async () => {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            const insideAgents = path.join(wsDir, 'config', 'agents')
+            fs.mkdirSync(insideAgents, { recursive: true })
+            linkFolder(insideAgents, path.join(wsDir, '.amazonq', 'agents'))
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            const written = JSON.parse(fs.readFileSync(path.join(insideAgents, 'default.json'), 'utf-8'))
+            expect(written.mcpServers).to.have.property('repoServer')
+            expect(warnings.filter(warning => warning.includes(refusal))).to.deep.equal([])
+        })
+
+        it('creates and updates the agent config at the resolved path that was checked', async () => {
+            writeRepoMcpConfig(path.join(wsDir, '.amazonq'))
+            const insideAgents = path.join(wsDir, 'config', 'agents')
+            fs.mkdirSync(insideAgents, { recursive: true })
+            linkFolder(insideAgents, path.join(wsDir, '.amazonq', 'agents'))
+            const reads: string[] = []
+            const writes: string[] = []
+            const { readFile, writeFile } = workspace.fs
+            workspace.fs.readFile = (p: string) => {
+                reads.push(p)
+                return readFile(p)
+            }
+            workspace.fs.writeFile = (p: string, d: string) => {
+                writes.push(p)
+                return writeFile(p, d)
+            }
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            const resolvedAgent = path.join(fs.realpathSync.native(insideAgents), 'default.json')
+            const linkedAgent = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            // Created once and updated once, both times at the resolved path, which the update also reads
+            expect(writes.filter(p => p === resolvedAgent)).to.have.length(2)
+            expect(reads).to.include(resolvedAgent)
+            expect([...reads, ...writes]).to.not.include(linkedAgent)
+        })
+
+        it('writes the agent config when the workspace folder is opened through a link', async () => {
+            const realRepo = path.join(tmpDir, 'real-repo')
+            writeRepoMcpConfig(path.join(realRepo, '.amazonq'))
+            const linkedRepo = path.join(tmpDir, 'linked-repo')
+            linkFolder(realRepo, linkedRepo)
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(linkedRepo).toString(), name: 'repo' }]
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            expect(fs.existsSync(path.join(realRepo, '.amazonq', 'agents', 'default.json'))).to.be.true
+            expect(warnings.filter(warning => warning.includes(refusal))).to.deep.equal([])
+        })
+
+        it('updates the existing workspace and global agent configs to the CLI format', async () => {
+            const wsAgent = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            const globalAgent = path.join(tmpDir, '.aws', 'amazonq', 'agents', 'default.json')
+            for (const agentPath of [wsAgent, globalAgent]) {
+                fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+                fs.writeFileSync(agentPath, legacyAgentConfig)
+            }
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            for (const agentPath of [wsAgent, globalAgent]) {
+                expect(JSON.parse(fs.readFileSync(agentPath, 'utf-8'))).to.include({
+                    name: 'q_ide_default',
+                    useLegacyMcpJson: true,
+                })
+            }
+            expect(warnings.filter(warning => warning.includes(updateRefusal))).to.deep.equal([])
+        })
+
+        it('does not update a file outside the workspace that default.json links to', async function () {
+            fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'), { recursive: true })
+            const target = path.join(outsideDir, 'settings.json')
+            fs.writeFileSync(target, legacyAgentConfig)
+            try {
+                fs.symlinkSync(target, path.join(wsDir, '.amazonq', 'agents', 'default.json'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            expect(fs.readFileSync(target, 'utf-8')).to.equal(legacyAgentConfig)
+            expect(warnings.filter(warning => warning.includes(updateRefusal))).to.have.length(1)
+        })
+
+        it('does not update an agent config in an agents folder that links out of the workspace', async () => {
+            fs.mkdirSync(path.join(wsDir, '.amazonq'))
+            fs.writeFileSync(path.join(outsideDir, 'default.json'), legacyAgentConfig)
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            expect(fs.readFileSync(path.join(outsideDir, 'default.json'), 'utf-8')).to.equal(legacyAgentConfig)
+            expect(warnings.filter(warning => warning.includes(updateRefusal))).to.have.length(1)
+        })
+
+        it('checks the workspace folder when a caller says which agent config it updates', async () => {
+            fs.mkdirSync(path.join(wsDir, '.amazonq'))
+            fs.writeFileSync(path.join(outsideDir, 'default.json'), legacyAgentConfig)
+            linkFolder(outsideDir, path.join(wsDir, '.amazonq', 'agents'))
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+            await migrateAgentConfigToCLIFormat(workspace, logger, agentPath, { kind: 'workspace', folderPath: wsDir })
+
+            expect(fs.readFileSync(path.join(outsideDir, 'default.json'), 'utf-8')).to.equal(legacyAgentConfig)
+            expect(warnings.filter(warning => warning.includes(updateRefusal))).to.have.length(1)
+            // A caller has to name the location: one that leaves it out does not compile
+            // @ts-expect-error The location of the agent config is required
+            const leftOut: Parameters<typeof migrateAgentConfigToCLIFormat> = [workspace, logger, agentPath]
+            expect(leftOut).to.have.length(3)
+        })
+
+        it('does not update a workspace agent config that is also reachable under another name', async function () {
+            if (process.platform === 'win32') {
+                this.skip()
+            }
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            const outsideFile = path.join(outsideDir, 'settings.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(outsideFile, legacyAgentConfig)
+            fs.linkSync(outsideFile, agentPath)
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            expect(fs.readFileSync(outsideFile, 'utf-8')).to.equal(legacyAgentConfig)
+            expect(
+                warnings.filter(warning => warning.includes(updateRefusal) && warning.includes('another name'))
+            ).to.have.length(1)
+        })
+
+        it('does not update a workspace agent config that a caller calls the global one', async () => {
+            const agentPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(agentPath, legacyAgentConfig)
+
+            await migrateAgentConfigToCLIFormat(workspace, logger, agentPath, { kind: 'global' })
+
+            expect(fs.readFileSync(agentPath, 'utf-8')).to.equal(legacyAgentConfig)
+            expect(
+                warnings.filter(
+                    warning => warning.includes(updateRefusal) && warning.includes('it is not the global agent config')
+                )
+            ).to.have.length(1)
+        })
+    })
 })
 describe('loadAgentConfig with registry support', () => {
     let tmpDir: string
@@ -1316,7 +1977,9 @@ describe('saveServerSpecificAgentConfig', () => {
                 readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
                 writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
                 mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts.recursive })),
+                getUserHomeDir: () => path.join(tmpDir, 'home'),
             },
+            getAllWorkspaceFolders: () => [{ uri: URI.file(tmpDir).toString() }],
         }
         logger = { warn: () => {}, info: () => {}, error: () => {} }
     })
@@ -1477,6 +2140,338 @@ describe('saveServerSpecificAgentConfig', () => {
         )
 
         expect(fs.existsSync(configPath)).to.be.true
+    })
+
+    it('does not write the agent config through an agents link that leaves the workspace folder', async function () {
+        const wsDir = path.join(tmpDir, 'repo')
+        const outsideDir = path.join(tmpDir, 'outside')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'), { recursive: true })
+        fs.mkdirSync(outsideDir)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        try {
+            // .amazonq/agents is a directory link that points outside the workspace folder
+            fs.symlinkSync(
+                outsideDir,
+                path.join(wsDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const errors: string[] = []
+        logger.error = (message: string) => errors.push(message)
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+        const error = await rejectionOf(
+            saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+        )
+
+        expect(error.message).to.include('was not saved because it is outside the workspace folder')
+        expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+        expect(errors.filter(message => message.includes('was not saved'))).to.have.length(1)
+    })
+
+    it('does not write an agent config that is also reachable under another name', async function () {
+        if (process.platform === 'win32') {
+            this.skip()
+        }
+        const wsDir = path.join(tmpDir, 'repo')
+        const outsideFile = path.join(tmpDir, 'outside.json')
+        const original = JSON.stringify({ name: 'other file', mcpServers: {}, tools: [], allowedTools: [] })
+        fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'), { recursive: true })
+        fs.writeFileSync(outsideFile, original)
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+        // default.json and a file outside the workspace folder are the same file on disk
+        fs.linkSync(outsideFile, configPath)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+
+        const error = await rejectionOf(
+            saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+        )
+
+        expect(error.message).to.include('was not saved because it is also reachable under another name')
+        expect(fs.readFileSync(outsideFile, 'utf-8')).to.equal(original)
+    })
+
+    it('writes the global agent config when its path differs only in letter case on macOS', async () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'darwin' })
+        try {
+            const wsDir = path.join(tmpDir, 'repo')
+            fs.mkdirSync(wsDir, { recursive: true })
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+            // getUserHomeDir() is tmpDir/home (set in beforeEach); this path differs from it only in letter case
+            const configPath = getGlobalAgentConfigPath(path.join(tmpDir, 'HOME'))
+
+            await saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'c' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+
+            expect(fs.existsSync(configPath)).to.be.true
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
+        }
+    })
+
+    it('writes the agent config of a workspace folder with no links', async () => {
+        const wsDir = path.join(tmpDir, 'repo')
+        fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'), { recursive: true })
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'c' },
+            ['@testServer'],
+            [],
+            configPath
+        )
+
+        expect(fs.existsSync(configPath)).to.be.true
+        expect(JSON.parse(fs.readFileSync(configPath, 'utf-8')).mcpServers.testServer).to.deep.equal({ command: 'c' })
+    })
+
+    it('writes the global agent config even when it is outside every workspace folder', async () => {
+        const wsDir = path.join(tmpDir, 'repo')
+        fs.mkdirSync(wsDir, { recursive: true })
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        // getUserHomeDir() is tmpDir/home (set in beforeEach), which is not inside wsDir
+        const configPath = getGlobalAgentConfigPath(path.join(tmpDir, 'home'))
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'c' },
+            ['@testServer'],
+            [],
+            configPath
+        )
+
+        expect(fs.existsSync(configPath)).to.be.true
+    })
+
+    it('writes through an agents link that stays inside the workspace folder', async function () {
+        const wsDir = path.join(tmpDir, 'repo')
+        const shared = path.join(wsDir, 'shared-agents')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'), { recursive: true })
+        fs.mkdirSync(shared, { recursive: true })
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        try {
+            // .amazonq/agents links to another folder inside the same workspace folder
+            fs.symlinkSync(
+                shared,
+                path.join(wsDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'c' },
+            ['@testServer'],
+            [],
+            configPath
+        )
+
+        // The write landed in the link target, which is inside the workspace folder
+        expect(fs.existsSync(path.join(shared, 'default.json'))).to.be.true
+    })
+
+    it('reads and writes the resolved path that it checked, not the path through the link', async function () {
+        const wsDir = path.join(tmpDir, 'repo')
+        const shared = path.join(wsDir, 'shared')
+        fs.mkdirSync(path.join(wsDir, '.amazonq'), { recursive: true })
+        fs.mkdirSync(shared)
+        workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(wsDir).toString() }]
+        try {
+            fs.symlinkSync(
+                shared,
+                path.join(wsDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+        } catch {
+            // A link on Windows may need a privilege the test does not have
+            this.skip()
+        }
+        const usedPaths: string[] = []
+        for (const name of ['mkdir', 'readFile', 'writeFile']) {
+            const original = workspace.fs[name]
+            workspace.fs[name] = (p: string, ...rest: any[]) => {
+                usedPaths.push(p)
+                return original(p, ...rest)
+            }
+        }
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'c' },
+            ['@testServer'],
+            [],
+            path.join(wsDir, '.amazonq', 'agents', 'default.json')
+        )
+
+        const resolvedFile = path.join(fs.realpathSync.native(shared), 'default.json')
+        expect(usedPaths).to.deep.equal([path.dirname(resolvedFile), resolvedFile, resolvedFile])
+    })
+
+    it('does not write the agent config of one workspace folder into a file of another open folder', async function () {
+        const folderA = path.join(tmpDir, 'a')
+        const folderB = path.join(tmpDir, 'b')
+        fs.mkdirSync(path.join(folderA, '.vscode'), { recursive: true })
+        fs.mkdirSync(path.join(folderB, '.amazonq', 'agents'), { recursive: true })
+        // A file that is not valid JSON, which the save would replace with a new agent config
+        const settings = '{\n  // tab size\n  "editor.tabSize": 2\n}\n'
+        fs.writeFileSync(path.join(folderA, '.vscode', 'settings.json'), settings)
+        workspace.getAllWorkspaceFolders = () => [
+            { uri: URI.file(folderA).toString() },
+            { uri: URI.file(folderB).toString() },
+        ]
+        const configPath = path.join(folderB, '.amazonq', 'agents', 'default.json')
+        try {
+            fs.symlinkSync(path.join(folderA, '.vscode', 'settings.json'), configPath, 'file')
+        } catch {
+            // A file link on Windows needs a privilege that the test may not have
+            this.skip()
+        }
+
+        const error = await rejectionOf(
+            saveServerSpecificAgentConfig(workspace, logger, 's', null, ['@s/tool'], [], configPath, true)
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+        expect(fs.readFileSync(path.join(folderA, '.vscode', 'settings.json'), 'utf-8')).to.equal(settings)
+    })
+
+    describe('of a workspace folder that was removed from the workspace', () => {
+        let wsDir: string
+
+        beforeEach(() => {
+            wsDir = path.join(tmpDir, 'repo')
+            fs.mkdirSync(path.join(wsDir, '.amazonq', 'agents'), { recursive: true })
+            // The servers of a removed folder stay loaded, so the user can still change them
+            workspace.getAllWorkspaceFolders = () => [{ uri: URI.file(path.join(tmpDir, 'other')).toString() }]
+            setConfigPathsOfLoadedServers(() => [path.join(wsDir, '.amazonq', 'agents', 'default.json')])
+        })
+
+        afterEach(() => {
+            setConfigPathsOfLoadedServers(undefined)
+        })
+
+        it('writes the agent config next to the mcp.json that a loaded legacy server comes from', async () => {
+            setConfigPathsOfLoadedServers(() => [URI.file(path.join(wsDir, '.amazonq', 'mcp.json')).toString()])
+            const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+            await saveServerSpecificAgentConfig(workspace, logger, 'a', null, ['@a/tool'], [], configPath, true)
+
+            expect(JSON.parse(fs.readFileSync(configPath, 'utf-8')).tools).to.include('@a/tool')
+        })
+
+        it('refuses its own agent config when no loaded server comes from that folder', async () => {
+            setConfigPathsOfLoadedServers(() => [])
+            const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+            const error = await rejectionOf(
+                saveServerSpecificAgentConfig(workspace, logger, 'a', { command: 'c' }, ['@a'], [], configPath)
+            )
+
+            expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+            expect(fs.existsSync(configPath)).to.be.false
+        })
+
+        it('writes its own agent config, inside that folder', async () => {
+            const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+            fs.writeFileSync(
+                configPath,
+                JSON.stringify({
+                    name: 'agent',
+                    description: '',
+                    mcpServers: { a: { command: 'x' }, b: { command: 'y' } },
+                    tools: ['@a', '@b'],
+                    allowedTools: [],
+                    toolsSettings: {},
+                    resources: [],
+                })
+            )
+
+            await saveServerSpecificAgentConfig(workspace, logger, 'a', null, [], [], configPath)
+
+            const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+            expect(content.mcpServers).to.deep.equal({ b: { command: 'y' } })
+            expect(content.tools).to.deep.equal(['@b'])
+        })
+
+        it('refuses its own agent config when its agents folder links out of that folder', async function () {
+            const outsideDir = path.join(tmpDir, 'outside')
+            fs.mkdirSync(outsideDir)
+            fs.rmdirSync(path.join(wsDir, '.amazonq', 'agents'))
+            try {
+                fs.symlinkSync(
+                    outsideDir,
+                    path.join(wsDir, '.amazonq', 'agents'),
+                    process.platform === 'win32' ? 'junction' : 'dir'
+                )
+            } catch {
+                // A link on Windows may need a privilege the test does not have
+                this.skip()
+            }
+            const configPath = path.join(wsDir, '.amazonq', 'agents', 'default.json')
+
+            const error = await rejectionOf(
+                saveServerSpecificAgentConfig(workspace, logger, 'a', { command: 'c' }, ['@a'], [], configPath)
+            )
+
+            expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+            expect(error.message).to.include('it is outside the workspace folder after symbolic links are followed')
+            expect(fs.readdirSync(outsideDir)).to.deep.equal([])
+        })
+
+        it('refuses another file in that folder, which only an open workspace folder may hold', async () => {
+            for (const configPath of [
+                path.join(wsDir, 'agent-config.json'),
+                path.join(wsDir, '.amazonq', 'agents', 'other.json'),
+            ]) {
+                const error = await rejectionOf(
+                    saveServerSpecificAgentConfig(workspace, logger, 'a', { command: 'c' }, ['@a'], [], configPath)
+                )
+
+                expect(error, configPath).to.be.instanceOf(ConfigWriteRefusedError)
+                expect(fs.existsSync(configPath), configPath).to.be.false
+            }
+        })
     })
 })
 

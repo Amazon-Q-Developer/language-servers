@@ -181,6 +181,39 @@ export async function hasAdditionalHardLinks(canonicalPath: string): Promise<boo
     }
 }
 
+/**
+ * Where a path is after every symbolic link in it is followed: strictly inside one of the folders, with the
+ * resolved path that a read or write should then use; outside all of them; or not resolved, with the error code of
+ * the failure if it has one.
+ */
+export type StrictlyInsideFoldersResult =
+    | { kind: 'inside'; canonicalPath: string }
+    | { kind: 'outside' }
+    | { kind: 'unresolved'; errorCode: string | undefined }
+
+/**
+ * Where `filePath` is, after every symbolic link in it is followed, relative to `folderPaths`. A path is strictly
+ * inside a folder: the folder itself is not inside it, and neither is a path whose first part inside the folder
+ * starts with '..', such as '..notes.md', which workspaceUtils.isParentFolder reads as a step out of the folder. A
+ * part of the path that does not exist yet is resolved as written. A path that cannot be resolved, for example
+ * because of links that point at each other (ELOOP) or a folder that cannot be read (EACCES), is `unresolved`.
+ */
+export async function resolveStrictlyInsideFolders(
+    folderPaths: string[],
+    filePath: string
+): Promise<StrictlyInsideFoldersResult> {
+    let canonicalPath: string
+    try {
+        canonicalPath = await resolveCanonicalPath(filePath)
+    } catch (error) {
+        return { kind: 'unresolved', errorCode: (error as NodeJS.ErrnoException | undefined)?.code }
+    }
+    const canonicalFolders = await canonicalizeWorkspaceFolders(folderPaths)
+    return canonicalFolders.some(folder => workspaceUtils.isParentFolder(folder, canonicalPath))
+        ? { kind: 'inside', canonicalPath }
+        : { kind: 'outside' }
+}
+
 /** How a tool accesses the path, which decides the wording of the prompt. */
 export type FileAccessKind = 'read' | 'modify'
 
