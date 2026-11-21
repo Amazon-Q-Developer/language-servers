@@ -35,6 +35,7 @@ import {
     describeStdioLaunchForLog,
     describeUrlForLog,
     getGlobalAgentConfigPath,
+    getWorkspaceAgentConfigPaths,
     getWorkspaceMcpConfigPaths,
     getGlobalMcpConfigPath,
     getGlobalPersonaConfigPath,
@@ -140,6 +141,8 @@ export class McpManager {
     private trustGeneration = 0
     // Set when the user forgot allowed folders but the saved approvals could not be cleared
     private ignoreSavedFolderApprovals = false
+    // Set once discovery has run after sign-in, so folder changes before then don't start servers early
+    private discoveryStarted = false
 
     private constructor(
         private agentPaths: string[],
@@ -267,12 +270,54 @@ export class McpManager {
 
     /**
      * Re-check started stdio servers after the workspace folders change. A server whose first folder changed
-     * restarts in the new one, which goes through the folder check again.
+     * restarts in the new one, which goes through the folder check again. When a folder with MCP configs is
+     * added, or one whose configs are loaded is removed, the configs are loaded again.
      */
     public async onWorkspaceFoldersChanged(): Promise<void> {
         this.trustGeneration++
+        // Before discovery, only the paths change: discovery reads the current folders when it runs
+        if ((await this.updateWorkspaceAgentPaths()) && this.discoveryStarted) {
+            // Reloading restarts every server through the folder check, so the checks below are not needed
+            await this.reinitializeMcpServers()
+            return
+        }
         await this.reevaluateStartedServers()
         await this.startServersAwaitingTrust()
+    }
+
+    /**
+     * Point the agent config paths at the current workspace folders. Returns true when the configs need loading
+     * again: an added folder has an MCP config, or a loaded server came from a removed folder.
+     */
+    private async updateWorkspaceAgentPaths(): Promise<boolean> {
+        const folderUris = this.features.workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+        const workspacePaths = getWorkspaceAgentConfigPaths(folderUris)
+        const known = new Set(this.agentPaths.map(p => path.normalize(p)))
+        const current = new Set(workspacePaths.map(p => path.normalize(p)))
+        const globalPath = path.normalize(getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir()))
+        const addedFolders = folderUris.filter((_, i) => !known.has(path.normalize(workspacePaths[i])))
+        // An agent config path is <folder>/.amazonq/agents/default.json
+        const removedConfigDirs = [...known]
+            .filter(p => p !== globalPath && !current.has(p))
+            .map(p => path.dirname(path.dirname(p)))
+        if (addedFolders.length === 0 && removedConfigDirs.length === 0) {
+            return false
+        }
+        this.agentPaths = [...workspacePaths, getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())]
+
+        const addedConfigs = [
+            ...getWorkspaceAgentConfigPaths(addedFolders),
+            ...getWorkspaceMcpConfigPaths(addedFolders),
+        ].map(p => normalizePathFromUri(p, this.features.logging))
+        for (const configPath of addedConfigs) {
+            if (await this.features.workspace.fs.exists(configPath).catch(() => false)) {
+                return true
+            }
+        }
+        return [...this.mcpServers.values()].some(cfg => {
+            const configPath = cfg.__configPath__ ? path.normalize(cfg.__configPath__) : undefined
+            return !!configPath && removedConfigDirs.some(dir => configPath.startsWith(dir + path.sep))
+        })
     }
 
     /**
@@ -463,6 +508,7 @@ export class McpManager {
      * Should only be called after auth is initialized and MCP is enabled.
      */
     public async discoverAllServers(): Promise<void> {
+        this.discoveryStarted = true
         // Load agent config with registry support
         const result = await loadAgentConfig(
             this.features.workspace,

@@ -127,6 +127,11 @@ export const QAgenticChatServer =
             await amazonQServiceManager.addDidChangeConfigurationListener(updateConfigurationHandler)
         })
 
+        lsp.workspace.onDidChangeWorkspaceFolders(() => {
+            // The controller is created on initialized, and the folder list is updated before this runs
+            chatController?.onWorkspaceFoldersChanged()
+        })
+
         lsp.onExecuteCommand((params, token) => {
             return chatController.onExecuteCommand(params, token)
         })

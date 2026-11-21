@@ -3345,3 +3345,159 @@ describe('Always Allow persists across a restart', () => {
         expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
     })
 })
+
+describe('MCP configs of workspace folders that change after startup', () => {
+    let tmpDir: string
+    let folderRoots: string[]
+    let folderFeatures: any
+
+    const writeJson = (p: string, value: unknown) => {
+        fs.mkdirSync(path.dirname(p), { recursive: true })
+        fs.writeFileSync(p, JSON.stringify(value))
+    }
+    const newFolder = (name: string) => {
+        const root = path.join(tmpDir, name)
+        fs.mkdirSync(root, { recursive: true })
+        return root
+    }
+    const agentConfigWith = (serverName: string) => ({
+        mcpServers: { [serverName]: { command: `${serverName}-mcp`, args: [] } },
+        tools: [`@${serverName}`],
+        allowedTools: [],
+    })
+
+    // Starts the manager the way toolServer does, with the folders open at that time
+    const startManager = async () => {
+        const wsUris = folderRoots.map(root => pathToFileURL(root).href)
+        const mgr = await McpManager.init(
+            [...mcpUtils.getWorkspaceAgentConfigPaths(wsUris), mcpUtils.getGlobalAgentConfigPath(tmpDir)],
+            folderFeatures
+        )
+        await mgr.discoverAllServers()
+        return mgr
+    }
+
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcpFolderConfigs-'))
+        folderRoots = []
+        folderFeatures = {
+            ...features,
+            workspace: {
+                fs: {
+                    exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                    readFile: (p: string) => Promise.resolve(Buffer.from(fs.readFileSync(p))),
+                    writeFile: (p: string, d: string) => Promise.resolve(fs.writeFileSync(p, d)),
+                    mkdir: (d: string, opts: any) => Promise.resolve(fs.mkdirSync(d, { recursive: opts?.recursive })),
+                    getUserHomeDir: () => tmpDir,
+                },
+                getUserHomeDir: () => tmpDir,
+                getAllWorkspaceFolders: () => folderRoots.map(root => ({ uri: pathToFileURL(root).href, name: root })),
+            },
+        }
+        stubInitOneServer()
+        sinon.stub(ProfileStatusMonitor, 'getMcpState').returns(true)
+    })
+
+    afterEach(async () => {
+        try {
+            await McpManager.instance.close()
+        } catch {}
+        sinon.restore()
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+
+    it('loads the agent config of a folder added after startup', async () => {
+        const mgr = await startManager()
+        const root = newFolder('added')
+        writeJson(path.join(root, '.amazonq', 'agents', 'default.json'), agentConfigWith('late'))
+        expect(mgr.getAllServerConfigs().has('late')).to.be.false
+
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(mgr.getAllServerConfigs().has('late')).to.be.true
+    })
+
+    it('loads the mcp.json of a folder added after startup', async () => {
+        const mgr = await startManager()
+        const root = newFolder('added')
+        writeJson(path.join(root, '.amazonq', 'mcp.json'), { mcpServers: { legacy: { command: 'legacy-mcp' } } })
+
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(mgr.getAllServerConfigs().has('legacy')).to.be.true
+    })
+
+    it('unloads the servers of a removed folder', async () => {
+        const kept = newFolder('kept')
+        const removed = newFolder('removed')
+        writeJson(path.join(removed, '.amazonq', 'agents', 'default.json'), agentConfigWith('gone'))
+        folderRoots = [kept, removed]
+        const mgr = await startManager()
+        expect(mgr.getAllServerConfigs().has('gone')).to.be.true
+
+        folderRoots = [kept]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(mgr.getAllServerConfigs().has('gone')).to.be.false
+    })
+
+    it('does not reload servers when the added folder has no MCP config', async () => {
+        writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), agentConfigWith('global'))
+        const mgr = await startManager()
+        const reinit = sinon.spy(mgr, 'reinitializeMcpServers')
+
+        folderRoots = [newFolder('plain')]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(reinit.called).to.be.false
+        expect(mgr.getAllServerConfigs().has('global')).to.be.true
+    })
+
+    it('does not start servers for a folder added before discovery has run', async () => {
+        const mgr = await McpManager.init([mcpUtils.getGlobalAgentConfigPath(tmpDir)], folderFeatures)
+        const reinit = sinon.spy(mgr, 'reinitializeMcpServers')
+        const root = newFolder('added')
+        writeJson(path.join(root, '.amazonq', 'agents', 'default.json'), agentConfigWith('early'))
+
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(reinit.called).to.be.false
+        expect(mgr.getAllServerConfigs().has('early')).to.be.false
+        // Discovery after sign-in reads the folder
+        await mgr.discoverAllServers()
+        expect(mgr.getAllServerConfigs().has('early')).to.be.true
+    })
+
+    it('asks before starting a server from an added folder, and does not start it when denied', async () => {
+        ;(McpManager.prototype as any).initOneServer.restore()
+        const connect = sinon.stub(Client.prototype, 'connect').rejects(new Error('connect stubbed'))
+        const showMessageRequest = sinon.stub().resolves({ title: 'Deny' })
+        folderFeatures.lsp = { window: { showMessageRequest, showDocument: sinon.stub() } }
+        const mgr = await startManager()
+        await mgr.setWorkspaceTrust('trusted')
+        const root = newFolder('added')
+        writeJson(path.join(root, '.amazonq', 'agents', 'default.json'), agentConfigWith('asked'))
+
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(showMessageRequest.calledOnce).to.be.true
+        expect(showMessageRequest.firstCall.args[0].message).to.include('asked')
+        expect(connect.called).to.be.false
+    })
+
+    it('reads the added folder on a later refresh', async () => {
+        const mgr = await startManager()
+        const root = newFolder('added')
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        writeJson(path.join(root, '.amazonq', 'agents', 'default.json'), agentConfigWith('later'))
+        await mgr.reinitializeMcpServers()
+
+        expect(mgr.getAllServerConfigs().has('later')).to.be.true
+    })
+})
