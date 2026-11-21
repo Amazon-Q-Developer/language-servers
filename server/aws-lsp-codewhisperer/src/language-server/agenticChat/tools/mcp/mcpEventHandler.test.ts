@@ -598,6 +598,59 @@ describe('McpEventHandler error handling', () => {
                 expect(result.id).to.equal('add-new-mcp')
                 expect(result.header.status).to.deep.equal({ title: reason, icon: 'cancel-circle', status: 'error' })
             })
+
+            // A dependency can also reject with a value that is not an Error, and the form shows its text
+            it('shows on the add form the text of a rejection that is not an Error', async () => {
+                await setupServers(new Map(), {})
+                sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(() => Promise.reject('disk busy'))
+                const addServer = sinon.stub(McpManager.instance, 'addServer').resolves()
+
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: {
+                        name: 'my server',
+                        transport: 'stdio',
+                        command: 'npx',
+                        args: [],
+                        env_variables: [],
+                        timeout: '60',
+                        scope: 'workspace',
+                    },
+                } as any)
+
+                sinon.assert.notCalled(addServer)
+                expect(result.id).to.equal('add-new-mcp')
+                expect(result.header.status).to.deep.equal({
+                    title: 'disk busy',
+                    icon: 'cancel-circle',
+                    status: 'error',
+                })
+            })
+
+            it('shows on the registry edit form the text of a rejection that is not an Error', async () => {
+                await setupServers(new Map([['srv', { url: 'https://example.com/mcp', disabled: false }]]), {
+                    srv: McpServerStatus.ENABLED,
+                })
+                sinon.stub(McpManager.instance, 'getRegistryService').returns({
+                    isRegistryActive: () => true,
+                    getServerByName: () => ({
+                        name: 'srv',
+                        version: '1.0.0',
+                        remotes: [{ type: 'streamable-http', url: 'https://example.com/mcp' }],
+                    }),
+                } as any)
+                sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(() => Promise.reject('disk busy'))
+                const removeServer = sinon.stub(McpManager.instance, 'removeServer').resolves()
+
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    title: 'srv',
+                    optionsValues: { name: 'srv', timeout: '60', scope: 'workspace', additional_headers: [] },
+                } as any)
+
+                sinon.assert.notCalled(removeServer)
+                expect(result.header.status.title).to.equal('disk busy')
+            })
         })
 
         it('stays on the edit form with the reason and writes nothing when the old server cannot be removed', async () => {

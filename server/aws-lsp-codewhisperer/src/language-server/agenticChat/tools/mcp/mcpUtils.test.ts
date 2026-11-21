@@ -747,6 +747,17 @@ describe('checkMcpConfigWrite', () => {
         )
     })
 
+    it('reads a missing folder list as no workspace folder open', async () => {
+        workspace.getAllWorkspaceFolders = () => undefined
+
+        await checkMcpConfigWrite(workspace, logger, getGlobalMcpConfigPath(path.join(tmpDir, 'home')))
+        const error = await rejectionOf(
+            checkMcpConfigWrite(workspace, logger, path.join(wsDir, '.amazonq', 'mcp.json'))
+        )
+
+        expect(error).to.be.instanceOf(ConfigWriteRefusedError)
+    })
+
     it('allows the global mcp.json with no workspace folder open, and refuses a file that no folder holds', async () => {
         workspace.getAllWorkspaceFolders = () => []
 
@@ -1449,6 +1460,42 @@ describe('migrateToAgentConfig', () => {
         expect(fs.existsSync(agentPath)).to.be.true
         const agentConfig = JSON.parse(fs.readFileSync(agentPath, 'utf-8'))
         expect(agentConfig.mcpServers).to.have.property('testServer')
+    })
+
+    describe('when the IDE gives no folder list', () => {
+        beforeEach(() => {
+            workspace.getAllWorkspaceFolders = () => undefined
+        })
+
+        it('migrates the global MCP config to the global agent config', async () => {
+            const mcpDir = path.join(tmpDir, '.aws', 'amazonq')
+            fs.mkdirSync(mcpDir, { recursive: true })
+            fs.writeFileSync(
+                path.join(mcpDir, 'mcp.json'),
+                JSON.stringify({ mcpServers: { testServer: { command: 'test-cmd' } } })
+            )
+
+            await migrateToAgentConfig(workspace, logger, mockAgent)
+
+            const agentConfig = JSON.parse(fs.readFileSync(path.join(mcpDir, 'agents', 'default.json'), 'utf-8'))
+            expect(agentConfig.mcpServers).to.have.property('testServer')
+        })
+
+        it('updates the global agent config to the CLI format', async () => {
+            const agentPath = path.join(tmpDir, '.aws', 'amazonq', 'agents', 'default.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(
+                agentPath,
+                JSON.stringify({ name: 'default-agent', mcpServers: {}, tools: [], allowedTools: [] })
+            )
+
+            await migrateAgentConfigsToCLIFormat(workspace, logger)
+
+            expect(JSON.parse(fs.readFileSync(agentPath, 'utf-8'))).to.include({
+                name: 'q_ide_default',
+                useLegacyMcpJson: true,
+            })
+        })
     })
 
     describe('a workspace agent config path with symbolic links', () => {
