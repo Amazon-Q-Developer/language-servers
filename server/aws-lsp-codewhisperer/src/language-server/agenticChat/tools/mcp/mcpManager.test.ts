@@ -71,6 +71,11 @@ function stubAgentConfig(): sinon.SinonStub {
     })
 }
 
+/** A stub of a config write check that allows the write at the path it is given, as the check does for a path with no links */
+async function returnCheckedPath(_workspace: unknown, _logging: unknown, configPath: string): Promise<string> {
+    return configPath
+}
+
 function stubInitOneServer(): sinon.SinonStub {
     return sinon.stub(McpManager.prototype as any, 'initOneServer' as keyof McpManager).callsFake(async function (
         this: any,
@@ -468,9 +473,67 @@ describe('addServer()', () => {
     })
 })
 
+describe('addServer() of a legacy server', () => {
+    afterEach(async () => {
+        sinon.restore()
+        try {
+            await McpManager.instance.close()
+        } catch {}
+    })
+
+    it('does not write through an mcp.json that links to a file outside the workspace folder', async function () {
+        stubAgentConfig()
+        const initOneStub = stubInitOneServer()
+        const saveStub = sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'add-mcp-json-link-'))
+        try {
+            const workspaceDir = path.join(root, 'repo')
+            const target = path.join(root, 'outside.json')
+            fs.mkdirSync(path.join(workspaceDir, '.amazonq'), { recursive: true })
+            const original = JSON.stringify({ mcpServers: {}, other: 'kept' })
+            fs.writeFileSync(target, original)
+            const mcpPath = path.join(workspaceDir, '.amazonq', 'mcp.json')
+            try {
+                fs.symlinkSync(target, mcpPath, 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+            const linkedFeatures = {
+                ...features,
+                workspace: {
+                    ...features.workspace,
+                    fs: {
+                        ...features.workspace.fs,
+                        getUserHomeDir: () => path.join(root, 'home'),
+                        readFile: (p: string) => fs.promises.readFile(p),
+                        writeFile: (p: string, d: string) => fs.promises.writeFile(p, d),
+                        mkdir: (p: string, o: any) => fs.promises.mkdir(p, o),
+                    },
+                    getAllWorkspaceFolders: () => [{ uri: pathToFileURL(workspaceDir).href, name: 'ws' }],
+                },
+            }
+            const mgr = await McpManager.init([], linkedFeatures)
+            ;(mgr as any).registryService = undefined
+
+            // addServer checks nothing itself, so the check in the mcp.json write refuses it
+            await mgr.addServer('newS', { command: 'c', __configPath__: mcpPath } as MCPServerConfig, mcpPath, true)
+
+            expect(fs.readFileSync(target, 'utf-8')).to.equal(original)
+            expect(mgr.getAllServerConfigs().has('newS')).to.be.false
+            sinon.assert.notCalled(saveStub)
+            sinon.assert.notCalled(initOneStub)
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true })
+        }
+    })
+})
+
 describe('removeServer()', () => {
     let loadStub: sinon.SinonStub
     let saveServerSpecificAgentConfigStub: sinon.SinonStub
+    let checkAgentConfigWriteStub: sinon.SinonStub
+    let checkMcpConfigWriteStub: sinon.SinonStub
     let existsStub: sinon.SinonStub
     let readFileStub: sinon.SinonStub
     let writeFileStub: sinon.SinonStub
@@ -481,6 +544,8 @@ describe('removeServer()', () => {
     beforeEach(() => {
         loadStub = stubAgentConfig()
         saveServerSpecificAgentConfigStub = sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+        checkAgentConfigWriteStub = sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(returnCheckedPath)
+        checkMcpConfigWriteStub = sinon.stub(mcpUtils, 'checkMcpConfigWrite').callsFake(returnCheckedPath)
         existsStub = sinon.stub(fakeWorkspace.fs, 'exists').resolves(true)
         readFileStub = sinon
             .stub(fakeWorkspace.fs, 'readFile')
@@ -563,6 +628,276 @@ describe('removeServer()', () => {
         expect((mgr as any).agentConfig.mcpServers).to.not.have.property('x')
         expect((mgr as any).agentConfig.tools).to.not.include('@x')
     })
+
+    describe('when a config file that the removal writes may not be written', () => {
+        const reason = 'The agent config was not saved because it is outside the workspace folder'
+
+        async function removeWithRefusedSave(configPath: string, refusingCheck: sinon.SinonStub) {
+            const mgr = await McpManager.init([], features)
+            const client = new Client({ name: 'c', version: 'v' })
+            const close = sinon.stub(client, 'close').resolves()
+            ;(mgr as any).clients.set('x', client)
+            ;(mgr as any).mcpServers.set('x', {
+                command: 'c',
+                args: [],
+                env: {},
+                timeout: 0,
+                disabled: false,
+                __configPath__: configPath,
+            } as MCPServerConfig)
+            ;(mgr as any).serverNameMapping.set('x', 'x')
+            ;(mgr as any).agentConfig = {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: { x: {} },
+                tools: ['@x'],
+                allowedTools: ['@x/tool'],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            }
+            ;(mgr as any).setState('x', McpServerStatus.ENABLED, 1)
+            const statusEvents: string[] = []
+            mgr.events.on(MCP_SERVER_STATUS_CHANGED, (_server: string, state: { status: string }) =>
+                statusEvents.push(state.status)
+            )
+            refusingCheck.rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+
+            let error: unknown
+            try {
+                await mgr.removeServer('x')
+            } catch (e) {
+                error = e
+            }
+            return { mgr, close, error, statusEvents }
+        }
+
+        it('throws the refusal and leaves the server running with its state and tools', async () => {
+            const { mgr, close, error, statusEvents } = await removeWithRefusedSave('c.json', checkAgentConfigWriteStub)
+
+            expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+            expect((error as Error).message).to.equal(reason)
+            sinon.assert.notCalled(close)
+            sinon.assert.notCalled(saveServerSpecificAgentConfigStub)
+            expect((mgr as any).clients.has('x')).to.be.true
+            expect(mgr.getAllServerConfigs().has('x')).to.be.true
+            expect((mgr as any).agentConfig.tools).to.deep.equal(['@x'])
+            expect((mgr as any).agentConfig.allowedTools).to.deep.equal(['@x/tool'])
+            // A refused write is not a server failure
+            expect(mgr.getServerState('x')).to.deep.equal({
+                status: McpServerStatus.ENABLED,
+                toolsCount: 1,
+                lastError: undefined,
+            })
+            expect(statusEvents).to.deep.equal([])
+        })
+
+        it('checks the mcp.json of a legacy server and the agent config next to it, and writes neither', async () => {
+            const mcpPath = path.join('ws', '.amazonq', 'mcp.json')
+            const { error } = await removeWithRefusedSave(mcpPath, checkAgentConfigWriteStub)
+
+            expect((error as Error)?.message).to.equal(reason)
+            sinon.assert.calledOnceWithMatch(checkMcpConfigWriteStub, sinon.match.any, sinon.match.any, mcpPath)
+            sinon.assert.calledOnceWithMatch(
+                checkAgentConfigWriteStub,
+                sinon.match.any,
+                sinon.match.any,
+                path.join('ws', '.amazonq', 'agents', 'default.json')
+            )
+            sinon.assert.notCalled(saveServerSpecificAgentConfigStub)
+            sinon.assert.notCalled(writeFileStub)
+        })
+
+        it('leaves a legacy server as it was when its mcp.json may not be written', async () => {
+            const mcpPath = path.join('ws', '.amazonq', 'mcp.json')
+            const { mgr, close, error, statusEvents } = await removeWithRefusedSave(mcpPath, checkMcpConfigWriteStub)
+
+            expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+            sinon.assert.notCalled(close)
+            sinon.assert.notCalled(readFileStub)
+            sinon.assert.notCalled(writeFileStub)
+            sinon.assert.notCalled(saveServerSpecificAgentConfigStub)
+            expect(mgr.getAllServerConfigs().has('x')).to.be.true
+            expect(mgr.getServerState('x')?.status).to.equal(McpServerStatus.ENABLED)
+            expect(statusEvents).to.deep.equal([])
+        })
+    })
+
+    it('does not write through an mcp.json that links to a file outside the workspace folder', async function () {
+        checkMcpConfigWriteStub.restore()
+        checkAgentConfigWriteStub.restore()
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-json-link-'))
+        try {
+            const workspaceDir = path.join(root, 'repo')
+            const target = path.join(root, 'outside.json')
+            // The agent config folder is a real folder in the workspace, so only the mcp.json check can refuse
+            fs.mkdirSync(path.join(workspaceDir, '.amazonq', 'agents'), { recursive: true })
+            // Any JSON file that the user can write, here one that looks like an MCP config
+            const original = JSON.stringify({ mcpServers: { x: { command: 'c' } }, other: 'kept' })
+            fs.writeFileSync(target, original)
+            try {
+                fs.symlinkSync(target, path.join(workspaceDir, '.amazonq', 'mcp.json'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+            const linkedFeatures = {
+                ...features,
+                workspace: {
+                    ...features.workspace,
+                    fs: {
+                        ...features.workspace.fs,
+                        getUserHomeDir: () => path.join(root, 'home'),
+                        readFile: (p: string) => fs.promises.readFile(p),
+                        writeFile: (p: string, d: string) => fs.promises.writeFile(p, d),
+                        mkdir: (p: string, o: any) => fs.promises.mkdir(p, o),
+                    },
+                    getAllWorkspaceFolders: () => [{ uri: pathToFileURL(workspaceDir).href, name: 'ws' }],
+                },
+            }
+            const mgr = await McpManager.init([], linkedFeatures)
+            ;(mgr as any).mcpServers.set('x', {
+                command: 'c',
+                __configPath__: path.join(workspaceDir, '.amazonq', 'mcp.json'),
+            } as MCPServerConfig)
+            ;(mgr as any).serverNameMapping.set('x', 'x')
+
+            let error: unknown
+            try {
+                await mgr.removeServer('x')
+            } catch (e) {
+                error = e
+            }
+
+            expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+            expect((error as Error).message).to.match(/^The MCP config ".*" was not saved because /)
+            expect(fs.readFileSync(target, 'utf-8')).to.equal(original)
+            expect(mgr.getAllServerConfigs().has('x')).to.be.true
+        } finally {
+            fs.rmSync(root, { recursive: true, force: true })
+        }
+    })
+
+    describe('of a workspace folder that left the workspace', () => {
+        let root: string
+        let agentPath: string
+        let folders: { uri: string; name: string }[]
+        let realFeatures: any
+        let mgr: McpManager
+        const agentConfig = {
+            name: 'agent',
+            description: '',
+            mcpServers: { x: { type: 'registry' }, y: { command: 'd' } },
+            tools: ['@x', '@y'],
+            allowedTools: [],
+            toolsSettings: {},
+            resources: [],
+        }
+        const readAgentConfig = () => JSON.parse(fs.readFileSync(agentPath, 'utf-8'))
+        const checkAgentConfig = async () => {
+            try {
+                return await mcpUtils.checkAgentConfigWrite(realFeatures.workspace, features.logging, agentPath)
+            } catch (e) {
+                return e
+            }
+        }
+
+        beforeEach(async () => {
+            checkMcpConfigWriteStub.restore()
+            checkAgentConfigWriteStub.restore()
+            saveServerSpecificAgentConfigStub.restore()
+            root = fs.mkdtempSync(path.join(os.tmpdir(), 'removed-folder-'))
+            const workspaceDir = path.join(root, 'repo')
+            agentPath = path.join(workspaceDir, '.amazonq', 'agents', 'default.json')
+            fs.mkdirSync(path.dirname(agentPath), { recursive: true })
+            fs.writeFileSync(agentPath, JSON.stringify(agentConfig))
+            folders = [{ uri: pathToFileURL(workspaceDir).href, name: 'ws' }]
+            realFeatures = {
+                ...features,
+                workspace: {
+                    ...features.workspace,
+                    fs: {
+                        ...features.workspace.fs,
+                        getUserHomeDir: () => path.join(root, 'home'),
+                        exists: (p: string) => Promise.resolve(fs.existsSync(p)),
+                        readFile: (p: string) => fs.promises.readFile(p),
+                        writeFile: (p: string, d: string) => fs.promises.writeFile(p, d),
+                        mkdir: (p: string, o: any) => fs.promises.mkdir(p, o),
+                    },
+                    getAllWorkspaceFolders: () => folders,
+                },
+            }
+            const discovered = (config: Partial<MCPServerConfig>): MCPServerConfig =>
+                ({ args: [], env: {}, timeout: 0, disabled: false, ...config, __configPath__: agentPath }) as any
+            loadStub.resolves({
+                servers: new Map([
+                    ['x', discovered({ url: 'https://example.com/mcp' })],
+                    ['y', discovered({ command: 'd' })],
+                ]),
+                serverNameMapping: new Map([
+                    ['x', 'x'],
+                    ['y', 'y'],
+                ]),
+                errors: new Map(),
+                agentConfig: JSON.parse(JSON.stringify(agentConfig)),
+            })
+            stubInitOneServer()
+            mgr = await McpManager.init([agentPath], realFeatures)
+            await mgr.discoverAllServers()
+            // The user removes the folder from the workspace, and McpManager keeps the servers loaded from it
+            folders = []
+        })
+
+        afterEach(() => {
+            fs.rmSync(root, { recursive: true, force: true })
+        })
+
+        it('deletes its servers in that folder, which stays writable until McpManager closes', async () => {
+            await mgr.removeServer('x')
+            await mgr.removeServer('y')
+
+            expect(readAgentConfig().mcpServers).to.deep.equal({})
+            expect(readAgentConfig().tools).to.deep.equal([])
+            // No server of that folder is left, but a discovered one counts until close
+            expect(await checkAgentConfig()).to.equal(fs.realpathSync.native(agentPath))
+            await mgr.close(true)
+            expect(await checkAgentConfig()).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+        })
+
+        it('reinstalls the only registry server of that folder there, so the folder keeps it', async () => {
+            await mgr.removeServer('y')
+
+            await (mgr as any).reinstallServer('x', 'x', {
+                name: 'x',
+                version: '2.0.0',
+                remotes: [{ type: 'streamable-http', url: 'https://example.com/mcp' }],
+            })
+
+            expect(readAgentConfig().mcpServers).to.deep.equal({ x: { type: 'registry' } })
+            expect(readAgentConfig().tools).to.deep.equal(['@x'])
+            expect(mgr.getAllServerConfigs().get('x')?.__configPath__).to.equal(agentPath)
+        })
+
+        it('reinstalls there a registry server that was added to that folder after discovery', async () => {
+            // A folder with no server at discovery, which gets one during the session and then leaves
+            const otherDir = path.join(root, 'other-repo')
+            const otherAgentPath = path.join(otherDir, '.amazonq', 'agents', 'default.json')
+            fs.mkdirSync(otherDir)
+            folders = [{ uri: pathToFileURL(otherDir).href, name: 'other' }]
+            await mgr.addRegistryServer('z', { url: 'https://example.com/mcp' } as MCPServerConfig, otherAgentPath)
+            folders = []
+
+            await (mgr as any).reinstallServer('z', 'z', {
+                name: 'z',
+                version: '2.0.0',
+                remotes: [{ type: 'streamable-http', url: 'https://example.com/mcp' }],
+            })
+
+            const saved = JSON.parse(fs.readFileSync(otherAgentPath, 'utf-8'))
+            expect(saved.mcpServers).to.deep.equal({ z: { type: 'registry' } })
+            expect(saved.tools).to.include('@z')
+        })
+    })
 })
 
 describe('mutateConfigFile()', () => {
@@ -570,11 +905,13 @@ describe('mutateConfigFile()', () => {
     let readFileStub: sinon.SinonStub
     let writeFileStub: sinon.SinonStub
     let mkdirStub: sinon.SinonStub
+    let checkMcpConfigWriteStub: sinon.SinonStub
     let mgr: McpManager
 
     beforeEach(async () => {
         sinon.restore()
         stubAgentConfig()
+        checkMcpConfigWriteStub = sinon.stub(mcpUtils, 'checkMcpConfigWrite').callsFake(returnCheckedPath)
         existsStub = sinon.stub(fakeWorkspace.fs, 'exists').resolves(true)
         readFileStub = sinon
             .stub(fakeWorkspace.fs, 'readFile')
@@ -626,6 +963,79 @@ describe('mutateConfigFile()', () => {
         // Verify the content was created correctly
         const writtenContent = JSON.parse(writeFileStub.firstCall.args[1])
         expect(writtenContent.mcpServers).to.have.property('newServer')
+    })
+
+    it('reads and writes nothing when the MCP config may not be written', async () => {
+        const refusal = new mcpUtils.ConfigWriteRefusedError('The MCP config was not saved because it is outside')
+        checkMcpConfigWriteStub.rejects(refusal)
+        const mutator = sinon.spy()
+        const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+        let error: unknown
+        try {
+            await mutateConfigFile(path.join('ws', '.amazonq', 'mcp.json'), mutator)
+        } catch (e) {
+            error = e
+        }
+
+        expect(error).to.equal(refusal)
+        sinon.assert.calledOnceWithMatch(
+            checkMcpConfigWriteStub,
+            sinon.match.any,
+            sinon.match.any,
+            path.join('ws', '.amazonq', 'mcp.json')
+        )
+        sinon.assert.notCalled(readFileStub)
+        sinon.assert.notCalled(mutator)
+        sinon.assert.notCalled(mkdirStub)
+        sinon.assert.notCalled(writeFileStub)
+    })
+
+    for (const folder of ['C#', 'what?', '100%25']) {
+        it(`checks, reads, and writes the same file when a folder is named ${folder}`, async () => {
+            // A path is not read as a URI, which would end it at '#' or '?' or decode '%25'
+            const configPath = path.join(path.sep, 'src', folder, 'app', '.amazonq', 'mcp.json')
+            const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+            await mutateConfigFile(configPath, (json: any) => {
+                json.mcpServers.newServer = { command: 'test' }
+            })
+
+            expect(checkMcpConfigWriteStub.firstCall.args[2]).to.equal(configPath)
+            expect(readFileStub.firstCall.args[0]).to.equal(configPath)
+            expect(mkdirStub.firstCall.args[0]).to.equal(path.dirname(configPath))
+            expect(writeFileStub.firstCall.args[0]).to.equal(configPath)
+        })
+    }
+
+    it('reads and writes the path that the check returns, which is the resolved path it checked', async () => {
+        const resolvedPath = path.join(path.sep, 'real', 'repo', '.amazonq', 'mcp.json')
+        checkMcpConfigWriteStub.resolves(resolvedPath)
+        const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+        await mutateConfigFile(path.join(path.sep, 'linked', 'repo', '.amazonq', 'mcp.json'), (json: any) => {
+            json.mcpServers.newServer = { command: 'test' }
+        })
+
+        expect(readFileStub.firstCall.args[0]).to.equal(resolvedPath)
+        expect(mkdirStub.firstCall.args[0]).to.equal(path.dirname(resolvedPath))
+        expect(writeFileStub.firstCall.args[0]).to.equal(resolvedPath)
+    })
+
+    it('checks, reads, and writes the file that a file URI names', async () => {
+        const configUri = pathToFileURL(path.join(os.tmpdir(), 'C#', 'app', '.amazonq', 'mcp.json')).href
+        const mutateConfigFile = (mgr as any).mutateConfigFile.bind(mgr)
+
+        await mutateConfigFile(configUri, (json: any) => {
+            json.mcpServers.newServer = { command: 'test' }
+        })
+
+        const checked: string = checkMcpConfigWriteStub.firstCall.args[2]
+        expect(path.isAbsolute(checked)).to.be.true
+        expect(checked.endsWith(path.join('C#', 'app', '.amazonq', 'mcp.json'))).to.be.true
+        expect(readFileStub.firstCall.args[0]).to.equal(checked)
+        expect(mkdirStub.firstCall.args[0]).to.equal(path.dirname(checked))
+        expect(writeFileStub.firstCall.args[0]).to.equal(checked)
     })
 })
 
@@ -1224,11 +1634,60 @@ describe('listServersAndTools()', () => {
 describe('updateServerPermission()', () => {
     let saveAgentConfigStub: sinon.SinonStub
     let saveServerSpecificAgentConfigStub: sinon.SinonStub
+    let checkAgentConfigWriteStub: sinon.SinonStub
+    let checkMcpConfigWriteStub: sinon.SinonStub
 
     beforeEach(() => {
         saveAgentConfigStub = sinon.stub(mcpUtils, 'saveAgentConfig').resolves()
         saveServerSpecificAgentConfigStub = sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+        checkAgentConfigWriteStub = sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(returnCheckedPath)
+        checkMcpConfigWriteStub = sinon.stub(mcpUtils, 'checkMcpConfigWrite').callsFake(returnCheckedPath)
     })
+
+    /** A running server 'srv' with one tool, saved in `configPath`, and the status changes after this */
+    async function startServer(configPath: string) {
+        const cfg: MCPServerConfig = {
+            command: 'c',
+            args: [],
+            env: {},
+            timeout: 0,
+            disabled: false,
+            __configPath__: configPath,
+        }
+        sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map([['srv', cfg]]),
+            serverNameMapping: new Map([['srv', 'srv']]),
+            errors: new Map(),
+            agentConfig: {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: { srv: cfg },
+                tools: ['@srv'],
+                allowedTools: [],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            },
+        })
+        stubInitOneServer()
+        await McpManager.init([configPath], features)
+        const mgr = McpManager.instance
+        await mgr.discoverAllServers()
+        const statusEvents: { server: string; status: McpServerStatus; lastError?: string }[] = []
+        mgr.events.on(MCP_SERVER_STATUS_CHANGED, (server, state) =>
+            statusEvents.push({ server, status: state.status, lastError: state.lastError })
+        )
+        return { mgr, statusEvents }
+    }
+
+    async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+        try {
+            await promise
+        } catch (error) {
+            return error
+        }
+        throw new Error('Expected the promise to reject')
+    }
 
     afterEach(async () => {
         sinon.restore()
@@ -1281,6 +1740,135 @@ describe('updateServerPermission()', () => {
 
         // Verify the tool permission was updated
         expect(mgr.requiresApproval('srv', 'tool1')).to.be.false
+    })
+
+    it('throws a refused agent config save and leaves the server with its permissions and state', async () => {
+        const { mgr, statusEvents } = await startServer('x.json')
+        const reason = 'The agent config was not saved because it is outside the workspace folder'
+        checkAgentConfigWriteStub.rejects(new mcpUtils.ConfigWriteRefusedError(reason))
+
+        const error = await rejectionOf(
+            mgr.updateServerPermission('srv', {
+                enabled: true,
+                toolPerms: { tool1: McpPermissionType.alwaysAllow },
+                __configPath__: '/p',
+            })
+        )
+
+        expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+        expect((error as Error).message).to.equal(reason)
+        sinon.assert.calledOnceWithMatch(checkAgentConfigWriteStub, sinon.match.any, sinon.match.any, '/p')
+        // A refused write is not a server failure: the server keeps its state, and nothing changed or was saved
+        expect(statusEvents).to.deep.equal([])
+        expect(mgr.getServerState('srv')).to.deep.equal({
+            status: McpServerStatus.ENABLED,
+            toolsCount: 1,
+            lastError: undefined,
+        })
+        sinon.assert.notCalled(saveServerSpecificAgentConfigStub)
+        expect(mgr.requiresApproval('srv', 'tool1')).to.be.true
+        expect(mgr.getMcpServerPermissions('srv')?.toolPerms ?? {}).to.not.have.property('tool1')
+    })
+
+    it('throws a refused mcp.json save of a legacy server before it checks or saves anything else', async () => {
+        const mcpPath = path.join('ws', '.amazonq', 'mcp.json')
+        const { mgr, statusEvents } = await startServer(mcpPath)
+        checkMcpConfigWriteStub.rejects(new mcpUtils.ConfigWriteRefusedError('The MCP config was not saved because x'))
+        const writeFile = sinon.spy(fakeWorkspace.fs, 'writeFile')
+
+        const error = await rejectionOf(mgr.updateServerPermission('srv', { enabled: false, toolPerms: {} }))
+
+        expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+        sinon.assert.calledOnceWithMatch(checkMcpConfigWriteStub, sinon.match.any, sinon.match.any, mcpPath)
+        sinon.assert.notCalled(checkAgentConfigWriteStub)
+        sinon.assert.notCalled(writeFile)
+        sinon.assert.notCalled(saveServerSpecificAgentConfigStub)
+        expect(mgr.isServerDisabled('srv')).to.be.false
+        expect(mgr.getServerState('srv')?.status).to.equal(McpServerStatus.ENABLED)
+        expect(statusEvents).to.deep.equal([])
+    })
+
+    it('still shows the server as failed with the reason when the change fails for another reason', async () => {
+        const { mgr } = await startServer('x.json')
+        saveServerSpecificAgentConfigStub.rejects(new Error('disk full'))
+
+        await mgr.updateServerPermission('srv', {
+            enabled: true,
+            toolPerms: { tool1: McpPermissionType.alwaysAllow },
+            __configPath__: '/p',
+        })
+
+        expect(mgr.getServerState('srv')).to.include({ status: McpServerStatus.FAILED, lastError: 'disk full' })
+    })
+
+    it('throws a refused save of a real workspace agent config that names the file, and writes nothing', async () => {
+        const cfg: MCPServerConfig = {
+            command: 'c',
+            args: [],
+            env: {},
+            timeout: 0,
+            disabled: false,
+            __configPath__: 'x.json',
+        }
+        sinon.stub(mcpUtils, 'loadAgentConfig').resolves({
+            servers: new Map([['srv', cfg]]),
+            serverNameMapping: new Map([['srv', 'srv']]),
+            errors: new Map(),
+            agentConfig: {
+                name: 'test-agent',
+                description: 'Test agent',
+                mcpServers: { srv: cfg },
+                tools: ['@srv'],
+                allowedTools: [],
+                toolsSettings: {},
+                includedFiles: [],
+                resources: [],
+            },
+        })
+        stubInitOneServer()
+        checkAgentConfigWriteStub.restore()
+        const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'workspace-'))
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'))
+        try {
+            fs.mkdirSync(path.join(workspaceDir, '.amazonq'))
+            fs.symlinkSync(
+                outside,
+                path.join(workspaceDir, '.amazonq', 'agents'),
+                process.platform === 'win32' ? 'junction' : 'dir'
+            )
+            const refusingFeatures = {
+                ...features,
+                workspace: {
+                    ...features.workspace,
+                    fs: { ...features.workspace.fs, getUserHomeDir: () => os.tmpdir() },
+                    getAllWorkspaceFolders: () => [{ uri: pathToFileURL(workspaceDir).href, name: 'ws' }],
+                },
+            }
+
+            await McpManager.init(['x.json'], refusingFeatures)
+            const mgr = McpManager.instance
+            await mgr.discoverAllServers()
+
+            const agentPath = path.join(workspaceDir, '.amazonq', 'agents', 'default.json')
+            const error = await rejectionOf(
+                mgr.updateServerPermission('srv', {
+                    enabled: true,
+                    toolPerms: { tool1: McpPermissionType.alwaysAllow },
+                    __configPath__: agentPath,
+                })
+            )
+
+            expect(error).to.be.instanceOf(mcpUtils.ConfigWriteRefusedError)
+            expect((error as Error).message).to.equal(
+                `The agent config ${JSON.stringify(agentPath)} was not saved because it is outside the workspace ` +
+                    'folder after symbolic links are followed'
+            )
+            expect(mgr.getServerState('srv')?.status).to.equal(McpServerStatus.ENABLED)
+            expect(fs.readdirSync(outside)).to.deep.equal([])
+        } finally {
+            fs.rmSync(workspaceDir, { recursive: true, force: true })
+            fs.rmSync(outside, { recursive: true, force: true })
+        }
     })
 })
 
@@ -1402,6 +1990,37 @@ describe('handleError()', () => {
         expect(toolsEvents[0].server).to.equal('srvX')
         expect(toolsEvents[0].tools).to.be.an('array').that.is.empty
     })
+
+    for (const message of [
+        'write EPIPE',
+        'read ECONNRESET',
+        'SSE error: TypeError: terminated: (ENETRESET)',
+        'SSE error: TypeError: terminated: Body Timeout Error',
+        'TypeError: terminated: other side closed',
+    ]) {
+        it(`logs a dropped connection at debug and keeps the state: ${message}`, () => {
+            const debugSpy = sinon.spy(fakeLogging as { debug: (message: string) => void }, 'debug')
+
+            ;(mgr as any).handleError('srvX', new Error(message))
+
+            sinon.assert.calledWithMatch(debugSpy, `MCP SSE idle timeout [srvX]: ${message}`)
+            sinon.assert.notCalled(errorSpy)
+            expect(statusEvents).to.deep.equal([])
+        })
+    }
+
+    for (const message of [
+        'The agent config "/src/CodePipelineTools/.amazonq/agents/default.json" was not saved',
+        "MCP: server 'repipe' failed to connect: ECONNRESETS is not a code",
+    ]) {
+        it(`reports an error whose message has the letters of a connection error code only inside a word: ${message}`, () => {
+            ;(mgr as any).handleError('srvX', new Error(message))
+
+            sinon.assert.calledOnce(errorSpy)
+            expect(statusEvents).to.have.length(1)
+            expect(statusEvents[0].state).to.include({ status: McpServerStatus.FAILED, lastError: message })
+        })
+    }
 })
 
 describe('concurrent server initialization', () => {
@@ -2656,6 +3275,7 @@ describe('workspace trust for stdio MCP servers', () => {
     it('forgets a removed server, so a later restricted change does not report it', async () => {
         const mgr = await buildMgr('trusted')
         sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+        sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(returnCheckedPath)
         mgr.mcpServers.set('svc', stdioCfg)
         mgr.stdioLaunchFolders.set('svc', folderPath)
 
@@ -3171,6 +3791,7 @@ describe('workspace trust for stdio MCP servers', () => {
         it('does not report a hold for a removed server', async () => {
             const mgr = await buildMgr('restricted')
             sinon.stub(mcpUtils, 'saveServerSpecificAgentConfig').resolves()
+            sinon.stub(mcpUtils, 'checkAgentConfigWrite').callsFake(returnCheckedPath)
             await start(mgr)
 
             await mgr.removeServer('svc')

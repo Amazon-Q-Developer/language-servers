@@ -5,6 +5,7 @@ import * as path from 'path'
 import sinon from 'ts-sinon'
 import {
     hasAdditionalHardLinks,
+    resolveStrictlyInsideFolders,
     isPathApproved,
     isRegularFile,
     requiresPathAcceptance,
@@ -1183,6 +1184,103 @@ describe('toolShared', () => {
             assert.strictEqual(await isRegularFile(file), true)
             assert.strictEqual(await isRegularFile(dir), false)
             assert.strictEqual(await isRegularFile(path.join(dir, 'missing.txt')), false)
+        })
+    })
+
+    describe('resolveStrictlyInsideFolders', () => {
+        let root: string
+        let folder: string
+        let outside: string
+
+        beforeEach(async () => {
+            // The real path, so that a resolved path can be compared on a host whose temporary folder is a link
+            root = await fs.promises.realpath(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'inside-folder-')))
+            folder = path.join(root, 'repo')
+            outside = path.join(root, 'outside')
+            await fs.promises.mkdir(folder)
+            await fs.promises.mkdir(outside)
+        })
+
+        afterEach(async () => {
+            sinon.restore()
+            await fs.promises.rm(root, { recursive: true, force: true })
+        })
+
+        it('is inside, with the resolved path, for a path in the folder, also one that does not exist yet', async () => {
+            await fs.promises.writeFile(path.join(folder, 'a.json'), '{}')
+
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], path.join(folder, 'a.json')), {
+                kind: 'inside',
+                canonicalPath: path.join(folder, 'a.json'),
+            })
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], path.join(folder, 'new', 'b.json')), {
+                kind: 'inside',
+                canonicalPath: path.join(folder, 'new', 'b.json'),
+            })
+        })
+
+        it("is outside for the folder itself, for a path next to it, and for a name that starts with '..'", async () => {
+            for (const filePath of [folder, path.join(outside, 'a.json'), path.join(folder, '..notes.md')]) {
+                assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], filePath), { kind: 'outside' })
+            }
+        })
+
+        it('is outside of no folders, and inside when any of the folders holds the path', async () => {
+            const filePath = path.join(outside, 'a.json')
+
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([], filePath), { kind: 'outside' })
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder, outside], filePath), {
+                kind: 'inside',
+                canonicalPath: filePath,
+            })
+        })
+
+        it('follows a folder link: outside when it leads out of the folder, inside at its target when it stays in', async () => {
+            const type = process.platform === 'win32' ? 'junction' : 'dir'
+            await fs.promises.mkdir(path.join(folder, 'inner'))
+            await fs.promises.symlink(outside, path.join(folder, 'out-link'), type)
+            await fs.promises.symlink(path.join(folder, 'inner'), path.join(folder, 'in-link'), type)
+
+            assert.deepStrictEqual(
+                await resolveStrictlyInsideFolders([folder], path.join(folder, 'out-link', 'a.json')),
+                { kind: 'outside' }
+            )
+            assert.deepStrictEqual(
+                await resolveStrictlyInsideFolders([folder], path.join(folder, 'in-link', 'a.json')),
+                { kind: 'inside', canonicalPath: path.join(folder, 'inner', 'a.json') }
+            )
+        })
+
+        it('is unresolved with ELOOP when the links in the path point at each other', async function (this: Context) {
+            try {
+                await fs.promises.symlink(path.join(folder, 'b'), path.join(folder, 'a'), 'file')
+                await fs.promises.symlink(path.join(folder, 'a'), path.join(folder, 'b'), 'file')
+            } catch {
+                // A file link on Windows needs a privilege that the test may not have
+                this.skip()
+            }
+
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], path.join(folder, 'a')), {
+                kind: 'unresolved',
+                errorCode: 'ELOOP',
+            })
+        })
+
+        it('is unresolved with the error code of another failure, and without one for an error that has none', async () => {
+            const lstat = sinon.stub(fs.promises, 'lstat')
+            lstat.rejects(Object.assign(new Error('permission denied'), { code: 'EACCES' }))
+
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], path.join(folder, 'a.json')), {
+                kind: 'unresolved',
+                errorCode: 'EACCES',
+            })
+
+            lstat.rejects(new Error('no code'))
+
+            assert.deepStrictEqual(await resolveStrictlyInsideFolders([folder], path.join(folder, 'a.json')), {
+                kind: 'unresolved',
+                errorCode: undefined,
+            })
         })
     })
 

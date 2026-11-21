@@ -19,8 +19,7 @@ import {
     createNamespacedToolName,
     enabledMCP,
     migrateToAgentConfig,
-    migrateAgentConfigToCLIFormat,
-    normalizePathFromUri,
+    migrateAgentConfigsToCLIFormat,
 } from './mcp/mcpUtils'
 import { FsReplace, FsReplaceParams } from './fsReplace'
 import { recordFileUpdate, requireResolvedTarget, requireResolvedTargets } from './toolShared'
@@ -451,13 +450,7 @@ export const McpToolsServer: Server = ({
             await migrateToAgentConfig(workspace, logging, agent)
 
             // Migrate existing agent configs to CLI format
-            for (const agentPath of allAgentPaths) {
-                const normalizedAgentPath = normalizePathFromUri(agentPath)
-                const exists = await workspace.fs.exists(normalizedAgentPath).catch(() => false)
-                if (exists) {
-                    await migrateAgentConfigToCLIFormat(workspace, logging, normalizedAgentPath)
-                }
-            }
+            await migrateAgentConfigsToCLIFormat(workspace, logging)
 
             // Get registry URL from profile monitor if available
             let registryUrl: string | null = null
