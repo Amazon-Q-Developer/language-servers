@@ -866,25 +866,28 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
         })
 
-        it('opens nothing for a network path or a non-http scheme and tells the user', () => {
+        it('opens nothing for a network path, a non-http scheme or a web link that can open another host', () => {
             props().onLinkClick('tab-1', 'answer-1', '\\\\host\\share\\x', undefined, 'event-1')
             props().onInfoLinkClick('tab-1', 'vscode://x', undefined, 'event-2')
+            props().onLinkClick('tab-1', 'answer-1', 'https://trusted.example@attacker.example/', undefined, 'event-3')
+            props().onInfoLinkClick('tab-1', 'https://trusted.example\\@attacker.example/', undefined, 'event-4')
 
             sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
-            sinon.assert.calledTwice(notifySpy)
+            strictEqual(notifySpy.callCount, 4)
             for (const call of notifySpy.getCalls()) {
                 deepStrictEqual(call.args, [
                     {
                         type: NotificationType.WARNING,
                         title: 'Link not opened',
-                        content: 'Chat opens only web (http or https) links and local file paths.',
+                        content:
+                            'Chat opens only web (http or https) links without a user name or password, and local file paths.',
                     },
                 ])
             }
-            strictEqual(telemetryNamed('linkClick').length, 1)
-            strictEqual(telemetryNamed('infoLinkClick').length, 1)
+            strictEqual(telemetryNamed('linkClick').length, 2)
+            strictEqual(telemetryNamed('infoLinkClick').length, 2)
         })
 
         it('sends an absolute info link path as a file click with fullPath', () => {
@@ -930,6 +933,8 @@ describe('MynahUI', () => {
                 'src/foo.ts',
                 '\\\\host\\share\\x',
                 '',
+                'https://user:pass@example.com/',
+                'https://trusted.example\\@attacker.example/',
             ]
             for (const link of links) {
                 props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
@@ -944,7 +949,7 @@ describe('MynahUI', () => {
                     {
                         type: NotificationType.WARNING,
                         title: 'Link not opened',
-                        content: 'Chat opens only web (http or https) source links.',
+                        content: 'Chat opens only web (http or https) source links without a user name or password.',
                     },
                 ])
             }

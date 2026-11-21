@@ -11,7 +11,11 @@ describe('ChatEventParser', () => {
     const mockMessageId = 'mock-message-id'
 
     it('set error if invalidState event is received', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         sinon.assert.match(
             chatEventParser.processPartialEvent({
@@ -39,7 +43,11 @@ describe('ChatEventParser', () => {
     })
 
     it('set error if error event is received', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         sinon.assert.match(
             chatEventParser.processPartialEvent({
@@ -72,7 +80,11 @@ describe('ChatEventParser', () => {
     })
 
     it('processPartialEvent appends new event on top of the previous result', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         assert.deepStrictEqual(
             chatEventParser.processPartialEvent({
@@ -120,7 +132,11 @@ describe('ChatEventParser', () => {
     })
 
     it('processPartialEvent with messageMetadataEvent appends conversation id', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         chatEventParser.processPartialEvent({
             messageMetadataEvent: {
@@ -150,7 +166,11 @@ describe('ChatEventParser', () => {
     })
 
     it('getResult returns the accumulated result', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         chatEventParser.processPartialEvent({
             assistantResponseEvent: {
@@ -362,21 +382,6 @@ describe('ChatEventParser', () => {
             )
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 3)
             assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 1'], ['Source links dropped: 1']])
-        })
-
-        it('still filters source links when the optional logger is omitted', () => {
-            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
-
-            chatEventParser.processPartialEvent({
-                supplementaryWebLinksEvent: {
-                    supplementaryWebLinks: [webLink('file:///private'), webLink('https://example.com/')],
-                },
-            })
-
-            assert.deepStrictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, {
-                content: [{ title: 'title', url: 'https://example.com/', body: 'snippet' }],
-            })
-            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
         })
     })
 })

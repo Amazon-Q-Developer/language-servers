@@ -556,7 +556,7 @@ export const createMynahUi = (
                 return
             }
             messager.onSourceLinkClickTelemetry(payload)
-            notifyUnsupportedLink('Chat opens only web (http or https) source links.')
+            notifyUnsupportedLink('Chat opens only web (http or https) source links without a user name or password.')
         },
         onInfoLinkClick: (tabId, link, mouseEvent, eventId) => {
             mouseEvent?.preventDefault()
@@ -941,7 +941,9 @@ export const createMynahUi = (
         return tabId ?? createTabId()
     }
 
-    const notifyUnsupportedLink = (content = 'Chat opens only web (http or https) links and local file paths.') => {
+    const notifyUnsupportedLink = (
+        content = 'Chat opens only web (http or https) links without a user name or password, and local file paths.'
+    ) => {
         mynahUi.notify({
             type: NotificationType.WARNING,
             title: 'Link not opened',

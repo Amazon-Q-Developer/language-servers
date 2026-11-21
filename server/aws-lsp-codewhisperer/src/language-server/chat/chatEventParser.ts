@@ -36,7 +36,7 @@ export class ChatEventParser implements ChatResult {
     conversationId?: string
 
     #metric: Metric<AddMessageEvent>
-    #logging?: Features['logging']
+    #logging: Features['logging']
     #lastChunkTime: number = 0
     #totalEvents = {
         followupPromptEvent: 0,
@@ -70,7 +70,7 @@ export class ChatEventParser implements ChatResult {
         }
     }
 
-    constructor(messageId: string, metric: Metric<AddMessageEvent>, logging?: Features['logging']) {
+    constructor(messageId: string, metric: Metric<AddMessageEvent>, logging: Features['logging']) {
         this.messageId = messageId
         this.#metric = metric
         this.#logging = logging
@@ -135,7 +135,7 @@ export class ChatEventParser implements ChatResult {
                 .map(ChatEventParser.mapRelatedData)
             const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
             if (droppedLinkCount > 0) {
-                this.#logging?.debug(`Source links dropped: ${droppedLinkCount}`)
+                this.#logging.debug(`Source links dropped: ${droppedLinkCount}`)
             }
 
             if (sourceLinks.length > 0) {

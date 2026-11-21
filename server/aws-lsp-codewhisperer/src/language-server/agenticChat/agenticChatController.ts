@@ -4893,7 +4893,8 @@ export class AgenticChatController implements ChatHandlers {
 
     /**
      * Handles when a builder-id (not IdC) user invoked "Manage Subscription" or "Upgrade Q". It acts only when
-     * `awsAccountId` is not given, and it gets the subscription status without waiting for it:
+     * `awsAccountId` is not given; with one, it only logs that it did nothing. It gets the subscription status without
+     * waiting for it:
      * - For a PAID-TIER user: opens the "Manage Subscription" AWS console page in the external browser.
      * - For a FREE-TIER user: opens the "Upgrade Q" URL of the status response in the external browser if
      *   parseSubscriptionUpgradeUrl accepts it, shows the "Waiting…" progress indicator, and updates the UI when the
@@ -4902,7 +4903,8 @@ export class AgenticChatController implements ChatHandlers {
      * A failed status request, a missing or rejected upgrade URL and a wait that ends without a subscription are
      * shown through `showMessage`. A failed `showDocument` call and a failed wait are only logged.
      *
-     * @param awsAccountId The method acts only when this is not given
+     * @param awsAccountId The method acts only when this is not given, because the flow with an account is not
+     * implemented
      * @returns `undefined`, before the subscription interaction ends
      */
     async onManageSubscription(tabId: string, awsAccountId?: string): Promise<void> {
@@ -5025,6 +5027,7 @@ export class AgenticChatController implements ChatHandlers {
 
             return
         }
+        this.#log('onManageSubscription: did nothing, because a call with an AWS account ID is not supported')
     }
 
     async #processAgenticChatResponseWithTimeout(

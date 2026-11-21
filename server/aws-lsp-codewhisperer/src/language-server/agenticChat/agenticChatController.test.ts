@@ -556,6 +556,19 @@ describe('AgenticChatController', () => {
             getCodewhispererServiceStub.restore()
         })
 
+        it('does nothing and logs that when it is given an AWS account ID', async () => {
+            assert.strictEqual(await chatController.onManageSubscription(mockTabId, '123456789012'), undefined)
+            await new Promise(resolve => setTimeout(resolve, 0))
+
+            sinon.assert.notCalled(getSubscriptionStatusStub)
+            sinon.assert.notCalled(testFeatures.lsp.window.showDocument as sinon.SinonStub)
+            sinon.assert.notCalled(testFeatures.lsp.window.showMessage as sinon.SinonStub)
+            assert.strictEqual(
+                loggedText(),
+                'onManageSubscription: did nothing, because a call with an AWS account ID is not supported'
+            )
+        })
+
         it('opens an https URL on the AWS sign-in host in the external browser without logging it', async () => {
             await manageSubscription(signInUrl)
 
