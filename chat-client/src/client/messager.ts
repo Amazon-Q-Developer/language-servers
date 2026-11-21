@@ -224,6 +224,15 @@ export class Messager {
 
     onSourceLinkClick = (params: SourceLinkClickParams): void => {
         this.chatApi.sourceLinkClick(params)
+        this.onSourceLinkClickTelemetry(params)
+    }
+
+    /**
+     * Records the telemetry of every source link click: the clicks that chat sends to the IDE (onSourceLinkClick)
+     * and the clicks that it does not send because classifyChatLink does not accept the link as a web link. The event
+     * carries the link, and the server records it as the interaction target.
+     */
+    onSourceLinkClickTelemetry = (params: SourceLinkClickParams): void => {
         this.chatApi.telemetry({ ...params, name: SOURCE_LINK_CLICK_TELEMETRY_EVENT })
     }
 

@@ -32,8 +32,9 @@ import {
     isUsingIAMAuth,
     getBearerTokenFromProviderWithType,
     sanitizeLogInput,
+    isWebUrl,
 } from './utils'
-import { promises as fsPromises } from 'fs'
+import { promises as fsPromises, readFileSync } from 'fs'
 
 describe('getBearerTokenFromProvider', () => {
     const mockToken = 'mockToken'
@@ -1700,4 +1701,69 @@ describe('sanitizeRequestInput', () => {
             assert.strictEqual(result, input)
         })
     })
+})
+
+describe('isWebUrl', () => {
+    for (const url of [
+        'https://example.com',
+        'https://docs.example.com/guide?a=1#part',
+        'http://example.com:8080/x',
+        'HTTPS://EXAMPLE.COM/',
+        'https://127.0.0.1/',
+        'https://[::1]/',
+        ' https://example.com/ ',
+    ]) {
+        it(`accepts ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), true)
+        })
+    }
+
+    for (const url of [
+        undefined,
+        '',
+        'javascript:x',
+        'JavaScript:x',
+        ' javascript:x',
+        '\u0000javascript:x',
+        'java\nscript:x',
+        'data:text/html,hello',
+        'vbscript:x',
+        'file:///etc/hosts',
+        'file://server/share/x',
+        'vscode://settings/x',
+        'command:workbench.action.reloadWindow',
+        'mailto:someone@example.com',
+        'ftp://example.com/x',
+        'ws://example.com/',
+        'about:blank',
+        'blob:https://example.com/id',
+        'https://',
+        '//example.com/x',
+        '/etc/hosts',
+        'docs/relative.md',
+        'not a url',
+        // A user name or password before the host can make a link show one host and open another
+        'https://user:pass@example.com/',
+        'https://trusted.example@attacker.example/',
+        'https://:pass@example.com/',
+        // This parser reads a backslash as a slash, but the IDE's URL parser may read the part before @ as a user name
+        'https://trusted.example\\@attacker.example/',
+    ]) {
+        it(`rejects ${JSON.stringify(url)}`, () => {
+            assert.strictEqual(isWebUrl(url), false)
+        })
+    }
+
+    // The same table tests classifyChatLink in the chat client, so the two rules cannot drift apart
+    const { cases } = JSON.parse(
+        readFileSync(
+            path.join(__dirname, '..', '..', '..', '..', 'chat-client', 'src', 'client', 'webLinkCases.json'),
+            'utf8'
+        )
+    ) as { cases: { url: string; web: boolean }[] }
+    for (const { url, web } of cases) {
+        it(`judges ${JSON.stringify(url)} as the chat client does (web: ${web})`, () => {
+            assert.strictEqual(isWebUrl(url), web)
+        })
+    }
 })

@@ -277,6 +277,51 @@ describe('ChatController', () => {
             assert.deepStrictEqual(chatResult, expectedCompleteChatResult)
         })
 
+        it('logs dropped source link counts and preserves the source link event metric', async () => {
+            const emitAddMessageMetric = sinon
+                .stub(ChatTelemetryController.prototype, 'emitAddMessageMetric')
+                .resolves()
+            sendMessageStub.resolves({
+                $metadata: { requestId: mockMessageId },
+                sendMessageResponse: createIterableResponse([
+                    ...mockChatResponseList,
+                    {
+                        supplementaryWebLinksEvent: {
+                            supplementaryWebLinks: [
+                                { url: 'https://example.com/guide', title: 'Guide' },
+                                { url: 'file:///private?token=TEST-TOKEN' },
+                                { url: 'custom-scheme:private?token=TEST-TOKEN' },
+                            ],
+                        },
+                    },
+                    {
+                        supplementaryWebLinksEvent: {
+                            supplementaryWebLinks: [{ url: 'command:private?token=TEST-TOKEN' }],
+                        },
+                    },
+                ]),
+            })
+
+            const result = await chatController.onChatPrompt(
+                { tabId: mockTabId, prompt: { prompt: 'Hello' } },
+                mockCancellationToken
+            )
+
+            assert.ok(!(result instanceof ResponseError))
+            assert.deepStrictEqual(result.relatedContent, {
+                content: [{ title: 'Guide', url: 'https://example.com/guide', body: undefined }],
+            })
+            sinon.assert.calledWith(emitAddMessageMetric, mockTabId, sinon.match({ cwsprChatSourceLinkCount: 2 }))
+            sinon.assert.calledWithExactly(testFeatures.logging.debug, 'Source links dropped: 2')
+            sinon.assert.calledWithExactly(testFeatures.logging.debug, 'Source links dropped: 1')
+            for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+                sinon.assert.neverCalledWithMatch(
+                    testFeatures.logging[level] as sinon.SinonStub,
+                    sinon.match('TEST-TOKEN')
+                )
+            }
+        })
+
         it('returns help message if it is a help follow up action', async () => {
             const chatResultPromise = chatController.onChatPrompt(
                 { tabId: mockTabId, prompt: { prompt: DEFAULT_HELP_FOLLOW_UP_PROMPT } },
@@ -547,6 +592,40 @@ describe('ChatController', () => {
     })
 
     describe('onInlineChatPrompt', () => {
+        it('logs dropped source link counts for inline chat without logging link values', async () => {
+            sendMessageStub.resolves({
+                $metadata: { requestId: mockMessageId },
+                sendMessageResponse: createIterableResponse([
+                    ...mockChatResponseList,
+                    {
+                        supplementaryWebLinksEvent: {
+                            supplementaryWebLinks: [
+                                { url: 'https://example.com/guide', title: 'Guide' },
+                                { url: 'file:///private?token=TEST-TOKEN' },
+                            ],
+                        },
+                    },
+                ]),
+            })
+
+            const result = await chatController.onInlineChatPrompt(
+                { prompt: { prompt: 'Hello' } },
+                mockCancellationToken
+            )
+
+            assert.ok(!(result instanceof ResponseError))
+            assert.deepStrictEqual(result.relatedContent, {
+                content: [{ title: 'Guide', url: 'https://example.com/guide', body: undefined }],
+            })
+            sinon.assert.calledWithExactly(testFeatures.logging.debug, 'Source links dropped: 1')
+            for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+                sinon.assert.neverCalledWithMatch(
+                    testFeatures.logging[level] as sinon.SinonStub,
+                    sinon.match('TEST-TOKEN')
+                )
+            }
+        })
+
         it('read all the response streams and return compiled results', async () => {
             const chatResultPromise = chatController.onInlineChatPrompt(
                 { prompt: { prompt: 'Hello' } },

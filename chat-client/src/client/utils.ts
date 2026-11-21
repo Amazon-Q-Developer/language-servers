@@ -285,21 +285,36 @@ export function chatMessageToChatItem(message: ChatMessage, isPairProgrammingMod
 
 export type ChatLinkTarget = { kind: 'link' } | { kind: 'file'; filePath: string; fullPath?: string } | { kind: 'none' }
 
+/** `href` without its leading characters up to U+0020, which a browser skips before it reads a URL */
+function withoutLeadingC0ControlsAndSpaces(href: string): string {
+    let start = 0
+    while (start < href.length && href.charCodeAt(start) <= 0x20) {
+        start++
+    }
+    return href.slice(start)
+}
+
 /**
  * Decides where a link clicked in a chat answer goes: http(s) URLs open as links, local paths
- * go to the file-click handler, and everything else (other schemes, `//host` paths) is dropped.
+ * go to the file-click handler, and everything else (other schemes, `//host` paths, and http(s)
+ * URLs that can show one host and open another) is dropped. The IDE gets the link as written,
+ * so an http(s) URL with a user name, a password or a backslash is dropped: a browser reads a
+ * backslash as a slash, but the IDE's URL parser may not.
  */
 export function classifyChatLink(href: string | undefined): ChatLinkTarget {
-    // As a browser reads a link: without tabs and line breaks, and without leading control characters and spaces
-    href = href?.replace(/[\t\n\r]/g, '').replace(/^[\p{Cc}\s]+/u, '')
-    if (!href) {
+    href = href?.replace(/[\t\n\r]/g, '')
+    // As a browser reads a web link: without tabs and line breaks, and without leading C0 control characters and spaces
+    const webHref = href === undefined ? undefined : withoutLeadingC0ControlsAndSpaces(href)
+    // Paths and schemes are also read without other leading control characters and spaces
+    href = href?.replace(/^[\p{Cc}\s]+/u, '')
+    if (!href || !webHref) {
         return { kind: 'none' }
     }
 
     try {
-        const url = new URL(href)
+        const url = new URL(webHref)
         if ((url.protocol === 'http:' || url.protocol === 'https:') && url.hostname) {
-            return { kind: 'link' }
+            return url.username || url.password || webHref.includes('\\') ? { kind: 'none' } : { kind: 'link' }
         }
     } catch {
         // Not an absolute URL; check below whether it is a local path.
