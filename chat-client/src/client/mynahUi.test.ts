@@ -866,27 +866,30 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
         })
 
-        it('opens nothing for a network path, a non-http scheme or a web link that can open another host', () => {
+        it('opens nothing for a network path, a non-http scheme or a web link with credentials or a backslash', () => {
             props().onLinkClick('tab-1', 'answer-1', '\\\\host\\share\\x', undefined, 'event-1')
             props().onInfoLinkClick('tab-1', 'vscode://x', undefined, 'event-2')
             props().onLinkClick('tab-1', 'answer-1', 'https://trusted.example@attacker.example/', undefined, 'event-3')
             props().onInfoLinkClick('tab-1', 'https://trusted.example\\@attacker.example/', undefined, 'event-4')
+            // A backslash alone, with no user name or password
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com\\path', undefined, 'event-5')
 
             sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
-            strictEqual(notifySpy.callCount, 4)
+            strictEqual(notifySpy.callCount, 5)
             for (const call of notifySpy.getCalls()) {
                 deepStrictEqual(call.args, [
                     {
                         type: NotificationType.WARNING,
                         title: 'Link not opened',
                         content:
-                            'Chat opens only web (http or https) links without a user name or password, and local file paths.',
+                            'Chat opens only web (http or https) links and local file paths. ' +
+                            'It does not open a web link with a user name, a password or a backslash.',
                     },
                 ])
             }
-            strictEqual(telemetryNamed('linkClick').length, 2)
+            strictEqual(telemetryNamed('linkClick').length, 3)
             strictEqual(telemetryNamed('infoLinkClick').length, 2)
         })
 
@@ -924,7 +927,7 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(notifySpy)
         })
 
-        it('does not send a source link with another scheme or a local path, and tells the user', () => {
+        it('does not send a source link with another scheme, a local path, credentials or a backslash', () => {
             const links = [
                 'javascript:x',
                 'file:///etc/hosts',
@@ -935,6 +938,8 @@ describe('MynahUI', () => {
                 '',
                 'https://user:pass@example.com/',
                 'https://trusted.example\\@attacker.example/',
+                // A backslash alone, with no user name or password
+                'https://example.com\\path',
             ]
             for (const link of links) {
                 props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
@@ -949,7 +954,9 @@ describe('MynahUI', () => {
                     {
                         type: NotificationType.WARNING,
                         title: 'Link not opened',
-                        content: 'Chat opens only web (http or https) source links without a user name or password.',
+                        content:
+                            'Chat opens only web (http or https) source links. ' +
+                            'It does not open a link with a user name, a password or a backslash.',
                     },
                 ])
             }
