@@ -31,6 +31,7 @@ import {
     checkAgentConfigWrite,
     checkMcpConfigWrite,
     ConfigWriteRefusedError,
+    setConfigPathsOfLoadedServers,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
@@ -143,6 +144,9 @@ export class McpManager {
     private trustGeneration = 0
     // Set when the user forgot allowed folders but the saved approvals could not be cleared
     private ignoreSavedFolderApprovals = false
+    // The config paths of the servers that discoverAllServers loaded or removeServer removed since the manager
+    // started or last closed
+    private readonly knownConfigPaths = new Set<string>()
 
     private constructor(
         private agentPaths: string[],
@@ -163,6 +167,14 @@ export class McpManager {
         this.features.logging.info(`MCP manager: initialized with ${agentPaths.length} configs`)
         this.toolNameMapping = new Map<string, { serverName: string; toolName: string }>()
         this.serverNameMapping = new Map<string, string>()
+        // A server stays loaded after its workspace folder leaves the workspace, and the config write checks let a
+        // change to it write the config files of that folder. A server that was discovered or removed counts until
+        // close, so that a change that removes the last server of the folder and adds it back, as a reinstall does,
+        // can write it.
+        setConfigPathsOfLoadedServers(() => [
+            ...this.knownConfigPaths,
+            ...[...this.mcpServers.values()].map(config => config.__configPath__),
+        ])
     }
 
     public static async init(
@@ -486,6 +498,11 @@ export class McpManager {
         )
         this.mcpServers = result.servers
         this.serverNameMapping = result.serverNameMapping
+        for (const config of result.servers.values()) {
+            if (config.__configPath__) {
+                this.knownConfigPaths.add(config.__configPath__)
+            }
+        }
 
         // Reset the configuration errors after every refresh.
         // But preserve registry errors when registry mode is active
@@ -1459,6 +1476,8 @@ export class McpManager {
         if (!cfg || !cfg.__configPath__) {
             throw new Error(`MCP: server '${serverName}' not found`)
         }
+        // A change that removes the server may add it back to the same file, after the server left the map
+        this.knownConfigPaths.add(cfg.__configPath__)
 
         // Check if this is a legacy MCP server (from MCP config file)
         const isLegacyMcpServer = cfg.__configPath__?.endsWith('mcp.json')
@@ -1692,6 +1711,7 @@ export class McpManager {
         this.dockerContainers.clear()
         this.mcpTools = []
         this.mcpServers.clear()
+        this.knownConfigPaths.clear()
         this.mcpServerStates.clear()
         this.sessionDeniedConsent.clear()
         this.resourceSources = new Map()
@@ -1710,6 +1730,7 @@ export class McpManager {
         }
         if (!keepInstance) {
             McpManager.#instance = undefined
+            setConfigPathsOfLoadedServers(undefined)
         }
     }
 
@@ -2057,19 +2078,21 @@ export class McpManager {
 
     /**
      * Read, mutate, and write the MCP JSON config at the given path. Throws ConfigWriteRefusedError, before it reads
-     * or writes anything, if checkMcpConfigWrite refuses the file.
+     * or writes anything, if checkMcpConfigWrite refuses the file, and otherwise reads and writes the path that
+     * checkMcpConfigWrite returns.
      * @private
      */
     private async mutateConfigFile(configPath: string, mutator: (json: any) => void): Promise<void> {
-        // The one file that is checked, read, and written. Only a file URI is parsed as a URI: a plain path parsed
-        // as one names another file if it has a '#', '?', or '%' in it, for example in a folder named C#.
+        // The file that is checked. Only a file URI is parsed as a URI: a plain path parsed as one names another file
+        // if it has a '#', '?', or '%' in it, for example in a folder named C#.
         const filePath = path.normalize(normalizePathFromUri(configPath, this.features.logging))
         return McpManager.configMutex
             .runExclusive(async () => {
-                await checkMcpConfigWrite(this.features.workspace, this.features.logging, filePath)
+                // The one file that is read and written: the checked file at its resolved path
+                const target = await checkMcpConfigWrite(this.features.workspace, this.features.logging, filePath)
                 let json: any = { mcpServers: {} }
                 try {
-                    const raw = await this.features.workspace.fs.readFile(filePath)
+                    const raw = await this.features.workspace.fs.readFile(target)
                     this.features.logging.info(`Updating MCP config file: ${configPath}`)
                     const existing = JSON.parse(raw.toString())
                     json = { mcpServers: {}, ...existing }
@@ -2079,9 +2102,9 @@ export class McpManager {
                 }
                 mutator(json)
 
-                await this.features.workspace.fs.mkdir(path.dirname(filePath), { recursive: true })
+                await this.features.workspace.fs.mkdir(path.dirname(target), { recursive: true })
 
-                await this.features.workspace.fs.writeFile(filePath, JSON.stringify(json, null, 2))
+                await this.features.workspace.fs.writeFile(target, JSON.stringify(json, null, 2))
                 this.features.logging.debug(`MCP config file write complete: ${configPath}`)
             })
             .catch((e: any) => {
@@ -2342,7 +2365,8 @@ export class McpManager {
             /SSE error:\s*TypeError:\s*terminated:\s*Body Timeout Error/i.test(msg) ||
             /TypeError:\s*terminated:\s*Body Timeout Error/i.test(msg) ||
             /TypeError:\s*terminated:\s*other side closed/i.test(msg) ||
-            /ECONNRESET|ENETRESET|EPIPE/i.test(msg)
+            // A connection error code as a whole word, so that a word such as "CodePipeline" does not match EPIPE
+            /\b(?:ECONNRESET|ENETRESET|EPIPE)\b/i.test(msg)
 
         if (isBenignSseDisconnect) {
             this.features.logging.debug(`MCP SSE idle timeout${server ? ` [${server}]` : ''}: ${msg}`)

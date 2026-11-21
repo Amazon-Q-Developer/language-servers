@@ -70,7 +70,8 @@ export class McpEventHandler {
     #lastProgrammaticState: boolean = false
     /**
      * A rename on the edit form, which renames the server in memory at once: the name before it and the name after
-     * it. Only the save of that edit uses it, as the name of the server to remove.
+     * it. Only the save of that edit uses it, as the name of the server to remove, and the edit form of another
+     * server forgets it.
      */
     #renameInEdit: { from: string; to: string } | undefined
     #converter: McpServerConfigConverter = new McpServerConfigConverter()
@@ -1268,6 +1269,10 @@ export class McpEventHandler {
     async #handleEditMcpServer(params: McpServerClickParams, error?: string) {
         const serverName = params.title
         if (!serverName) return { id: params.id }
+        if (serverName !== this.#renameInEdit?.to) {
+            // The edit form of another server: a rename belongs to the edit it was made in
+            this.#renameInEdit = undefined
+        }
 
         const isRegistryModeActive = McpManager.instance.getRegistryService()?.isRegistryActive()
         if (isRegistryModeActive) {
@@ -1604,6 +1609,16 @@ export class McpEventHandler {
         // Handle server name change in edit mode
         if (editingServerName && title && editingServerName !== title) {
             const servers = McpManager.instance.getAllServerConfigs()
+            // Servers are stored under their sanitized names, so a name can collide in either spelling
+            const collides = (name: string) => name !== editingServerName && servers.has(name)
+            if (collides(title) || collides(sanitizeName(title))) {
+                // The rename would replace that server: stay on the edit form of this server and say why
+                params.id = 'edit-mcp'
+                return this.#handleEditMcpServer(
+                    { ...params, title: editingServerName },
+                    `Server name "${title}" already exists`
+                )
+            }
             const existingConfig = servers.get(editingServerName)
 
             if (existingConfig) {
@@ -2342,7 +2357,8 @@ export class McpEventHandler {
         } catch (error) {
             this.#features.logging.error(`Failed to update registry server: ${error}`)
             this.#releaseProgrammaticAfterDebounce()
-            return this.#handleEditRegistryMcpServer(params, String(error))
+            // Show the reason, as the add and edit forms do, without the error type in front of it
+            return this.#handleEditRegistryMcpServer(params, error instanceof Error ? error.message : String(error))
         }
     }
 

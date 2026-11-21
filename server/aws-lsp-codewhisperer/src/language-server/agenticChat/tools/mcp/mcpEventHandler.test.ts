@@ -568,7 +568,8 @@ describe('McpEventHandler error handling', () => {
                 sinon.assert.calledOnce(check)
                 sinon.assert.notCalled(removeServer)
                 sinon.assert.notCalled(addRegistryServer)
-                expect(result.header.status.title).to.include(reason)
+                // The reason as the user should read it, without the error type in front of it
+                expect(result.header.status.title).to.equal(reason)
             })
 
             it('stays on the add form with the reason and does not add a server that cannot be saved', async () => {
@@ -776,16 +777,21 @@ describe('McpEventHandler error handling', () => {
             }
 
             beforeEach(async () => {
-                // updateServerMap is stubbed, so these tests check only which server a save asks to remove
-                await setupServers(
-                    new Map([
-                        ['a', { command: 'npx', disabled: false }],
-                        ['b', { command: 'npx', disabled: false }],
-                        ['c', { command: 'npx', disabled: false }],
-                    ]),
-                    { a: McpServerStatus.ENABLED, b: McpServerStatus.ENABLED, c: McpServerStatus.ENABLED }
-                )
-                sinon.stub(McpManager.instance, 'updateServerMap')
+                // The servers are only renamed in the map that getAllServerConfigs returns, so these tests check only
+                // which server a save asks to remove
+                const configs = new Map<string, MCPServerConfig>([
+                    ['a', { command: 'npx', disabled: false }],
+                    ['c', { command: 'npx', disabled: false }],
+                ])
+                await setupServers(configs, {
+                    a: McpServerStatus.ENABLED,
+                    b: McpServerStatus.ENABLED,
+                    c: McpServerStatus.ENABLED,
+                })
+                sinon.stub(McpManager.instance, 'updateServerMap').callsFake(servers => {
+                    configs.clear()
+                    servers.forEach((config, name) => configs.set(name, config))
+                })
                 sinon.stub(McpManager.instance, 'addServer').resolves()
             })
 
@@ -822,6 +828,119 @@ describe('McpEventHandler error handling', () => {
                     sinon.assert.calledOnceWithExactly(removeServer, 'c')
                 })
             }
+
+            it('is forgotten when the edit form of another server opens, so a later edit of b does not remove a', async () => {
+                sinon.stub(mcpUtils, 'checkAgentConfigWrite').resolves()
+                const removeServer = sinon.stub(McpManager.instance, 'removeServer').resolves()
+                await renameAToB()
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'c' })
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'b' })
+                await saveForm('b')
+
+                sinon.assert.calledOnceWithExactly(removeServer, 'b')
+            })
+        })
+
+        describe('a rename on the edit form onto the name of another server', () => {
+            const serverA: MCPServerConfig = { command: 'npx', args: ['a'], disabled: false }
+
+            for (const status of [McpServerStatus.ENABLED, McpServerStatus.DISABLED]) {
+                it(`keeps both servers and shows why on the edit form when that server is ${status}`, async () => {
+                    const serverB: MCPServerConfig = {
+                        command: 'uvx',
+                        args: ['b'],
+                        disabled: status === McpServerStatus.DISABLED,
+                    }
+                    const configs = new Map([
+                        ['a', serverA],
+                        ['b', serverB],
+                    ])
+                    await setupServers(configs, { a: McpServerStatus.ENABLED, b: status })
+                    const updateServerMap = sinon.stub(McpManager.instance, 'updateServerMap')
+
+                    await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'a' })
+                    const result: any = await eventHandler.onMcpServerClick({
+                        id: 'change-transport',
+                        title: 'b',
+                        optionsValues: { name: 'b', transport: 'http', url: 'https://example.com/mcp' },
+                    } as any)
+
+                    sinon.assert.notCalled(updateServerMap)
+                    expect(configs.get('a')).to.equal(serverA)
+                    expect(configs.get('b')).to.equal(serverB)
+                    expect(result.id).to.equal('edit-mcp')
+                    expect(result.header.title).to.equal('Edit MCP Server')
+                    expect(result.header.status).to.deep.equal({
+                        title: 'Server name "b" already exists',
+                        icon: 'cancel-circle',
+                        status: 'error',
+                    })
+                })
+            }
+
+            it('refuses a name that another server is stored under after sanitizing', async () => {
+                const configs = new Map<string, MCPServerConfig>([
+                    ['a', serverA],
+                    ['myserver', { command: 'uvx', disabled: false }],
+                ])
+                await setupServers(configs, { a: McpServerStatus.ENABLED, myserver: McpServerStatus.ENABLED })
+                const updateServerMap = sinon.stub(McpManager.instance, 'updateServerMap')
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'a' })
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'change-transport',
+                    title: 'my server',
+                    optionsValues: { name: 'my server', transport: 'http', url: 'https://example.com/mcp' },
+                } as any)
+
+                sinon.assert.notCalled(updateServerMap)
+                expect(result.header.status.title).to.equal('Server name "my server" already exists')
+            })
+
+            it('still renames a server to another spelling of its own sanitized name', async () => {
+                await setupServers(new Map<string, MCPServerConfig>([['myserver', serverA]]), {
+                    myserver: McpServerStatus.ENABLED,
+                })
+                const updateServerMap = sinon.stub(McpManager.instance, 'updateServerMap')
+
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'myserver' })
+                await eventHandler.onMcpServerClick({
+                    id: 'change-transport',
+                    title: 'my server',
+                    optionsValues: { name: 'my server', transport: 'http', url: 'https://example.com/mcp' },
+                } as any)
+
+                sinon.assert.calledOnce(updateServerMap)
+                expect([...updateServerMap.firstCall.args[0].keys()]).to.deep.equal(['my server'])
+            })
+
+            it('then saves nothing under that name, and removes nothing', async () => {
+                const configs = new Map<string, MCPServerConfig>([
+                    ['a', serverA],
+                    ['b', { command: 'uvx', disabled: false }],
+                ])
+                await setupServers(configs, { a: McpServerStatus.ENABLED, b: McpServerStatus.ENABLED })
+                sinon.stub(McpManager.instance, 'updateServerMap')
+                const removeServer = sinon.stub(McpManager.instance, 'removeServer').resolves()
+                const addServer = sinon.stub(McpManager.instance, 'addServer').resolves()
+                await eventHandler.onMcpServerClick({ id: 'edit-mcp', title: 'a' })
+                await eventHandler.onMcpServerClick({
+                    id: 'change-transport',
+                    title: 'b',
+                    optionsValues: { name: 'b', transport: 'http', url: 'https://example.com/mcp' },
+                } as any)
+
+                const result: any = await eventHandler.onMcpServerClick({
+                    id: 'save-mcp',
+                    optionsValues: { name: 'b', transport: 'http', url: 'https://example.com/mcp', timeout: '60' },
+                } as any)
+
+                expect(result.id).to.equal('edit-mcp')
+                expect(result.header.status.title).to.equal('Server name "b" already exists')
+                sinon.assert.notCalled(removeServer)
+                sinon.assert.notCalled(addServer)
+            })
         })
 
         describe('servers held back by the workspace trust check', () => {

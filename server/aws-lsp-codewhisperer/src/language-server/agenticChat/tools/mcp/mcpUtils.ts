@@ -20,7 +20,7 @@ import path = require('path')
 import { QClientCapabilities } from '../../../configuration/qConfigurationServer'
 import crypto = require('crypto')
 import { McpServerConfigConverter } from './mcpServerConfigConverter'
-import { hasAdditionalHardLinks, isSamePath, resolveCanonicalPath, resolvesStrictlyInsideFolder } from '../toolShared'
+import { hasAdditionalHardLinks, isSamePath, resolveStrictlyInsideFolders } from '../toolShared'
 
 /**
  * Load, validate, and parse MCP server configurations from JSON files.
@@ -1141,49 +1141,102 @@ function isGlobalAgentConfigPath(workspace: Workspace, agentPath: string): boole
     )
 }
 
+/** The kinds of config file that a change to an MCP server writes */
+type ConfigKind = 'agent config' | 'MCP config'
+
+/** The path at which a config file may be written, which is the path that was checked, or why it may not be */
+type ConfigWriteDecision = { kind: 'allowed'; path: string } | { kind: 'refused'; refusal: string }
+
 /**
- * Why a write to the config file of a workspace folder at `configPath` is refused, or undefined if it may go ahead.
- * After every symbolic link in it is followed, `configPath` must be inside one of `folderPaths`, and a file that is
- * already there must have no other name on disk, because the write would change the file under that name too.
+ * Whether a change may write the config file of a workspace folder at `configPath`. After every symbolic link in it
+ * is followed, `configPath` must be strictly inside one of `folderPaths`, and a file that is already there must have
+ * no other name on disk, because the write would change the file under that name too. The path to write is the
+ * resolved one, so that the write does not follow the links in `configPath` a second time.
  */
-async function workspaceConfigWriteRefusal(folderPaths: string[], configPath: string): Promise<string | undefined> {
-    for (const folderPath of folderPaths) {
-        if (await resolvesStrictlyInsideFolder(folderPath, configPath)) {
-            try {
-                return (await hasAdditionalHardLinks(await resolveCanonicalPath(configPath)))
-                    ? 'it is also reachable under another name on disk'
-                    : undefined
-            } catch {
-                return 'it could not be resolved'
-            }
-        }
+async function decideWorkspaceConfigWrite(folderPaths: string[], configPath: string): Promise<ConfigWriteDecision> {
+    const target = await resolveStrictlyInsideFolders(folderPaths, configPath)
+    if (target.kind === 'inside') {
+        return (await hasAdditionalHardLinks(target.canonicalPath))
+            ? { kind: 'refused', refusal: 'it is also reachable under another name on disk' }
+            : { kind: 'allowed', path: target.canonicalPath }
     }
-    return 'it is outside the workspace folder after symbolic links are followed, or could not be resolved'
+    if (target.kind === 'outside') {
+        return { kind: 'refused', refusal: 'it is outside the workspace folder after symbolic links are followed' }
+    }
+    return {
+        kind: 'refused',
+        refusal: `its location could not be resolved${target.errorCode ? ` (${target.errorCode})` : ''}`,
+    }
 }
 
 /**
- * Whether a migration may write the agent config at `agentPath`: the global agent config when the location says
- * so and the path is that file, and the agent config of a workspace folder only as workspaceConfigWriteRefusal
- * allows. Logs a warning if not.
+ * The workspace folder whose own `kind` file is at `configPath`: `<folder>` for `<folder>/.amazonq/mcp.json` and for
+ * `<folder>/.amazonq/agents/default.json`, with any '.' and '..' in it applied as written, before links are followed.
+ * Undefined for any other path.
  */
-async function mayMigrateAgentConfig(
+function workspaceFolderOfConfig(configPath: string, kind: ConfigKind): string | undefined {
+    const folderPath = path.dirname(path.dirname(kind === 'MCP config' ? configPath : path.dirname(configPath)))
+    const [ownConfigPath] = (kind === 'MCP config' ? getWorkspaceMcpConfigPaths : getWorkspaceAgentConfigPaths)([
+        folderPath,
+    ])
+    return isSamePath(ownConfigPath, configPath) ? path.resolve(folderPath) : undefined
+}
+
+// The config paths of the servers that McpManager has loaded, see setConfigPathsOfLoadedServers
+let configPathsOfLoadedServers: () => Iterable<string | undefined> = () => []
+
+/**
+ * Sets where checkConfigWrite gets the config paths of the servers that McpManager has loaded. McpManager keeps a
+ * server after its workspace folder leaves the workspace, so a change to that server may still write the own config
+ * files of that folder, inside it. McpManager sets this when it starts, and resets it with undefined when it closes.
+ */
+export function setConfigPathsOfLoadedServers(provider: (() => Iterable<string | undefined>) | undefined): void {
+    configPathsOfLoadedServers = provider ?? (() => [])
+}
+
+/** Whether a server that McpManager has loaded comes from the own mcp.json or agents/default.json of `folderPath` */
+function isFolderOfLoadedServer(folderPath: string): boolean {
+    for (const serverConfigPath of configPathsOfLoadedServers()) {
+        if (!serverConfigPath) {
+            continue
+        }
+        const normalizedServerPath = normalizePathFromUri(serverConfigPath)
+        const serverFolder =
+            workspaceFolderOfConfig(normalizedServerPath, 'MCP config') ??
+            workspaceFolderOfConfig(normalizedServerPath, 'agent config')
+        if (serverFolder !== undefined && isSamePath(serverFolder, folderPath)) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * The path at which a migration may write the agent config at `agentPath`, or undefined, after a warning, if it may
+ * not. The global agent config may be written at `agentPath` when the location says so and the path is that file,
+ * and the agent config of a workspace folder at the resolved path that decideWorkspaceConfigWrite allows for that
+ * folder.
+ */
+async function agentConfigMigrationTarget(
     workspace: Workspace,
     logging: Logger,
     agentPath: string,
     location: AgentConfigLocation,
     action: 'create' | 'update'
-): Promise<boolean> {
-    let refusal: string | undefined
+): Promise<string | undefined> {
+    let decision: ConfigWriteDecision
     if (location.kind === 'global') {
-        refusal = isGlobalAgentConfigPath(workspace, agentPath) ? undefined : 'it is not the global agent config'
+        decision = isGlobalAgentConfigPath(workspace, agentPath)
+            ? { kind: 'allowed', path: agentPath }
+            : { kind: 'refused', refusal: 'it is not the global agent config' }
     } else {
-        refusal = await workspaceConfigWriteRefusal([location.folderPath], agentPath)
+        decision = await decideWorkspaceConfigWrite([location.folderPath], agentPath)
     }
-    if (refusal) {
-        logging.warn(`Did not ${action} the agent config ${JSON.stringify(agentPath)} because ${refusal}`)
-        return false
+    if (decision.kind === 'refused') {
+        logging.warn(`Did not ${action} the agent config ${JSON.stringify(agentPath)} because ${decision.refusal}`)
+        return undefined
     }
-    return true
+    return decision.path
 }
 
 /**
@@ -1193,40 +1246,51 @@ async function mayMigrateAgentConfig(
 export class ConfigWriteRefusedError extends Error {}
 
 /**
- * Throws ConfigWriteRefusedError if a change may not write the config file at `configPath`, which is a `kind` file.
- * The global file of that kind, `globalPath`, may always be written, and the file of a workspace folder only as
- * workspaceConfigWriteRefusal allows for the open workspace folders.
+ * Returns the path at which a change may write the config file at `configPath`, which is a `kind` file, or throws
+ * ConfigWriteRefusedError if it may not write it. The global file of that kind, `globalPath`, may always be written,
+ * at `configPath`. The own config file of a workspace folder may be written at the resolved path that
+ * decideWorkspaceConfigWrite allows for that folder only, so that a link in one workspace folder cannot take the
+ * write into another one, when the folder is open or a loaded server comes from it. That folder does not have to be
+ * open: McpManager keeps the servers of a folder that was removed from the workspace, and the user can still change
+ * them. Any other file may be written at the resolved path that decideWorkspaceConfigWrite allows for the open
+ * workspace folders.
  */
 async function checkConfigWrite(
     workspace: Workspace,
     logging: Logger,
     configPath: string,
     globalPath: string,
-    kind: 'agent config' | 'MCP config'
-): Promise<void> {
-    if (isSamePath(normalizePathFromUri(configPath), normalizePathFromUri(globalPath))) {
-        return
+    kind: ConfigKind
+): Promise<string> {
+    const normalizedPath = normalizePathFromUri(configPath, logging)
+    if (isSamePath(normalizedPath, normalizePathFromUri(globalPath))) {
+        return configPath
     }
-    const folderPaths =
+    const openFolders =
         workspace.getAllWorkspaceFolders()?.map(folder => normalizePathFromUri(folder.uri, logging)) ?? []
-    const refusal = await workspaceConfigWriteRefusal(folderPaths, normalizePathFromUri(configPath, logging))
-    if (refusal) {
-        // The message does not repeat the path: handleError reads some error words in a message, which a path
-        // could contain, as a dropped connection
-        logging.warn(`The ${kind} ${JSON.stringify(configPath)} was not saved because ${refusal}`)
-        throw new ConfigWriteRefusedError(`The ${kind} was not saved because ${refusal}`)
+    const ownerFolder = workspaceFolderOfConfig(normalizedPath, kind)
+    const isKnownOwner =
+        ownerFolder !== undefined &&
+        (openFolders.some(folder => isSamePath(folder, ownerFolder)) || isFolderOfLoadedServer(ownerFolder))
+    const decision = await decideWorkspaceConfigWrite(isKnownOwner ? [ownerFolder] : openFolders, normalizedPath)
+    if (decision.kind === 'refused') {
+        const message = `The ${kind} ${JSON.stringify(configPath)} was not saved because ${decision.refusal}`
+        logging.warn(message)
+        throw new ConfigWriteRefusedError(message)
     }
+    return decision.path
 }
 
 /**
- * Throws ConfigWriteRefusedError if a save may not write the agent config at `agentPath`. The global agent config
- * may always be written, and the agent config of a workspace folder only as workspaceConfigWriteRefusal allows for
- * the open workspace folders. The save functions call this before they write and throw its error, so the caller of
- * a refused server add, remove, or permission change reports the error instead of a saved change. A change that
- * removes a server before it saves the new one, such as an edit, calls it first for the new location.
+ * Returns the path at which a save may write the agent config at `agentPath`, or throws ConfigWriteRefusedError if
+ * it may not. The global agent config may always be written, at `agentPath`, and the agent config of a workspace
+ * folder at the resolved path, as checkConfigWrite allows. The save functions call this before they write, write at
+ * the path it returns, and throw its error, so the caller of a refused server add, remove, or permission change
+ * reports the error instead of a saved change. A change that removes a server before it saves the new one, such as
+ * an edit, calls it first for the new location.
  */
-export async function checkAgentConfigWrite(workspace: Workspace, logging: Logger, agentPath: string): Promise<void> {
-    await checkConfigWrite(
+export async function checkAgentConfigWrite(workspace: Workspace, logging: Logger, agentPath: string): Promise<string> {
+    return checkConfigWrite(
         workspace,
         logging,
         agentPath,
@@ -1236,12 +1300,13 @@ export async function checkAgentConfigWrite(workspace: Workspace, logging: Logge
 }
 
 /**
- * Throws ConfigWriteRefusedError if a change may not write the legacy MCP config (an mcp.json) at `mcpPath`, by the
- * rule of checkAgentConfigWrite with the global MCP config as the file that may always be written. McpManager checks
- * every mcp.json that it writes, and a change that writes one calls this before it changes anything.
+ * Returns the path at which a change may write the legacy MCP config (an mcp.json) at `mcpPath`, or throws
+ * ConfigWriteRefusedError if it may not, by the rule of checkAgentConfigWrite with the global MCP config as the file
+ * that may always be written. McpManager checks every mcp.json that it writes, and a change that writes one calls
+ * this before it changes anything.
  */
-export async function checkMcpConfigWrite(workspace: Workspace, logging: Logger, mcpPath: string): Promise<void> {
-    await checkConfigWrite(
+export async function checkMcpConfigWrite(workspace: Workspace, logging: Logger, mcpPath: string): Promise<string> {
+    return checkConfigWrite(
         workspace,
         logging,
         mcpPath,
@@ -1278,7 +1343,8 @@ async function migrateConfigToAgent(
         return
     }
 
-    if (!(await mayMigrateAgentConfig(workspace, logging, agentPath, location, 'create'))) {
+    const target = await agentConfigMigrationTarget(workspace, logging, agentPath, location, 'create')
+    if (target === undefined) {
         return
     }
 
@@ -1345,9 +1411,9 @@ async function migrateConfigToAgent(
     agentConfig.createHooks = defaultAgent.createHooks
     agentConfig.promptHooks = defaultAgent.promptHooks
 
-    // Save agent config
+    // Save agent config, at the path that was checked
     try {
-        await saveAgentConfig(workspace, logging, agentConfig, agentPath)
+        await saveAgentConfig(workspace, logging, agentConfig, target)
         logging.info(`Successfully created agent config at ${agentPath}`)
     } catch (err) {
         logging.error(`Failed to save agent config to ${agentPath}: ${err}`)
@@ -1362,10 +1428,10 @@ export async function saveAgentConfig(
     configPath: string
 ): Promise<void> {
     try {
-        await checkAgentConfigWrite(workspace, logging, configPath)
-        await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
+        const target = await checkAgentConfigWrite(workspace, logging, configPath)
+        await workspace.fs.mkdir(path.dirname(target), { recursive: true })
         // Save the whole config
-        await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
+        await workspace.fs.writeFile(target, JSON.stringify(config, null, 2))
         logging.info(`Saved agent config to ${configPath}`)
     } catch (err: any) {
         logging.error(`Failed to save agent config to ${configPath}: ${err.message}`)
@@ -1388,13 +1454,13 @@ export async function saveServerSpecificAgentConfig(
     skipMcpServerConfig: boolean = false
 ): Promise<void> {
     try {
-        await checkAgentConfigWrite(workspace, logging, configPath)
-        await workspace.fs.mkdir(path.dirname(configPath), { recursive: true })
+        const target = await checkAgentConfigWrite(workspace, logging, configPath)
+        await workspace.fs.mkdir(path.dirname(target), { recursive: true })
 
         // Read existing config
         let existingConfig: AgentConfig
         try {
-            const raw = await workspace.fs.readFile(configPath)
+            const raw = await workspace.fs.readFile(target)
             existingConfig = JSON.parse(raw.toString())
         } catch {
             // If file doesn't exist, create minimal config
@@ -1424,7 +1490,7 @@ export async function saveServerSpecificAgentConfig(
         existingConfig.tools.push(...serverTools)
         existingConfig.allowedTools.push(...serverAllowedTools)
 
-        await workspace.fs.writeFile(configPath, JSON.stringify(existingConfig, null, 2))
+        await workspace.fs.writeFile(target, JSON.stringify(existingConfig, null, 2))
         logging.info(`Saved server-specific agent config for ${serverName} to ${configPath}`)
     } catch (err: any) {
         logging.error(`Failed to save server-specific agent config to ${configPath}: ${err.message}`)
@@ -1464,9 +1530,10 @@ export async function migrateAgentConfigToCLIFormat(
     try {
         const exists = await workspace.fs.exists(configPath)
         if (!exists) return
-        if (!(await mayMigrateAgentConfig(workspace, logging, configPath, location, 'update'))) return
+        const target = await agentConfigMigrationTarget(workspace, logging, configPath, location, 'update')
+        if (target === undefined) return
 
-        const raw = await workspace.fs.readFile(configPath)
+        const raw = await workspace.fs.readFile(target)
         const config = JSON.parse(raw.toString())
 
         let updated = false
@@ -1528,7 +1595,7 @@ export async function migrateAgentConfigToCLIFormat(
         updated = true
 
         if (updated) {
-            await workspace.fs.writeFile(configPath, JSON.stringify(config, null, 2))
+            await workspace.fs.writeFile(target, JSON.stringify(config, null, 2))
             logging.info(`Migrated agent config to CLI format: ${configPath}`)
         }
     } catch (err: any) {

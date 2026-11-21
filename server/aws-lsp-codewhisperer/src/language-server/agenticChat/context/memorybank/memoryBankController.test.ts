@@ -423,7 +423,8 @@ describe('MemoryBankController', () => {
         }
 
         beforeEach(() => {
-            tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'memory-bank-')))
+            // The native real path, as the code resolves paths: on Windows it also expands a short (8.3) folder name
+            tempRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'memory-bank-')))
             workspacePath = path.join(tempRoot, 'workspace')
             fs.mkdirSync(workspacePath)
 
@@ -465,8 +466,15 @@ describe('MemoryBankController', () => {
 
             await controller.cleanMemoryBankDirectory(workspacePath)
 
-            assert.deepStrictEqual(fs.readdirSync(path.join(target, 'rules', 'memory-bank')), [])
+            const resolvedFolder = path.join(target, 'rules', 'memory-bank')
+            assert.deepStrictEqual(fs.readdirSync(resolvedFolder), [])
             sinon.assert.notCalled(mockLogging.warn)
+            // The files are removed, and the folder is created, at the resolved path that was checked
+            sinon.assert.callCount(mockFs.rm, memoryBankFiles.length)
+            for (const call of mockFs.rm.getCalls()) {
+                assert.ok(String(call.args[0]).startsWith(resolvedFolder), String(call.args[0]))
+            }
+            sinon.assert.calledOnceWithExactly(mockFs.mkdir, resolvedFolder, { recursive: true })
         })
 
         it('removes the files when the workspace folder itself is reached through a link', async () => {
@@ -500,7 +508,11 @@ describe('MemoryBankController', () => {
                 }
                 sinon.assert.notCalled(mockFs.rm)
                 sinon.assert.notCalled(mockFs.mkdir)
-                sinon.assert.calledOnceWithMatch(mockLogging.warn, /outside the workspace folder/)
+                // The warning names the workspace folder, which a workspace with several folders needs
+                sinon.assert.calledOnceWithExactly(
+                    mockLogging.warn,
+                    `Memory Bank: did not clean .amazonq/rules/memory-bank in the workspace folder ${JSON.stringify(workspacePath)} because it resolves to a location outside that folder`
+                )
             })
         }
 
@@ -530,8 +542,27 @@ describe('MemoryBankController', () => {
 
             sinon.assert.notCalled(mockFs.rm)
             sinon.assert.notCalled(mockFs.mkdir)
-            sinon.assert.calledOnceWithMatch(mockLogging.warn, /outside the workspace folder, or cannot be resolved/)
+            // Not reported as a location outside the folder: the warning gives the error code of the failure
+            sinon.assert.calledOnceWithExactly(
+                mockLogging.warn,
+                `Memory Bank: did not clean .amazonq/rules/memory-bank in the workspace folder ${JSON.stringify(workspacePath)} because its location could not be resolved (ELOOP)`
+            )
             sinon.assert.notCalled(mockLogging.error)
+        })
+
+        it('gives no error code in the warning when the failure has none', async () => {
+            const lstat = sinon.stub(fs.promises, 'lstat').rejects(new Error('no code'))
+            try {
+                await controller.cleanMemoryBankDirectory(workspacePath)
+            } finally {
+                lstat.restore()
+            }
+
+            sinon.assert.notCalled(mockFs.mkdir)
+            sinon.assert.calledOnceWithExactly(
+                mockLogging.warn,
+                `Memory Bank: did not clean .amazonq/rules/memory-bank in the workspace folder ${JSON.stringify(workspacePath)} because its location could not be resolved`
+            )
         })
     })
 })
