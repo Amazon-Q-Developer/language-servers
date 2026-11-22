@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.0.136](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.135...lsp-codewhisperer/v0.0.136) (2026-11-22)
+
+
+### Bug Fixes
+
+* **amazonq:** an ATX artifact download gets its file name only when the whole file is on disk ([#3077](https://github.com/Amazon-Q-Developer/language-servers/issues/3077)) ([25adee7](https://github.com/Amazon-Q-Developer/language-servers/commit/25adee7cf7f306bca1035b54aa04200ef9f1e0ab))
+* **amazonq:** find beamed repos and the beam map in jobs with many artifacts ([#3090](https://github.com/Amazon-Q-Developer/language-servers/issues/3090)) ([08dbc88](https://github.com/Amazon-Q-Developer/language-servers/commit/08dbc8885cd632f12751fe5ba4e2c6ecc9bf7185))
+* **amazonq:** stricter checks for chat file links and configuration files ([25adee7](https://github.com/Amazon-Q-Developer/language-servers/commit/25adee7cf7f306bca1035b54aa04200ef9f1e0ab))
+* Merge pull request [#3083](https://github.com/Amazon-Q-Developer/language-servers/issues/3083) from Amazon-Q-Developer/release/agentic/1.87.0 ([37715a9](https://github.com/Amazon-Q-Developer/language-servers/commit/37715a9612fd1519a9f4642d0f612873fb632f78))
+
 ## [0.0.135](https://github.com/Amazon-Q-Developer/language-servers/compare/lsp-codewhisperer/v0.0.134...lsp-codewhisperer/v0.0.135) (2026-11-18)
 
 
