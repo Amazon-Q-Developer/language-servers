@@ -671,6 +671,21 @@ describe('McpEventHandler error handling', () => {
             expect(watch.getCalls().some(c => c.args[0][0] === file)).to.be.false
         })
 
+        it('watches the config files of a workspace folder added after startup', async () => {
+            const watch = sinon.stub(ChokidarFileWatcher.prototype, 'watchPaths')
+            const folders = features.workspace.getAllWorkspaceFolders as sinon.SinonStub
+            folders.returns([])
+            const handler = new McpEventHandler(features, telemetryService)
+            const added = require('path').join('/added', '.amazonq', 'agents', 'default.json')
+            const watched = () => watch.getCalls().some(c => c.args[0].includes(added))
+            expect(watched()).to.be.false
+
+            folders.returns([{ uri: '/added' }])
+            handler.onWorkspaceFoldersChanged()
+
+            expect(watched()).to.be.true
+        })
+
         describe('forgetting allowed folders', () => {
             let showMessageRequest: sinon.SinonStub
             let showMessage: sinon.SinonStub

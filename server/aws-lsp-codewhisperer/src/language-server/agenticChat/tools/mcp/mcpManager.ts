@@ -28,6 +28,8 @@ import {
 import {
     isEmptyEnv,
     loadAgentConfig,
+    migrateAgentConfigToCLIFormat,
+    migrateToAgentConfig,
     saveAgentConfig,
     saveServerSpecificAgentConfig,
     getAgentConfigPathForMcpConfig,
@@ -35,6 +37,7 @@ import {
     describeStdioLaunchForLog,
     describeUrlForLog,
     getGlobalAgentConfigPath,
+    getWorkspaceAgentConfigPaths,
     getWorkspaceMcpConfigPaths,
     getGlobalMcpConfigPath,
     getGlobalPersonaConfigPath,
@@ -140,6 +143,15 @@ export class McpManager {
     private trustGeneration = 0
     // Set when the user forgot allowed folders but the saved approvals could not be cleared
     private ignoreSavedFolderApprovals = false
+    // Set once discovery has run after sign-in, so folder changes before then don't start servers early
+    private discoveryStarted = false
+    // Discovery in progress, so a folder change waits for it instead of loading the configs at the same time
+    private discovery: Promise<void> | undefined
+    // Folder changes run one at a time; a change that arrives while one runs is applied once after it
+    private folderChangeQueue: Promise<void> = Promise.resolve()
+    private folderChangeQueued = false
+    // Workspace config files that existed at the last load, to tell whether a removed folder contributed any
+    private loadedWorkspaceConfigs = new Set<string>()
 
     private constructor(
         private agentPaths: string[],
@@ -267,12 +279,105 @@ export class McpManager {
 
     /**
      * Re-check started stdio servers after the workspace folders change. A server whose first folder changed
-     * restarts in the new one, which goes through the folder check again.
+     * restarts in the new one, which goes through the folder check again. When a folder with MCP configs is
+     * added, or one whose configs are loaded is removed, the configs are loaded again.
      */
-    public async onWorkspaceFoldersChanged(): Promise<void> {
+    public onWorkspaceFoldersChanged(): Promise<void> {
+        // Bumped right away so a server start that is already running checks its folder again
         this.trustGeneration++
+        if (!this.folderChangeQueued) {
+            this.folderChangeQueued = true
+            this.folderChangeQueue = this.folderChangeQueue
+                .catch(() => {})
+                .then(() => {
+                    this.folderChangeQueued = false
+                    return this.applyWorkspaceFolderChange()
+                })
+        }
+        return this.folderChangeQueue
+    }
+
+    private async applyWorkspaceFolderChange(): Promise<void> {
+        await this.discovery?.catch(() => {})
+        // Before discovery, only the paths change: discovery reads the current folders when it runs
+        if ((await this.updateWorkspaceAgentPaths()) && this.discoveryStarted) {
+            // Reloading restarts every server through the folder check, so the checks below are not needed
+            await this.reinitializeMcpServers()
+            return
+        }
         await this.reevaluateStartedServers()
         await this.startServersAwaitingTrust()
+    }
+
+    /**
+     * Point the agent config paths at the current workspace folders. Returns true when the configs need loading
+     * again: an added folder has an MCP config, or a loaded server came from a removed folder.
+     */
+    private async updateWorkspaceAgentPaths(): Promise<boolean> {
+        const folderUris = this.features.workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+        const workspacePaths = getWorkspaceAgentConfigPaths(folderUris)
+        const known = new Set(this.agentPaths.map(p => path.normalize(p)))
+        const current = new Set(workspacePaths.map(p => path.normalize(p)))
+        const globalPath = path.normalize(getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir()))
+        const addedFolders = folderUris.filter((_, i) => !known.has(path.normalize(workspacePaths[i])))
+        // An agent config path is <folder>/.amazonq/agents/default.json
+        const removedConfigDirs = [...known]
+            .filter(p => p !== globalPath && !current.has(p))
+            .map(p => path.dirname(path.dirname(p)))
+        if (addedFolders.length === 0 && removedConfigDirs.length === 0) {
+            return false
+        }
+        this.agentPaths = [...workspacePaths, getGlobalAgentConfigPath(this.features.workspace.fs.getUserHomeDir())]
+        if (addedFolders.length > 0) {
+            await this.migrateAddedFolderConfigs(getWorkspaceAgentConfigPaths(addedFolders))
+        }
+
+        const addedConfigs = [
+            ...getWorkspaceAgentConfigPaths(addedFolders),
+            ...getWorkspaceMcpConfigPaths(addedFolders),
+        ].map(p => normalizePathFromUri(p, this.features.logging))
+        for (const configPath of addedConfigs) {
+            if (await this.features.workspace.fs.exists(configPath).catch(() => false)) {
+                return true
+            }
+        }
+        const inRemovedFolder = (configPath: string) =>
+            removedConfigDirs.some(dir => path.normalize(configPath).startsWith(dir + path.sep))
+        // A removed folder's config can grant permissions without defining a server
+        if ([...this.loadedWorkspaceConfigs].some(inRemovedFolder)) {
+            return true
+        }
+        return [...this.mcpServers.values()].some(cfg => !!cfg.__configPath__ && inRemovedFolder(cfg.__configPath__))
+    }
+
+    /** Run the config migrations that startup runs for the folders open at that time. */
+    private async migrateAddedFolderConfigs(agentConfigPaths: string[]): Promise<void> {
+        try {
+            await migrateToAgentConfig(this.features.workspace, this.features.logging, this.features.agent)
+            for (const agentPath of agentConfigPaths) {
+                const normalized = normalizePathFromUri(agentPath, this.features.logging)
+                if (await this.features.workspace.fs.exists(normalized).catch(() => false)) {
+                    await migrateAgentConfigToCLIFormat(this.features.workspace, this.features.logging, normalized)
+                }
+            }
+        } catch (e) {
+            this.features.logging.error(`MCP: failed to migrate configs of added workspace folders: ${e}`)
+        }
+    }
+
+    /** Record which workspace config files exist, after the configs were loaded from them. */
+    private async recordLoadedWorkspaceConfigs(): Promise<void> {
+        const folderUris = this.features.workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+        const candidates = [...getWorkspaceAgentConfigPaths(folderUris), ...getWorkspaceMcpConfigPaths(folderUris)].map(
+            p => normalizePathFromUri(p, this.features.logging)
+        )
+        const loaded = new Set<string>()
+        for (const candidate of candidates) {
+            if (await this.features.workspace.fs.exists(candidate).catch(() => false)) {
+                loaded.add(path.normalize(candidate))
+            }
+        }
+        this.loadedWorkspaceConfigs = loaded
     }
 
     /**
@@ -463,6 +568,19 @@ export class McpManager {
      * Should only be called after auth is initialized and MCP is enabled.
      */
     public async discoverAllServers(): Promise<void> {
+        this.discoveryStarted = true
+        const run = this.discoverAllServersInternal()
+        this.discovery = run
+        try {
+            await run
+        } finally {
+            if (this.discovery === run) {
+                this.discovery = undefined
+            }
+        }
+    }
+
+    private async discoverAllServersInternal(): Promise<void> {
         // Load agent config with registry support
         const result = await loadAgentConfig(
             this.features.workspace,
@@ -483,6 +601,7 @@ export class McpManager {
         )
         this.mcpServers = result.servers
         this.serverNameMapping = result.serverNameMapping
+        await this.recordLoadedWorkspaceConfigs()
 
         // Reset the configuration errors after every refresh.
         // But preserve registry errors when registry mode is active
@@ -1682,6 +1801,7 @@ export class McpManager {
         this.mcpServerStates.clear()
         this.sessionDeniedConsent.clear()
         this.resourceSources = new Map()
+        this.loadedWorkspaceConfigs.clear()
         this.serversAwaitingTrust.clear()
         this.trustHolds.clear()
         this.stdioLaunchFolders.clear()
@@ -1713,6 +1833,7 @@ export class McpManager {
             const isRegistryActive = this.isRegistryModeActive()
             const savedRegistryErrors = isRegistryActive ? this.configLoadErrors.get('registry') : undefined
 
+            const serversBefore = [...this.mcpServers.keys()]
             // close clients, clear state, but don't reset singleton
             await this.close(true)
 
@@ -1726,6 +1847,12 @@ export class McpManager {
             const shouldDiscoverServers = ProfileStatusMonitor.getMcpState()
             if (shouldDiscoverServers) {
                 await this.discoverAllServers()
+            }
+            // Servers gone after the reload send no tools update of their own, so clear their tools
+            for (const server of serversBefore) {
+                if (!this.mcpServers.has(server)) {
+                    this.emitToolsChanged(server)
+                }
             }
             const reinitializedServerCount = McpManager.#instance?.mcpServers.size
             this.features.logging.info(

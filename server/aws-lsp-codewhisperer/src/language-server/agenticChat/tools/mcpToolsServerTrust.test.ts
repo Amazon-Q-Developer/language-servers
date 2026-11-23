@@ -95,4 +95,53 @@ describe('McpToolsServer workspace trust updates', () => {
         handlers.forEach(([handler]) => handler({ event: { added: [], removed: [] } }))
         expect(onWorkspaceFoldersChanged.called).to.be.false
     })
+
+    describe('folders that change while the MCP manager starts', () => {
+        let folders: Array<{ uri: string; name: string }>
+        let changeFoldersDuringMigration: boolean
+
+        // Starts the server and runs its initialized handler, which starts the MCP manager
+        async function startServer() {
+            managerReady = false
+            features.setClientParams({
+                initializationOptions: { aws: { awsClientCapabilities: { q: { mcp: true } } } },
+            } as any)
+            const workspace = features.workspace as any
+            workspace.getAllWorkspaceFolders = () => folders
+            workspace.fs.getUserHomeDir = () => '/home/user'
+            workspace.fs.exists = async () => false
+            sinon.stub(mcpUtils, 'migrateToAgentConfig').callsFake(async () => {
+                if (changeFoldersDuringMigration) {
+                    // The folder arrives before the manager exists, so the folder change handler ignores it
+                    folders = [...folders, { uri: 'file:///opened-later', name: 'opened-later' }]
+                    features.lsp.workspace.onDidChangeWorkspaceFolders.args.forEach(([handler]) =>
+                        handler({ event: { added: [], removed: [] } })
+                    )
+                }
+            })
+            sinon.stub(McpManager, 'init').callsFake(async () => {
+                managerReady = true
+                return {} as any
+            })
+
+            McpToolsServer(features as any)
+            await features.lsp.onInitialized.args[0][0]({})
+        }
+
+        beforeEach(() => {
+            folders = [{ uri: 'file:///open-at-start', name: 'open-at-start' }]
+            changeFoldersDuringMigration = false
+        })
+
+        it('applies a folder change that arrived before the manager started', async () => {
+            changeFoldersDuringMigration = true
+            await startServer()
+            expect(onWorkspaceFoldersChanged.calledOnce).to.be.true
+        })
+
+        it('does not re-check folders when they did not change during startup', async () => {
+            await startServer()
+            expect(onWorkspaceFoldersChanged.called).to.be.false
+        })
+    })
 })

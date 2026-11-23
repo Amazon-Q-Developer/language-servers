@@ -828,6 +828,10 @@ export class AgenticChatController implements ChatHandlers {
         return this.#additionalContextProvider.onListRules(params)
     }
 
+    onWorkspaceFoldersChanged() {
+        this.#mcpEventHandler.onWorkspaceFoldersChanged()
+    }
+
     async onListMcpServers(params: ListMcpServersParams) {
         return this.#mcpEventHandler.onListMcpServers(params)
     }

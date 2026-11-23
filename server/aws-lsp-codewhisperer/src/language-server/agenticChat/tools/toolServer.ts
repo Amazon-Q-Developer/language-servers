@@ -482,6 +482,12 @@ export const McpToolsServer: Server = ({
 
             McpManager.instance.clearToolNameMapping()
             await McpManager.instance.setWorkspaceTrust(workspaceTrust ?? 'prompt')
+
+            // A folder change during the migrations above arrived before the manager existed and was ignored
+            const currentUris = workspace.getAllWorkspaceFolders()?.map(f => f.uri) ?? []
+            if (currentUris.join('\n') !== wsUris.join('\n')) {
+                await McpManager.instance.onWorkspaceFoldersChanged()
+            }
         } catch (e) {
             logging.error(`Failed to initialize MCP Manager: ${e}`)
         }

@@ -2112,6 +2112,16 @@ export class McpEventHandler {
     }
 
     /**
+     * Watch the MCP config files of the current workspace folders. The manager loads the new folders' configs.
+     */
+    onWorkspaceFoldersChanged(): void {
+        if (this.#disposed) {
+            return
+        }
+        this.#setupFileWatchers()
+    }
+
+    /**
      * Setup file watchers for MCP config and persona files
      */
     #setupFileWatchers(): void {

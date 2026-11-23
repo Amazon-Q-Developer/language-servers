@@ -117,6 +117,16 @@ describe('QAgenticChatServer', () => {
         sinon.assert.calledOnce(tabAddStub)
     })
 
+    it('calls the corresponding controller when the workspace folders change', () => {
+        const foldersChangedStub = sinon.stub(AgenticChatController.prototype, 'onWorkspaceFoldersChanged')
+
+        testFeatures.lsp.workspace.onDidChangeWorkspaceFolders.firstCall.firstArg({
+            event: { added: [{ uri: 'file:///added', name: 'added' }], removed: [] },
+        })
+
+        sinon.assert.calledOnce(foldersChangedStub)
+    })
+
     it('calls the corresponding controller when tabRemove notification is received', () => {
         const tabRemoveStub = sinon.stub(AgenticChatController.prototype, 'onTabRemove')
 
