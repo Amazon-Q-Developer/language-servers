@@ -3489,6 +3489,143 @@ describe('MCP configs of workspace folders that change after startup', () => {
         expect(connect.called).to.be.false
     })
 
+    it('drops the permissions of a removed folder whose config defines no server', async () => {
+        const kept = newFolder('kept')
+        const removed = newFolder('removed')
+        writeJson(path.join(removed, '.amazonq', 'agents', 'default.json'), {
+            mcpServers: {},
+            tools: ['executeBash'],
+            allowedTools: ['executeBash'],
+        })
+        folderRoots = [kept, removed]
+        const mgr = await startManager()
+        expect(mgr.requiresApproval('builtIn', 'executeBash')).to.be.false
+
+        folderRoots = [kept]
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(mgr.requiresApproval('builtIn', 'executeBash')).to.be.true
+    })
+
+    it('clears the tools of servers that a removed folder defined', async () => {
+        const removed = newFolder('removed')
+        writeJson(path.join(removed, '.amazonq', 'agents', 'default.json'), agentConfigWith('gone'))
+        folderRoots = [removed]
+        const mgr = await startManager()
+        const toolUpdates: Array<[string, unknown[]]> = []
+        mgr.events.on(AGENT_TOOLS_CHANGED, (server: string, defs: unknown[]) => toolUpdates.push([server, defs]))
+
+        folderRoots = []
+        await mgr.onWorkspaceFoldersChanged()
+
+        expect(toolUpdates).to.deep.include(['gone', []])
+    })
+
+    it('migrates an old-format agent config in an added folder, as startup does', async () => {
+        const mgr = await startManager()
+        const root = newFolder('added')
+        const agentPath = path.join(root, '.amazonq', 'agents', 'default.json')
+        writeJson(agentPath, { ...agentConfigWith('old'), name: 'default-agent', includedFiles: ['README.md'] })
+
+        folderRoots = [root]
+        await mgr.onWorkspaceFoldersChanged()
+
+        const migrated = JSON.parse(fs.readFileSync(agentPath, 'utf8'))
+        expect(migrated.name).to.equal('q_ide_default')
+        expect(migrated.includedFiles).to.be.undefined
+        expect(migrated.resources).to.include('file://README.md')
+        expect(mgr.getAllServerConfigs().has('old')).to.be.true
+    })
+
+    it('applies a folder change that arrives during a reload after that reload, not alongside it', async () => {
+        writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), agentConfigWith('global'))
+        const mgr = await startManager()
+        const first = newFolder('first')
+        const second = newFolder('second')
+        writeJson(path.join(first, '.amazonq', 'agents', 'default.json'), agentConfigWith('one'))
+        writeJson(path.join(second, '.amazonq', 'agents', 'default.json'), agentConfigWith('two'))
+        ;(McpManager.prototype as any).initOneServer.restore()
+        const starting = new Set<string>()
+        let overlapped = false
+        let secondChange: Promise<void> | undefined
+        sinon.stub(McpManager.prototype as any, 'initOneServer').callsFake(async function (this: any, name: any) {
+            overlapped = overlapped || starting.has(name)
+            starting.add(name)
+            if (name === 'one' && !secondChange) {
+                // The second folder arrives while the first reload is still starting servers
+                folderRoots = [first, second]
+                secondChange = mgr.onWorkspaceFoldersChanged()
+            }
+            await new Promise(resolve => setTimeout(resolve, 20))
+            this.clients.set(name, new Client({ name: 'stub', version: '0.0.0' }))
+            starting.delete(name)
+        })
+
+        folderRoots = [first]
+        await mgr.onWorkspaceFoldersChanged()
+        await secondChange
+
+        expect(overlapped).to.be.false
+        expect(mgr.getAllServerConfigs().has('one')).to.be.true
+        expect(mgr.getAllServerConfigs().has('two')).to.be.true
+    })
+
+    it('applies folder changes one at a time', async () => {
+        const mgr: any = await startManager()
+        const order: string[] = []
+        const apply = mgr.applyWorkspaceFolderChange.bind(mgr)
+        let calls = 0
+        sinon.stub(mgr, 'applyWorkspaceFolderChange').callsFake(async () => {
+            const n = ++calls
+            order.push(`start ${n}`)
+            await apply()
+            order.push(`end ${n}`)
+        })
+        let secondChange: Promise<void> | undefined
+        sinon.stub(mcpUtils, 'migrateToAgentConfig').callsFake(async () => {
+            if (!secondChange) {
+                // The next folder arrives while the first change is still migrating configs
+                folderRoots = [...folderRoots, newFolder('second')]
+                secondChange = mgr.onWorkspaceFoldersChanged()
+            }
+        })
+        const first = newFolder('first')
+        writeJson(path.join(first, '.amazonq', 'agents', 'default.json'), agentConfigWith('one'))
+
+        folderRoots = [first]
+        await mgr.onWorkspaceFoldersChanged()
+        await secondChange
+
+        expect(order).to.deep.equal(['start 1', 'end 1', 'start 2', 'end 2'])
+        expect(mgr.getAllServerConfigs().has('one')).to.be.true
+    })
+
+    it('waits for a running discovery before loading the configs of an added folder', async () => {
+        writeJson(mcpUtils.getGlobalAgentConfigPath(tmpDir), agentConfigWith('global'))
+        const mgr = await McpManager.init([mcpUtils.getGlobalAgentConfigPath(tmpDir)], folderFeatures)
+        ;(McpManager.prototype as any).initOneServer.restore()
+        // Discovery starts different servers in parallel; the same server must never start twice at once
+        const starting = new Set<string>()
+        let overlapped = false
+        sinon.stub(McpManager.prototype as any, 'initOneServer').callsFake(async function (this: any, name: any) {
+            overlapped = overlapped || starting.has(name)
+            starting.add(name)
+            await new Promise(resolve => setTimeout(resolve, 20))
+            this.clients.set(name, new Client({ name: 'stub', version: '0.0.0' }))
+            starting.delete(name)
+        })
+        const root = newFolder('added')
+        writeJson(path.join(root, '.amazonq', 'agents', 'default.json'), agentConfigWith('late'))
+
+        const discovery = mgr.discoverAllServers()
+        folderRoots = [root]
+        await Promise.all([discovery, mgr.onWorkspaceFoldersChanged()])
+
+        expect(overlapped).to.be.false
+        expect(mgr.getAllServerConfigs().has('late')).to.be.true
+        expect(mgr.getAllServerConfigs().has('global')).to.be.true
+    })
+
     it('reads the added folder on a later refresh', async () => {
         const mgr = await startManager()
         const root = newFolder('added')
