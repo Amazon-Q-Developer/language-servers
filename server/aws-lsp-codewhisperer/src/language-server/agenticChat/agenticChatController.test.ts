@@ -2526,7 +2526,7 @@ describe('AgenticChatController', () => {
             assert.deepStrictEqual(result.relatedContent, {
                 content: [{ title: 'Guide', url: 'https://example.com/guide', body: undefined }],
             })
-            sinon.assert.calledWithExactly(testFeatures.logging.debug, 'Source links dropped: 1')
+            sinon.assert.calledWithExactly(testFeatures.logging.log, 'Source links dropped: 1')
             for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
                 sinon.assert.neverCalledWithMatch(
                     testFeatures.logging[level] as sinon.SinonStub,

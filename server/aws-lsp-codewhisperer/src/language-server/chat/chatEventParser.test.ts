@@ -295,8 +295,11 @@ describe('ChatEventParser', () => {
     describe('source links', () => {
         const webLink = (url: string | undefined, title = 'title') => ({ title, snippet: 'snippet', url })
         let logging: TestFeatures['logging']
+        // Each logged line with its level
         const loggedCalls = () =>
-            (['log', 'info', 'warn', 'error', 'debug'] as const).flatMap(level => logging[level].args)
+            (['log', 'info', 'warn', 'error', 'debug'] as const).flatMap(level =>
+                logging[level].args.map(args => [level, ...args])
+            )
 
         beforeEach(() => {
             logging = new TestFeatures().logging
@@ -326,7 +329,7 @@ describe('ChatEventParser', () => {
                 ],
             })
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
-            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 5']])
+            assert.deepStrictEqual(loggedCalls(), [['log', 'Source links dropped: 5']])
         })
 
         it('adds no related content when an event has no http or https link', () => {
@@ -340,7 +343,7 @@ describe('ChatEventParser', () => {
 
             assert.strictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, undefined)
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
-            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 2']])
+            assert.deepStrictEqual(loggedCalls(), [['log', 'Source links dropped: 2']])
         })
 
         for (const urls of [[], ['https://docs.example.com/guide', 'http://example.com/page']]) {
@@ -381,7 +384,10 @@ describe('ChatEventParser', () => {
                 ['https://a.example.com/', 'http://b.example.com/']
             )
             assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 3)
-            assert.deepStrictEqual(loggedCalls(), [['Source links dropped: 1'], ['Source links dropped: 1']])
+            assert.deepStrictEqual(loggedCalls(), [
+                ['log', 'Source links dropped: 1'],
+                ['log', 'Source links dropped: 1'],
+            ])
         })
     })
 })

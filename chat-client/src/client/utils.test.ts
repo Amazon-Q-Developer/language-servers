@@ -259,15 +259,18 @@ describe('utils', () => {
             })
         }
 
-        // The same table tests isWebUrl in the language server, so the two rules cannot drift apart
-        const { cases } = JSON.parse(fs.readFileSync(path.join(__dirname, 'webLinkCases.json'), 'utf8')) as {
-            cases: { url: string; web: boolean }[]
-        }
-        for (const { url, web } of cases) {
-            it(`judges ${JSON.stringify(url)} as the language server does (web: ${web})`, () => {
-                assert.strictEqual(classifyChatLink(url).kind === 'link', web)
-            })
-        }
+        // The same table tests isWebUrl in the language server, so the two rules cannot drift apart.
+        // The table is read in the test, so that a moved or missing table fails only this test.
+        it('judges every link of the shared table as the language server does', () => {
+            const { cases } = JSON.parse(fs.readFileSync(path.join(__dirname, 'webLinkCases.json'), 'utf8')) as {
+                cases: { url: string; web: boolean }[]
+            }
+            assert.ok(cases.length > 0)
+            assert.deepStrictEqual(
+                cases.filter(({ url, web }) => (classifyChatLink(url).kind === 'link') !== web),
+                []
+            )
+        })
 
         // A user name or password before the host can make a link show one host and open another
         for (const href of ['https://user:pass@example.com/', 'https://trusted.example@attacker.example/']) {

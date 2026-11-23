@@ -1136,16 +1136,19 @@ describe('isWebUrl', () => {
         })
     }
 
-    // The same table tests classifyChatLink in the chat client, so the two rules cannot drift apart
-    const { cases } = JSON.parse(
-        readFileSync(
-            path.join(__dirname, '..', '..', '..', '..', 'chat-client', 'src', 'client', 'webLinkCases.json'),
-            'utf8'
+    // The same table tests classifyChatLink in the chat client, so the two rules cannot drift apart.
+    // The table is read in the test, so that a moved or missing table fails only this test.
+    it('judges every link of the shared table as the chat client does', () => {
+        const { cases } = JSON.parse(
+            readFileSync(
+                path.join(__dirname, '..', '..', '..', '..', 'chat-client', 'src', 'client', 'webLinkCases.json'),
+                'utf8'
+            )
+        ) as { cases: { url: string; web: boolean }[] }
+        assert.ok(cases.length > 0)
+        assert.deepStrictEqual(
+            cases.filter(({ url, web }) => isWebUrl(url) !== web),
+            []
         )
-    ) as { cases: { url: string; web: boolean }[] }
-    for (const { url, web } of cases) {
-        it(`judges ${JSON.stringify(url)} as the chat client does (web: ${web})`, () => {
-            assert.strictEqual(isWebUrl(url), web)
-        })
-    }
+    })
 })

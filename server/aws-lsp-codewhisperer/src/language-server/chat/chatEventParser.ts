@@ -135,7 +135,8 @@ export class ChatEventParser implements ChatResult {
                 .map(ChatEventParser.mapRelatedData)
             const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
             if (droppedLinkCount > 0) {
-                this.#logging.debug(`Source links dropped: ${droppedLinkCount}`)
+                // At the default log level, so that a log shows why an answer has fewer source links. The count only.
+                this.#logging.log(`Source links dropped: ${droppedLinkCount}`)
             }
 
             if (sourceLinks.length > 0) {
