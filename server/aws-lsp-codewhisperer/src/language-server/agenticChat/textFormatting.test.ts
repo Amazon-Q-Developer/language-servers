@@ -21,6 +21,50 @@ describe('textFormatting', () => {
             assert.strictEqual(shellCommandBlockStart(command), '````shell\necho ```')
             assert.strictEqual(codeFence(command), '````')
         })
+
+        it('show bidirectional, zero-width and other hidden characters as escapes', () => {
+            const cases: [string, string][] = [
+                // Bidirectional overrides and isolates, and zero-width characters
+                ['echo one \u202Eowt', 'echo one \\u202Eowt'],
+                ['\u2066ls one\u2069 \u2067x\u2068', '\\u2066ls one\\u2069 \\u2067x\\u2068'],
+                [
+                    'cat \u200Bnotes \u200C\u200D\u2060\uFEFF\u061C\u200E\u200F',
+                    'cat \\u200Bnotes \\u200C\\u200D\\u2060\\uFEFF\\u061C\\u200E\\u200F',
+                ],
+                // Tag characters
+                ['ls \u{E0041}\u{E0042}', 'ls \\u{E0041}\\u{E0042}'],
+                // Interlinear annotation characters
+                ['echo \uFFF9ok\uFFFAls one\uFFFB', 'echo \\uFFF9ok\\uFFFAls one\\uFFFB'],
+                // A carriage return, and line and paragraph separators
+                ['echo a\rls b', 'echo a\\u000Dls b'],
+                ['echo a\u2028ls b\u2029', 'echo a\\u2028ls b\\u2029'],
+                // Spaces other than U+0020
+                ['ls ./build\u00A0x \u3000y', 'ls ./build\\u00A0x \\u3000y'],
+                ['echo \u001B[2Jdone\u0007\u0000', 'echo \\u001B[2Jdone\\u0007\\u0000'],
+                ['echo \u3164 \u115F \uFE0F', 'echo \\u3164 \\u115F \\uFE0F'],
+                // The braille blank, which shows as a space, private use and unassigned code points, whose look
+                // depends on the font, and a lone surrogate
+                ['echo a\u2800b \uE000 \u{F0000} \u0378 \uD800', 'echo a\\u2800b \\uE000 \\u{F0000} \\u0378 \\uD800'],
+            ]
+            for (const [command, shown] of cases) {
+                assert.strictEqual(shellCommandBlock(command), '```shell\n' + shown + '\n```')
+                assert.strictEqual(shellCommandBlockStart(command), '```shell\n' + shown)
+            }
+        })
+
+        it('show line feeds, tabs, spaces and other visible text as they are', () => {
+            const command = 'for f in *.ts; do\n\techo "$f" > out.txt && cat < in.txt | grep -i \'ü€中😀\'\ndone'
+
+            assert.strictEqual(shellCommandBlock(command), '```shell\n' + command + '\n```')
+        })
+
+        it('keep the fence of the command, so the fence that closes the output still matches', () => {
+            for (const command of ['echo `\u202E`', 'echo ``\u200B```', '```\u2028````', 'echo \u{E0060}`````']) {
+                const start = shellCommandBlockStart(command)
+                assert.ok(start.startsWith(codeFence(command) + 'shell\n'), JSON.stringify(start))
+                assert.strictEqual(shellCommandBlock(command), start + '\n' + codeFence(command))
+            }
+        })
     })
 
     describe('text inside a code block', () => {
