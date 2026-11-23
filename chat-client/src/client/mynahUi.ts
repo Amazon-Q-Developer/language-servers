@@ -550,7 +550,16 @@ export const createMynahUi = (
                 link,
                 eventId,
             }
-            messager.onSourceLinkClick(payload)
+            // A source link comes from the service, so only an http or https URL goes to the IDE.
+            if (classifyChatLink(link).kind === 'link') {
+                messager.onSourceLinkClick(payload)
+                return
+            }
+            messager.onSourceLinkClickTelemetry(payload)
+            notifyUnsupportedLink(
+                'Chat opens only web (http or https) source links. ' +
+                    'It does not open a link with a user name, a password or a backslash before any ? or #.'
+            )
         },
         onInfoLinkClick: (tabId, link, mouseEvent, eventId) => {
             mouseEvent?.preventDefault()
@@ -935,11 +944,14 @@ export const createMynahUi = (
         return tabId ?? createTabId()
     }
 
-    const notifyUnsupportedLink = () => {
+    const notifyUnsupportedLink = (
+        content = 'Chat opens only web (http or https) links and local file paths. ' +
+            'It does not open a web link with a user name, a password or a backslash before any ? or #.'
+    ) => {
         mynahUi.notify({
             type: NotificationType.WARNING,
             title: 'Link not opened',
-            content: 'Chat opens only web (http or https) links and local file paths.',
+            content,
         })
     }
 

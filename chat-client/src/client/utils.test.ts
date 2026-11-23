@@ -1,4 +1,6 @@
 import * as assert from 'assert'
+import * as fs from 'fs'
+import * as path from 'path'
 import { MynahIcons } from '@aws/mynah-ui'
 import { Button, ChatMessage } from '@aws/language-server-runtimes-types'
 import { FeatureContext } from '@aws/chat-client-ui-types'
@@ -254,6 +256,55 @@ describe('utils', () => {
         for (const href of ['https://example.com/a', 'http://example.com']) {
             it(`opens ${href} as a link`, () => {
                 assert.deepEqual(classifyChatLink(href), { kind: 'link' })
+            })
+        }
+
+        // The same table tests isWebUrl in the language server, so the two rules cannot drift apart.
+        // The table is read in the test, so that a moved or missing table fails only this test.
+        it('judges every link of the shared table as the language server does', () => {
+            const { cases } = JSON.parse(fs.readFileSync(path.join(__dirname, 'webLinkCases.json'), 'utf8')) as {
+                cases: { url: string; web: boolean }[]
+            }
+            assert.ok(cases.length > 0)
+            assert.deepStrictEqual(
+                cases.filter(({ url, web }) => (classifyChatLink(url).kind === 'link') !== web),
+                []
+            )
+        })
+
+        // A user name or password before the host can make a link show one host and open another
+        for (const href of ['https://user:pass@example.com/', 'https://trusted.example@attacker.example/']) {
+            it(`sends nothing for the web link with credentials ${href}`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'none' })
+            })
+        }
+
+        it('sends nothing when there is no link', () => {
+            assert.deepEqual(classifyChatLink(undefined), { kind: 'none' })
+        })
+
+        // A browser reads a backslash before the first ? or # as a slash, but the IDE's URL parser may read the part
+        // before @ as a user name
+        it('sends nothing for a web link with a backslash before the first ? or #', () => {
+            assert.deepEqual(classifyChatLink('https://trusted.example\\@attacker.example/'), { kind: 'none' })
+            assert.deepEqual(classifyChatLink('https://trusted.example\\?@attacker.example/'), { kind: 'none' })
+        })
+
+        // A backslash after the first ? or # is in the query or fragment
+        for (const href of ['https://example.com/search?q=C:\\Users\\x', 'https://example.com/a#C:\\Users\\x']) {
+            it(`opens ${JSON.stringify(href)} as a link`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'link' })
+            })
+        }
+
+        // A browser skips only leading C0 control characters and spaces, so these are not web links
+        for (const href of ['\u00a0https://example.com/', '\u007fhttps://example.com/']) {
+            it(`sends nothing for ${JSON.stringify(href)}, and still opens the path after other leading spaces`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'none' })
+                assert.deepEqual(classifyChatLink(href.replace('https://example.com/', 'src/foo.ts')), {
+                    kind: 'file',
+                    filePath: 'src/foo.ts',
+                })
             })
         }
 

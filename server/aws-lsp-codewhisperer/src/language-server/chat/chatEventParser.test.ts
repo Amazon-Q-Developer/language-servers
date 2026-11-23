@@ -1,4 +1,5 @@
 import { ChatResult } from '@aws/language-server-runtimes/protocol'
+import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import * as assert from 'assert'
 import sinon from 'ts-sinon'
 
@@ -10,7 +11,11 @@ describe('ChatEventParser', () => {
     const mockMessageId = 'mock-message-id'
 
     it('set error if invalidState event is received', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         sinon.assert.match(
             chatEventParser.processPartialEvent({
@@ -38,7 +43,11 @@ describe('ChatEventParser', () => {
     })
 
     it('set error if error event is received', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         sinon.assert.match(
             chatEventParser.processPartialEvent({
@@ -71,7 +80,11 @@ describe('ChatEventParser', () => {
     })
 
     it('processPartialEvent appends new event on top of the previous result', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         assert.deepStrictEqual(
             chatEventParser.processPartialEvent({
@@ -119,7 +132,11 @@ describe('ChatEventParser', () => {
     })
 
     it('processPartialEvent with messageMetadataEvent appends conversation id', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         chatEventParser.processPartialEvent({
             messageMetadataEvent: {
@@ -149,7 +166,11 @@ describe('ChatEventParser', () => {
     })
 
     it('getResult returns the accumulated result', () => {
-        const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>())
+        const chatEventParser = new ChatEventParser(
+            mockMessageId,
+            new Metric<AddMessageEvent>(),
+            new TestFeatures().logging
+        )
 
         chatEventParser.processPartialEvent({
             assistantResponseEvent: {
@@ -269,5 +290,104 @@ describe('ChatEventParser', () => {
         }
 
         assert.deepStrictEqual(chatEventParser.getResult(), { success: true, data: expectedData })
+    })
+
+    describe('source links', () => {
+        const webLink = (url: string | undefined, title = 'title') => ({ title, snippet: 'snippet', url })
+        let logging: TestFeatures['logging']
+        // Each logged line with its level
+        const loggedCalls = () =>
+            (['log', 'info', 'warn', 'error', 'debug'] as const).flatMap(level =>
+                logging[level].args.map(args => [level, ...args])
+            )
+
+        beforeEach(() => {
+            logging = new TestFeatures().logging
+        })
+
+        it('keeps only http and https source links, in order and unchanged', () => {
+            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [
+                        webLink('javascript:x'),
+                        webLink('https://docs.example.com/guide', 'https link'),
+                        webLink('file:///etc/hosts'),
+                        webLink('http://example.com/page', 'http link'),
+                        webLink('vscode://settings/x'),
+                        webLink('https://'),
+                        webLink(undefined),
+                    ],
+                },
+            })
+
+            assert.deepStrictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, {
+                content: [
+                    { title: 'https link', url: 'https://docs.example.com/guide', body: 'snippet' },
+                    { title: 'http link', url: 'http://example.com/page', body: 'snippet' },
+                ],
+            })
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+            assert.deepStrictEqual(loggedCalls(), [['log', 'Source links dropped: 5']])
+        })
+
+        it('adds no related content when an event has no http or https link', () => {
+            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [webLink('data:text/html,hello'), webLink('command:x')],
+                },
+            })
+
+            assert.strictEqual(chatEventParser.getResult().data?.chatResult.relatedContent, undefined)
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 1)
+            assert.deepStrictEqual(loggedCalls(), [['log', 'Source links dropped: 2']])
+        })
+
+        for (const urls of [[], ['https://docs.example.com/guide', 'http://example.com/page']]) {
+            it(`does not log when a list of ${urls.length} source links is unchanged`, () => {
+                const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+                chatEventParser.processPartialEvent({
+                    supplementaryWebLinksEvent: { supplementaryWebLinks: urls.map(url => webLink(url)) },
+                })
+
+                assert.deepStrictEqual(loggedCalls(), [])
+                assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, urls.length ? 1 : 0)
+            })
+        }
+
+        it('keeps earlier links and logs each event drop count without link values', () => {
+            const chatEventParser = new ChatEventParser(mockMessageId, new Metric<AddMessageEvent>(), logging)
+
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: { supplementaryWebLinks: [webLink('https://a.example.com/')] },
+            })
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [webLink('custom-scheme:private?token=TEST-TOKEN')],
+                },
+            })
+            chatEventParser.processPartialEvent({
+                supplementaryWebLinksEvent: {
+                    supplementaryWebLinks: [
+                        webLink('http://b.example.com/'),
+                        webLink('file:///private?token=TEST-TOKEN'),
+                    ],
+                },
+            })
+
+            assert.deepStrictEqual(
+                chatEventParser.getResult().data?.chatResult.relatedContent?.content.map(link => link.url),
+                ['https://a.example.com/', 'http://b.example.com/']
+            )
+            assert.strictEqual(chatEventParser.totalEvents.supplementaryWebLinksEvent, 3)
+            assert.deepStrictEqual(loggedCalls(), [
+                ['log', 'Source links dropped: 1'],
+                ['log', 'Source links dropped: 1'],
+            ])
+        })
     })
 })

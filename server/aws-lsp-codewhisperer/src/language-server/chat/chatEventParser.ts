@@ -10,9 +10,11 @@ import {
     ReferenceTrackerInformation,
     SourceLink,
 } from '@aws/language-server-runtimes/protocol'
+import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { Result } from '../types'
 import { AddMessageEvent } from '../../shared/telemetry/types'
 import { Metric } from '../../shared/telemetry/metric'
+import { isWebUrl } from '../../shared/utils'
 export type ChatResponseStream = ChatResponseStreamCodeWhispererStreaming | ChatResponseStreamQDeveloperStreaming
 
 export type ChatResultWithMetadata = {
@@ -34,6 +36,7 @@ export class ChatEventParser implements ChatResult {
     conversationId?: string
 
     #metric: Metric<AddMessageEvent>
+    #logging: Features['logging']
     #lastChunkTime: number = 0
     #totalEvents = {
         followupPromptEvent: 0,
@@ -67,9 +70,10 @@ export class ChatEventParser implements ChatResult {
         }
     }
 
-    constructor(messageId: string, metric: Metric<AddMessageEvent>) {
+    constructor(messageId: string, metric: Metric<AddMessageEvent>, logging: Features['logging']) {
         this.messageId = messageId
         this.#metric = metric
+        this.#logging = logging
     }
 
     public get totalEvents() {
@@ -126,11 +130,20 @@ export class ChatEventParser implements ChatResult {
             supplementaryWebLinksEvent.supplementaryWebLinks.length > 0
         ) {
             this.#totalEvents.supplementaryWebLinksEvent += 1
-            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks.map(ChatEventParser.mapRelatedData)
+            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks
+                .filter(link => isWebUrl(link.url))
+                .map(ChatEventParser.mapRelatedData)
+            const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
+            if (droppedLinkCount > 0) {
+                // At the default log level, so that a log shows why an answer has fewer source links. The count only.
+                this.#logging.log(`Source links dropped: ${droppedLinkCount}`)
+            }
 
-            this.relatedContent = {
-                ...this.relatedContent,
-                content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+            if (sourceLinks.length > 0) {
+                this.relatedContent = {
+                    ...this.relatedContent,
+                    content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+                }
             }
         } else if (codeReferenceEvent?.references && codeReferenceEvent.references.length > 0) {
             this.#totalEvents.codeReferenceEvent += 1

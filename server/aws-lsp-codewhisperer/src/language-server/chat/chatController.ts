@@ -641,7 +641,7 @@ export class ChatController implements ChatHandlers {
         partialResultToken?: string | number
     ): Promise<Result<ChatResultWithMetadata, string>> {
         const requestId = response.$metadata.requestId!
-        const chatEventParser = new ChatEventParser(requestId, metric)
+        const chatEventParser = new ChatEventParser(requestId, metric, this.#features.logging)
 
         for await (const chatEvent of response.sendMessageResponse!) {
             const result = chatEventParser.processPartialEvent(chatEvent)
@@ -673,7 +673,7 @@ export class ChatController implements ChatHandlers {
         partialResultToken?: string | number
     ): Promise<Result<ChatResultWithMetadata, string>> {
         const requestId = response.$metadata.requestId!
-        const chatEventParser = new ChatEventParser(requestId, metric)
+        const chatEventParser = new ChatEventParser(requestId, metric, this.#features.logging)
 
         for await (const chatEvent of response.sendMessageResponse!) {
             const result = chatEventParser.processPartialEvent(chatEvent)

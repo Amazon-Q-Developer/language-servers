@@ -16,6 +16,7 @@ import { AddMessageEvent } from '../../shared/telemetry/types'
 import { Metric } from '../../shared/telemetry/metric'
 import { Features } from '@aws/language-server-runtimes/server-interface/server'
 import { loggingUtils } from '@aws/lsp-core'
+import { isWebUrl } from '../../shared/utils'
 
 export type ChatResultWithMetadata = {
     chatResult: ChatResult
@@ -180,13 +181,20 @@ export class AgenticChatEventParser implements ChatResult {
             supplementaryWebLinksEvent.supplementaryWebLinks.length > 0
         ) {
             this.#totalEvents.supplementaryWebLinksEvent += 1
-            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks.map(
-                AgenticChatEventParser.mapRelatedData
-            )
+            const sourceLinks = supplementaryWebLinksEvent.supplementaryWebLinks
+                .filter(link => isWebUrl(link.url))
+                .map(AgenticChatEventParser.mapRelatedData)
+            const droppedLinkCount = supplementaryWebLinksEvent.supplementaryWebLinks.length - sourceLinks.length
+            if (droppedLinkCount > 0) {
+                // At the default log level, so that a log shows why an answer has fewer source links. The count only.
+                this.#logging.log(`Source links dropped: ${droppedLinkCount}`)
+            }
 
-            this.relatedContent = {
-                ...this.relatedContent,
-                content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+            if (sourceLinks.length > 0) {
+                this.relatedContent = {
+                    ...this.relatedContent,
+                    content: [...(this.relatedContent?.content ?? []), ...sourceLinks],
+                }
             }
         } else if (codeReferenceEvent?.references && codeReferenceEvent.references.length > 0) {
             this.#totalEvents.codeReferenceEvent += 1

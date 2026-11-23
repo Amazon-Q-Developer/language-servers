@@ -866,18 +866,44 @@ describe('MynahUI', () => {
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
         })
 
-        it('opens nothing for a network path or a non-http scheme and tells the user', () => {
+        it('opens nothing for a network path, a non-http scheme or a web link with credentials or a backslash', () => {
             props().onLinkClick('tab-1', 'answer-1', '\\\\host\\share\\x', undefined, 'event-1')
             props().onInfoLinkClick('tab-1', 'vscode://x', undefined, 'event-2')
+            props().onLinkClick('tab-1', 'answer-1', 'https://trusted.example@attacker.example/', undefined, 'event-3')
+            props().onInfoLinkClick('tab-1', 'https://trusted.example\\@attacker.example/', undefined, 'event-4')
+            // A backslash alone, with no user name or password
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com\\path', undefined, 'event-5')
 
             sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
             sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
-            sinon.assert.calledTwice(notifySpy)
-            strictEqual(notifySpy.firstCall.args[0].type, NotificationType.WARNING)
-            strictEqual(notifySpy.firstCall.args[0].title, 'Link not opened')
-            strictEqual(telemetryNamed('linkClick').length, 1)
-            strictEqual(telemetryNamed('infoLinkClick').length, 1)
+            strictEqual(notifySpy.callCount, 5)
+            for (const call of notifySpy.getCalls()) {
+                deepStrictEqual(call.args, [
+                    {
+                        type: NotificationType.WARNING,
+                        title: 'Link not opened',
+                        content:
+                            'Chat opens only web (http or https) links and local file paths. ' +
+                            'It does not open a web link with a user name, a password or a backslash before any ? or #.',
+                    },
+                ])
+            }
+            strictEqual(telemetryNamed('linkClick').length, 3)
+            strictEqual(telemetryNamed('infoLinkClick').length, 2)
+        })
+
+        it('sends a web link with a backslash after the first ? or # as a link click', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com/search?q=C:\\Users\\x', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.linkClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/search?q=C:\\Users\\x',
+                eventId: 'event-1',
+            })
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.notCalled(notifySpy)
         })
 
         it('sends an absolute info link path as a file click with fullPath', () => {
@@ -889,6 +915,86 @@ describe('MynahUI', () => {
                 fullPath: '/home/x/a.ts',
             })
             sinon.assert.notCalled(outboundChatApi.infoLinkClick as sinon.SinonStub)
+        })
+    })
+
+    describe('source link clicks', () => {
+        const props = () => (mynahUi as any).props
+        const sourceLinkTelemetry = () =>
+            (outboundChatApi.telemetry as sinon.SinonStub).getCalls().filter(c => c.args[0].name === 'sourceLinkClick')
+
+        it('sends an https or http source link to the IDE and records telemetry', () => {
+            props().onSourceLinkClick('tab-1', 'answer-1', 'https://example.com/doc', undefined, 'event-1')
+            props().onSourceLinkClick('tab-1', 'answer-1', 'http://example.com/page', undefined, 'event-2')
+
+            const sourceLinkClick = outboundChatApi.sourceLinkClick as sinon.SinonStub
+            sinon.assert.calledTwice(sourceLinkClick)
+            deepStrictEqual(sourceLinkClick.firstCall.args[0], {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/doc',
+                eventId: 'event-1',
+            })
+            strictEqual(sourceLinkClick.secondCall.args[0].link, 'http://example.com/page')
+            strictEqual(sourceLinkTelemetry().length, 2)
+            sinon.assert.notCalled(notifySpy)
+        })
+
+        it('does not send a source link with another scheme, a local path, credentials or a backslash', () => {
+            const links = [
+                'javascript:x',
+                'file:///etc/hosts',
+                'vscode://settings/x',
+                'command:workbench.action.reloadWindow',
+                'src/foo.ts',
+                '\\\\host\\share\\x',
+                '',
+                'https://user:pass@example.com/',
+                'https://trusted.example\\@attacker.example/',
+                // A backslash alone, with no user name or password, also in the path before a query
+                'https://example.com\\path',
+                'https://example.com/a\\b?q=x',
+            ]
+            for (const link of links) {
+                props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
+            }
+
+            sinon.assert.notCalled(outboundChatApi.sourceLinkClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.notCalled(outboundChatApi.linkClick as sinon.SinonStub)
+            strictEqual(notifySpy.callCount, links.length)
+            for (const call of notifySpy.getCalls()) {
+                deepStrictEqual(call.args, [
+                    {
+                        type: NotificationType.WARNING,
+                        title: 'Link not opened',
+                        content:
+                            'Chat opens only web (http or https) source links. ' +
+                            'It does not open a link with a user name, a password or a backslash before any ? or #.',
+                    },
+                ])
+            }
+            deepStrictEqual(
+                sourceLinkTelemetry().map(c => c.args[0].link),
+                links
+            )
+        })
+
+        it('sends a source link with a backslash after the first ? or # to the IDE', () => {
+            const links = ['https://example.com/search?q=C:\\Users\\x', 'https://example.com/a#C:\\Users\\x']
+            for (const link of links) {
+                props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
+            }
+
+            deepStrictEqual(
+                (outboundChatApi.sourceLinkClick as sinon.SinonStub).getCalls().map(c => c.args[0].link),
+                links
+            )
+            deepStrictEqual(
+                sourceLinkTelemetry().map(c => c.args[0].link),
+                links
+            )
+            sinon.assert.notCalled(notifySpy)
         })
     })
 
