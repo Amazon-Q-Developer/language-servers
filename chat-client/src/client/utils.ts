@@ -298,8 +298,8 @@ function withoutLeadingC0ControlsAndSpaces(href: string): string {
  * Decides where a link clicked in a chat answer goes: http(s) URLs open as links, local paths
  * go to the file-click handler, and everything else (other schemes, `//host` paths, and http(s)
  * URLs that can show one host and open another) is dropped. The IDE gets the link as written,
- * so an http(s) URL with a user name, a password or a backslash is dropped: a browser reads a
- * backslash as a slash, but the IDE's URL parser may not.
+ * so an http(s) URL with a user name, a password or a backslash before the first `?` or `#` is
+ * dropped: a browser reads such a backslash as a slash, but the IDE's URL parser may not.
  */
 export function classifyChatLink(href: string | undefined): ChatLinkTarget {
     href = href?.replace(/[\t\n\r]/g, '')
@@ -314,7 +314,10 @@ export function classifyChatLink(href: string | undefined): ChatLinkTarget {
     try {
         const url = new URL(webHref)
         if ((url.protocol === 'http:' || url.protocol === 'https:') && url.hostname) {
-            return url.username || url.password || webHref.includes('\\') ? { kind: 'none' } : { kind: 'link' }
+            // URL parsers end the host at the first ? or #, so a backslash after it cannot change the host
+            return url.username || url.password || webHref.split(/[?#]/, 1)[0].includes('\\')
+                ? { kind: 'none' }
+                : { kind: 'link' }
         }
     } catch {
         // Not an absolute URL; check below whether it is a local path.

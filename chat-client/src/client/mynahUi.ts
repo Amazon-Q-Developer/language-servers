@@ -558,7 +558,7 @@ export const createMynahUi = (
             messager.onSourceLinkClickTelemetry(payload)
             notifyUnsupportedLink(
                 'Chat opens only web (http or https) source links. ' +
-                    'It does not open a link with a user name, a password or a backslash.'
+                    'It does not open a link with a user name, a password or a backslash before any ? or #.'
             )
         },
         onInfoLinkClick: (tabId, link, mouseEvent, eventId) => {
@@ -946,7 +946,7 @@ export const createMynahUi = (
 
     const notifyUnsupportedLink = (
         content = 'Chat opens only web (http or https) links and local file paths. ' +
-            'It does not open a web link with a user name, a password or a backslash.'
+            'It does not open a web link with a user name, a password or a backslash before any ? or #.'
     ) => {
         mynahUi.notify({
             type: NotificationType.WARNING,

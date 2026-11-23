@@ -1094,6 +1094,9 @@ describe('isWebUrl', () => {
         'https://127.0.0.1/',
         'https://[::1]/',
         ' https://example.com/ ',
+        // A backslash after the first ? or # is in the query or fragment
+        'https://example.com/search?q=C:\\Users\\x',
+        'https://example.com/a#C:\\Users\\x',
     ]) {
         it(`accepts ${JSON.stringify(url)}`, () => {
             assert.strictEqual(isWebUrl(url), true)
@@ -1128,8 +1131,10 @@ describe('isWebUrl', () => {
         'https://user:pass@example.com/',
         'https://trusted.example@attacker.example/',
         'https://:pass@example.com/',
-        // This parser reads a backslash as a slash, but the IDE's URL parser may read the part before @ as a user name
+        // This parser reads a backslash before the first ? or # as a slash, but the IDE's URL parser may read the part
+        // before @ as a user name
         'https://trusted.example\\@attacker.example/',
+        'https://trusted.example\\?@attacker.example/',
     ]) {
         it(`rejects ${JSON.stringify(url)}`, () => {
             assert.strictEqual(isWebUrl(url), false)

@@ -699,12 +699,13 @@ export function sanitizeRequestInput(input: any): any {
 }
 
 /**
- * Whether `url` is an absolute http or https URL with a host name, no user name or password, and no backslash. The
- * chat UI shows the source links of a response and the IDE opens them as written, so a source link with any other URL
- * is dropped. A user name or password can make a link show one host and open another, and so can a backslash, which
- * this parser reads as a slash but the IDE's URL parser may not. The host is not checked: any host is accepted, also
- * a loopback or private address, as for the other web links that chat opens (classifyChatLink in the chat client,
- * which follows the same rule; webLinkCases.json there tests both).
+ * Whether `url` is an absolute http or https URL with a host name, no user name or password, and no backslash before
+ * the first `?` or `#`. The chat UI shows the source links of a response and the IDE opens them as written, so a
+ * source link with any other URL is dropped. A user name or password can make a link show one host and open another,
+ * and so can a backslash before the query or fragment, which this parser reads as a slash but the IDE's URL parser
+ * may not. The host is not checked: any host is accepted, also a loopback or private address, as for the other web
+ * links that chat opens (classifyChatLink in the chat client, which follows the same rule; webLinkCases.json there
+ * tests both).
  */
 export function isWebUrl(url: string | undefined): boolean {
     if (!url) {
@@ -713,7 +714,13 @@ export function isWebUrl(url: string | undefined): boolean {
     try {
         // `URL` rejects an http or https URL without a host.
         const { protocol, username, password } = new URL(url)
-        return (protocol === 'http:' || protocol === 'https:') && !username && !password && !url.includes('\\')
+        return (
+            (protocol === 'http:' || protocol === 'https:') &&
+            !username &&
+            !password &&
+            // URL parsers end the host at the first ? or #, so a backslash after it cannot change the host
+            !url.split(/[?#]/, 1)[0].includes('\\')
+        )
     } catch {
         return false
     }

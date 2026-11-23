@@ -283,10 +283,19 @@ describe('utils', () => {
             assert.deepEqual(classifyChatLink(undefined), { kind: 'none' })
         })
 
-        // A browser reads a backslash as a slash, but the IDE's URL parser may read the part before @ as a user name
-        it('sends nothing for a web link with a backslash', () => {
+        // A browser reads a backslash before the first ? or # as a slash, but the IDE's URL parser may read the part
+        // before @ as a user name
+        it('sends nothing for a web link with a backslash before the first ? or #', () => {
             assert.deepEqual(classifyChatLink('https://trusted.example\\@attacker.example/'), { kind: 'none' })
+            assert.deepEqual(classifyChatLink('https://trusted.example\\?@attacker.example/'), { kind: 'none' })
         })
+
+        // A backslash after the first ? or # is in the query or fragment
+        for (const href of ['https://example.com/search?q=C:\\Users\\x', 'https://example.com/a#C:\\Users\\x']) {
+            it(`opens ${JSON.stringify(href)} as a link`, () => {
+                assert.deepEqual(classifyChatLink(href), { kind: 'link' })
+            })
+        }
 
         // A browser skips only leading C0 control characters and spaces, so these are not web links
         for (const href of ['\u00a0https://example.com/', '\u007fhttps://example.com/']) {

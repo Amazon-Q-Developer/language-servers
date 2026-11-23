@@ -885,12 +885,25 @@ describe('MynahUI', () => {
                         title: 'Link not opened',
                         content:
                             'Chat opens only web (http or https) links and local file paths. ' +
-                            'It does not open a web link with a user name, a password or a backslash.',
+                            'It does not open a web link with a user name, a password or a backslash before any ? or #.',
                     },
                 ])
             }
             strictEqual(telemetryNamed('linkClick').length, 3)
             strictEqual(telemetryNamed('infoLinkClick').length, 2)
+        })
+
+        it('sends a web link with a backslash after the first ? or # as a link click', () => {
+            props().onLinkClick('tab-1', 'answer-1', 'https://example.com/search?q=C:\\Users\\x', undefined, 'event-1')
+
+            sinon.assert.calledOnceWithExactly(outboundChatApi.linkClick as sinon.SinonStub, {
+                tabId: 'tab-1',
+                messageId: 'answer-1',
+                link: 'https://example.com/search?q=C:\\Users\\x',
+                eventId: 'event-1',
+            })
+            sinon.assert.notCalled(outboundChatApi.fileClick as sinon.SinonStub)
+            sinon.assert.notCalled(notifySpy)
         })
 
         it('sends an absolute info link path as a file click with fullPath', () => {
@@ -938,8 +951,9 @@ describe('MynahUI', () => {
                 '',
                 'https://user:pass@example.com/',
                 'https://trusted.example\\@attacker.example/',
-                // A backslash alone, with no user name or password
+                // A backslash alone, with no user name or password, also in the path before a query
                 'https://example.com\\path',
+                'https://example.com/a\\b?q=x',
             ]
             for (const link of links) {
                 props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
@@ -956,7 +970,7 @@ describe('MynahUI', () => {
                         title: 'Link not opened',
                         content:
                             'Chat opens only web (http or https) source links. ' +
-                            'It does not open a link with a user name, a password or a backslash.',
+                            'It does not open a link with a user name, a password or a backslash before any ? or #.',
                     },
                 ])
             }
@@ -964,6 +978,23 @@ describe('MynahUI', () => {
                 sourceLinkTelemetry().map(c => c.args[0].link),
                 links
             )
+        })
+
+        it('sends a source link with a backslash after the first ? or # to the IDE', () => {
+            const links = ['https://example.com/search?q=C:\\Users\\x', 'https://example.com/a#C:\\Users\\x']
+            for (const link of links) {
+                props().onSourceLinkClick('tab-1', 'answer-1', link, undefined, 'event-1')
+            }
+
+            deepStrictEqual(
+                (outboundChatApi.sourceLinkClick as sinon.SinonStub).getCalls().map(c => c.args[0].link),
+                links
+            )
+            deepStrictEqual(
+                sourceLinkTelemetry().map(c => c.args[0].link),
+                links
+            )
+            sinon.assert.notCalled(notifySpy)
         })
     })
 
