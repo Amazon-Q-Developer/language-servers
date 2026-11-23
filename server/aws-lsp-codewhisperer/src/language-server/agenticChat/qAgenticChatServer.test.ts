@@ -3,7 +3,24 @@
  * Will be deleted or merged.
  */
 
+import * as assert from 'assert'
 import { CancellationToken, Server } from '@aws/language-server-runtimes/server-interface'
+import {
+    activeEditorChangedNotificationType,
+    createPromptNotificationType,
+    feedbackNotificationType,
+    fileClickNotificationType,
+    followUpClickNotificationType,
+    inlineChatResultNotificationType,
+    insertToCursorPositionNotificationType,
+    onPinnedContextAddNotificationType,
+    onPinnedContextRemoveNotificationType,
+    promptInputOptionChangeNotificationType,
+    readyNotificationType,
+    tabAddNotificationType,
+    tabChangeNotificationType,
+    tabRemoveNotificationType,
+} from '@aws/language-server-runtimes/protocol'
 import { TestFeatures } from '@aws/language-server-runtimes/testing'
 import sinon from 'ts-sinon'
 import { AgenticChatController } from './agenticChatController'
@@ -12,6 +29,7 @@ import { QAgenticChatServer } from './qAgenticChatServer'
 import { AmazonQTokenServiceManager } from '../../shared/amazonQServiceManager/AmazonQTokenServiceManager'
 import { AmazonQBaseServiceManager } from '../../shared/amazonQServiceManager/BaseAmazonQServiceManager'
 import { LocalProjectContextController } from '../../shared/localProjectContextController'
+import { unhandledRejectionsDuring } from '../../shared/testUtils'
 import { Features } from '../types'
 
 describe('QAgenticChatServer', () => {
@@ -157,5 +175,121 @@ describe('QAgenticChatServer', () => {
         testFeatures.chat.onTabBarAction.firstCall.firstArg({ tabId: mockTabId, action: 'export' })
 
         sinon.assert.calledOnce(tabBarActionStub)
+    })
+
+    // The chat registrations that the runtime binds to JSON-RPC requests. They must return the controller's
+    // result, because the JSON-RPC layer sends it as the response.
+    const requestRegistrations = [
+        'onEndChat',
+        'onChatPrompt',
+        'onOpenFileDialog',
+        'onInlineChatPrompt',
+        'onQuickAction',
+        'onListConversations',
+        'onListRules',
+        'onConversationClick',
+        'onRuleClick',
+        'onListMcpServers',
+        'onMcpServerClick',
+        'onTabBarAction',
+        'onButtonClick',
+        'onListAvailableModels',
+    ] as const
+
+    // The chat registrations that the runtime binds to JSON-RPC notifications, with their method names. Each
+    // registration has the same name as the controller method that it calls.
+    const notificationRegistrations = [
+        ['onTabAdd', tabAddNotificationType.method],
+        ['onReady', readyNotificationType.method],
+        ['onTabChange', tabChangeNotificationType.method],
+        ['onTabRemove', tabRemoveNotificationType.method],
+        ['onSendFeedback', feedbackNotificationType.method],
+        ['onCodeInsertToCursorPosition', insertToCursorPositionNotificationType.method],
+        ['onCreatePrompt', createPromptNotificationType.method],
+        ['onFileClicked', fileClickNotificationType.method],
+        ['onFollowUpClicked', followUpClickNotificationType.method],
+        ['onPromptInputOptionChange', promptInputOptionChangeNotificationType.method],
+        ['onInlineChatResult', inlineChatResultNotificationType.method],
+        ['onActiveEditorChanged', activeEditorChangedNotificationType.method],
+        ['onPinnedContextAdd', onPinnedContextAddNotificationType.method],
+        ['onPinnedContextRemove', onPinnedContextRemoveNotificationType.method],
+    ] as const
+
+    it('lists every chat handler that the server registers as a request or a notification', () => {
+        // A handler that is in neither list would have no test of its result or of its failures. The context
+        // commands provider of the controller registers onFilterContextCommands, a request handler, itself.
+        const registered = Object.entries(testFeatures.chat)
+            .filter(([name, stub]) => name.startsWith('on') && (stub as sinon.SinonStub).called)
+            .map(([name]) => name)
+
+        assert.deepStrictEqual(
+            registered.sort(),
+            [
+                ...requestRegistrations,
+                ...notificationRegistrations.map(([name]) => name),
+                'onFilterContextCommands',
+            ].sort()
+        )
+    })
+
+    describe('request handler results', () => {
+        for (const name of requestRegistrations) {
+            it(`returns the controller result from the ${name} handler`, () => {
+                const result = { marker: name }
+                sinon.stub(AgenticChatController.prototype, name).returns(result as any)
+                const handler = (testFeatures.chat[name] as sinon.SinonStub).firstCall.firstArg
+
+                assert.strictEqual(handler({ tabId: mockTabId }, {}), result)
+            })
+        }
+    })
+
+    describe('notification handler failures', () => {
+        for (const [name, method] of notificationRegistrations) {
+            it(`logs a rejected ${name} handler and leaves no unhandled rejection`, async () => {
+                const failure = new Error(`${name} failed`)
+                sinon.stub(AgenticChatController.prototype, name).rejects(failure)
+                const handler = (testFeatures.chat[name] as sinon.SinonStub).firstCall.firstArg
+
+                const rejections = await unhandledRejectionsDuring(() => handler({ tabId: mockTabId }))
+
+                assert.ok(!rejections.includes(failure), `the ${name} failure was left as an unhandled rejection`)
+                sinon.assert.calledWithMatch(
+                    testFeatures.logging.error as sinon.SinonStub,
+                    sinon.match(method).and(sinon.match(`${name} failed`))
+                )
+            })
+        }
+
+        it('logs a notification handler that throws instead of throwing to the caller', () => {
+            sinon.stub(AgenticChatController.prototype, 'onTabAdd').throws(new Error('onTabAdd threw'))
+
+            assert.doesNotThrow(() => testFeatures.chat.onTabAdd.firstCall.firstArg({ tabId: mockTabId }))
+
+            sinon.assert.calledWithMatch(
+                testFeatures.logging.error as sinon.SinonStub,
+                sinon.match(tabAddNotificationType.method).and(sinon.match('onTabAdd threw'))
+            )
+        })
+
+        it('shows a message and creates no saved prompt when a rule is requested with no workspace folder open', async () => {
+            testFeatures.workspace.getAllWorkspaceFolders.returns([])
+            const showMessageStub = sinon.stub().resolves()
+            testFeatures.lsp.window.showMessage = showMessageStub
+            const handler = testFeatures.chat.onCreatePrompt.firstCall.firstArg
+
+            handler({ promptName: 'no-folder-rule', isRule: true })
+            await new Promise(resolve => setImmediate(resolve))
+
+            sinon.assert.neverCalledWithMatch(
+                testFeatures.logging.error as sinon.SinonStub,
+                sinon.match(createPromptNotificationType.method)
+            )
+            sinon.assert.neverCalledWithMatch(
+                testFeatures.workspace.fs.writeFile as sinon.SinonStub,
+                sinon.match(/no-folder-rule\.md$/)
+            )
+            sinon.assert.calledOnce(showMessageStub)
+        })
     })
 })

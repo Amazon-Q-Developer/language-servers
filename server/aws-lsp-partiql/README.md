@@ -6,9 +6,7 @@ This parser is compiled to a WebAssembly binary using the bindings maintained by
 
 ### Updating the binary
 
-_Updating the binary requires the Docker CLI to be in your PATH_
-
-To update the binary used by the server, run `npm run update-parser-binary`. This will, inside a Docker container, pull the PartiQL playground repository from GitHub and run the `build` command to create a new binary. It is then encoded into base64 in a Typescript file and copied to the `src` folder. Running `npm run build` will then transpile the binary file to Javascript and place it in the `lib` folder.
+To update the binary used by the server, run `npm run update-parser-binary`. The script `build-scripts/compile-inline-partiql-wasm.mts` downloads the release archive of the PartiQL playground that it names, checks the archive against the SHA-256 in the script, and writes the binary encoded into base64 in a TypeScript file, the bindings, and the SHA-256 of the binary to the `src/partiql-parser-wasm` folder. See [the README of that folder](src/partiql-parser-wasm/README.md). Running `npm run compile` will then transpile the binary file to JavaScript and place it in the `out` folder.
 
 To update the binary used in package `web-tree-sitter`, run `npm run update-treesitter-wasm`. This update is forced to make everytime upgrading the version of `web-tree-sitter`. This will compile the `tree-sitter.wasm` file inside the package into a base64 string in a TypeScript file to the `src/tree-sitter-parser` folder as `tree-sitter-inline.ts`. 
 

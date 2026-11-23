@@ -76,17 +76,6 @@ The server is managed via scripts/dev-server.js, which ensures:
 
 **NOTE**: Tests are currently disabled for Windows as we currently face issues with automatically shutting down devserver and cleaning resources after tests are executed.
 
-## Binary Dependencies
-
-### registry.node
-The file `_bundle-assets/registry-js/win32-x64/registry.node` is a precompiled binary downloaded from the [registry-js](https://github.com/desktop/registry-js) project.
-
-- **Current version**: v1.16.1 (released May 21, 2024)
-- **Source**: https://github.com/desktop/registry-js/releases
-- **Purpose**: Provides Windows registry access functionality
-
-**To update**: Download the latest `registry.node` binary for win32-x64 from the registry-js releases page and replace the existing file.
-
 #### Tests configuration
 - Test settings are defined in `wdio.conf.ts`
 - The actual test implementation is in the `test/e2e` folder

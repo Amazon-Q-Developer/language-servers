@@ -129,6 +129,7 @@ import {
     isNullish,
     getOriginFromClientInfo,
     getClientName,
+    restorePropertyNames,
     sanitizeInput,
     sanitizeRequestInput,
 } from '../../shared/utils'
@@ -766,20 +767,27 @@ export class AgenticChatController implements ChatHandlers {
 
     async onCreatePrompt(params: CreatePromptParams): Promise<void> {
         if (params.isRule) {
-            let workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
-            let workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
-            if (workspaceFolders.length > 0) {
-                const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
-                const newFileContent = ''
-                try {
-                    await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
-                    await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
-                    await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
-                } catch (e) {
-                    this.#features.logging.warn(`Error creating rule file: ${e}`)
-                }
+            const workspaceFolders = workspaceUtils.getWorkspaceFolderPaths(this.#features.workspace)
+            // A rule is a file in the rules folder of the first workspace folder, so it needs an open folder.
+            if (workspaceFolders.length === 0) {
+                this.#features.logging.warn('Not creating a rule: no workspace folder is open')
+                await this.#features.lsp.window.showMessage({
+                    type: MessageType.Warning,
+                    message: 'Open a folder to create a rule.',
+                })
                 return
             }
+            const workspaceRulesDirectory = path.join(workspaceFolders[0], '.amazonq', 'rules')
+            const newFilePath = getNewRuleFilePath(params.promptName, workspaceRulesDirectory)
+            const newFileContent = ''
+            try {
+                await this.#features.workspace.fs.mkdir(workspaceRulesDirectory, { recursive: true })
+                await this.#features.workspace.fs.writeFile(newFilePath, newFileContent, { mode: 0o600 })
+                await this.#features.lsp.window.showDocument({ uri: URI.file(newFilePath).toString() })
+            } catch (e) {
+                this.#features.logging.warn(`Error creating rule file: ${e}`)
+            }
+            return
         }
 
         const newFilePath = getNewPromptFilePath(params.promptName)
@@ -1068,7 +1076,9 @@ export class AgenticChatController implements ChatHandlers {
                                 },
                             }
 
-                            const response = await client.sendMessage(requestInput)
+                            // The prompt lists workspace file paths. Remove invisible characters, as for the
+                            // other chat requests.
+                            const response = await client.sendMessage(sanitizeRequestInput(requestInput))
 
                             let responseContent = ''
                             const maxResponseSize = 50000 // 50KB limit
@@ -2376,6 +2386,19 @@ export class AgenticChatController implements ChatHandlers {
                         }
 
                         if (originalNames) {
+                            // The request gives the model the property names of the tool's input schema in their
+                            // sanitized form (sanitizeRequestInput). The tool runs with the names of its schema.
+                            const inputSchema = this.#features.agent
+                                .getTools({ format: 'bedrock' })
+                                .find(tool => tool.toolSpecification.name === toolUse.name)?.toolSpecification
+                                .inputSchema?.json
+                            if (inputSchema === undefined || inputSchema === null) {
+                                this.#features.logging.debug(
+                                    `MCP tool ${toolUse.name} has no input schema, so its input keeps the property names that the model sent`
+                                )
+                            }
+                            executionInput = restorePropertyNames(toolUse.input as object, inputSchema)
+
                             const { serverName, toolName } = originalNames
                             let def
                             try {
@@ -4225,6 +4248,8 @@ export class AgenticChatController implements ChatHandlers {
                 ChatTriggerType.INLINE_CHAT,
                 this.#customizationArn
             )
+            // Remove invisible characters from the whole request, as for the agent loop and compaction requests
+            requestInput = sanitizeRequestInput(requestInput)
 
             if (!this.#serviceManager) {
                 throw new Error('amazonQServiceManager is not initialized')
@@ -4538,7 +4563,16 @@ export class AgenticChatController implements ChatHandlers {
             const contextItems = await localProjectContextController.getContextCommandItems()
             this.#contextCommandsProvider.setFilesAndFoldersPending(false)
             await this.#contextCommandsProvider.processContextCommandUpdate(contextItems)
-            void this.#contextCommandsProvider.maybeUpdateCodeSymbols()
+            // This update runs in the background, so its failure must be handled here, not by the catch below
+            this.#contextCommandsProvider.maybeUpdateCodeSymbols().catch(error => {
+                try {
+                    this.#features.logging.error(
+                        `Error updating code symbols for context commands: ${loggingUtils.formatErr(error)}`
+                    )
+                } catch {
+                    // A failure that cannot be formatted must not become an unhandled rejection
+                }
+            })
         } catch (error) {
             this.#contextCommandsProvider.setFilesAndFoldersFailed(true)
             await this.#contextCommandsProvider.processContextCommandUpdate([])
@@ -4575,6 +4609,8 @@ export class AgenticChatController implements ChatHandlers {
         const sessionResult = this.#chatSessionManagementService.createSession(params.tabId)
         const { data: session, success } = sessionResult
         if (!success) {
+            // tabAdd is a notification, so the JSON-RPC layer discards this result and nobody else reports it
+            this.#features.logging.error(`Chat tab ${params.tabId} has no session: ${sessionResult.error}`)
             return new ResponseError<ChatResult>(ErrorCodes.InternalError, sessionResult.error)
         }
 
