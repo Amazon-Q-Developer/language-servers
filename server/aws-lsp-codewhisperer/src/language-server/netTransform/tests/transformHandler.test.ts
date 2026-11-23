@@ -411,8 +411,8 @@ describe('Test Transform handler ', () => {
             }
 
             await transformHandler.extractAllEntriesTo(pathContainingArchive, zipEntries)
-            expect(mockedLogging.log.args.flat()).to.include(
-                'Attempted to extract a file that does not exist : file1.txt'
+            expect(mockedLogging.error.args.flat()).to.include(
+                'Attempted to extract a file that does not exist: file1.txt'
             )
         })
 
@@ -448,6 +448,27 @@ describe('Test Transform handler ', () => {
             sinon.assert.calledThrice(mkdirStub)
             sinon.assert.calledOnce(writeFileStub)
             sinon.assert.calledWith(writeFileStub, '/test/path/dir1/dir2/file1.txt')
+        })
+
+        it('should skip entries that escape the extraction folder (zip slip)', async () => {
+            mockedLogging.error.resetHistory()
+            const pathContainingArchive = '/test/path'
+            const zipEntries = [
+                createMockZipEntry(`..${path.sep}..${path.sep}evil.txt`, false, 'malicious'),
+                createMockZipEntry(`..${path.sep}outside${path.sep}`, true),
+                createMockZipEntry('dir1/file1.txt', false, 'content1'),
+            ]
+
+            await transformHandler.extractAllEntriesTo(pathContainingArchive, zipEntries)
+
+            // Only the entry inside the folder is written; nothing is created or written for the escaping ones.
+            sinon.assert.calledOnce(writeFileStub)
+            sinon.assert.calledWith(writeFileStub, '/test/path/dir1/file1.txt')
+            sinon.assert.calledOnce(mkdirStub)
+            const blocked = mockedLogging.error.args
+                .flat()
+                .filter(message => String(message).includes('escaping extraction directory'))
+            expect(blocked).to.have.length(2)
         })
 
         it('should handle empty entry list', async () => {
@@ -493,7 +514,9 @@ describe('Test Transform handler ', () => {
             const invalidError = new Error('Invalid path') as NodeJS.ErrnoException
             invalidError.code = 'EINVAL'
 
-            const zipEntries = [createMockZipEntry('invalid/../../file.txt', false, 'content')]
+            // An entry inside the folder, so it reaches mkdir. A ../ entry is now skipped before mkdir (see the zip
+            // slip test above), so it can no longer exercise this error path.
+            const zipEntries = [createMockZipEntry('invalid/file.txt', false, 'content')]
 
             ;(fs.promises.mkdir as sinon.SinonStub).rejects(invalidError)
 

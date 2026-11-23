@@ -103,6 +103,44 @@ function isSafePathSegment(value: unknown): value is string {
 }
 
 /**
+ * A path from a checkpoint's metadata.json joined to rootPath, or undefined when it isn't a relative path that stays
+ * inside rootPath: an absolute or drive path, a '..' segment, or on Windows a ':' (a drive or a stream). Checked as
+ * text, so a link the customer made inside the folder is still followed, as before.
+ */
+export function checkpointEntryPath(rootPath: string, relativePath: unknown): string | undefined {
+    if (typeof relativePath !== 'string' || relativePath.trim() === '') {
+        return undefined
+    }
+    if (
+        path.isAbsolute(relativePath) ||
+        /^[A-Za-z]:/.test(relativePath) ||
+        relativePath.split(/[\\/]/).includes('..') ||
+        (process.platform === 'win32' && relativePath.includes(':'))
+    ) {
+        return undefined
+    }
+    const root = path.resolve(rootPath)
+    return path.resolve(root, relativePath).startsWith(root + path.sep) ? path.join(rootPath, relativePath) : undefined
+}
+
+/**
+ * A path from a checkpoint's metadata.json in the solution folder (see checkpointEntryPath), or undefined when it is
+ * not inside the solution folder or is in the job data folder (workspaceFolderName), whose files the transform uses to
+ * track the job.
+ */
+export function solutionEntryPath(solutionRootPath: string, relativePath: unknown): string | undefined {
+    const entryPath = checkpointEntryPath(solutionRootPath, relativePath)
+    if (!entryPath) {
+        return undefined
+    }
+    const [firstSegment] = path.relative(path.resolve(solutionRootPath), path.resolve(entryPath)).split(path.sep)
+    // Windows ignores trailing dots and spaces in a folder name
+    return firstSegment.replace(/[. ]+$/, '').toLowerCase() === workspaceFolderName.toLowerCase()
+        ? undefined
+        : entryPath
+}
+
+/**
  * ITGen: the folder under itgen/ for a test-run request's project, or undefined for no project (absent or empty).
  * Project names come from the customer's .csproj file names, so they can hold spaces, parentheses or other
  * characters: a name that isn't a plain folder name is made one, with a hash of the name so two names that look
@@ -3318,7 +3356,11 @@ export class ATXTransformHandler {
                             responseType: 'buffer',
                             timeout: { request: 30000 },
                         })
-                        const rawPath = path.join(pathToDownload, `hitl-artifact-${hitlTag || 'unknown'}`)
+                        // The tag names the file: one that isn't a plain file name falls back like a missing one
+                        const rawPath = path.join(
+                            pathToDownload,
+                            `hitl-artifact-${isSafePathSegment(hitlTag) ? hitlTag : 'unknown'}`
+                        )
                         fs.writeFileSync(rawPath, response.body)
                         this.logging.log(`ATX: Raw artifact saved to ${rawPath} (${response.body.length} bytes)`)
                     } catch (downloadError) {
@@ -4397,6 +4439,13 @@ export class ATXTransformHandler {
         solutionRootPath: string,
         stepId: string
     ): Promise<string> {
+        // The job and step IDs name the folder the checkpoint is extracted to
+        if (!isSafePathSegment(jobId) || !isSafePathSegment(stepId)) {
+            this.logging.error(
+                `ATX: Skipped the diff artifact of step ${JSON.stringify(stepId)}: the job or step ID is not a folder name`
+            )
+            return ''
+        }
         const maxRetries = 3
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -5208,6 +5257,13 @@ export class ATXTransformHandler {
             this.logging.log(`ATX: Found ${completedSteps.length} completed steps to check for artifacts`)
 
             for (const step of completedSteps) {
+                // The job and step IDs name the folder the step's checkpoint is extracted to
+                if (!isSafePathSegment(jobId) || !isSafePathSegment(step.StepId)) {
+                    this.logging.error(
+                        `ATX: Skipped completed step ${JSON.stringify(step.StepId)}: the job or step ID is not a folder name`
+                    )
+                    continue
+                }
                 const stepCheckpointPath = path.join(
                     solutionRootPath,
                     workspaceFolderName,
@@ -6423,8 +6479,12 @@ export class ATXTransformHandler {
             // Handle filesAdded: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesAdded) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = checkpointEntryPath(path.join(checkpointFolderPath, 'after'), relativePath)
+                    const destPath = solutionEntryPath(solutionRootPath, relativePath)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped added file outside the solution folder: ${relativePath}`)
+                        continue
+                    }
 
                     // Preserve a customer edit rather than clobber it (see userModifiedFiles).
                     if (
@@ -6460,7 +6520,11 @@ export class ATXTransformHandler {
             // and record the conflict rather than silently deleting their work.
             for (const relativePath of filesRemoved) {
                 try {
-                    const filePath = path.join(solutionRootPath, relativePath)
+                    const filePath = solutionEntryPath(solutionRootPath, relativePath)
+                    if (!filePath) {
+                        this.logging.error(`ATX: Skipped removed file outside the solution folder: ${relativePath}`)
+                        continue
+                    }
                     if (fs.existsSync(filePath)) {
                         if (userModifiedFiles.size > 0 && userModifiedFiles.has(path.resolve(filePath))) {
                             try {
@@ -6486,8 +6550,12 @@ export class ATXTransformHandler {
             // Handle filesUpdated: Copy from {checkpointFolder}/after/{relativePath} to {solutionRootPath}/{relativePath}
             for (const relativePath of filesUpdated) {
                 try {
-                    const sourcePath = path.join(checkpointFolderPath, 'after', relativePath)
-                    const destPath = path.join(solutionRootPath, relativePath)
+                    const sourcePath = checkpointEntryPath(path.join(checkpointFolderPath, 'after'), relativePath)
+                    const destPath = solutionEntryPath(solutionRootPath, relativePath)
+                    if (!sourcePath || !destPath) {
+                        this.logging.error(`ATX: Skipped updated file outside the solution folder: ${relativePath}`)
+                        continue
+                    }
 
                     // The customer-reported edit clobber: if the customer edited this
                     // already-applied file since the last sync, preserve their version instead
@@ -6522,8 +6590,14 @@ export class ATXTransformHandler {
             // Handle filesMoved: Use movedFilesMap to copy content from before to after location, delete before file
             for (const mapping of movedFilesMap) {
                 try {
-                    const beforePath = path.join(solutionRootPath, mapping.before)
-                    const afterPath = path.join(solutionRootPath, mapping.after)
+                    const beforePath = solutionEntryPath(solutionRootPath, mapping.before)
+                    const afterPath = solutionEntryPath(solutionRootPath, mapping.after)
+                    if (!beforePath || !afterPath) {
+                        this.logging.error(
+                            `ATX: Skipped moved file outside the solution folder: ${mapping.before} -> ${mapping.after}`
+                        )
+                        continue
+                    }
 
                     // Ensure destination directory exists
                     const afterDir = path.dirname(afterPath)
