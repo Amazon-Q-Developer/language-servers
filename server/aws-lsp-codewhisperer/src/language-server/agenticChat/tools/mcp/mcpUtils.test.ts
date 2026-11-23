@@ -33,6 +33,7 @@ import {
     migrateToAgentConfig,
     restoreServerScopedPermissions,
     removeUntrustedPermissionSources,
+    isGlobalConfigPath,
     getAgentConfigPathForMcpConfig,
     isPermissionForServer,
     DEFAULT_TOOL_EXEC_TIMEOUT_MS,
@@ -130,6 +131,31 @@ describe('loadMcpServerConfigs', () => {
 
         const out2 = await loadMcpServerConfigs(workspace, logger, [overridePath, globalPath])
         expect(out2.servers.get('S')!.command).to.equal('workspaceCmd')
+    })
+
+    it('treats a global config path that differs only in case as the global config on Windows', async () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'win32' })
+        try {
+            const globalDir = path.join(tmpDir, '.aws', 'amazonq')
+            fs.mkdirSync(globalDir, { recursive: true })
+            // A path of the global mcp.json on Windows, where file names do not depend on case
+            const globalPathInOtherCase = path.join(globalDir, 'MCP.json')
+            fs.writeFileSync(
+                globalPathInOtherCase,
+                JSON.stringify({ mcpServers: { S: { command: 'globalCmd' }, 'glob*': { command: 'globCmd' } } })
+            )
+            const overridePath = path.join(tmpDir, 'override.json')
+            fs.writeFileSync(overridePath, JSON.stringify({ mcpServers: { S: { command: 'workspaceCmd' } } }))
+
+            const out = await loadMcpServerConfigs(workspace, logger, [globalPathInOtherCase, overridePath])
+
+            // The workspace server replaces the global one, and the global file can name a server with '*'
+            expect(out.servers.get('S')!.command).to.equal('workspaceCmd')
+            expect(out.servers.get(sanitizeName('glob*'))!.command).to.equal('globCmd')
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
+        }
     })
 
     it('loads config that uses url only', async () => {
@@ -244,6 +270,16 @@ describe('loadAgentConfig', () => {
         expect(fs.existsSync(agentPath)).to.be.true
         const content = fs.readFileSync(agentPath, 'utf-8')
         expect(content).to.contain('tools')
+    })
+
+    it('creates the default agent config at no other global config path', async () => {
+        const otherGlobalPaths = [getGlobalMcpConfigPath(tmpDir), getGlobalPersonaConfigPath(tmpDir)]
+
+        await loadAgentConfig(workspace, logger, otherGlobalPaths, null, false)
+
+        for (const otherPath of otherGlobalPaths) {
+            expect(fs.existsSync(otherPath), otherPath).to.be.false
+        }
     })
 
     it('loads valid server configs from agent config', async () => {
@@ -1460,6 +1496,152 @@ describe('saveServerSpecificAgentConfig', () => {
         expect(content.mcpServers.testServer).to.deep.equal({ command: 'new-cmd' })
     })
 
+    // Loading skips these fields when they are missing or have another type, so a save must not fail on them
+    for (const [description, lists] of [
+        ['are missing', {}],
+        ['are not arrays', { tools: '*', allowedTools: { tool: true } }],
+    ] as const) {
+        it(`writes the entries of the server when tools and allowedTools ${description}`, async () => {
+            const configPath = path.join(tmpDir, 'agent-config.json')
+            fs.writeFileSync(
+                configPath,
+                JSON.stringify({ name: 'test-agent', mcpServers: { testServer: { command: 'old-cmd' } }, ...lists })
+            )
+
+            await saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'new-cmd' },
+                ['@testServer'],
+                ['@testServer/newTool'],
+                configPath
+            )
+
+            const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+            expect(content.tools).to.deep.equal(['@testServer'])
+            expect(content.allowedTools).to.deep.equal(['@testServer/newTool'])
+            expect(content.mcpServers.testServer).to.deep.equal({ command: 'new-cmd' })
+        })
+    }
+
+    for (const [description, mcpServers] of [
+        ['is missing', undefined],
+        ['is not an object', 'servers'],
+    ] as const) {
+        it(`adds the server when mcpServers ${description}`, async () => {
+            const configPath = path.join(tmpDir, 'agent-config.json')
+            fs.writeFileSync(
+                configPath,
+                JSON.stringify({ name: 'test-agent', mcpServers, tools: ['fs_read'], allowedTools: [] })
+            )
+
+            await saveServerSpecificAgentConfig(
+                workspace,
+                logger,
+                'testServer',
+                { command: 'new-cmd' },
+                ['@testServer'],
+                [],
+                configPath
+            )
+
+            const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+            expect(content.mcpServers).to.deep.equal({ testServer: { command: 'new-cmd' } })
+            expect(content.tools).to.deep.equal(['fs_read', '@testServer'])
+        })
+    }
+
+    it('writes an mcpServers array, which loading reads by index, as an object with the same entries', async () => {
+        const configPath = path.join(tmpDir, 'agent-config.json')
+        fs.writeFileSync(
+            configPath,
+            JSON.stringify({ name: 'test-agent', mcpServers: [{ command: 'first-cmd' }], tools: [], allowedTools: [] })
+        )
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'testServer',
+            { command: 'new-cmd' },
+            ['@testServer'],
+            [],
+            configPath
+        )
+
+        const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        expect(content.mcpServers).to.deep.equal({ 0: { command: 'first-cmd' }, testServer: { command: 'new-cmd' } })
+    })
+
+    it('removes a server from an mcpServers array, which it writes as an object', async () => {
+        const configPath = path.join(tmpDir, 'agent-config.json')
+        // Loading names the servers of an array by their index
+        fs.writeFileSync(
+            configPath,
+            JSON.stringify({
+                name: 'test-agent',
+                mcpServers: [{ command: 'first-cmd' }],
+                tools: ['@0'],
+                allowedTools: [],
+            })
+        )
+
+        await saveServerSpecificAgentConfig(workspace, logger, '0', null, [], [], configPath)
+
+        const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        expect(content.mcpServers).to.deep.equal({})
+        expect(content.tools).to.deep.equal([])
+    })
+
+    it('writes the entries of a legacy server when tools is not an array, and keeps mcpServers', async () => {
+        const configPath = path.join(tmpDir, 'agent-config.json')
+        fs.writeFileSync(
+            configPath,
+            JSON.stringify({ name: 'test-agent', mcpServers: 'servers', tools: '*', allowedTools: [] })
+        )
+
+        await saveServerSpecificAgentConfig(
+            workspace,
+            logger,
+            'legacy',
+            { command: 'legacy-cmd' },
+            ['@legacy'],
+            ['@legacy/tool'],
+            configPath,
+            true
+        )
+
+        const content = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+        expect(content.tools).to.deep.equal(['@legacy'])
+        expect(content.allowedTools).to.deep.equal(['@legacy/tool'])
+        expect(content.mcpServers).to.equal('servers')
+    })
+
+    for (const text of ['null', '[]', '"agent"']) {
+        it(`throws and does not change an agent config that is ${text}`, async () => {
+            const configPath = path.join(tmpDir, 'agent-config.json')
+            fs.writeFileSync(configPath, text)
+
+            let error: Error | undefined
+            try {
+                await saveServerSpecificAgentConfig(
+                    workspace,
+                    logger,
+                    'testServer',
+                    { command: 'new-cmd' },
+                    ['@testServer'],
+                    [],
+                    configPath
+                )
+            } catch (e: any) {
+                error = e
+            }
+
+            expect(error?.message).to.equal('The agent config is not a JSON object')
+            expect(fs.readFileSync(configPath, 'utf-8')).to.equal(text)
+        })
+    }
+
     it('creates parent directories if they do not exist', async () => {
         const configPath = path.join(tmpDir, 'nested', 'dir', 'agent-config.json')
         const serverConfig = { command: 'test-cmd' }
@@ -1715,6 +1897,11 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
     }
     const load = () => loadAgentConfig(workspace, logger, [wsAgentPath, globalAgentPath], null, false)
     const permissions = (agentConfig: AgentConfig) => new AgentPermissionManager(agentConfig)
+    // The config error of a file with ignored permission entries, for a count such as '2 permission entries'
+    const ignoredPermissionsError = (count: string) =>
+        `Ignored ${count}: a workspace config grants permissions only for the MCP servers that it defines; ` +
+        `'*' in tools enables those servers, and other wildcards are ignored. ` +
+        'Set permissions in the MCP server list instead. The log lists each entry.'
 
     beforeEach(async () => {
         sinon.restore()
@@ -1776,9 +1963,15 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
 
         const { errors } = await load()
 
-        expect(errors.get(wsAgentPath)).to.equal(
-            'Ignored 1 permission entry: a workspace config grants permissions only for the MCP servers that it defines, without wildcards. The log lists each entry.'
-        )
+        expect(errors.get(wsAgentPath)).to.equal(ignoredPermissionsError('1 permission entry'))
+    })
+
+    it('says in the error that "*" in tools is accepted and that other wildcards are ignored', async () => {
+        await writeJson(wsAgentPath, { tools: ['*'], allowedTools: ['*'] })
+
+        const { errors } = await load()
+
+        expect(errors.get(wsAgentPath)).to.equal(ignoredPermissionsError('1 permission entry'))
     })
 
     it('does not copy the text of an ignored entry into the errors', async () => {
@@ -1795,8 +1988,8 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
 
         const { errors } = await load()
 
-        expect(errors.get(wsAgentPath)).to.match(/^Ignored 2000 permission entries: /)
-        expect(errors.get(wsAgentPath)!.length).to.be.below(200)
+        // The same text as for one entry: the error does not grow with the entries
+        expect(errors.get(wsAgentPath)).to.equal(ignoredPermissionsError('2000 permission entries'))
     })
 
     it('ignores a wildcard that starts with "@" in a workspace config with one warning, and returns it', async () => {
@@ -1843,6 +2036,43 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
             expect(agentConfig.tools).to.include('*')
             expect(errors.has(globalPathInOtherCase)).to.be.false
             sinon.assert.neverCalledWithMatch(logger.warn, /wildcard permission/)
+        } finally {
+            Object.defineProperty(process, 'platform', platform)
+        }
+    })
+
+    it('treats a global agent config path that differs only in case as global in every check on Windows', async () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+        Object.defineProperty(process, 'platform', { value: 'win32' })
+        try {
+            // A path of the same file on Windows, where file names do not depend on case
+            const globalPathInOtherCase = path.join(path.dirname(globalAgentPath), 'DEFAULT.json')
+            const resource = pathToFileURL(path.join(tmpDir, 'notes.md')).toString()
+            await writeJson(globalPathInOtherCase, {
+                name: 'user-agent',
+                mcpServers: { S: { command: 'global-mcp', args: [] } },
+                resources: [resource],
+            })
+            await writeJson(wsAgentPath, { mcpServers: { S: { command: 'workspace-mcp', args: [] } } })
+
+            for (const agentPaths of [
+                [globalPathInOtherCase, wsAgentPath],
+                [wsAgentPath, globalPathInOtherCase],
+            ]) {
+                const { agentConfig, servers, resourceSources } = await loadAgentConfig(
+                    workspace,
+                    logger,
+                    agentPaths,
+                    null,
+                    false
+                )
+
+                // The workspace server replaces the global one in both orders. The name and the absolute resource
+                // come from the global file, as only the global agent config can give them.
+                expect(servers.get('S')!.command, agentPaths.join()).to.equal('workspace-mcp')
+                expect(agentConfig.name).to.equal('user-agent')
+                expect(resourceSources!.get(resource)).to.deep.equal({ global: true, configPaths: [] })
+            }
         } finally {
             Object.defineProperty(process, 'platform', platform)
         }
@@ -2201,10 +2431,65 @@ describe('loadAgentConfig permission entries from a workspace agent config', () 
     })
 })
 
+describe('isGlobalConfigPath()', () => {
+    const home = path.join(os.tmpdir(), 'home')
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+
+    afterEach(() => {
+        Object.defineProperty(process, 'platform', platform)
+    })
+
+    it('is true for the global MCP config, agent config, and persona config', () => {
+        for (const configPath of [
+            getGlobalMcpConfigPath(home),
+            getGlobalAgentConfigPath(home),
+            getGlobalPersonaConfigPath(home),
+        ]) {
+            expect(isGlobalConfigPath(configPath, home), configPath).to.be.true
+        }
+    })
+
+    it('is false for the config files of a workspace folder, also when the folder is the home folder', () => {
+        // Workspace folders at the home folder or in ~/.aws come closest to the global config paths
+        const folders = [home, path.join(home, '.aws'), path.join(home, '.aws', 'amazonq')]
+        const workspacePaths = [
+            ...getWorkspaceMcpConfigPaths(folders),
+            ...getWorkspaceAgentConfigPaths(folders),
+            ...getWorkspacePersonaConfigPaths(folders),
+            path.join(home, '.aws', 'amazonq', 'mcp-other.json'),
+            // A '..' segment that is not normalized yet
+            `${path.join(home, '.aws', 'amazonq')}${path.sep}..${path.sep}.amazonq${path.sep}mcp.json`,
+        ]
+        for (const value of [platform.value, 'win32']) {
+            Object.defineProperty(process, 'platform', { value })
+            for (const configPath of workspacePaths) {
+                expect(isGlobalConfigPath(configPath, home), `${value}: ${configPath}`).to.be.false
+            }
+        }
+    })
+
+    it('is true for a global config path that is not normalized', () => {
+        const globalDir = path.dirname(getGlobalMcpConfigPath(home))
+
+        expect(isGlobalConfigPath(`${globalDir}${path.sep}.${path.sep}mcp.json`, home)).to.be.true
+    })
+
+    it('compares paths without case on Windows only', () => {
+        const otherCase = path.join(path.dirname(getGlobalAgentConfigPath(home)), 'DEFAULT.json')
+
+        Object.defineProperty(process, 'platform', { value: 'win32' })
+        expect(isGlobalConfigPath(otherCase, home)).to.be.true
+        for (const value of ['linux', 'darwin']) {
+            Object.defineProperty(process, 'platform', { value })
+            expect(isGlobalConfigPath(otherCase, home), value).to.be.false
+        }
+    })
+})
+
 describe('removeUntrustedPermissionSources()', () => {
     const originalPlatform = process.platform
+    const home = '/home/u'
     const globalAgent = '/home/u/.aws/amazonq/agents/default.json'
-    const globalPaths = [globalAgent, '/home/u/.aws/amazonq/mcp.json']
     const wsAgent = '/work/ws/.amazonq/agents/default.json'
     let logger: any
 
@@ -2235,7 +2520,7 @@ describe('removeUntrustedPermissionSources()', () => {
             ['@local/read_tool', new Set(['/work/WS/.amazonq/agents/default.json'])],
             ['@user/tool', new Set(['/HOME/u/.aws/amazonq/agents/default.json'])],
         ])
-        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), home, logger)
         return remaining(pending)
     }
 
@@ -2262,7 +2547,7 @@ describe('removeUntrustedPermissionSources()', () => {
         const loaded = servers({ user: globalAgent })
         const pending = new Map([['@user/tool', new Set([wsAgent, globalAgent])]])
 
-        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), home, logger)
 
         expect(remaining(pending)).to.deep.equal({ '@user/tool': [globalAgent] })
         sinon.assert.calledOnceWithExactly(
@@ -2279,7 +2564,7 @@ describe('removeUntrustedPermissionSources()', () => {
             ['@user/x', new Set([wsMcp])],
         ])
 
-        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), home, logger)
 
         expect(remaining(pending)).to.deep.equal({ '@local': [wsMcp] })
         sinon.assert.calledOnceWithMatch(logger.warn, `Ignoring permission "@user/x" in ${wsMcp}:`)
@@ -2289,7 +2574,7 @@ describe('removeUntrustedPermissionSources()', () => {
         const loaded = servers({ user: globalAgent })
         const pending = new Map([['@removed/tool', new Set([wsAgent])]])
 
-        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), home, logger)
 
         expect(remaining(pending)).to.deep.equal({ '@removed/tool': [wsAgent] })
         sinon.assert.notCalled(logger.warn)
@@ -2299,7 +2584,7 @@ describe('removeUntrustedPermissionSources()', () => {
         const loaded = servers({ user: globalAgent })
         const pending = new Map([['@user/tool', new Set([wsAgent, globalAgent])]])
 
-        const removed = removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), globalPaths, logger)
+        const removed = removeUntrustedPermissionSources(pending, loaded, mappingFor(loaded), home, logger)
 
         expect(removed).to.deep.equal([{ source: wsAgent, message: logger.warn.firstCall.args[0] }])
     })
@@ -2308,7 +2593,7 @@ describe('removeUntrustedPermissionSources()', () => {
         const loaded = servers({ user: globalAgent })
         const pending = new Map([['@user/tool', new Set([wsAgent])]])
 
-        removeUntrustedPermissionSources(pending, loaded, new Map(), globalPaths, logger)
+        removeUntrustedPermissionSources(pending, loaded, new Map(), home, logger)
 
         expect(remaining(pending)).to.deep.equal({})
         sinon.assert.calledOnceWithMatch(logger.warn, /does not define: "user"$/)
