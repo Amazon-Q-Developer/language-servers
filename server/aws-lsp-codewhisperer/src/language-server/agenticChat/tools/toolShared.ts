@@ -202,8 +202,44 @@ export const uncheckedConfigLinksWarning =
     'Amazon Q could not check every link in the configuration folders of this workspace, so this file ' +
     'may be part of the Amazon Q, editor, or Git configuration.'
 
-// Folders inside a workspace that hold Amazon Q, editor, or Git configuration
-const configFolderNames = new Set(['.amazonq', '.vscode', '.git'])
+// Folders inside a workspace that hold Amazon Q, editor, or Git configuration: Amazon Q, VS Code, Git, dev
+// containers, JetBrains IDEs (.idea, and .run for shared run configurations), and Eclipse project settings
+// and builders. They are searched for links as described in isInConfigFolder.
+const configFolderNames = new Set([
+    '.amazonq',
+    '.vscode',
+    '.git',
+    '.devcontainer',
+    '.idea',
+    '.run',
+    '.settings',
+    '.externalToolBuilders',
+])
+
+// Configuration folders that are not searched for links: Visual Studio keeps large caches in .vs, and a
+// searched configuration folder with more links and folders than the search reads makes writes ask (see
+// isInConfigFolder). A link inside such a folder is not resolved, but when the folder itself is a link,
+// its target still counts as configuration.
+const unsearchedConfigFolderNames = new Set(['.vs'])
+
+const allConfigFolderNames = [...configFolderNames, ...unsearchedConfigFolderNames]
+
+// Lowercase names of the configuration folders, to match a folder on a path in any case
+const configFolderNameKeys = new Set(allConfigFolderNames.map(name => name.toLowerCase()))
+
+// Lowercase names and extensions of editor configuration files in any folder of a workspace: dev
+// container, Visual Studio, .NET launch and Eclipse project configuration, VS Code workspace files,
+// JetBrains project files and run configurations, and Eclipse launch configurations
+const configFileNames = new Set([
+    '.devcontainer.json',
+    'tasks.vs.json',
+    'launch.vs.json',
+    'launchsettings.json',
+    '.project',
+    '.cproject',
+    '.factorypath',
+])
+const configFileExtensions = ['.code-workspace', '.run.xml', '.ipr', '.iws', '.launch']
 
 // Folders of a Git directory that are not searched for links: they can be large and hold no
 // configuration
@@ -251,6 +287,16 @@ async function resolveConfigLinkTarget(linkPath: string, logging?: Features['log
  */
 function windowsFileName(name: string): string {
     return process.platform === 'win32' ? name.replace(/:.*$/, '').replace(/[. ]+$/, '') : name
+}
+
+/**
+ * True when `name` is the name of an editor configuration file (see configFileNames and
+ * configFileExtensions), compared in any case and, on Windows, as the file system opens it (see
+ * windowsFileName)
+ */
+function isConfigFileName(name: string): boolean {
+    const key = windowsFileName(name).toLowerCase()
+    return configFileNames.has(key) || configFileExtensions.some(extension => key.endsWith(extension))
 }
 
 /** The path relative to `folder` when `filePath` is inside it, otherwise undefined */
@@ -376,8 +422,8 @@ async function isGitDirectory(dir: string): Promise<boolean> {
 
 /**
  * Where the configuration folders of each workspace folder resolve to, including the git directory
- * a .git file names and the targets of links inside the folders, and the global configuration
- * folder and the targets of links inside it.
+ * a .git file names and the targets of links inside the folders in configFolderNames, and the global
+ * configuration folder and the targets of links inside it.
  */
 async function configFolderLocations(
     canonicalWorkspaceFolders: string[],
@@ -385,7 +431,7 @@ async function configFolderLocations(
 ): Promise<string[]> {
     const locations = await Promise.all([
         ...canonicalWorkspaceFolders.flatMap(folder =>
-            [...configFolderNames].map(async name => {
+            allConfigFolderNames.map(async name => {
                 const folderPath = path.join(folder, name)
                 const [location, linked] = await Promise.all([
                     resolveConfigLinkTarget(folderPath, logging),
@@ -398,7 +444,9 @@ async function configFolderLocations(
                 return [
                     ...(location === undefined ? [] : [location]),
                     searched,
-                    ...(await linkedLocationsInside(searched, name === '.git', logging)),
+                    ...(configFolderNames.has(name)
+                        ? await linkedLocationsInside(searched, name === '.git', logging)
+                        : []),
                 ]
             })
         ),
@@ -418,7 +466,7 @@ async function configFolderLocations(
 
 /**
  * Where a configuration folder in a folder below the top of a workspace folder resolves to, when it
- * is a link or a .git file, and where the links inside it resolve to.
+ * is a link or a .git file, and, for a folder in configFolderNames, where the links inside it resolve to.
  */
 async function nestedConfigFolderLocations(
     folderPath: string,
@@ -426,6 +474,10 @@ async function nestedConfigFolderLocations(
     logging?: Features['logging']
 ): Promise<string[]> {
     const linked = await resolveConfigLink(folderPath, logging)
+    if (!configFolderNames.has(name)) {
+        // Not searched for links
+        return linked === undefined ? [] : [linked]
+    }
     const searched = linked ?? folderPath
     const isFolder = (await fs.promises.stat(searched).catch(() => undefined))?.isDirectory()
     return [
@@ -434,16 +486,8 @@ async function nestedConfigFolderLocations(
     ]
 }
 
-/**
- * Configuration locations in the folders above `canonicalPath`, inside the workspace: where
- * configuration folders there and the links inside them resolve to, the git directory a .git file
- * there names, and any of those folders that is itself a Git directory.
- */
-async function configLocationsAbove(
-    canonicalPath: string,
-    canonicalWorkspaceFolders: string[],
-    logging?: Features['logging']
-): Promise<string[]> {
+/** The folders above `canonicalPath` that are inside a workspace folder, without the workspace folder itself */
+function foldersAboveInWorkspace(canonicalPath: string, canonicalWorkspaceFolders: string[]): string[] {
     const folders: string[] = []
     for (
         let dir = path.dirname(canonicalPath);
@@ -452,9 +496,24 @@ async function configLocationsAbove(
     ) {
         folders.push(dir)
     }
+    return folders
+}
+
+/**
+ * Configuration locations in the folders above `canonicalPath`, inside the workspace: where
+ * configuration folders there and, for the folders in configFolderNames, the links inside them resolve
+ * to, the git directory a .git file there names, and any of those folders that is itself a Git
+ * directory.
+ */
+async function configLocationsAbove(
+    canonicalPath: string,
+    canonicalWorkspaceFolders: string[],
+    logging?: Features['logging']
+): Promise<string[]> {
+    const folders = foldersAboveInWorkspace(canonicalPath, canonicalWorkspaceFolders)
     const locations = await Promise.all([
         ...folders.flatMap(dir =>
-            [...configFolderNames].map(name => nestedConfigFolderLocations(path.join(dir, name), name, logging))
+            allConfigFolderNames.map(name => nestedConfigFolderLocations(path.join(dir, name), name, logging))
         ),
         ...folders.map(async dir => ((await isGitDirectory(dir)) ? [dir] : [])),
     ])
@@ -462,18 +521,55 @@ async function configLocationsAbove(
 }
 
 /**
+ * Where the links with an editor configuration file name (see isConfigFileName) resolve to: the links at
+ * the top of each workspace folder and in the folders above `canonicalPath` inside the workspace. Links
+ * inside configuration folders are handled by the link search (see isInConfigFolder). Other links with
+ * these names, such as links inside .vs, are not resolved.
+ */
+async function configFileLinkTargets(
+    canonicalPath: string,
+    canonicalWorkspaceFolders: string[],
+    logging?: Features['logging']
+): Promise<string[]> {
+    const folders = [
+        ...new Set([
+            ...canonicalWorkspaceFolders,
+            ...foldersAboveInWorkspace(canonicalPath, canonicalWorkspaceFolders),
+        ]),
+    ]
+    const targets = await Promise.all(
+        folders.map(async folder => {
+            // A folder that can't be read has no links to resolve
+            const entries = await fs.promises.readdir(folder, { withFileTypes: true }).catch(() => [] as fs.Dirent[])
+            return Promise.all(
+                entries
+                    .filter(entry => entry.isSymbolicLink() && isConfigFileName(entry.name))
+                    .map(entry => resolveConfigLinkTarget(path.join(folder, entry.name), logging))
+            )
+        })
+    )
+    return targets.flat().filter((target): target is string => target !== undefined)
+}
+
+/**
  * True when `canonicalPath` is inside a workspace folder and is Amazon Q, editor, or Git configuration:
- * - in a configuration folder there, by the name of a folder on the path, or because it is where a
- *   top-level configuration folder, a link inside one, a configuration folder in a folder above the
- *   path or a link inside it, or the git directory named by a .git file resolves to
+ * - in a configuration folder there (see configFolderNames and unsearchedConfigFolderNames), by the
+ *   name of a folder on the path, or because it is where a top-level configuration folder, a link
+ *   inside one, a configuration folder in a folder above the path or a link inside it, or the git
+ *   directory named by a .git file resolves to. Folders in unsearchedConfigFolderNames are not
+ *   searched for links inside them.
+ * - an editor configuration file by its name or by the name it is requested as (see
+ *   isConfigFileName), or the file that a link with such a name resolves to, when the link is at the
+ *   top of a workspace folder or in a folder above the path
  * - in a Git directory, such as a bare repository or the Git directory of a nested repository
  * - the AmazonQ.md rules file at the root of a workspace folder, or the file it links to
  * - in the global Amazon Q configuration folder (~/.aws/amazonq), or where a link inside it resolves
  *   to, when the workspace includes it
  *
  * Returns 'uncheckedLinks' for any other path inside a workspace folder when a configuration folder
- * of the workspace holds more links and folders than the search reads, because a link that the
- * search didn't reach may point to the path.
+ * that is searched for this path (one at the top of a workspace folder, or one in a folder above the
+ * path) holds more links and folders than the search reads, because a link that the search didn't reach
+ * may point to the path.
  */
 async function isInConfigFolder(
     inputPath: string,
@@ -487,15 +583,17 @@ async function isInConfigFolder(
         return false
     }
 
-    const hasConfigFolderName = (folder: string, filePath: string) =>
-        pathInside(folder, filePath)
-            ?.split(/[\\/]/)
-            .some(segment => configFolderNames.has(windowsFileName(segment).toLowerCase())) ?? false
+    const hasConfigName = (folder: string, filePath: string) => {
+        const segments = pathInside(folder, filePath)?.split(/[\\/]/)
+        return (
+            segments !== undefined &&
+            (segments.some(segment => configFolderNameKeys.has(windowsFileName(segment).toLowerCase())) ||
+                isConfigFileName(segments[segments.length - 1]))
+        )
+    }
     const inputFullPath = path.resolve(sanitize(inputPath))
     const folders = [...new Set([...workspaceFolders, ...canonicalWorkspaceFolders])]
-    if (
-        folders.some(folder => hasConfigFolderName(folder, canonicalPath) || hasConfigFolderName(folder, inputFullPath))
-    ) {
+    if (folders.some(folder => hasConfigName(folder, canonicalPath) || hasConfigName(folder, inputFullPath))) {
         return 'configuration'
     }
 
@@ -507,6 +605,7 @@ async function isInConfigFolder(
                 resolveConfigLinkTarget(path.join(folder, rootRulesFileName), logging)
             )
         ),
+        configFileLinkTargets(canonicalPath, canonicalWorkspaceFolders, logging),
     ]).catch(error => {
         if (error instanceof LinkSearchLimitError) {
             return undefined
@@ -516,15 +615,15 @@ async function isInConfigFolder(
     if (!found) {
         return 'uncheckedLinks'
     }
-    const [locations, linkedAbove, rootRulesFiles] = found
-    const isRulesFile = (rulesFile: string | undefined) =>
-        rulesFile !== undefined &&
-        isSamePath(path.dirname(rulesFile), path.dirname(canonicalPath)) &&
-        isSamePath(path.basename(rulesFile), windowsFileName(path.basename(canonicalPath)))
+    const [locations, linkedAbove, rootRulesFiles, rootConfigFileTargets] = found
+    const isConfigFile = (configFile: string | undefined) =>
+        configFile !== undefined &&
+        isSamePath(path.dirname(configFile), path.dirname(canonicalPath)) &&
+        isSamePath(path.basename(configFile), windowsFileName(path.basename(canonicalPath)))
     const isConfiguration =
         [...locations, ...linkedAbove].some(
             location => isSamePath(location, canonicalPath) || pathInside(location, canonicalPath) !== undefined
-        ) || rootRulesFiles.some(isRulesFile)
+        ) || [...rootRulesFiles, ...rootConfigFileTargets].some(isConfigFile)
     return isConfiguration && 'configuration'
 }
 
@@ -544,8 +643,9 @@ export interface PathAcceptanceOptions {
     /**
      * Require approval for Amazon Q, editor, or Git configuration inside the workspace (see
      * isInConfigFolder), unless that exact path is approved. This includes every path inside the
-     * workspace while a configuration folder there holds more links and folders than are searched.
-     * Set by tools that modify files.
+     * workspace while a configuration folder at the top of a workspace folder that is searched for
+     * links holds more links and folders than are searched, and every path below a folder whose own
+     * searched configuration folder holds that many. Set by tools that modify files.
      */
     flagConfigFiles?: boolean
 }
