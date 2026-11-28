@@ -74,6 +74,32 @@ describe('workspace configuration files', () => {
         '.git/config',
         'packages/app/.git/config',
         'AmazonQ.md',
+        'project.code-workspace',
+        'tools/dev.code-workspace',
+        'PROJECT.CODE-WORKSPACE',
+        '.devcontainer/devcontainer.json',
+        '.devcontainer/python/devcontainer.json',
+        '.devcontainer.json',
+        '.idea/workspace.xml',
+        '.idea/runConfigurations/App.xml',
+        'services/api/.idea/misc.xml',
+        '.run/App.run.xml',
+        'app.ipr',
+        'app.iws',
+        '.vs/tasks.vs.json',
+        '.vs/app/v17/.suo',
+        'tasks.vs.json',
+        'src/launch.vs.json',
+        'src/App/Properties/launchSettings.json',
+        '.project',
+        '.cproject',
+        '.factorypath',
+        '.settings/org.eclipse.core.resources.prefs',
+        '.externalToolBuilders/Build.launch',
+        '.externalToolBuilders/builder.xml',
+        'plugins/core/.externalToolBuilders/builder.xml',
+        '.run/App.xml',
+        'App.launch',
     ]) {
         it(`requires acceptance to modify ${relativePath}`, async () => {
             const filePath = path.join(ws, ...relativePath.split('/'))
@@ -94,6 +120,21 @@ describe('workspace configuration files', () => {
         'docs/AmazonQ.md',
         '.gitignore',
         '.github/ci.yml',
+        'docs/workspace.md',
+        'project.code-workspace.bak',
+        'code-workspace/settings.json',
+        '.vscode-test/runner.js',
+        '.devcontainers/notes.md',
+        'idea/notes.md',
+        'build/run.xml',
+        'scripts/app.launch.py',
+        'scripts/relaunch',
+        'docs/tipr',
+        'docs/kiws',
+        'src/App/Properties/AssemblyInfo.cs',
+        '.projectile',
+        'settings/app.json',
+        '.vsconfig',
     ]) {
         it(`does not require acceptance to modify ${relativePath}`, async () => {
             const result = await checkWrite(path.join(ws, ...relativePath.split('/')))
@@ -656,6 +697,246 @@ describe('workspace configuration files', () => {
         assert.strictEqual(result.acceptanceReason, 'configFile')
     })
 
+    describe('workspace files and other IDE configuration', () => {
+        const trySymlink = (target: string, linkPath: string, type: 'file' | 'dir'): boolean => {
+            try {
+                fs.symlinkSync(target, linkPath, type)
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        it('requires acceptance to modify the file that a workspace file at the top of a workspace folder links to', async function () {
+            fs.mkdirSync(path.join(ws, 'notes'))
+            fs.writeFileSync(path.join(ws, 'notes', 'workspace.json'), '{}')
+            if (
+                !trySymlink(path.join(ws, 'notes', 'workspace.json'), path.join(ws, 'project.code-workspace'), 'file')
+            ) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'notes', 'workspace.json'))
+
+            assert.strictEqual(result.requiresAcceptance, true)
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+            assert.strictEqual(result.warning, configFileWarning)
+        })
+
+        it('requires acceptance to modify a file through a link named like a configuration file', async function () {
+            fs.mkdirSync(path.join(ws, 'notes'))
+            fs.writeFileSync(path.join(ws, 'notes', 'other.json'), '{}')
+            const link = path.join(ws, 'notes', 'alias.code-workspace')
+            if (!trySymlink(path.join(ws, 'notes', 'other.json'), link, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(link)
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+            assert.deepStrictEqual(result.canonicalPaths, [path.join(ws, 'notes', 'other.json')])
+        })
+
+        it('requires acceptance to modify a configuration file through a link with another name', async function () {
+            fs.writeFileSync(path.join(ws, '.devcontainer.json'), '{}')
+            const link = path.join(ws, 'container.json')
+            if (!trySymlink(path.join(ws, '.devcontainer.json'), link, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(link)
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+            assert.deepStrictEqual(result.canonicalPaths, [path.join(ws, '.devcontainer.json')])
+        })
+
+        it('requires acceptance to modify the file that a link in a JetBrains configuration folder points to', async function () {
+            fs.mkdirSync(path.join(ws, '.idea', 'runConfigurations'), { recursive: true })
+            fs.mkdirSync(path.join(ws, 'shared'))
+            fs.writeFileSync(path.join(ws, 'shared', 'App.xml'), '<component/>')
+            const link = path.join(ws, '.idea', 'runConfigurations', 'App.xml')
+            if (!trySymlink(path.join(ws, 'shared', 'App.xml'), link, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'shared', 'App.xml'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+        })
+
+        it('requires acceptance to modify the file that a link in the Eclipse builders folder points to', async function () {
+            fs.mkdirSync(path.join(ws, '.externalToolBuilders'))
+            fs.mkdirSync(path.join(ws, 'shared'))
+            fs.writeFileSync(path.join(ws, 'shared', 'build.xml'), '<launchConfiguration/>')
+            const link = path.join(ws, '.externalToolBuilders', 'Build.launch')
+            if (!trySymlink(path.join(ws, 'shared', 'build.xml'), link, 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'shared', 'build.xml'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+        })
+
+        it('does not flag the file that an ordinary link at the top of a workspace folder points to', async function () {
+            fs.writeFileSync(path.join(ws, 'real.txt'), 'synthetic fixture only')
+            if (!trySymlink(path.join(ws, 'real.txt'), path.join(ws, 'alias.txt'), 'file')) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'real.txt'))
+
+            assert.strictEqual(result.requiresAcceptance, false)
+        })
+
+        it('requires acceptance to modify the file that a link named like a configuration file in a folder above it points to', async function () {
+            fs.mkdirSync(path.join(ws, 'sub'))
+            fs.writeFileSync(path.join(ws, 'sub', 'settings.json'), '{}')
+            if (
+                !trySymlink(path.join(ws, 'sub', 'settings.json'), path.join(ws, 'sub', 'dev.code-workspace'), 'file')
+            ) {
+                return this.skip()
+            }
+
+            const result = await checkWrite(path.join(ws, 'sub', 'settings.json'))
+
+            assert.strictEqual(result.acceptanceReason, 'configFile')
+        })
+
+        for (const [folder, linkName] of [
+            ['.devcontainer', 'devcontainer.json'],
+            ['.settings', 'org.eclipse.jdt.core.prefs'],
+            ['.run', 'App.run.xml'],
+        ]) {
+            it(`requires acceptance to modify the file that a link in ${folder} points to`, async function () {
+                fs.mkdirSync(path.join(ws, folder))
+                fs.mkdirSync(path.join(ws, 'shared'))
+                fs.writeFileSync(path.join(ws, 'shared', 'target.txt'), 'synthetic fixture only')
+                if (!trySymlink(path.join(ws, 'shared', 'target.txt'), path.join(ws, folder, linkName), 'file')) {
+                    return this.skip()
+                }
+
+                const result = await checkWrite(path.join(ws, 'shared', 'target.txt'))
+
+                assert.strictEqual(result.acceptanceReason, 'configFile')
+            })
+        }
+
+        for (const [folder, linkName] of [
+            ['.idea', 'App.xml'],
+            ['.externalToolBuilders', 'Build.launch'],
+        ]) {
+            it(`requires acceptance to modify the file that a link in a nested ${folder} folder points to`, async function () {
+                fs.mkdirSync(path.join(ws, 'pkg', folder), { recursive: true })
+                fs.mkdirSync(path.join(ws, 'pkg', 'shared'))
+                fs.writeFileSync(path.join(ws, 'pkg', 'shared', 'target.txt'), 'synthetic fixture only')
+                const link = path.join(ws, 'pkg', folder, linkName)
+                if (!trySymlink(path.join(ws, 'pkg', 'shared', 'target.txt'), link, 'file')) {
+                    return this.skip()
+                }
+
+                const result = await checkWrite(path.join(ws, 'pkg', 'shared', 'target.txt'))
+
+                assert.strictEqual(result.acceptanceReason, 'configFile')
+            })
+        }
+
+        for (const parent of ['', 'pkg']) {
+            it(`requires acceptance to modify a file in the folder that ${parent ? 'a nested' : 'the top-level'} .vs link points to`, async function () {
+                fs.mkdirSync(path.join(ws, parent, 'other'), { recursive: true })
+                if (!trySymlink(path.join(ws, parent, 'other'), path.join(ws, parent, '.vs'), 'dir')) {
+                    return this.skip()
+                }
+
+                const result = await checkWrite(path.join(ws, parent, 'other', 'applicationhost.config'))
+
+                assert.strictEqual(result.acceptanceReason, 'configFile')
+            })
+        }
+
+        for (const folder of ['.idea', '.settings']) {
+            it(`requires acceptance to modify a workspace file when ${folder} holds more links and folders than the search reads`, async () => {
+                const cache = path.join(ws, folder, 'shelf')
+                fs.mkdirSync(cache, { recursive: true })
+                for (let i = 0; i < 2001; i++) {
+                    fs.mkdirSync(path.join(cache, `entry-${i}`))
+                }
+
+                const result = await checkWrite(path.join(ws, 'src', 'index.ts'))
+
+                assert.strictEqual(result.acceptanceReason, 'configFile')
+                assert.strictEqual(result.warning, uncheckedConfigLinksWarning)
+            })
+        }
+
+        it('limits the unchecked-links prompt of a nested configuration folder to the files below its parent folder', async () => {
+            const cache = path.join(ws, 'pkg', '.idea', 'shelf')
+            fs.mkdirSync(cache, { recursive: true })
+            for (let i = 0; i < 2001; i++) {
+                fs.mkdirSync(path.join(cache, `entry-${i}`))
+            }
+
+            const below = await checkWrite(path.join(ws, 'pkg', 'src', 'index.ts'))
+            const elsewhere = await checkWrite(path.join(ws, 'other', 'index.ts'))
+
+            assert.strictEqual(below.warning, uncheckedConfigLinksWarning)
+            assert.strictEqual(elsewhere.requiresAcceptance, false)
+        })
+
+        for (const parent of ['', 'pkg']) {
+            it(`does not search ${parent ? 'a nested' : 'the top-level'} Visual Studio folder for links`, async () => {
+                const cache = path.join(ws, parent, '.vs', 'App', 'v17', 'ipch')
+                fs.mkdirSync(cache, { recursive: true })
+                for (let i = 0; i < 2001; i++) {
+                    fs.mkdirSync(path.join(cache, `entry-${i}`))
+                }
+
+                const result = await checkWrite(path.join(ws, parent, 'src', 'index.ts'))
+                const tasks = await checkWrite(path.join(ws, parent, '.vs', 'tasks.vs.json'))
+
+                // If .vs were searched, this many folders would make this write ask
+                assert.strictEqual(result.requiresAcceptance, false)
+                assert.strictEqual(tasks.acceptanceReason, 'configFile')
+                assert.strictEqual(tasks.warning, configFileWarning)
+            })
+        }
+
+        it('flags these files for fsWrite and fsReplace', async () => {
+            const features = { workspace: makeWorkspace(ws), logging: noopLogging } as unknown as Features
+            for (const relativePath of [
+                'project.code-workspace',
+                '.devcontainer/devcontainer.json',
+                '.idea/workspace.xml',
+            ]) {
+                const filePath = path.join(ws, ...relativePath.split('/'))
+
+                const writeResult = await new FsWrite(features).requiresAcceptance({
+                    command: 'create',
+                    path: filePath,
+                    fileText: '{}',
+                })
+                const replaceResult = await new FsReplace(features).requiresAcceptance({
+                    path: filePath,
+                    diffs: [{ oldStr: '{}', newStr: '{ }' }],
+                })
+
+                assert.strictEqual(writeResult.acceptanceReason, 'configFile', relativePath)
+                assert.strictEqual(replaceResult.acceptanceReason, 'configFile', relativePath)
+            }
+        })
+
+        it('does not flag these files when the option is not set', async () => {
+            const result = await requiresPathAcceptance(
+                path.join(ws, 'project.code-workspace'),
+                'fsRead',
+                makeWorkspace(ws),
+                noopLogging
+            )
+
+            assert.strictEqual(result.requiresAcceptance, false)
+        })
+    })
+
     describe('global Amazon Q configuration', () => {
         const homeVariables = ['HOME', 'USERPROFILE'] as const
         let savedHome: Partial<Record<(typeof homeVariables)[number], string>>
@@ -746,6 +1027,10 @@ describe('workspace configuration files', () => {
             '.git::$INDEX_ALLOCATION/config',
             'AmazonQ.md.',
             'AmazonQ.md::$DATA',
+            'project.code-workspace.',
+            'project.code-workspace::$DATA',
+            '.devcontainer./devcontainer.json',
+            '.vs /app.txt',
         ]) {
             it(`requires acceptance on Windows to modify ${relativePath}`, async () => {
                 const result = await onPlatform('win32', () => checkWrite(`${ws}/${relativePath}`))
